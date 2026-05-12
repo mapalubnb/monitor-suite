@@ -1,19 +1,15 @@
 /**
- * 飞书交互机器人 — 远程 Shell
- * 通过飞书消息执行服务器命令，同时提供监控快捷指令
+ * 飞书交互机器人 — 远程 Shell（长连接模式）
+ * 通过飞书 WebSocket 长连接接收消息，无需公网 IP 和事件订阅配置。
  *
  * 前置条件：
  *   1. 飞书开放平台创建自建应用，拿到 App ID / App Secret
  *   2. 开启「机器人」能力
- *   3. 事件订阅地址填 http://<你的IP>:3001/feishu/event
- *   4. 订阅事件：im.message.receive_v1
- *   5. 发布应用版本
+ *   3. 发布应用版本
  *
  * 启动：node feishu-bot.mjs  或  pm2 start feishu-bot.mjs --name feishu-bot
  */
 
-import { createServer } from "node:http";
-import { createHmac, createDecipheriv } from "node:crypto";
 import { exec as execCb } from "node:child_process";
 import { readFileSync, writeFileSync, statSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -24,8 +20,9 @@ import {
   sendCard as _sdkSendCard, sendText as _sdkSendText,
   replyText as _sdkReplyText, replyCard as _sdkReplyCard,
   replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile, sendFile as _sdkSendFile,
-  getClient, getChatId,
+  getClient, getChatId, lark,
 } from "../shared/feishu-client.mjs";
+import { AI, chatCompletion, listProviders, switchProvider } from "../shared/ai-client.mjs";
 
 const execAsync = promisify(execCb);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -46,14 +43,9 @@ for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) 
    配置（从环境变量读取，部署前请配置 .env）
    ══════════════════════════════════════════ */
 const CONFIG = {
-  port: 3001,
-
   // 飞书自建应用凭证
   feishuAppId: process.env.FEISHU_APP_ID || "",
   feishuAppSecret: process.env.FEISHU_APP_SECRET || "",
-
-  // 飞书事件订阅配置
-  feishuEncryptKey: "",   // 事件加密 Key，留空表示不加密
 
   // 监控脚本目录（snapshot.json 所在位置）
   monitorDir: __dirname,
@@ -100,24 +92,6 @@ async function sendWebhookCard(title, content, template = "blue") {
   await _sdkSendCard(title, content, template);
 }
 
-// 事件去重缓存（message_id -> timestamp）
-const eventCache = new Map();
-const EVENT_CACHE_TTL = 300_000; // 5 分钟
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [k, v] of eventCache) {
-    if (now - v > EVENT_CACHE_TTL) eventCache.delete(k);
-  }
-}, 60_000);
-
-function isDuplicate(eventId) {
-  if (!eventId) return false;
-  if (eventCache.has(eventId)) return true;
-  eventCache.set(eventId, Date.now());
-  return false;
-}
-
 /* ── 飞书 API：使用 SDK 自动管理 token ── */
 // getTenantToken 不再需要，SDK 内部自动处理
 
@@ -159,26 +133,110 @@ async function replyFile(messageId, fileKey) {
 }
 
 /* ══════════════════════════════════════════
-   事件解密（如果配置了 Encrypt Key）
+   消息路由
    ══════════════════════════════════════════ */
-function decryptEvent(encrypted) {
-  const key = CONFIG.feishuEncryptKey;
-  if (!key) return null;
-  const keyHash = createHmac("sha256", "").update(key).digest();
-  const enc = Buffer.from(encrypted, "base64");
-  const iv = enc.subarray(0, 16);
-  const data = enc.subarray(16);
-  const decipher = createDecipheriv("aes-256-cbc", keyHash, iv);
-  let decrypted = decipher.update(data, undefined, "utf8");
-  decrypted += decipher.final("utf8");
-  return JSON.parse(decrypted);
+async function handleMessage(messageId, rawText) {
+  // 去除 @机器人 的 mention 标记
+  const text = rawText.replace(/@_user_\d+/g, "").trim();
+  if (!text) return;
+
+  log(`收到指令：${text}`);
+
+  const parts = text.split(/\s+/);
+  const cmd = parts[0].toLowerCase();
+  const args = parts.slice(1);
+
+  try {
+    let reply;
+    switch (cmd) {
+      case "help":
+      case "帮助":
+        reply = cmdHelp();
+        await replyCard(messageId, "帮助", reply, "blue");
+        return;
+
+      case "ai":
+      case "问":
+      case "ask": {
+        // 检查是否为模型管理子命令
+        const aiSubCmd = (args[0] || "").toLowerCase();
+        if (["model", "模型", "switch", "切换", "list", "列表"].includes(aiSubCmd)) {
+          reply = cmdAiModel(aiSubCmd, args.slice(1));
+          await replyCard(messageId, "AI 模型", reply, "purple");
+          return;
+        }
+        reply = await cmdAi(args.join(" "));
+        await replyCard(messageId, "AI 助手", reply, "blue");
+        return;
+      }
+
+      case "history":
+      case "历史": {
+        const n = Math.min(parseInt(args[0]) || 10, 50);
+        const records = readRecentHistory(n);
+        if (records.length === 0) {
+          reply = "暂无变更记录";
+        } else {
+          const lines = [`**最近 ${records.length} 条变更记录：**`, ""];
+          for (const r of records) {
+            const time = new Date(r.ts).toLocaleString("zh-CN", { hour12: false });
+            lines.push(`\`${time}\` **[${r.module}]** ${r.title}`);
+          }
+          reply = lines.join("\n");
+        }
+        await replyCard(messageId, "变更历史", reply, "purple");
+        return;
+      }
+
+      case "report":
+      case "日报": {
+        await replyText(messageId, "正在生成日报...");
+        await sendDailyReport();
+        await replyText(messageId, "日报已推送到群聊");
+        return;
+      }
+
+      case "exec":
+      case "$": {
+        const command = args.join(" ");
+        if (willRestartSelf(command)) {
+          await replyCard(messageId, "重启", `即将执行：\`${command}\`\n机器人将短暂离线...`, "yellow");
+          setTimeout(() => { execAsync(command, { timeout: CONFIG.execTimeout, cwd: CONFIG.monitorDir, env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }).catch(() => {}); }, 1_000);
+          return;
+        }
+        const result = await cmdExec(command);
+        const card = inferCard(command);
+        await replyCard(messageId, card.title, formatExecBody(result, card), result.ok ? card.color : "red");
+        if (result.ok && LOG_CMD_RE.test(command.trim())) {
+          await sendLogFile(messageId, command);
+        }
+        return;
+      }
+
+      default: {
+        if (willRestartSelf(text)) {
+          await replyCard(messageId, "重启", `即将执行：\`${text}\`\n机器人将短暂离线...`, "yellow");
+          setTimeout(() => { execAsync(text, { timeout: CONFIG.execTimeout, cwd: CONFIG.monitorDir, env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }).catch(() => {}); }, 1_000);
+          return;
+        }
+        const result = await cmdExec(text);
+        const card = inferCard(text);
+        await replyCard(messageId, card.title, formatExecBody(result, card), result.ok ? card.color : "red");
+        if (result.ok && LOG_CMD_RE.test(text.trim())) {
+          await sendLogFile(messageId, text);
+        }
+        return;
+      }
+    }
+  } catch (err) {
+    log(`指令处理异常：${err.message}`);
+    try { await replyText(messageId, `处理异常：${err.message}`); } catch {}
+  }
 }
 
 /* ══════════════════════════════════════════
    AI 对话（共享 ai-client，多模型热切换）
    ══════════════════════════════════════════ */
-
-import { AI, chatCompletion, listProviders, switchProvider } from "../shared/ai-client.mjs";
 
 const AI_CONFIG = {
   get apiUrl() { return AI.apiUrl; },
@@ -885,320 +943,78 @@ async function cmdExec(command) {
 }
 
 /* ══════════════════════════════════════════
-   消息路由
+   启动（WebSocket 长连接模式）
    ══════════════════════════════════════════ */
-async function handleMessage(messageId, rawText) {
-  // 去除 @机器人 的 mention 标记
-  const text = rawText.replace(/@_user_\d+/g, "").trim();
-  if (!text) return;
 
-  log(`收到指令：${text}`);
+const APP_ID = process.env.FEISHU_APP_ID || "";
+const APP_SECRET = process.env.FEISHU_APP_SECRET || "";
 
-  const parts = text.split(/\s+/);
-  const cmd = parts[0].toLowerCase();
-  const args = parts.slice(1);
-
-  try {
-    let reply;
-    switch (cmd) {
-      case "help":
-      case "帮助":
-        reply = cmdHelp();
-        await replyCard(messageId, "帮助", reply, "blue");
-        return;
-
-      case "ai":
-      case "问":
-      case "ask": {
-        // 检查是否为模型管理子命令
-        const aiSubCmd = (args[0] || "").toLowerCase();
-        if (["model", "模型", "switch", "切换", "list", "列表"].includes(aiSubCmd)) {
-          reply = cmdAiModel(aiSubCmd, args.slice(1));
-          await replyCard(messageId, "AI 模型", reply, "purple");
-          return;
-        }
-        reply = await cmdAi(args.join(" "));
-        await replyCard(messageId, "AI 助手", reply, "blue");
-        return;
-      }
-
-      case "history":
-      case "历史": {
-        const n = Math.min(parseInt(args[0]) || 10, 50);
-        const records = readRecentHistory(n);
-        if (records.length === 0) {
-          reply = "暂无变更记录";
-        } else {
-          const lines = [`**最近 ${records.length} 条变更记录：**`, ""];
-          for (const r of records) {
-            const time = new Date(r.ts).toLocaleString("zh-CN", { hour12: false });
-            lines.push(`\`${time}\` **[${r.module}]** ${r.title}`);
-          }
-          reply = lines.join("\n");
-        }
-        await replyCard(messageId, "变更历史", reply, "purple");
-        return;
-      }
-
-      case "report":
-      case "日报": {
-        await replyText(messageId, "正在生成日报...");
-        await sendDailyReport();
-        await replyText(messageId, "日报已推送到群聊");
-        return;
-      }
-
-      case "exec":
-      case "$": {
-        const command = args.join(" ");
-        if (willRestartSelf(command)) {
-          await replyCard(messageId, "重启", `即将执行：\`${command}\`\n机器人将短暂离线...`, "yellow");
-          setTimeout(() => { execAsync(command, { timeout: CONFIG.execTimeout, cwd: CONFIG.monitorDir, env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }).catch(() => {}); }, 1_000);
-          return;
-        }
-        const result = await cmdExec(command);
-        const card = inferCard(command);
-        await replyCard(messageId, card.title, formatExecBody(result, card), result.ok ? card.color : "red");
-        // 日志命令：追加完整日志文件下载
-        if (result.ok && LOG_CMD_RE.test(command.trim())) {
-          await sendLogFile(messageId, command);
-        }
-        return;
-      }
-
-      default: {
-        if (willRestartSelf(text)) {
-          await replyCard(messageId, "重启", `即将执行：\`${text}\`\n机器人将短暂离线...`, "yellow");
-          setTimeout(() => { execAsync(text, { timeout: CONFIG.execTimeout, cwd: CONFIG.monitorDir, env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }).catch(() => {}); }, 1_000);
-          return;
-        }
-        const result = await cmdExec(text);
-        const card = inferCard(text);
-        await replyCard(messageId, card.title, formatExecBody(result, card), result.ok ? card.color : "red");
-        // 日志命令：追加完整日志文件下载
-        if (result.ok && LOG_CMD_RE.test(text.trim())) {
-          await sendLogFile(messageId, text);
-        }
-        return;
-      }
-    }
-  } catch (err) {
-    log(`指令处理异常：${err.message}`);
-    try { await replyText(messageId, `处理异常：${err.message}`); } catch {}
-  }
+if (!APP_ID || !APP_SECRET) {
+  log("⚠ 错误：FEISHU_APP_ID / FEISHU_APP_SECRET 未配置，无法启动");
+  process.exit(1);
 }
 
-/* ══════════════════════════════════════════
-   HTTP Server
-   ══════════════════════════════════════════ */
-function parseBody(req, maxBytes = 1024 * 1024) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let totalLen = 0;
-    let destroyed = false;
-    req.on("data", (c) => {
-      if (destroyed) return;
-      totalLen += c.length;
-      if (totalLen > maxBytes) {
-        destroyed = true;
-        req.destroy();
-        reject(new Error(`请求体超过 ${maxBytes} 字节限制`));
+// 创建事件分发器
+const eventDispatcher = new lark.EventDispatcher({}).register({
+  "im.message.receive_v1": async (data) => {
+    try {
+      const message = data.message;
+      if (!message || message.message_type !== "text") {
+        log(`非文本消息，忽略（类型：${message?.message_type}）`);
         return;
       }
-      chunks.push(c);
-    });
-    req.on("end", () => {
-      if (destroyed) return;
+
+      // 解析消息内容
+      let content;
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString()));
-      } catch (e) {
-        reject(e);
-      }
-    });
-    req.on("error", (e) => {
-      if (!destroyed) reject(e);
-    });
-  });
-}
-
-const server = createServer(async (req, res) => {
-  // ── 健康检查 ──
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", uptime: process.uptime() }));
-    return;
-  }
-
-  // ── 飞书卡片交互回调（按钮点击） ──
-  if (req.method === "POST" && req.url === "/feishu/card") {
-    try {
-      const body = await parseBody(req);
-
-      // URL 验证（配置卡片请求地址时飞书会发 challenge）
-      if (body.type === "url_verification") {
-        log("[卡片回调] 收到 URL 验证请求");
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ challenge: body.challenge }));
+        content = JSON.parse(message.content);
+      } catch {
+        log(`消息内容解析失败：${message.content}`);
         return;
       }
 
-      const action = body.action;
-      const value = action?.value;
-      if (value?.action === "download_diff" && value?.file) {
-        // 快速响应 200，防止飞书超时
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({}));
-        // 异步上传文件并发送到群聊
-        (async () => {
-          try {
-            const filePath = value.file;
-            // 安全校验：只允许访问 diffs 目录
-            const allowedDirs = ["/root/fourmeme-monitor/diffs/", "/root/flap-monitor/diffs/"];
-            const resolved = join("/", filePath);
-            if (!allowedDirs.some(d => resolved.startsWith(d))) {
-              log(`[卡片回调] 路径不合法: ${resolved}`);
-              return;
-            }
-            if (!existsSync(resolved)) {
-              log(`[卡片回调] 文件不存在: ${resolved}`);
-              try {
-                const chatId = getChatId() || body.open_chat_id;
-                if (chatId) {
-                    await _sdkSendText("Diff 文件已过期或不存在（文件保留 7 天）", { chatId });
-                }
-              } catch (_) {}
-              return;
-            }
-            const fileContent = readFileSync(resolved, "utf-8");
-            const fileName = resolved.split("/").pop();
-            const fileKey = await _sdkUploadFile(fileName, fileContent);
-            const chatId = getChatId() || body.open_chat_id;
-            if (chatId) await _sdkSendFile(fileKey, { chatId });
-            log(`[卡片回调] diff 文件已发送: ${fileName}`);
-          } catch (err) {
-            log(`[卡片回调] 发送失败: ${err.message}`);
-          }
-        })();
+      const text = content.text || "";
+      const messageId = message.message_id;
+
+      // 发送者鉴权
+      const senderId = data?.sender?.sender_id?.open_id || "";
+      if (CONFIG.allowedSenders.length > 0 && !CONFIG.allowedSenders.includes(senderId)) {
+        log(`未授权用户：${senderId}`);
         return;
       }
-      // 未知按钮，返回空
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({}));
-      return;
+
+      // 速率限制
+      if (!checkRateLimit(senderId || "anonymous")) {
+        log(`速率限制：${senderId}`);
+        try { await replyText(messageId, "操作过于频繁，请稍后再试"); } catch {}
+        return;
+      }
+
+      // 处理命令
+      await handleMessage(messageId, text);
     } catch (err) {
-      log(`[卡片回调] 异常: ${err.message}`);
-      if (!res.headersSent) { res.writeHead(200); res.end("{}"); }
-      return;
+      log(`消息处理失败：${err.message}`);
     }
-  }
-
-  // ── 飞书事件回调 ──
-  if (req.method === "POST" && req.url === "/feishu/event") {
-    try {
-      let body = await parseBody(req);
-
-      // 如果启用了加密
-      if (body.encrypt && CONFIG.feishuEncryptKey) {
-        body = decryptEvent(body.encrypt);
-      }
-
-      // URL 验证（首次配置事件订阅时飞书会发）
-      if (body.type === "url_verification") {
-        log("收到 URL 验证请求");
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ challenge: body.challenge }));
-        return;
-      }
-
-      // v2.0 事件格式
-      if (body.header && body.header.event_type === "im.message.receive_v1") {
-        const eventId = body.header.event_id;
-        // 快速响应 200，防止飞书重试
-        res.writeHead(200, { "Content-Type": "text/plain" });
-        res.end("ok");
-
-        // 去重
-        if (isDuplicate(eventId)) {
-          log(`重复事件，跳过：${eventId}`);
-          return;
-        }
-
-        const event = body.event;
-        const message = event?.message;
-        if (!message || message.message_type !== "text") {
-          log(`非文本消息，忽略（类型：${message?.message_type}）`);
-          return;
-        }
-
-        // 解析消息内容
-        let content;
-        try {
-          content = JSON.parse(message.content);
-        } catch {
-          log(`消息内容解析失败：${message.content}`);
-          return;
-        }
-
-        const text = content.text || "";
-        const messageId = message.message_id;
-
-        // 发送者鉴权
-        const senderId = event?.sender?.sender_id?.open_id || "";
-        if (CONFIG.allowedSenders.length > 0 && !CONFIG.allowedSenders.includes(senderId)) {
-          log(`未授权用户：${senderId}`);
-          // Don't reply to avoid leaking info, just ignore
-          return;
-        }
-
-        // 速率限制
-        if (!checkRateLimit(senderId || "anonymous")) {
-          log(`速率限制：${senderId}`);
-          try { await replyText(message.message_id, "操作过于频繁，请稍后再试"); } catch {}
-          return;
-        }
-
-        // 异步处理命令（不阻塞 HTTP 响应）
-        handleMessage(messageId, text).catch((err) => {
-          log(`消息处理失败：${err.message}`);
-        });
-        return;
-      }
-
-      // 其他事件
-      res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("ok");
-    } catch (err) {
-      log(`请求处理异常：${err.message}`);
-      if (!res.headersSent) {
-        res.writeHead(500);
-        res.end("error");
-      }
-    }
-    return;
-  }
-
-  // 404
-  res.writeHead(404);
-  res.end("Not Found");
+  },
 });
 
-server.timeout = 30_000;
-server.requestTimeout = 10_000;
-server.maxConnections = 100;
+// 启动 WebSocket 长连接
+const wsClient = new lark.WSClient({
+  appId: APP_ID,
+  appSecret: APP_SECRET,
+  loggerLevel: lark.LoggerLevel.info,
+});
 
-/* ══════════════════════════════════════════
-   启动
-   ══════════════════════════════════════════ */
-server.listen(CONFIG.port, () => {
-  log(`飞书交互机器人已启动，监听端口 ${CONFIG.port}`);
-  log(`事件回调地址：http://0.0.0.0:${CONFIG.port}/feishu/event`);
-  log(`卡片回调地址：http://0.0.0.0:${CONFIG.port}/feishu/card`);
-  log(`健康检查地址：http://0.0.0.0:${CONFIG.port}/health`);
-  if (!getClient()) {
-    log("⚠ 警告：飞书 SDK 未初始化，无法回复消息！");
-  }
+wsClient.start({
+  eventDispatcher,
+}).then(() => {
+  log("飞书交互机器人已启动（WebSocket 长连接模式）");
+  log("无需配置事件订阅地址，消息通过长连接接收");
   // 启动每日报告定时器
   scheduleDailyReport();
+}).catch((err) => {
+  log(`WebSocket 连接失败：${err.message}`);
+  process.exit(1);
 });
 
 process.on("unhandledRejection", (err) => {
