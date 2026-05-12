@@ -308,16 +308,27 @@ export async function uploadFile(fileName, content) {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
   const buf = typeof content === "string" ? Buffer.from(content, "utf-8") : content;
+  // 飞书 SDK 要求 file 字段为 ReadableStream，不能直接传 Buffer
+  const { Readable } = await import("node:stream");
+  const stream = Readable.from(buf);
   const tokenOpt = await withToken();
   const res = await client.im.file.create({
     data: {
       file_type: "stream",
       file_name: fileName,
-      file: buf,
+      file: stream,
     },
   }, tokenOpt);
-  if (res.code !== 0) throw new Error(`文件上传失败: ${res.msg}`);
-  return res.data?.file_key;
+  if (res.code !== 0) {
+    const errMsg = res.msg || res.message || JSON.stringify(res).slice(0, 200);
+    throw new Error(`文件上传失败 code=${res.code}: ${errMsg}`);
+  }
+  const fileKey = res.data?.file_key || res.file_key;
+  if (!fileKey) {
+    log(`[飞书SDK] 上传成功但未返回 file_key，完整响应: ${JSON.stringify(res).slice(0, 300)}`);
+    throw new Error("文件上传成功但未返回 file_key");
+  }
+  return fileKey;
 }
 
 /**
