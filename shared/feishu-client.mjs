@@ -236,7 +236,7 @@ export async function uploadFile(fileName, content) {
     },
   });
   if (res.code !== 0) throw new Error(`文件上传失败: ${res.msg}`);
-  return res.data.file_key;
+  return res.data?.file_key;
 }
 
 /**
@@ -312,9 +312,15 @@ const messageThrottle = {
   pendingHeartbeat: null,
 };
 
+let _processingPromise = null;
+
 async function processQueue() {
-  if (messageThrottle.processing) return;
-  messageThrottle.processing = true;
+  if (_processingPromise) return _processingPromise;
+  _processingPromise = _doProcessQueue();
+  return _processingPromise;
+}
+
+async function _doProcessQueue() {
   try {
     while (messageThrottle.queue.length > 0) {
       const now = Date.now();
@@ -347,7 +353,7 @@ async function processQueue() {
       }
     }
   } finally {
-    messageThrottle.processing = false;
+    _processingPromise = null;
   }
 }
 

@@ -21,7 +21,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
-  sendCard as _sdkSendCard, replyText as _sdkReplyText, replyCard as _sdkReplyCard,
+  sendCard as _sdkSendCard, sendText as _sdkSendText,
+  replyText as _sdkReplyText, replyCard as _sdkReplyCard,
   replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile, sendFile as _sdkSendFile,
   getClient, getChatId,
 } from "../shared/feishu-client.mjs";
@@ -484,7 +485,7 @@ async function buildDailyReport() {
 }
 
 /**
- * 发送每日报告到飞书 webhook（使用与监控相同的 webhook）
+ * 发送每日报告到飞书群聊（通过飞书 SDK）
  */
 async function sendDailyReport() {
   log("[日报] 开始生成每日报告...");
@@ -1063,8 +1064,7 @@ const server = createServer(async (req, res) => {
               try {
                 const chatId = getChatId() || body.open_chat_id;
                 if (chatId) {
-                  const { sendText } = await import("../shared/feishu-client.mjs");
-                  await sendText("Diff 文件已过期或不存在（文件保留 7 天）", { chatId });
+                    await _sdkSendText("Diff 文件已过期或不存在（文件保留 7 天）", { chatId });
                 }
               } catch (_) {}
               return;

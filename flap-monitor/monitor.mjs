@@ -19,7 +19,7 @@ import { createHash, createHmac } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync, statSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sendCard, sendCardQueued, patchCard, uploadFile, sendFile, pinMessage, buildCardJson, waitQueueDrain } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard, uploadFile, sendFile, pinMessage, waitQueueDrain } from "../shared/feishu-client.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 

@@ -24,7 +24,7 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mk
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, uploadFile, sendFile, pinMessage, buildCardJson, waitQueueDrain } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, uploadFile, sendFile, waitQueueDrain } from "../shared/feishu-client.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
