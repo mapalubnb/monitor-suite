@@ -990,6 +990,24 @@ if (!APP_ID || !APP_SECRET) {
   process.exit(1);
 }
 
+// ── 消息去重（防止 WebSocket 重投导致重复处理）──
+const processedMessages = new Map(); // messageId -> timestamp
+const DEDUP_TTL = 300_000; // 5 分钟内同一条消息不重复处理
+
+function isMessageProcessed(messageId) {
+  if (!messageId) return false;
+  if (processedMessages.has(messageId)) return true;
+  processedMessages.set(messageId, Date.now());
+  // 定期清理过期条目
+  if (processedMessages.size > 500) {
+    const now = Date.now();
+    for (const [id, ts] of processedMessages) {
+      if (now - ts > DEDUP_TTL) processedMessages.delete(id);
+    }
+  }
+  return false;
+}
+
 // 创建事件分发器
 const eventDispatcher = new lark.EventDispatcher({}).register({
   "im.message.receive_v1": async (data) => {
@@ -1011,6 +1029,12 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 
       const text = content.text || "";
       const messageId = message.message_id;
+
+      // ── 消息去重：防止 WebSocket 重连/超时重投导致同一命令被重复执行 ──
+      if (isMessageProcessed(messageId)) {
+        log(`[去重] 跳过已处理消息：${messageId} (${text.slice(0, 30)})`);
+        return;
+      }
 
       // 发送者鉴权
       const senderId = data?.sender?.sender_id?.open_id || "";
