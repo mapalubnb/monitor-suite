@@ -44,18 +44,23 @@ SUITE_DIR="/root/monitor-suite"
 SHARED_DIR="$SUITE_DIR/shared"
 echo "[2.5/5] 部署共享模块 → ${SHARED_DIR}"
 mkdir -p "$SHARED_DIR"
-cp shared/ai-client.mjs "$SHARED_DIR/"
-cp shared/feishu-client.mjs "$SHARED_DIR/"
-# ai-models.json：如果目标已存在则不覆盖（保留用户自定义配置）
-if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
-  cp ai-models.json "$SUITE_DIR/"
-  echo "  ai-models.json 已安装"
+# 如果当前目录就是 SUITE_DIR，跳过复制（避免 cp same file 错误）
+CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
+  cp shared/ai-client.mjs "$SHARED_DIR/"
+  cp shared/feishu-client.mjs "$SHARED_DIR/"
+  if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
+    cp ai-models.json "$SUITE_DIR/"
+    echo "  ai-models.json 已安装"
+  else
+    echo "  ai-models.json 已存在，跳过（保留现有配置）"
+  fi
+  cp package.json "$SUITE_DIR/"
 else
-  echo "  ai-models.json 已存在，跳过（保留现有配置）"
+  echo "  源码目录即部署目录，跳过复制"
 fi
 # 安装共享依赖（@larksuiteoapi/node-sdk 等）
 echo "  安装共享依赖..."
-cp package.json "$SUITE_DIR/"
 cd "$SUITE_DIR" && npm install --omit=dev && cd - >/dev/null
 # .env：如果不存在则从 .env.example 生成空模板
 if [ ! -f "$SUITE_DIR/.env" ]; then
@@ -66,9 +71,12 @@ fi
 # ── 3. 部署 fourmeme-monitor ──
 echo "[3/5] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
 mkdir -p "$FOURMEME_DIR"
-cp fourmeme-monitor/monitor.mjs "$FOURMEME_DIR/"
-cp fourmeme-monitor/package.json "$FOURMEME_DIR/"
-cp fourmeme-monitor/feishu-bot.mjs "$FOURMEME_DIR/"
+# 如果源目录和目标不同才复制
+if [ "$(cd fourmeme-monitor && pwd)" != "$(cd "$FOURMEME_DIR" 2>/dev/null && pwd)" ]; then
+  cp fourmeme-monitor/monitor.mjs "$FOURMEME_DIR/"
+  cp fourmeme-monitor/package.json "$FOURMEME_DIR/"
+  cp fourmeme-monitor/feishu-bot.mjs "$FOURMEME_DIR/"
+fi
 # 创建 shared 软链接（让 import "../shared/..." 能正确解析）
 ln -sfn "$SHARED_DIR" "$FOURMEME_DIR/../shared"
 ln -sfn "$SUITE_DIR/ai-models.json" "$FOURMEME_DIR/../ai-models.json"
@@ -89,8 +97,11 @@ echo "  fourmeme-monitor ✓"
 # ── 4. 部署 flap-monitor ──
 echo "[4/5] 部署 flap-monitor → ${FLAP_DIR}"
 mkdir -p "$FLAP_DIR"
-cp flap-monitor/monitor.mjs "$FLAP_DIR/"
-cp flap-monitor/package.json "$FLAP_DIR/"
+# 如果源目录和目标不同才复制
+if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; then
+  cp flap-monitor/monitor.mjs "$FLAP_DIR/"
+  cp flap-monitor/package.json "$FLAP_DIR/"
+fi
 # 创建 shared 软链接
 ln -sfn "$SHARED_DIR" "$FLAP_DIR/../shared"
 ln -sfn "$SUITE_DIR/ai-models.json" "$FLAP_DIR/../ai-models.json"
