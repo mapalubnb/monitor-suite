@@ -319,16 +319,18 @@ export async function uploadFile(fileName, content) {
       file: stream,
     },
   }, tokenOpt);
-  if (res.code !== 0) {
+  // 飞书 SDK im.file.create 返回结构不统一：
+  // 成功时可能直接返回 { file_key: "..." } 或 { code: 0, data: { file_key: "..." } }
+  const fileKey = res.file_key || res.data?.file_key;
+  if (fileKey) return fileKey;
+  // 有明确错误码的情况
+  if (res.code !== undefined && res.code !== 0) {
     const errMsg = res.msg || res.message || JSON.stringify(res).slice(0, 200);
     throw new Error(`文件上传失败 code=${res.code}: ${errMsg}`);
   }
-  const fileKey = res.data?.file_key || res.file_key;
-  if (!fileKey) {
-    log(`[飞书SDK] 上传成功但未返回 file_key，完整响应: ${JSON.stringify(res).slice(0, 300)}`);
-    throw new Error("文件上传成功但未返回 file_key");
-  }
-  return fileKey;
+  // 兜底：无 file_key 也无错误码
+  log(`[飞书SDK] 文件上传响应异常: ${JSON.stringify(res).slice(0, 300)}`);
+  throw new Error("文件上传失败：响应中无 file_key");
 }
 
 /**
