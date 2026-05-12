@@ -1,0 +1,867 @@
+#!/usr/bin/env bash
+# ============================================================
+# install.sh — 一键部署 fourmeme-monitor + flap-monitor
+# 适用于 Ubuntu 24.04 (LTS) x64 / DigitalOcean
+# 用法: sudo bash install.sh
+# ============================================================
+
+set -euo pipefail
+
+FOURMEME_DIR="/opt/fourmeme-monitor"
+FLAP_DIR="/opt/flap-monitor"
+
+echo "========================================="
+echo "  Monitor Suite 安装脚本"
+echo "  - fourmeme-monitor (four.meme)"
+echo "  - flap-monitor     (flap.sh)"
+echo "========================================="
+
+if [[ $EUID -ne 0 ]]; then
+  echo "请使用 sudo 运行此脚本"
+  exit 1
+fi
+
+# ── 1. 检查 Node.js ──
+echo ""
+echo "[1/5] 检查 Node.js..."
+if ! command -v node &>/dev/null; then
+  echo "  安装 Node.js 20.x..."
+  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+  apt-get install -y nodejs
+fi
+echo "  Node.js $(node -v)"
+
+# ── 2. 检查 pm2 ──
+echo "[2/5] 检查 pm2..."
+if ! command -v pm2 &>/dev/null; then
+  echo "  安装 pm2..."
+  npm install -g pm2
+fi
+echo "  pm2 $(pm2 -v)"
+
+# ── 2.5. 部署共享模块 + 配置 ──
+SUITE_DIR="/opt/monitor-suite"
+SHARED_DIR="$SUITE_DIR/shared"
+echo "[2.5/5] 部署共享模块 → ${SHARED_DIR}"
+mkdir -p "$SHARED_DIR"
+cp shared/ai-client.mjs "$SHARED_DIR/"
+# ai-models.json：如果目标已存在则不覆盖（保留用户自定义配置）
+if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
+  cp ai-models.json "$SUITE_DIR/"
+  echo "  ai-models.json 已安装"
+else
+  echo "  ai-models.json 已存在，跳过（保留现有配置）"
+fi
+# .env：如果不存在则从 .env.example 生成空模板
+if [ ! -f "$SUITE_DIR/.env" ]; then
+  cp .env.example "$SUITE_DIR/.env"
+  echo "  .env 模板已生成，请编辑填入真实密钥: $SUITE_DIR/.env"
+fi
+
+# ── 3. 部署 fourmeme-monitor ──
+echo "[3/5] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
+mkdir -p "$FOURMEME_DIR"
+cp fourmeme-monitor/monitor.mjs "$FOURMEME_DIR/"
+cp fourmeme-monitor/package.json "$FOURMEME_DIR/"
+cp fourmeme-monitor/feishu-bot.mjs "$FOURMEME_DIR/"
+# 创建 shared 软链接（让 import "../shared/..." 能正确解析）
+ln -sfn "$SHARED_DIR" "$FOURMEME_DIR/../shared"
+ln -sfn "$SUITE_DIR/ai-models.json" "$FOURMEME_DIR/../ai-models.json"
+ln -sfn "$SUITE_DIR/.env" "$FOURMEME_DIR/../.env"
+cd "$FOURMEME_DIR" && npm install --omit=dev && cd - >/dev/null
+
+pm2 delete fourmeme-monitor 2>/dev/null || true
+# 创建 .env 文件（如不存在）供快捷命令写入配置
+touch "$FOURMEME_DIR/.env"
+pm2 start "$FOURMEME_DIR/monitor.mjs" --name fourmeme-monitor --time
+
+# feishu-bot（如果之前启动过也重建）
+pm2 delete feishu-bot 2>/dev/null || true
+pm2 start "$FOURMEME_DIR/feishu-bot.mjs" --name feishu-bot --time
+
+echo "  fourmeme-monitor ✓"
+
+# ── 4. 部署 flap-monitor ──
+echo "[4/5] 部署 flap-monitor → ${FLAP_DIR}"
+mkdir -p "$FLAP_DIR"
+cp flap-monitor/monitor.mjs "$FLAP_DIR/"
+cp flap-monitor/package.json "$FLAP_DIR/"
+# 创建 shared 软链接
+ln -sfn "$SHARED_DIR" "$FLAP_DIR/../shared"
+ln -sfn "$SUITE_DIR/ai-models.json" "$FLAP_DIR/../ai-models.json"
+ln -sfn "$SUITE_DIR/.env" "$FLAP_DIR/../.env"
+cd "$FLAP_DIR" && npm install --omit=dev && cd - >/dev/null
+
+pm2 delete flap-monitor 2>/dev/null || true
+pm2 start "$FLAP_DIR/monitor.mjs" --name flap-monitor --time
+
+echo "  flap-monitor ✓"
+
+# pm2 持久化 + 开机自启
+pm2 save
+if pm2 startup systemd -u root --hp /root 2>/dev/null; then
+  echo "  pm2 开机自启已配置"
+else
+  echo "  ⚠ pm2 开机自启配置失败（可能不支持 systemd），请手动配置"
+fi
+
+# ── 5. 安装快捷命令（可执行脚本，非 alias）──
+echo "[5/5] 安装快捷命令到 /usr/local/bin/..."
+
+BIN_DIR="/usr/local/bin"
+
+# 通用 pm2 进程状态显示工具（供其他命令复用）
+cat > "$BIN_DIR/_pm2-proc-info" << 'HELPER_EOF'
+#!/usr/bin/env node
+// 用法: pm2 jlist | _pm2-proc-info <进程名> [--brief]
+const name = process.argv[2];
+const brief = process.argv.includes("--brief");
+let d = "";
+process.stdin.on("data", c => d += c);
+process.stdin.on("end", () => {
+  try {
+    const list = JSON.parse(d);
+    const p = list.find(x => x.name === name);
+    if (!p) { console.log(brief ? "  未找到进程" : "  状态: 未运行"); return; }
+    const env = p.pm2_env || {};
+    if (brief) {
+      console.log("  状态: " + (env.status || "unknown"));
+      console.log("  PID: " + p.pid);
+      console.log("  重启次数: " + (env.restart_time ?? 0));
+      return;
+    }
+    const mem = p.monit?.memory ? (p.monit.memory / 1024 / 1024).toFixed(1) + " MB" : "N/A";
+    const cpu = p.monit?.cpu ?? "N/A";
+    const up = env.pm_uptime ? Math.floor((Date.now() - env.pm_uptime) / 1000) : 0;
+    const h = Math.floor(up / 3600), m = Math.floor((up % 3600) / 60), s = up % 60;
+    const icon = env.status === "online" ? "●" : "○";
+    console.log("  " + icon + " 状态: " + env.status);
+    console.log("  PID: " + p.pid);
+    console.log("  内存: " + mem + "  |  CPU: " + cpu + "%");
+    console.log("  运行时间: " + h + "h " + m + "m " + s + "s");
+    console.log("  重启次数: " + (env.restart_time ?? 0));
+  } catch (e) { console.log("  解析失败: " + e.message); }
+});
+HELPER_EOF
+chmod +x "$BIN_DIR/_pm2-proc-info"
+
+# fourmeme-monitor
+cat > "$BIN_DIR/fm-status" << 'EOF'
+#!/bin/sh
+echo "====== fourmeme-monitor (four.meme) ======"
+echo ""
+# 进程信息
+echo "[ 进程 ]"
+pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor
+# 快照摘要
+SNAP="/opt/fourmeme-monitor/snapshot.json"
+if [ -f "$SNAP" ]; then
+  echo ""
+  node -e "
+    const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
+
+    // 模块 1：底池
+    const allPools=s.poolConfig||[];
+    const networks={};
+    for(const p of allPools){const n=p.networkCode||'?';networks[n]=(networks[n]||0)+1}
+    const total=allPools.length;
+    const netStr=Object.entries(networks).map(([k,v])=>k+' '+v).join(', ');
+    console.log('[ 模块1: 底池配置 ]');
+    console.log('  总计: '+total+' 个 ('+netStr+')');
+    const bsc=allPools.filter(p=>p.networkCode==='BSC');
+    for(const p of bsc){
+      const sym=p.symbol||'?';
+      const fee=p.buyFee||'?';
+      const b0=p.b0Amount||'?';
+      const tb=p.totalBAmount||'?';
+      const st=p.status||'?';
+      console.log('  '+sym.padEnd(12)+' fee='+fee+' b0='+b0+' total='+tb+' ['+st+']');
+    }
+
+    // 模块 2：前端
+    const pages=Object.keys(s.frontendPages||{});
+    console.log('');
+    console.log('[ 模块2: 前端监控 ]');
+    console.log('  页面: '+pages.length+' 个');
+    for(const k of pages){
+      const p=s.frontendPages[k];
+      const url=p.originalUrl||k;
+      const files=(p.assetFiles||[]).length;
+      const dlCount=Object.keys(p.assetContents||{}).length;
+      const text=(p.textContent||'').length;
+      const hash=(p.contentHash||'').slice(0,8)||'-';
+      const i18n=p.i18nStrings?Object.keys(p.i18nStrings).length:0;
+      const nextData=p.nextDataHash?'有':'无';
+      console.log('  '+url);
+      console.log('    JS/CSS: '+files+' 文件（已下载 '+dlCount+'）  |  文案: '+text+' 字  |  hash: '+hash);
+      console.log('    i18n: '+i18n+' 键  |  __NEXT_DATA__: '+nextData);
+    }
+
+    // 模块 3/5：API
+    const api=s.apiStructure||{};
+    const apiKeys=Object.keys(api);
+    console.log('');
+    console.log('[ 模块3/5: API结构 ]');
+    console.log('  端点: '+apiKeys.length+' 个');
+    for(const k of apiKeys){
+      const a=api[k];
+      const fields=typeof a==='object'?Object.keys(a).length:'?';
+      console.log('  '+k+' ('+fields+' 个顶层字段)');
+    }
+
+    // 模块 4：GitHub
+    const sha=(s.githubSha||'').slice(0,8)||'N/A';
+    console.log('');
+    console.log('[ 模块4: GitHub ]');
+    console.log('  仓库: four-meme-community/four-meme-ai');
+    console.log('  最新 SHA: '+sha);
+
+    // 模块 6：合约
+    const fp=s.contractFingerprints||{};
+    const fpKeys=Object.keys(fp);
+    console.log('');
+    console.log('[ 模块6: 智能合约 ]');
+    console.log('  合约: '+fpKeys.length+' 个');
+    for(const k of fpKeys){
+      const c=fp[k];
+      const hash=(c.codeHash||'').slice(0,8);
+      const addr=(c.address||'').slice(0,10)+'...';
+      let line='  '+k.padEnd(22)+addr+'  code='+hash;
+      if(c.implAddress){
+        const impl=(c.implAddress||'').slice(0,10)+'...';
+        const ih=(c.implCodeHash||'').slice(0,8);
+        line+='  impl='+impl+' ('+ih+')';
+      }
+      console.log(line);
+    }
+
+    // 模块 7：链上参数
+    const op=s.onchainParams||{};
+    console.log('');
+    console.log('[ 模块7: 链上参数 ]');
+    console.log('  Agent NFT 数量: '+(op.agentNftCount??'N/A'));
+    const nfts=op.agentNfts||[];
+    for(const n of nfts.slice(0,10)){
+      console.log('  '+n);
+    }
+    if(nfts.length>10) console.log('  ... 及其余 '+(nfts.length-10)+' 个');
+  " 2>/dev/null
+  echo ""
+  echo "------"
+  LASTPOLL="/opt/fourmeme-monitor/lastpoll.txt"
+  if [ -f "$LASTPOLL" ]; then
+    echo "最后检测: $(cat "$LASTPOLL")"
+  else
+    echo "最后检测: N/A"
+  fi
+  echo "快照更新: $(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
+fi
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/fm-log" << 'EOF'
+#!/bin/sh
+LINES=${1:-80}
+echo "====== fourmeme-monitor 日志 (最近 ${LINES} 行, 倒序) ======"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+PM2_HOME="${PM2_HOME:-/root/.pm2}"
+echo "日志文件: $(ls -la $PM2_HOME/logs/fourmeme-monitor-out*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
+echo "错误日志: $(ls -la $PM2_HOME/logs/fourmeme-monitor-err*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
+echo "========================================="
+pm2 logs fourmeme-monitor --lines "$LINES" --nostream 2>&1 | tac
+EOF
+
+cat > "$BIN_DIR/fm-restart" << 'EOF'
+#!/bin/sh
+echo "====== 重启 fourmeme-monitor ======"
+echo "[$(date '+%H:%M:%S')] 正在重启..."
+pm2 restart fourmeme-monitor --update-env
+echo ""
+echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
+pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor --brief
+# 显示快捷配置状态
+CONF="/opt/fourmeme-monitor/.env"
+if [ -f "$CONF" ]; then
+  HB=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
+  DR=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
+  DRH=$(grep '^DAILY_REPORT_HOUR=' "$CONF" 2>/dev/null | cut -d= -f2)
+  [ -n "$HB" ] && echo "  心跳间隔: ${HB} 分钟"
+  [ "$DR" = "true" ] && echo "  日报: 开启（每天 ${DRH:-9}:00）" || echo "  日报: 关闭"
+fi
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/fm-stop" << 'EOF'
+#!/bin/sh
+pm2 stop fourmeme-monitor
+echo "[$(date '+%H:%M:%S')] fourmeme-monitor 已停止"
+EOF
+
+cat > "$BIN_DIR/fm-check" << 'EOF'
+#!/bin/sh
+echo "====== 触发 fourmeme 全量检测 ======"
+PID=$(pm2 pid fourmeme-monitor 2>/dev/null)
+if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+  kill -USR1 "$PID"
+  echo "[$(date '+%H:%M:%S')] 已向 PID $PID 发送 SIGUSR1"
+  echo "提示: 使用 fm-log 查看检测结果"
+else
+  echo "fourmeme-monitor 未运行，使用 fm-restart 启动"
+fi
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/fm-daily" << 'EOF'
+#!/bin/sh
+echo "====== fourmeme 日报设置 ======"
+CONF="/opt/fourmeme-monitor/.env"
+
+# 读取当前状态
+CURRENT_ENABLED=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
+CURRENT_HOUR=$(grep '^DAILY_REPORT_HOUR=' "$CONF" 2>/dev/null | cut -d= -f2)
+CURRENT_ENABLED="${CURRENT_ENABLED:-false}"
+CURRENT_HOUR="${CURRENT_HOUR:-9}"
+
+show_status() {
+  if [ "$CURRENT_ENABLED" = "true" ]; then
+    echo "  状态: 已开启"
+    echo "  发送时间: 每天 ${CURRENT_HOUR}:00"
+  else
+    echo "  状态: 已关闭"
+  fi
+}
+
+usage() {
+  echo ""
+  echo "用法:"
+  echo "  fm-daily              查看当前日报状态"
+  echo "  fm-daily on           开启日报（默认 9:00 发送）"
+  echo "  fm-daily on 20        开启日报，每天 20:00 发送"
+  echo "  fm-daily off          关闭日报"
+  echo ""
+  show_status
+  echo "========================================="
+}
+
+write_env() {
+  # 更新 .env 文件
+  touch "$CONF"
+  grep -v '^DAILY_REPORT=' "$CONF" | grep -v '^DAILY_REPORT_HOUR=' > "$CONF.tmp" 2>/dev/null || true
+  echo "DAILY_REPORT=$1" >> "$CONF.tmp"
+  echo "DAILY_REPORT_HOUR=$2" >> "$CONF.tmp"
+  mv "$CONF.tmp" "$CONF"
+}
+
+case "${1:-}" in
+  "")
+    usage
+    ;;
+  on)
+    HOUR="${2:-$CURRENT_HOUR}"
+    # 验证小时数
+    if ! echo "$HOUR" | grep -qE '^[0-9]+$' || [ "$HOUR" -gt 23 ]; then
+      echo "  错误：小时数必须为 0-23"
+      exit 1
+    fi
+    write_env "true" "$HOUR"
+    echo "  日报已开启，每天 ${HOUR}:00 发送"
+    echo ""
+    echo "  正在重启 fourmeme-monitor 使配置生效..."
+    pm2 restart fourmeme-monitor --update-env 2>/dev/null
+    echo "  重启完成 ✓"
+    echo "========================================="
+    ;;
+  off)
+    write_env "false" "$CURRENT_HOUR"
+    echo "  日报已关闭"
+    echo ""
+    echo "  正在重启 fourmeme-monitor 使配置生效..."
+    pm2 restart fourmeme-monitor --update-env 2>/dev/null
+    echo "  重启完成 ✓"
+    echo "========================================="
+    ;;
+  *)
+    echo "  未知参数: $1"
+    usage
+    exit 1
+    ;;
+esac
+EOF
+
+cat > "$BIN_DIR/fm-heartbeat" << 'EOF'
+#!/bin/sh
+echo "====== fourmeme 心跳间隔设置 ======"
+CONF="/opt/fourmeme-monitor/.env"
+
+# 读取当前值
+CURRENT_MIN=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
+CURRENT_MIN="${CURRENT_MIN:-240}"
+
+show_status() {
+  echo "  当前心跳间隔: ${CURRENT_MIN} 分钟（每 ${CURRENT_MIN} 分钟推送一次状态）"
+}
+
+usage() {
+  echo ""
+  echo "用法:"
+  echo "  fm-heartbeat          查看当前心跳间隔"
+  echo "  fm-heartbeat 30       设为 30 分钟"
+  echo "  fm-heartbeat 60       设为 1 小时"
+  echo "  fm-heartbeat 120      设为 2 小时"
+  echo "  fm-heartbeat 240      设为 4 小时（默认）"
+  echo ""
+  show_status
+  echo "========================================="
+}
+
+case "${1:-}" in
+  "")
+    usage
+    ;;
+  *)
+    MINUTES="$1"
+    # 验证是否为正整数
+    if ! echo "$MINUTES" | grep -qE '^[0-9]+$' || [ "$MINUTES" -lt 1 ]; then
+      echo "  错误：间隔必须为正整数（分钟）"
+      exit 1
+    fi
+    # 更新 .env 文件
+    touch "$CONF"
+    grep -v '^HEARTBEAT_MINUTES=' "$CONF" > "$CONF.tmp" 2>/dev/null || true
+    echo "HEARTBEAT_MINUTES=$MINUTES" >> "$CONF.tmp"
+    mv "$CONF.tmp" "$CONF"
+    echo "  心跳间隔已设为 ${MINUTES} 分钟"
+    echo ""
+    echo "  正在重启 fourmeme-monitor 使配置生效..."
+    pm2 restart fourmeme-monitor --update-env 2>/dev/null
+    echo "  重启完成 ✓"
+    echo "========================================="
+    ;;
+esac
+EOF
+
+# flap-monitor
+cat > "$BIN_DIR/fl-status" << 'EOF'
+#!/bin/sh
+echo "====== flap-monitor (flap.sh) ======"
+echo ""
+echo "[ 进程 ]"
+pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor
+# 快照摘要
+SNAP="/opt/flap-monitor/snapshot.json"
+if [ -f "$SNAP" ]; then
+  echo ""
+  node -e "
+    const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
+    const pages=s.pages||{};
+    const keys=Object.keys(pages);
+    console.log('[ 页面监控 ]');
+    console.log('  页面: '+keys.length+' 个');
+    console.log('');
+    for(const k of keys){
+      const f=pages[k];
+      const url=f.originalUrl||k;
+      const assets=f.assetFiles||[];
+      const jsCount=assets.filter(a=>a.endsWith('.js')).length;
+      const cssCount=assets.filter(a=>a.endsWith('.css')).length;
+      const nextData=f.nextDataHash?'有 ('+f.nextDataHash.slice(0,8)+')':'无';
+      const contentHash=(f.contentHash||'').slice(0,8)||'-';
+      const textLen=(f.textContent||'').length;
+      console.log('  '+url);
+      console.log('    资源: '+assets.length+' 个 (JS:'+jsCount+' CSS:'+cssCount+')  |  文案: '+textLen+' 字  |  hash: '+contentHash);
+      console.log('    __NEXT_DATA__: '+nextData);
+      const i18nHash=(f.i18nHash||'').slice(0,8);
+      if(i18nHash){
+        console.log('    i18n: hash='+i18nHash+(f.i18nChunk?' chunk='+f.i18nChunk.split('/').pop():''));
+      }
+      console.log('');
+    }
+
+    // 检测配置
+    console.log('[ 检测配置 ]');
+    console.log('  心跳间隔: 4 小时（支持 HEARTBEAT_MINUTES 环境变量覆盖）');
+  " 2>/dev/null
+  echo ""
+  echo "------"
+  LASTPOLL="/opt/flap-monitor/lastpoll.txt"
+  if [ -f "$LASTPOLL" ]; then
+    echo "最后检测: $(cat "$LASTPOLL")"
+  else
+    echo "最后检测: N/A"
+  fi
+  echo "快照更新: $(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
+fi
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/fl-log" << 'EOF'
+#!/bin/sh
+LINES=${1:-80}
+echo "====== flap-monitor 日志 (最近 ${LINES} 行, 倒序) ======"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+PM2_HOME="${PM2_HOME:-/root/.pm2}"
+echo "日志文件: $(ls -la $PM2_HOME/logs/flap-monitor-out*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
+echo "错误日志: $(ls -la $PM2_HOME/logs/flap-monitor-err*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
+echo "========================================="
+pm2 logs flap-monitor --lines "$LINES" --nostream 2>&1 | tac
+EOF
+
+cat > "$BIN_DIR/fl-restart" << 'EOF'
+#!/bin/sh
+echo "====== 重启 flap-monitor ======"
+echo "[$(date '+%H:%M:%S')] 正在重启..."
+pm2 restart flap-monitor
+echo ""
+echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
+pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor --brief
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/fl-stop" << 'EOF'
+#!/bin/sh
+pm2 stop flap-monitor
+echo "[$(date '+%H:%M:%S')] flap-monitor 已停止"
+EOF
+
+cat > "$BIN_DIR/fl-check" << 'EOF'
+#!/bin/sh
+echo "====== 触发 flap 全量检测 ======"
+PID=$(pm2 pid flap-monitor 2>/dev/null)
+if [ -n "$PID" ] && [ "$PID" != "0" ]; then
+  kill -USR1 "$PID"
+  echo "[$(date '+%H:%M:%S')] 已向 PID $PID 发送 SIGUSR1"
+  echo "提示: 使用 fl-log 查看检测结果"
+else
+  echo "flap-monitor 未运行，使用 fl-restart 启动"
+fi
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/fl-check-manual" << 'EOF'
+#!/bin/sh
+echo "[$(date '+%H:%M:%S')] flap 手动检测（独立进程）..."
+node /opt/flap-monitor/monitor.mjs check
+echo "[$(date '+%H:%M:%S')] 检测完成"
+EOF
+
+# feishu-bot
+cat > "$BIN_DIR/bot-status" << 'EOF'
+#!/bin/sh
+echo "====== feishu-bot ======"
+echo ""
+echo "[ 进程 ]"
+pm2 jlist 2>/dev/null | _pm2-proc-info feishu-bot
+echo ""
+echo "[ 服务 ]"
+echo "  端口: 3001"
+echo "  事件回调: /feishu/event"
+echo "  卡片回调: /feishu/card"
+# 端口检测
+if command -v ss >/dev/null 2>&1; then
+  LISTEN=$(ss -tlnp 2>/dev/null | grep ':3001 ')
+elif command -v netstat >/dev/null 2>&1; then
+  LISTEN=$(netstat -tlnp 2>/dev/null | grep ':3001 ')
+fi
+echo "  状态: ${LISTEN:+已监听}${LISTEN:-未监听}"
+echo ""
+echo "飞书群发 help 查看机器人指令"
+echo "提示：卡片请求地址请配置为 http://<IP>:3001/feishu/card"
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/bot-log" << 'EOF'
+#!/bin/sh
+LINES=${1:-80}
+echo "====== feishu-bot 日志 (最近 ${LINES} 行, 倒序) ======"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "========================================="
+pm2 logs feishu-bot --lines "$LINES" --nostream 2>&1 | tac
+EOF
+
+cat > "$BIN_DIR/bot-restart" << 'EOF'
+#!/bin/sh
+echo "====== 重启 feishu-bot ======"
+echo "[$(date '+%H:%M:%S')] 正在重启..."
+pm2 restart feishu-bot
+echo ""
+echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
+pm2 jlist 2>/dev/null | _pm2-proc-info feishu-bot --brief
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/bot-stop" << 'EOF'
+#!/bin/sh
+pm2 stop feishu-bot
+echo "[$(date '+%H:%M:%S')] feishu-bot 已停止"
+EOF
+
+# 全局
+cat > "$BIN_DIR/mon-status" << 'EOF'
+#!/bin/sh
+echo "╔══════════════════════════════════════════╗"
+echo "║       Monitor Suite 状态总览             ║"
+echo "╚══════════════════════════════════════════╝"
+echo ""
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "主机: $(hostname) ($(uname -r))"
+echo "负载: $(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}' || echo 'N/A')"
+echo ""
+echo "[ 进程状态 ]"
+pm2 jlist 2>/dev/null | node -e "
+  let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+    try{
+      const list=JSON.parse(d);
+      const services=[
+        {name:'fourmeme-monitor', label:'Four.meme 监控', desc:'7模块全面监控'},
+        {name:'flap-monitor',     label:'Flap.sh 监控',   desc:'页面/资源/文案监控'},
+        {name:'feishu-bot',       label:'飞书交互机器人',   desc:'端口 3001'},
+      ];
+      for(const svc of services){
+        const p=list.find(x=>x.name===svc.name);
+        if(!p){console.log('  ○ '+svc.label.padEnd(18)+' 未部署');continue}
+        const env=p.pm2_env||{};
+        const mem=p.monit?.memory?(p.monit.memory/1024/1024).toFixed(1)+'MB':'?';
+        const cpu=(p.monit?.cpu??0)+'%';
+        const up=env.pm_uptime?Math.floor((Date.now()-env.pm_uptime)/1000):0;
+        const d=Math.floor(up/86400),h=Math.floor((up%86400)/3600),m=Math.floor((up%3600)/60);
+        const upStr=d>0?d+'d '+h+'h '+m+'m':h+'h '+m+'m';
+        const icon=env.status==='online'?'●':'○';
+        const restarts=env.restart_time||0;
+        console.log('  '+icon+' '+svc.label.padEnd(18)+' '+(env.status||'unknown').padEnd(10)+' PID:'+String(p.pid).padEnd(8)+' '+mem.padEnd(10)+cpu.padEnd(6)+upStr);
+        if(restarts>0) console.log('    '+''.padEnd(18)+' 重启: '+restarts+'次');
+      }
+    }catch(e){console.log('  解析失败: '+e.message)}
+  })
+" 2>/dev/null
+echo ""
+# 快照摘要
+echo "[ 数据摘要 ]"
+FM_SNAP="/opt/fourmeme-monitor/snapshot.json"
+FL_SNAP="/opt/flap-monitor/snapshot.json"
+if [ -f "$FM_SNAP" ]; then
+  node -e "
+    const s=JSON.parse(require('fs').readFileSync('$FM_SNAP','utf-8'));
+    const pools=(s.poolConfig||[]).length;
+    const nets={};for(const p of s.poolConfig||[]){const n=p.networkCode||'?';nets[n]=(nets[n]||0)+1}
+    const netStr=Object.entries(nets).map(([k,v])=>k+':'+v).join(' ');
+    const pages=Object.keys(s.frontendPages||{}).length;
+    const apis=Object.keys(s.apiStructure||{}).length;
+    const sha=(s.githubSha||'').slice(0,8)||'-';
+    const contracts=Object.keys(s.contractFingerprints||{}).length;
+    const nfts=(s.onchainParams||{}).agentNftCount??'-';
+    console.log('  Four.meme:');
+    console.log('    底池: '+pools+' 个 ('+netStr+')');
+    console.log('    前端: '+pages+' 页面  |  API: '+apis+' 端点  |  GitHub: '+sha);
+    console.log('    合约: '+contracts+' 个  |  Agent NFT: '+nfts+' 个');
+  " 2>/dev/null
+  FM_LASTPOLL="/opt/fourmeme-monitor/lastpoll.txt"
+  if [ -f "$FM_LASTPOLL" ]; then
+    echo "    最后检测: $(cat "$FM_LASTPOLL")"
+  fi
+  echo "    快照: $(stat -c '%y' "$FM_SNAP" 2>/dev/null | cut -d. -f1)"
+else
+  echo "  Four.meme: 无快照（首次启动中）"
+fi
+if [ -f "$FL_SNAP" ]; then
+  node -e "
+    const s=JSON.parse(require('fs').readFileSync('$FL_SNAP','utf-8'));
+    const pages=Object.keys(s.pages||{}).length;
+    console.log('  Flap.sh:');
+    console.log('    页面: '+pages+' 个');
+  " 2>/dev/null
+  FL_LASTPOLL="/opt/flap-monitor/lastpoll.txt"
+  if [ -f "$FL_LASTPOLL" ]; then
+    echo "    最后检测: $(cat "$FL_LASTPOLL")"
+  fi
+  echo "    快照: $(stat -c '%y' "$FL_SNAP" 2>/dev/null | cut -d. -f1)"
+else
+  echo "  Flap.sh: 无快照（首次启动中）"
+fi
+echo ""
+# 磁盘和日志
+echo "[ 磁盘占用 ]"
+FM_SIZE=$(du -sh /opt/fourmeme-monitor 2>/dev/null | awk '{print $1}' || echo '?')
+FL_SIZE=$(du -sh /opt/flap-monitor 2>/dev/null | awk '{print $1}' || echo '?')
+PM2_HOME="${PM2_HOME:-/root/.pm2}"
+LOG_SIZE=$(du -sh $PM2_HOME/logs 2>/dev/null | awk '{print $1}' || echo '?')
+echo "  fourmeme-monitor: $FM_SIZE"
+echo "  flap-monitor:     $FL_SIZE"
+echo "  PM2 日志:         $LOG_SIZE"
+echo ""
+echo "──────────────────────────────────────────"
+echo "详细: fm-status | fl-status | bot-status"
+echo "帮助: mon-help"
+echo "══════════════════════════════════════════"
+EOF
+
+cat > "$BIN_DIR/mon-log" << 'EOF'
+#!/bin/sh
+LINES=${1:-80}
+echo "====== 全部日志 (最近 ${LINES} 行, 倒序) ======"
+echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "========================================="
+pm2 logs --lines "$LINES" --nostream 2>&1 | tac
+EOF
+
+cat > "$BIN_DIR/mon-restart" << 'EOF'
+#!/bin/sh
+echo "====== 重启全部进程 ======"
+echo "[$(date '+%H:%M:%S')] 正在重启所有监控进程..."
+pm2 restart all
+echo ""
+echo "[$(date '+%H:%M:%S')] 重启完成"
+echo ""
+pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor --brief
+pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor --brief
+pm2 jlist 2>/dev/null | _pm2-proc-info feishu-bot --brief
+echo "========================================="
+EOF
+
+cat > "$BIN_DIR/mon-stop" << 'EOF'
+#!/bin/sh
+pm2 stop all
+echo "[$(date '+%H:%M:%S')] 全部进程已停止"
+EOF
+
+cat > "$BIN_DIR/mon-ai" << 'AIEOF'
+#!/usr/bin/env node
+// mon-ai — 动态读取 ai-models.json 的 AI 模型管理命令
+const fs = require("fs");
+const MODELS_FILE = "/opt/fourmeme-monitor/../ai-models.json".replace(/\.\./, "");
+const REAL_MODELS = "/opt/monitor-suite/ai-models.json";
+// 兼容两种安装路径
+const modelsPath = fs.existsSync(REAL_MODELS) ? REAL_MODELS
+  : fs.existsSync("/opt/fourmeme-monitor/ai-models.json") ? "/opt/fourmeme-monitor/ai-models.json"
+  : null;
+
+function loadConfig() {
+  // 尝试多个路径
+  const paths = [
+    "/opt/monitor-suite/ai-models.json",
+    "/opt/fourmeme-monitor/../ai-models.json",
+  ];
+  for (const p of paths) {
+    try {
+      if (fs.existsSync(p)) return { data: JSON.parse(fs.readFileSync(p, "utf-8")), path: p };
+    } catch {}
+  }
+  console.log("  错误：未找到 ai-models.json");
+  process.exit(1);
+}
+
+const arg = process.argv[2] || "";
+const modelOverride = process.argv[3] || "";
+
+if (!arg) {
+  // 显示当前状态 + 所有可用模型
+  const { data, path } = loadConfig();
+  const current = data.current || "(未设置)";
+  const providers = data.providers || {};
+  const p = providers[current];
+  console.log("====== AI 模型管理 ======");
+  console.log("");
+  console.log("当前: " + current + (p ? " (" + p.model + ") — " + (p.label || "") : ""));
+  console.log("");
+  console.log("可用模型:");
+  for (const [name, cfg] of Object.entries(providers)) {
+    const icon = name === current ? "●" : "○";
+    const label = (cfg.label || "").padEnd(16);
+    const model = cfg.model || "";
+    const fmt = cfg.format === "anthropic" ? " [Anthropic]" : "";
+    console.log("  " + icon + " " + name.padEnd(16) + label + model + fmt);
+  }
+  console.log("");
+  console.log("用法:");
+  console.log("  mon-ai <名称>           切换模型");
+  console.log("  mon-ai <名称> <model>   切换并覆盖 model 名称");
+  console.log("");
+  console.log("配置文件: " + path);
+  console.log("切换即时生效（5s 内），无需重启。");
+  console.log("=========================================");
+} else if (arg === "list") {
+  const { data } = loadConfig();
+  for (const [name, cfg] of Object.entries(data.providers || {})) {
+    console.log(name + " — " + (cfg.label || "") + " (" + (cfg.model || "") + ")");
+  }
+} else {
+  // 切换模型
+  const { data, path } = loadConfig();
+  if (!data.providers[arg]) {
+    console.log("未知模型: " + arg);
+    console.log("可用: " + Object.keys(data.providers).join(", "));
+    process.exit(1);
+  }
+  data.current = arg;
+  if (modelOverride) {
+    data.providers[arg].model = modelOverride;
+  }
+  fs.writeFileSync(path, JSON.stringify(data, null, 2), "utf-8");
+  const p = data.providers[arg];
+  console.log("[" + new Date().toTimeString().slice(0,8) + "] AI 模型已切换为: " + arg + " (" + p.model + ") — " + (p.label || ""));
+  console.log("已即时生效，无需重启。");
+  console.log("=========================================");
+}
+AIEOF
+
+cat > "$BIN_DIR/mon-help" << 'HELPEOF'
+#!/bin/sh
+cat << 'INNER'
+╔══════════════════════════════════════════════════════╗
+║            Monitor Suite 快捷命令                    ║
+╚══════════════════════════════════════════════════════╝
+
+── 全局 (mon-*) ─────────────────────────────────────
+  mon-status          所有进程 + 数据摘要 + 磁盘占用
+  mon-log [N]         所有进程日志（默认 80 行, 倒序）
+  mon-restart         重启全部进程
+  mon-stop            停止全部进程
+  mon-ai              查看/切换 AI 模型（支持 10+ 模型，动态配置）
+  mon-help            显示此帮助
+
+── fourmeme (fm-*) ──────────────────────────────────
+  fm-status           进程 + 7 模块数据摘要
+  fm-log [N]          日志（默认 80 行, 倒序）
+  fm-restart          重启
+  fm-stop             停止
+  fm-check            SIGUSR1 触发全量检测
+  fm-daily            日报开关（on/off/on 20）
+  fm-heartbeat        心跳间隔设置（分钟数）
+
+── flap (fl-*) ──────────────────────────────────────
+  fl-status           进程 + 页面/资源/i18n 摘要
+  fl-log [N]          日志（默认 80 行, 倒序）
+  fl-restart          重启
+  fl-stop             停止
+  fl-check            SIGUSR1 触发检测
+  fl-check-manual     独立进程完整检测
+
+── feishu-bot (bot-*) ───────────────────────────────
+  bot-status          进程 + 端口状态
+  bot-log [N]         日志（默认 80 行, 倒序）
+  bot-restart         重启
+  bot-stop            停止
+
+── 飞书 bot 内置指令 ────────────────────────────────
+  help / ai <问题> / history [N] / report
+  直接输入任意 shell 命令亦可执行
+
+══════════════════════════════════════════════════════
+INNER
+HELPEOF
+
+# 给所有命令加执行权限
+chmod +x "$BIN_DIR"/fm-* "$BIN_DIR"/fl-* "$BIN_DIR"/bot-* "$BIN_DIR"/mon-*
+
+# 清理旧版 alias 文件（如果存在）
+rm -f /etc/profile.d/monitor-aliases.sh
+
+echo ""
+echo "========================================="
+echo "  安装完成"
+echo "========================================="
+echo ""
+pm2 status
+echo ""
+echo "输入 mon-help 查看所有快捷命令"
+echo "（命令在任何 shell 中均可使用，包括飞书 bot）"
+echo ""

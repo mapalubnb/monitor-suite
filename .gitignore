@@ -1,0 +1,23 @@
+# 环境变量（含密钥）
+.env
+
+# 依赖
+node_modules/
+
+# 运行时数据
+snapshot.json
+snapshot.json.tmp
+lastpoll.txt
+history.jsonl
+diffs/
+snapshots/
+
+# PM2
+.pm2/
+
+# 日报状态
+.daily-report-state.json
+
+# OS
+.DS_Store
+Thumbs.db

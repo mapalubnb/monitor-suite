@@ -1,0 +1,9 @@
+{
+  "name": "flap-monitor",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node monitor.mjs",
+    "check": "node monitor.mjs check"
+  }
+}
