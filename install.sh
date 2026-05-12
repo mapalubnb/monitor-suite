@@ -7,8 +7,8 @@
 
 set -euo pipefail
 
-FOURMEME_DIR="/opt/fourmeme-monitor"
-FLAP_DIR="/opt/flap-monitor"
+FOURMEME_DIR="/root/fourmeme-monitor"
+FLAP_DIR="/root/flap-monitor"
 
 echo "========================================="
 echo "  Monitor Suite 安装脚本"
@@ -40,7 +40,7 @@ fi
 echo "  pm2 $(pm2 -v)"
 
 # ── 2.5. 部署共享模块 + 配置 ──
-SUITE_DIR="/opt/monitor-suite"
+SUITE_DIR="/root/monitor-suite"
 SHARED_DIR="$SUITE_DIR/shared"
 echo "[2.5/5] 部署共享模块 → ${SHARED_DIR}"
 mkdir -p "$SHARED_DIR"
@@ -159,7 +159,7 @@ echo ""
 echo "[ 进程 ]"
 pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor
 # 快照摘要
-SNAP="/opt/fourmeme-monitor/snapshot.json"
+SNAP="/root/fourmeme-monitor/snapshot.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
@@ -253,7 +253,7 @@ if [ -f "$SNAP" ]; then
   " 2>/dev/null
   echo ""
   echo "------"
-  LASTPOLL="/opt/fourmeme-monitor/lastpoll.txt"
+  LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
   if [ -f "$LASTPOLL" ]; then
     echo "最后检测: $(cat "$LASTPOLL")"
   else
@@ -285,7 +285,7 @@ echo ""
 echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
 pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor --brief
 # 显示快捷配置状态
-CONF="/opt/fourmeme-monitor/.env"
+CONF="/root/fourmeme-monitor/.env"
 if [ -f "$CONF" ]; then
   HB=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
   DR=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
@@ -319,7 +319,7 @@ EOF
 cat > "$BIN_DIR/fm-daily" << 'EOF'
 #!/bin/sh
 echo "====== fourmeme 日报设置 ======"
-CONF="/opt/fourmeme-monitor/.env"
+CONF="/root/fourmeme-monitor/.env"
 
 # 读取当前状态
 CURRENT_ENABLED=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
@@ -396,7 +396,7 @@ EOF
 cat > "$BIN_DIR/fm-heartbeat" << 'EOF'
 #!/bin/sh
 echo "====== fourmeme 心跳间隔设置 ======"
-CONF="/opt/fourmeme-monitor/.env"
+CONF="/root/fourmeme-monitor/.env"
 
 # 读取当前值
 CURRENT_MIN=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
@@ -453,7 +453,7 @@ echo ""
 echo "[ 进程 ]"
 pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor
 # 快照摘要
-SNAP="/opt/flap-monitor/snapshot.json"
+SNAP="/root/flap-monitor/snapshot.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
@@ -488,7 +488,7 @@ if [ -f "$SNAP" ]; then
   " 2>/dev/null
   echo ""
   echo "------"
-  LASTPOLL="/opt/flap-monitor/lastpoll.txt"
+  LASTPOLL="/root/flap-monitor/lastpoll.txt"
   if [ -f "$LASTPOLL" ]; then
     echo "最后检测: $(cat "$LASTPOLL")"
   else
@@ -545,7 +545,7 @@ EOF
 cat > "$BIN_DIR/fl-check-manual" << 'EOF'
 #!/bin/sh
 echo "[$(date '+%H:%M:%S')] flap 手动检测（独立进程）..."
-node /opt/flap-monitor/monitor.mjs check
+node /root/flap-monitor/monitor.mjs check
 echo "[$(date '+%H:%M:%S')] 检测完成"
 EOF
 
@@ -641,8 +641,8 @@ pm2 jlist 2>/dev/null | node -e "
 echo ""
 # 快照摘要
 echo "[ 数据摘要 ]"
-FM_SNAP="/opt/fourmeme-monitor/snapshot.json"
-FL_SNAP="/opt/flap-monitor/snapshot.json"
+FM_SNAP="/root/fourmeme-monitor/snapshot.json"
+FL_SNAP="/root/flap-monitor/snapshot.json"
 if [ -f "$FM_SNAP" ]; then
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$FM_SNAP','utf-8'));
@@ -659,7 +659,7 @@ if [ -f "$FM_SNAP" ]; then
     console.log('    前端: '+pages+' 页面  |  API: '+apis+' 端点  |  GitHub: '+sha);
     console.log('    合约: '+contracts+' 个  |  Agent NFT: '+nfts+' 个');
   " 2>/dev/null
-  FM_LASTPOLL="/opt/fourmeme-monitor/lastpoll.txt"
+  FM_LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
   if [ -f "$FM_LASTPOLL" ]; then
     echo "    最后检测: $(cat "$FM_LASTPOLL")"
   fi
@@ -674,7 +674,7 @@ if [ -f "$FL_SNAP" ]; then
     console.log('  Flap.sh:');
     console.log('    页面: '+pages+' 个');
   " 2>/dev/null
-  FL_LASTPOLL="/opt/flap-monitor/lastpoll.txt"
+  FL_LASTPOLL="/root/flap-monitor/lastpoll.txt"
   if [ -f "$FL_LASTPOLL" ]; then
     echo "    最后检测: $(cat "$FL_LASTPOLL")"
   fi
@@ -685,8 +685,8 @@ fi
 echo ""
 # 磁盘和日志
 echo "[ 磁盘占用 ]"
-FM_SIZE=$(du -sh /opt/fourmeme-monitor 2>/dev/null | awk '{print $1}' || echo '?')
-FL_SIZE=$(du -sh /opt/flap-monitor 2>/dev/null | awk '{print $1}' || echo '?')
+FM_SIZE=$(du -sh /root/fourmeme-monitor 2>/dev/null | awk '{print $1}' || echo '?')
+FL_SIZE=$(du -sh /root/flap-monitor 2>/dev/null | awk '{print $1}' || echo '?')
 PM2_HOME="${PM2_HOME:-/root/.pm2}"
 LOG_SIZE=$(du -sh $PM2_HOME/logs 2>/dev/null | awk '{print $1}' || echo '?')
 echo "  fourmeme-monitor: $FM_SIZE"
@@ -732,18 +732,18 @@ cat > "$BIN_DIR/mon-ai" << 'AIEOF'
 #!/usr/bin/env node
 // mon-ai — 动态读取 ai-models.json 的 AI 模型管理命令
 const fs = require("fs");
-const MODELS_FILE = "/opt/fourmeme-monitor/../ai-models.json".replace(/\.\./, "");
-const REAL_MODELS = "/opt/monitor-suite/ai-models.json";
+const MODELS_FILE = "/root/fourmeme-monitor/../ai-models.json".replace(/\.\./, "");
+const REAL_MODELS = "/root/monitor-suite/ai-models.json";
 // 兼容两种安装路径
 const modelsPath = fs.existsSync(REAL_MODELS) ? REAL_MODELS
-  : fs.existsSync("/opt/fourmeme-monitor/ai-models.json") ? "/opt/fourmeme-monitor/ai-models.json"
+  : fs.existsSync("/root/fourmeme-monitor/ai-models.json") ? "/root/fourmeme-monitor/ai-models.json"
   : null;
 
 function loadConfig() {
   // 尝试多个路径
   const paths = [
-    "/opt/monitor-suite/ai-models.json",
-    "/opt/fourmeme-monitor/../ai-models.json",
+    "/root/monitor-suite/ai-models.json",
+    "/root/fourmeme-monitor/../ai-models.json",
   ];
   for (const p of paths) {
     try {

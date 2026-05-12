@@ -247,7 +247,7 @@ function buildMonitorContext() {
   }
 
   // flap 快照
-  const flSnapPath = "/opt/flap-monitor/snapshot.json";
+  const flSnapPath = "/root/flap-monitor/snapshot.json";
   if (existsSync(flSnapPath)) {
     try {
       const snap = JSON.parse(readFileSync(flSnapPath, "utf-8"));
@@ -287,7 +287,7 @@ function buildMonitorContext() {
 function readRecentHistory(n = 20) {
   const historyFiles = [
     join(CONFIG.monitorDir, "history.jsonl"),
-    "/opt/flap-monitor/history.jsonl",
+    "/root/flap-monitor/history.jsonl",
   ];
   const allRecords = [];
   for (const f of historyFiles) {
@@ -1053,7 +1053,7 @@ const server = createServer(async (req, res) => {
           try {
             const filePath = value.file;
             // 安全校验：只允许访问 diffs 目录
-            const allowedDirs = ["/opt/fourmeme-monitor/diffs/", "/opt/flap-monitor/diffs/"];
+            const allowedDirs = ["/root/fourmeme-monitor/diffs/", "/root/flap-monitor/diffs/"];
             const resolved = join("/", filePath);
             if (!allowedDirs.some(d => resolved.startsWith(d))) {
               log(`[卡片回调] 路径不合法: ${resolved}`);
