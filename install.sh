@@ -178,8 +178,9 @@ echo ""
 # 进程信息
 echo "[ 进程 ]"
 pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor
-# 快照摘要
-SNAP="/root/fourmeme-monitor/snapshot.json"
+# 快照摘要（兼容两种部署路径）
+SNAP="/root/monitor-suite/fourmeme-monitor/snapshot.json"
+[ -f "$SNAP" ] || SNAP="/root/fourmeme-monitor/snapshot.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
@@ -273,7 +274,8 @@ if [ -f "$SNAP" ]; then
   " 2>/dev/null
   echo ""
   echo "------"
-  LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
+  LASTPOLL="/root/monitor-suite/fourmeme-monitor/lastpoll.txt"
+  [ -f "$LASTPOLL" ] || LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
   if [ -f "$LASTPOLL" ]; then
     echo "最后检测: $(cat "$LASTPOLL")"
   else
@@ -472,8 +474,9 @@ echo "====== flap-monitor (flap.sh) ======"
 echo ""
 echo "[ 进程 ]"
 pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor
-# 快照摘要
-SNAP="/root/flap-monitor/snapshot.json"
+# 快照摘要（兼容两种部署路径）
+SNAP="/root/monitor-suite/flap-monitor/snapshot.json"
+[ -f "$SNAP" ] || SNAP="/root/flap-monitor/snapshot.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
@@ -508,7 +511,8 @@ if [ -f "$SNAP" ]; then
   " 2>/dev/null
   echo ""
   echo "------"
-  LASTPOLL="/root/flap-monitor/lastpoll.txt"
+  LASTPOLL="/root/monitor-suite/flap-monitor/lastpoll.txt"
+  [ -f "$LASTPOLL" ] || LASTPOLL="/root/flap-monitor/lastpoll.txt"
   if [ -f "$LASTPOLL" ]; then
     echo "最后检测: $(cat "$LASTPOLL")"
   else
@@ -651,8 +655,10 @@ pm2 jlist 2>/dev/null | node -e "
 echo ""
 # 快照摘要
 echo "[ 数据摘要 ]"
-FM_SNAP="/root/fourmeme-monitor/snapshot.json"
-FL_SNAP="/root/flap-monitor/snapshot.json"
+FM_SNAP="/root/monitor-suite/fourmeme-monitor/snapshot.json"
+[ -f "$FM_SNAP" ] || FM_SNAP="/root/fourmeme-monitor/snapshot.json"
+FL_SNAP="/root/monitor-suite/flap-monitor/snapshot.json"
+[ -f "$FL_SNAP" ] || FL_SNAP="/root/flap-monitor/snapshot.json"
 if [ -f "$FM_SNAP" ]; then
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$FM_SNAP','utf-8'));
@@ -669,7 +675,8 @@ if [ -f "$FM_SNAP" ]; then
     console.log('    前端: '+pages+' 页面  |  API: '+apis+' 端点  |  GitHub: '+sha);
     console.log('    合约: '+contracts+' 个  |  Agent NFT: '+nfts+' 个');
   " 2>/dev/null
-  FM_LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
+  FM_LASTPOLL="/root/monitor-suite/fourmeme-monitor/lastpoll.txt"
+  [ -f "$FM_LASTPOLL" ] || FM_LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
   if [ -f "$FM_LASTPOLL" ]; then
     echo "    最后检测: $(cat "$FM_LASTPOLL")"
   fi
@@ -684,7 +691,8 @@ if [ -f "$FL_SNAP" ]; then
     console.log('  Flap.sh:');
     console.log('    页面: '+pages+' 个');
   " 2>/dev/null
-  FL_LASTPOLL="/root/flap-monitor/lastpoll.txt"
+  FL_LASTPOLL="/root/monitor-suite/flap-monitor/lastpoll.txt"
+  [ -f "$FL_LASTPOLL" ] || FL_LASTPOLL="/root/flap-monitor/lastpoll.txt"
   if [ -f "$FL_LASTPOLL" ]; then
     echo "    最后检测: $(cat "$FL_LASTPOLL")"
   fi
@@ -695,8 +703,12 @@ fi
 echo ""
 # 磁盘和日志
 echo "[ 磁盘占用 ]"
-FM_SIZE=$(du -sh /root/fourmeme-monitor 2>/dev/null | awk '{print $1}' || echo '?')
-FL_SIZE=$(du -sh /root/flap-monitor 2>/dev/null | awk '{print $1}' || echo '?')
+FM_DIR="/root/monitor-suite/fourmeme-monitor"
+[ -d "$FM_DIR" ] || FM_DIR="/root/fourmeme-monitor"
+FL_DIR="/root/monitor-suite/flap-monitor"
+[ -d "$FL_DIR" ] || FL_DIR="/root/flap-monitor"
+FM_SIZE=$(du -sh "$FM_DIR" 2>/dev/null | awk '{print $1}' || echo '?')
+FL_SIZE=$(du -sh "$FL_DIR" 2>/dev/null | awk '{print $1}' || echo '?')
 PM2_HOME="${PM2_HOME:-/root/.pm2}"
 LOG_SIZE=$(du -sh $PM2_HOME/logs 2>/dev/null | awk '{print $1}' || echo '?')
 echo "  fourmeme-monitor: $FM_SIZE"
