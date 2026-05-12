@@ -5,21 +5,26 @@
 ## 架构概览
 
 ```
-monitor-suite/
-├── fourmeme-monitor/     # Four.meme 全面监控
-│   ├── monitor.mjs       #   7 大监控模块（底池/前端/API/GitHub/合约/链上参数）
-│   ├── feishu-bot.mjs    #   飞书 Bot（群聊指令交互 + 卡片回调）
+~/monitor-suite/              # 源码 + 部署目录（/root/monitor-suite/）
+├── fourmeme-monitor/         # Four.meme 全面监控
+│   ├── monitor.mjs           #   7 大监控模块（底池/前端/API/GitHub/合约/链上参数）
+│   ├── feishu-bot.mjs        #   飞书 Bot（群聊指令交互 + 卡片回调）
 │   └── package.json
-├── flap-monitor/         # Flap.sh 页面监控
-│   ├── monitor.mjs       #   前端/API/i18n/路由监控
+├── flap-monitor/             # Flap.sh 页面监控
+│   ├── monitor.mjs           #   前端/API/i18n/路由监控
 │   └── package.json
-├── shared/               # 共享模块
-│   ├── feishu-client.mjs #   飞书 SDK 统一消息通道
-│   └── ai-client.mjs    #   多模型 AI 客户端（热切换）
-├── ai-models.json        # AI 模型配置（10+ 模型）
-├── install.sh            # 一键部署脚本
-├── .env.example          # 环境变量模板
-└── package.json          # 根依赖（飞书 SDK）
+├── shared/                   # 共享模块
+│   ├── feishu-client.mjs     #   飞书 SDK 统一消息通道（手动 token 管理）
+│   └── ai-client.mjs        #   多模型 AI 客户端（热切换）
+├── ai-models.json            # AI 模型配置（10+ 模型）
+├── install.sh                # 一键部署脚本
+├── .env.example              # 环境变量模板
+├── .env                      # 实际环境变量（需手动创建，不提交）
+└── package.json              # 根依赖（飞书 SDK）
+
+部署后额外生成：
+~/fourmeme-monitor/           # PM2 运行目录（从源码复制）
+~/flap-monitor/               # PM2 运行目录（从源码复制）
 ```
 
 ## 核心功能
@@ -87,13 +92,14 @@ monitor-suite/
 ### 安装步骤
 
 ```bash
-# 1. 克隆仓库
-git clone https://github.com/mapalubnb/monitor-suite.git
-cd monitor-suite
+# 1. 克隆仓库到 /root/monitor-suite
+cd ~ && git clone https://github.com/mapalubnb/monitor-suite.git
+cd ~/monitor-suite
 
 # 2. 配置环境变量
-cp .env.example /opt/monitor-suite/.env
+cp .env.example .env
 # 编辑 .env 填入飞书应用凭证、AI API Key 等
+nano .env
 
 # 3. 一键部署
 sudo bash install.sh
@@ -101,10 +107,24 @@ sudo bash install.sh
 
 `install.sh` 会自动完成：
 - 检查并安装 Node.js 20.x 和 PM2
-- 部署共享模块到 `/opt/monitor-suite/shared/`
-- 部署各监控服务到 `/opt/fourmeme-monitor/` 和 `/opt/flap-monitor/`
-- 创建共享目录的符号链接
+- 检测源码目录即部署目录时跳过复制（避免冲突）
+- 部署 fourmeme-monitor 到 `/root/fourmeme-monitor/`
+- 部署 flap-monitor 到 `/root/flap-monitor/`
+- 创建共享目录的符号链接（`../shared/` → `/root/monitor-suite/shared/`）
 - 安装依赖并通过 PM2 启动服务
+- 安装 20+ 快捷命令到 `/usr/local/bin/`
+
+### 卸载
+
+```bash
+# 仅卸载 monitor-suite（不影响其他 PM2 进程）
+pm2 delete fourmeme-monitor 2>/dev/null
+pm2 delete flap-monitor 2>/dev/null
+pm2 delete feishu-bot 2>/dev/null
+pm2 save
+rm -rf ~/fourmeme-monitor ~/flap-monitor
+rm -f /usr/local/bin/fm-* /usr/local/bin/fl-* /usr/local/bin/bot-* /usr/local/bin/mon-* /usr/local/bin/_pm2-proc-info
+```
 
 ### 环境变量
 
@@ -128,6 +148,13 @@ pm2 status                    # 查看服务状态
 pm2 logs fourmeme-monitor     # 查看日志
 pm2 restart all               # 重启所有服务
 kill -USR1 <PID>              # 手动触发一次全量检测
+```
+
+### 更新代码
+
+```bash
+cd ~/monitor-suite && git pull
+sudo bash install.sh
 ```
 
 ## 飞书应用配置
