@@ -45,6 +45,7 @@ SHARED_DIR="$SUITE_DIR/shared"
 echo "[2.5/5] 部署共享模块 → ${SHARED_DIR}"
 mkdir -p "$SHARED_DIR"
 cp shared/ai-client.mjs "$SHARED_DIR/"
+cp shared/feishu-client.mjs "$SHARED_DIR/"
 # ai-models.json：如果目标已存在则不覆盖（保留用户自定义配置）
 if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
   cp ai-models.json "$SUITE_DIR/"
@@ -52,6 +53,10 @@ if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
 else
   echo "  ai-models.json 已存在，跳过（保留现有配置）"
 fi
+# 安装共享依赖（@larksuiteoapi/node-sdk 等）
+echo "  安装共享依赖..."
+cp package.json "$SUITE_DIR/"
+cd "$SUITE_DIR" && npm install --omit=dev && cd - >/dev/null
 # .env：如果不存在则从 .env.example 生成空模板
 if [ ! -f "$SUITE_DIR/.env" ]; then
   cp .env.example "$SUITE_DIR/.env"

@@ -1,0 +1,9 @@
+{
+  "name": "monitor-suite",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.35.0"
+  }
+}

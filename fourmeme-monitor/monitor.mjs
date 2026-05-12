@@ -24,6 +24,8 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mk
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, uploadFile, sendFile, pinMessage, buildCardJson, waitQueueDrain } from "../shared/feishu-client.mjs";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // 加载本地 .env 文件（快捷命令写入的配置）
@@ -56,11 +58,7 @@ const CONFIG = {
   githubApiBranch: "main",
   githubToken: process.env.GITHUB_TOKEN || "",  // 可选：填入 PAT 提升 rate limit 至 5000/h
 
-  // 飞书 Webhook
-  feishuWebhook: process.env.FEISHU_WEBHOOK || process.env.FEISHU_WEBHOOK_FOURMEME || "",
-  feishuSecret: process.env.FEISHU_SECRET_FOURMEME || "",
-
-  // 飞书 API（用于发送文件附件，与 feishu-bot 共用同一应用）
+  // 飞书 API（SDK 统一发送，只需 App 凭证 + Chat ID）
   feishuAppId: process.env.FEISHU_APP_ID || "",
   feishuAppSecret: process.env.FEISHU_APP_SECRET || "",
   feishuChatId: process.env.FEISHU_CHAT_ID || "",
@@ -309,136 +307,16 @@ function saveSnapshot(data) {
   return snapshotWriteQueue;
 }
 
-/* ── 飞书 ── */
-function feishuSign(secret, timestamp) {
-  const str = `${timestamp}\n${secret}`;
-  return createHmac("sha256", str).update("").digest("base64");
-}
-
-/* ── Webhook 节流器：无签名模式下飞书限制 5 条/分钟 ── */
-const webhookThrottle = {
-  timestamps: [],          // 最近 60s 内的发送时间戳
-  maxPerMinute: 4,         // 预留 1 条余量
-  queue: [],               // 等待发送的消息队列
-  maxQueueSize: 50,        // 队列上限，防止飞书长时间不可达时内存无限增长
-  processing: false,
-  pendingHeartbeat: null,  // 待发心跳（低优先级，队列空闲时发送）
-};
-
-async function processWebhookQueue() {
-  if (webhookThrottle.processing) return;
-  webhookThrottle.processing = true;
-  try {
-    while (webhookThrottle.queue.length > 0) {
-      const now = Date.now();
-      // 清理 60s 之前的记录
-      webhookThrottle.timestamps = webhookThrottle.timestamps.filter(t => now - t < 60_000);
-      if (webhookThrottle.timestamps.length >= webhookThrottle.maxPerMinute) {
-        // 等到最早的记录过期
-        const waitMs = 60_000 - (now - webhookThrottle.timestamps[0]) + 500;
-        log(`[节流] webhook 达到 ${webhookThrottle.maxPerMinute} 条/分钟限制，等待 ${Math.ceil(waitMs / 1000)}s（队列: ${webhookThrottle.queue.length} 条）`);
-        await sleep(waitMs);
-        continue;
-      }
-      const task = webhookThrottle.queue.shift();
-      webhookThrottle.timestamps.push(Date.now());
-      await task();
-    }
-    // 队列已空，检查是否有待发心跳（低优先级，空闲时推送）
-    if (webhookThrottle.pendingHeartbeat) {
-      const heartbeatTask = webhookThrottle.pendingHeartbeat;
-      webhookThrottle.pendingHeartbeat = null;
-      const now = Date.now();
-      webhookThrottle.timestamps = webhookThrottle.timestamps.filter(t => now - t < 60_000);
-      if (webhookThrottle.timestamps.length < webhookThrottle.maxPerMinute) {
-        webhookThrottle.timestamps.push(Date.now());
-        try {
-          await heartbeatTask();
-          log("[心跳] 队列空闲，心跳已推送");
-        } catch (err) {
-          log(`[心跳] 推送失败：${err.message}`);
-        }
-      } else {
-        // 仍在限流中，重新挂起等下一轮
-        webhookThrottle.pendingHeartbeat = heartbeatTask;
-        log("[心跳] 仍在限流中，心跳延迟到下一轮空闲");
-      }
-    }
-  } finally {
-    webhookThrottle.processing = false;
-  }
-}
+/* ── 飞书消息（SDK 统一通道） ── */
 
 /**
- * 提交低优先级心跳消息 — 不入队列，仅在队列空闲时推送
- * 如果上一次心跳还没发出去（队列一直忙），新心跳覆盖旧心跳（只保留最新状态）
+ * 带重试的卡片发送（兼容旧接口 sendFeishu）
  */
-function sendHeartbeat(title, content, template = "green") {
-  webhookThrottle.pendingHeartbeat = async () => {
-    await _sendFeishuDirect(title, content, template);
-  };
-  log(`[心跳] 已挂起，等待队列空闲（当前队列: ${webhookThrottle.queue.length} 条）`);
-  // 如果队列已经空了，立即触发处理
-  if (webhookThrottle.queue.length === 0) {
-    processWebhookQueue().catch(err => {
-      log(`[心跳] processWebhookQueue 异常：${err.message}`);
-    });
-  }
-}
-
 async function sendFeishu(title, content, template = "red", _retries = 2) {
-  return new Promise((resolve) => {
-    // 队列已满时丢弃最旧的消息，防止内存无限增长
-    if (webhookThrottle.queue.length >= webhookThrottle.maxQueueSize) {
-      webhookThrottle.queue.shift();
-      log(`[飞书] 队列已满（${webhookThrottle.maxQueueSize}），丢弃最早一条通知`);
-    }
-    webhookThrottle.queue.push(async () => {
-      await _sendFeishuDirect(title, content, template, _retries);
-      resolve();
-    });
-    processWebhookQueue().catch(err => {
-      log(`[飞书] processWebhookQueue 异常：${err.message}`);
-    });
-  });
-}
-
-async function _sendFeishuDirect(title, content, template = "red", _retries = 2) {
-  const body = {
-    msg_type: "interactive",
-    card: {
-      header: { title: { tag: "plain_text", content: title }, template },
-      elements: [
-        { tag: "markdown", content },
-        { tag: "note", elements: [{ tag: "plain_text", content: `监控时间：${ts()}` }] },
-      ],
-    },
-  };
-  if (CONFIG.feishuSecret) {
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    body.timestamp = timestamp;
-    body.sign = feishuSign(CONFIG.feishuSecret, timestamp);
-  }
   for (let attempt = 0; attempt <= _retries; attempt++) {
     try {
-      const res = await fetch(CONFIG.feishuWebhook, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      const json = await res.json();
-      if (json.code === 0 || json.StatusCode === 0) {
-        log("飞书推送成功");
-        return;
-      }
-      // 频率限制：等待后重试（不计入常规重试次数）
-      if (json.code === 11232) {
-        log(`[节流] webhook 被限流，等待 15s 后重试...`);
-        await sleep(15_000);
-        continue;
-      }
-      log(`飞书推送失败：${JSON.stringify(json)}`);
-      return; // 其他业务层失败，重试无意义
+      await sendCardQueued(title, content, template);
+      return;
     } catch (err) {
       log(`飞书推送异常（第${attempt + 1}次）：${err.message}`);
       if (attempt < _retries) {
@@ -449,183 +327,48 @@ async function _sendFeishuDirect(title, content, template = "red", _retries = 2)
   log(`飞书推送最终失败（已重试 ${_retries} 次）`);
 }
 
-/* ── 飞书 API：获取 tenant_access_token（用于文件上传）── */
-let cachedToken = { token: "", expiresAt: 0 };
-let tokenRefreshPromise = null;
-
-async function getTenantToken() {
-  if (cachedToken.token && Date.now() < cachedToken.expiresAt) {
-    return cachedToken.token;
-  }
-  if (tokenRefreshPromise) return tokenRefreshPromise;
-  tokenRefreshPromise = (async () => {
-    try {
-      const res = await fetch(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            app_id: CONFIG.feishuAppId,
-            app_secret: CONFIG.feishuAppSecret,
-          }),
-        }
-      );
-      if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`获取 token HTTP ${res.status}: ${errText.slice(0, 200)}`);
-      }
-      const json = await res.json();
-      if (json.code !== 0) throw new Error(`获取 token 失败：${json.msg}`);
-      cachedToken = {
-        token: json.tenant_access_token,
-        expiresAt: Date.now() + (json.expire - 300) * 1000,
-      };
-      log(`[飞书API] tenant_access_token 已刷新`);
-      return cachedToken.token;
-    } finally {
-      tokenRefreshPromise = null;
-    }
-  })();
-  return tokenRefreshPromise;
-}
-
-/** 上传文件到飞书，返回 file_key */
-async function uploadFileToFeishu(fileName, content) {
-  const token = await getTenantToken();
-  const form = new FormData();
-  form.append("file_type", "stream");
-  form.append("file_name", fileName);
-  form.append("file", new Blob([content], { type: "text/plain" }), fileName);
-
-  const res = await fetch("https://open.feishu.cn/open-apis/im/v1/files", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`文件上传 HTTP ${res.status}: ${errText.slice(0, 200)}`);
-  }
-  const json = await res.json();
-  if (json.code !== 0) throw new Error(`文件上传失败: ${json.msg}`);
-  return json.data.file_key;
-}
-
-/** 主动发送文件消息到群聊 */
-async function sendFileToChat(fileKey) {
-  const token = await getTenantToken();
-  const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      receive_id: CONFIG.feishuChatId,
-      content: JSON.stringify({ file_key: fileKey }),
-      msg_type: "file",
-    }),
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`发送文件消息 HTTP ${res.status}: ${errText.slice(0, 200)}`);
-  }
-  const json = await res.json();
-  if (json.code !== 0) throw new Error(`发送文件消息失败: ${json.msg}`);
-}
-
-/* ── 飞书 IM API：发送卡片消息（返回 message_id，用于后续编辑） ── */
-
-function buildCardJson(title, content, template, diffFilePath) {
-  const elements = [
-    { tag: "markdown", content },
-  ];
-  if (diffFilePath) {
-    elements.push({
-      tag: "action",
-      actions: [{
-        tag: "button",
-        text: { tag: "plain_text", content: "📎 下载 Diff 详情" },
-        type: "default",
-        value: { action: "download_diff", file: diffFilePath },
-      }],
-    });
-  }
-  elements.push({ tag: "note", elements: [{ tag: "plain_text", content: `监控时间：${ts()}` }] });
-  return JSON.stringify({
-    header: { title: { tag: "plain_text", content: title }, template },
-    elements,
-  });
+/**
+ * 提交低优先级心跳消息
+ */
+function sendHeartbeat(title, content, template = "green") {
+  sendHeartbeatQueued(title, content, template);
 }
 
 /**
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
- * 失败时 fallback 到 webhook 推送，返回 null
  */
 async function sendCardViaApi(title, content, template = "red", diffFilePath) {
-  if (!CONFIG.feishuAppId || !CONFIG.feishuChatId) {
-    await sendFeishu(title, content, template);
-    return null;
-  }
   try {
-    const token = await getTenantToken();
-    const res = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-      body: JSON.stringify({
-        receive_id: CONFIG.feishuChatId,
-        content: buildCardJson(title, content, template, diffFilePath),
-        msg_type: "interactive",
-      }),
-    });
-    if (!res.ok) {
-      const errText = await res.text().catch(() => "");
-      throw new Error(`HTTP ${res.status}: ${errText.slice(0, 200)}`);
-    }
-    const json = await res.json();
-    if (json.code !== 0) throw new Error(`code=${json.code}: ${json.msg}`);
-    const messageId = json.data?.message_id;
-    log(`[IM API] 卡片已发送 → ${messageId}`);
-    return messageId;
+    return await sendCard(title, content, template, { diffFilePath });
   } catch (err) {
-    log(`[IM API] 发送失败(${err.message})，fallback 到 webhook`);
-    await sendFeishu(title, content, template);
+    log(`[IM API] 发送失败：${err.message}`);
     return null;
   }
 }
 
 /**
- * 通过 IM API 编辑已发送的卡片消息（用于补充 AI 摘要）
- * 飞书 PATCH /im/v1/messages/{message_id} 只需传 content（字符串化的卡片 JSON）
+ * 编辑已发送的卡片消息（用于补充 AI 摘要）
  */
 async function patchCardViaApi(messageId, title, content, template = "red", diffFilePath) {
-  const token = await getTenantToken();
-  const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-    body: JSON.stringify({
-      content: buildCardJson(title, content, template, diffFilePath),
-    }),
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`HTTP ${res.status}: ${errText.slice(0, 200)}`);
-  }
-  const json = await res.json();
-  if (json.code !== 0) throw new Error(`code=${json.code}: ${json.msg}`);
+  await patchCard(messageId, title, content, template, { diffFilePath });
+}
+
+/**
+ * 上传文件到飞书，返回 file_key
+ */
+async function uploadFileToFeishu(fileName, content) {
+  return uploadFile(fileName, content);
+}
+
+/**
+ * 主动发送文件消息到群聊
+ */
+async function sendFileToChat(fileKey) {
+  await sendFile(fileKey);
 }
 
 /**
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
- *
- * @param {string} title - 通知标题
- * @param {string} content - 裸 diff 内容（不含 AI 摘要）
- * @param {string} template - 卡片颜色
- * @param {string} moduleContext - AI 模块上下文描述
- * @param {string} [aiInput] - 可选：给 AI 的输入（默认用 content）
- * @param {function} [enrichFn] - 可选：自定义 enrichment 函数 (summary) => enrichedContent
- * @param {string} [diffFilePath] - 可选：本地 diff 文件路径（卡片内嵌下载按钮）
  */
 async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath) {
   // 1. 立即推送裸 diff（秒级送达）
@@ -647,7 +390,6 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
           await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
         }
       } else {
-        // sendCardViaApi fallback 到 webhook 时无 messageId，追加发送
         await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
       }
     }).catch(err => log(`[AI] 异步摘要异常：${err.message}`));
@@ -4150,19 +3892,8 @@ async function gracefulShutdown(signal) {
     }
     log(`已停止 ${global.__moduleTimers.length} 个模块定时器`);
   }
-  // 等待 webhook 队列排空（最多等 30s）
-  const deadline = Date.now() + 30_000;
-  while (webhookThrottle.queue.length > 0 && Date.now() < deadline) {
-    log(`等待 ${webhookThrottle.queue.length} 条通知发送完成...`);
-    await sleep(1_000);
-  }
-  // 丢弃 pending 心跳（退出时无需推送）
-  webhookThrottle.pendingHeartbeat = null;
-  if (webhookThrottle.queue.length > 0) {
-    log(`超时退出，${webhookThrottle.queue.length} 条通知未发送`);
-  } else {
-    log(`所有通知已发送完成`);
-  }
+  // 等待消息队列排空（最多等 30s）
+  await waitQueueDrain(30_000);
   // 保存最终快照
   try { await saveSnapshot(snapshot); } catch {}
   process.exit(0);

@@ -20,6 +20,12 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
+import {
+  sendCard as _sdkSendCard, replyText as _sdkReplyText, replyCard as _sdkReplyCard,
+  replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile, sendFile as _sdkSendFile,
+  getClient, getChatId,
+} from "../shared/feishu-client.mjs";
+
 const execAsync = promisify(execCb);
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -54,9 +60,6 @@ const CONFIG = {
   // exec 命令超时（毫秒）
   execTimeout: 30_000,
 
-  // 飞书 webhook（与 fourmeme-monitor 共用）
-  feishuWebhook: process.env.FEISHU_WEBHOOK || process.env.FEISHU_WEBHOOK_FOURMEME || "",
-  feishuSecret: process.env.FEISHU_SECRET_FOURMEME || "",
 
   // 飞书消息最大长度（超出截断）
   maxReplyLen: 3500,
@@ -91,37 +94,9 @@ function checkRateLimit(senderId) {
   return entry.count <= rateLimiter.maxPerWindow;
 }
 
-/** 通过 webhook 发送飞书卡片消息 */
+/** 发送飞书卡片消息到群聊（通过 SDK） */
 async function sendWebhookCard(title, content, template = "blue") {
-  const card = {
-    msg_type: "interactive",
-    card: {
-      header: { title: { tag: "plain_text", content: title }, template },
-      elements: [
-        { tag: "markdown", content },
-        { tag: "note", elements: [{ tag: "plain_text", content: `自动生成于 ${ts()}` }] },
-      ],
-    },
-  };
-  if (CONFIG.feishuSecret) {
-    const timestamp = Math.floor(Date.now() / 1000).toString();
-    const str = `${timestamp}\n${CONFIG.feishuSecret}`;
-    card.timestamp = timestamp;
-    card.sign = createHmac("sha256", str).update("").digest("base64");
-  }
-  const res = await fetch(CONFIG.feishuWebhook, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(card),
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`webhook HTTP ${res.status}: ${errText.slice(0, 200)}`);
-  }
-  const json = await res.json();
-  if (json.code !== 0 && json.StatusCode !== 0) {
-    throw new Error(`webhook 推送失败：${JSON.stringify(json)}`);
-  }
+  await _sdkSendCard(title, content, template);
 }
 
 // 事件去重缓存（message_id -> timestamp）
@@ -142,113 +117,26 @@ function isDuplicate(eventId) {
   return false;
 }
 
-/* ══════════════════════════════════════════
-   飞书 API：获取 tenant_access_token
-   ══════════════════════════════════════════ */
-let cachedToken = { token: "", expiresAt: 0 };
-let tokenRefreshPromise = null;
-
-async function getTenantToken() {
-  if (cachedToken.token && Date.now() < cachedToken.expiresAt) {
-    return cachedToken.token;
-  }
-  if (tokenRefreshPromise) return tokenRefreshPromise;
-  tokenRefreshPromise = (async () => {
-    try {
-      const res = await fetch(
-        "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            app_id: CONFIG.feishuAppId,
-            app_secret: CONFIG.feishuAppSecret,
-          }),
-        }
-      );
-      if (!res.ok) {
-        const errText = await res.text().catch(() => "");
-        throw new Error(`获取 token HTTP ${res.status}: ${errText.slice(0, 200)}`);
-      }
-      const json = await res.json();
-      if (json.code !== 0) throw new Error(`获取 token 失败：${json.msg}`);
-      cachedToken = {
-        token: json.tenant_access_token,
-        expiresAt: Date.now() + (json.expire - 300) * 1000,
-      };
-      log(`tenant_access_token 已刷新，有效期 ${json.expire}s`);
-      return cachedToken.token;
-    } finally {
-      tokenRefreshPromise = null;
-    }
-  })();
-  return tokenRefreshPromise;
-}
+/* ── 飞书 API：使用 SDK 自动管理 token ── */
+// getTenantToken 不再需要，SDK 内部自动处理
 
 /* ══════════════════════════════════════════
    飞书 API：回复消息
    ══════════════════════════════════════════ */
 async function replyText(messageId, text) {
-  const token = await getTenantToken();
-  const truncated = text.length > CONFIG.maxReplyLen
-    ? text.slice(0, CONFIG.maxReplyLen) + "\n\n... (输出已截断)"
-    : text;
-  const res = await fetch(
-    `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        content: JSON.stringify({ text: truncated }),
-        msg_type: "text",
-      }),
-    }
-  );
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    log(`回复失败 HTTP ${res.status}: ${errText.slice(0, 200)}`);
-    return;
+  try {
+    await _sdkReplyText(messageId, text);
+  } catch (err) {
+    log(`回复失败：${err.message}`);
   }
-  const json = await res.json();
-  if (json.code !== 0) log(`回复失败：${JSON.stringify(json)}`);
 }
 
 async function replyCard(messageId, title, content, color = "blue") {
-  const token = await getTenantToken();
-  const truncated = content.length > CONFIG.maxReplyLen
-    ? content.slice(0, CONFIG.maxReplyLen) + "\n\n... (输出已截断，完整日志见下方文件)"
-    : content;
-  const card = {
-    header: { title: { tag: "plain_text", content: title }, template: color },
-    elements: [
-      { tag: "markdown", content: truncated },
-      { tag: "note", elements: [{ tag: "plain_text", content: ts() }] },
-    ],
-  };
-  const res = await fetch(
-    `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        content: JSON.stringify(card),
-        msg_type: "interactive",
-      }),
-    }
-  );
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    log(`回复失败 HTTP ${res.status}: ${errText.slice(0, 200)}`);
-    return;
+  try {
+    await _sdkReplyCard(messageId, title, content, color);
+  } catch (err) {
+    log(`回复卡片失败：${err.message}`);
   }
-  const json = await res.json();
-  if (json.code !== 0) log(`回复失败：${JSON.stringify(json)}`);
 }
 
 /* ══════════════════════════════════════════
@@ -257,46 +145,15 @@ async function replyCard(messageId, title, content, color = "blue") {
 
 /** 上传文件到飞书，返回 file_key */
 async function uploadFileToFeishu(fileName, content) {
-  const token = await getTenantToken();
-  const form = new FormData();
-  form.append("file_type", "stream");
-  form.append("file_name", fileName);
-  form.append("file", new Blob([content], { type: "text/plain" }), fileName);
-
-  const res = await fetch("https://open.feishu.cn/open-apis/im/v1/files", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  });
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    throw new Error(`文件上传 HTTP ${res.status}: ${errText.slice(0, 200)}`);
-  }
-  const json = await res.json();
-  if (json.code !== 0) throw new Error(`文件上传失败: ${json.msg}`);
-  return json.data.file_key;
+  return _sdkUploadFile(fileName, content);
 }
 
 /** 回复文件消息 */
 async function replyFile(messageId, fileKey) {
-  const token = await getTenantToken();
-  const res = await fetch(
-    `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        content: JSON.stringify({ file_key: fileKey }),
-        msg_type: "file",
-      }),
-    }
-  );
-  if (!res.ok) {
-    const errText = await res.text().catch(() => "");
-    log(`文件回复失败 HTTP ${res.status}: ${errText.slice(0, 200)}`);
+  try {
+    await _sdkReplyFile(messageId, fileKey);
+  } catch (err) {
+    log(`文件回复失败：${err.message}`);
   }
 }
 
@@ -1196,42 +1053,27 @@ const server = createServer(async (req, res) => {
             const filePath = value.file;
             // 安全校验：只允许访问 diffs 目录
             const allowedDirs = ["/opt/fourmeme-monitor/diffs/", "/opt/flap-monitor/diffs/"];
-            const resolved = join("/", filePath); // resolve relative to root
+            const resolved = join("/", filePath);
             if (!allowedDirs.some(d => resolved.startsWith(d))) {
               log(`[卡片回调] 路径不合法: ${resolved}`);
               return;
             }
             if (!existsSync(resolved)) {
               log(`[卡片回调] 文件不存在: ${resolved}`);
-              // 通知用户
               try {
-                const token = await getTenantToken();
-                await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-                  body: JSON.stringify({
-                    receive_id: CONFIG.feishuChatId || body.open_chat_id,
-                    content: JSON.stringify({ text: `Diff 文件已过期或不存在（文件保留 7 天）` }),
-                    msg_type: "text",
-                  }),
-                });
+                const chatId = getChatId() || body.open_chat_id;
+                if (chatId) {
+                  const { sendText } = await import("../shared/feishu-client.mjs");
+                  await sendText("Diff 文件已过期或不存在（文件保留 7 天）", { chatId });
+                }
               } catch (_) {}
               return;
             }
             const fileContent = readFileSync(resolved, "utf-8");
             const fileName = resolved.split("/").pop();
-            const fileKey = await uploadFileToFeishu(fileName, fileContent);
-            // 发送文件到群聊
-            const token = await getTenantToken();
-            await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
-              method: "POST",
-              headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
-              body: JSON.stringify({
-                receive_id: CONFIG.feishuChatId || body.open_chat_id,
-                content: JSON.stringify({ file_key: fileKey }),
-                msg_type: "file",
-              }),
-            });
+            const fileKey = await _sdkUploadFile(fileName, fileContent);
+            const chatId = getChatId() || body.open_chat_id;
+            if (chatId) await _sdkSendFile(fileKey, { chatId });
             log(`[卡片回调] diff 文件已发送: ${fileName}`);
           } catch (err) {
             log(`[卡片回调] 发送失败: ${err.message}`);
@@ -1352,8 +1194,8 @@ server.listen(CONFIG.port, () => {
   log(`事件回调地址：http://0.0.0.0:${CONFIG.port}/feishu/event`);
   log(`卡片回调地址：http://0.0.0.0:${CONFIG.port}/feishu/card`);
   log(`健康检查地址：http://0.0.0.0:${CONFIG.port}/health`);
-  if (!CONFIG.feishuAppId || !CONFIG.feishuAppSecret) {
-    log("⚠ 警告：feishuAppId / feishuAppSecret 未配置，无法回复消息！");
+  if (!getClient()) {
+    log("⚠ 警告：飞书 SDK 未初始化，无法回复消息！");
   }
   // 启动每日报告定时器
   scheduleDailyReport();
