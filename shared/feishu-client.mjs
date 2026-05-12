@@ -16,22 +16,33 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const ENV_FILE = join(__dirname, "..", ".env");
-
-/* ── .env 加载（与 ai-client.mjs 一致） ── */
-if (existsSync(ENV_FILE)) {
-  try {
-    for (const line of readFileSync(ENV_FILE, "utf-8").split("\n")) {
-      const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-      if (m && !(m[1] in process.env)) {
-        process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
-      }
-    }
-  } catch { /* ignore */ }
-}
 
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
+
+/* ── .env 加载（多路径搜索，确保 symlink 部署下也能正确加载）── */
+const ENV_PATHS = [
+  join(__dirname, "..", ".env"),           // 相对路径: /opt/monitor-suite/.env
+  "/opt/monitor-suite/.env",              // 绝对路径: 主配置
+  "/opt/fourmeme-monitor/../.env",        // symlink 路径
+];
+
+for (const envPath of ENV_PATHS) {
+  if (existsSync(envPath)) {
+    try {
+      for (const line of readFileSync(envPath, "utf-8").split("\n")) {
+        const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+        if (m) {
+          // 始终从文件加载（覆盖可能错误的已有值）
+          const val = m[2].replace(/^["']|["']$/g, "").trim();
+          if (val) process.env[m[1]] = val;
+        }
+      }
+      log(`[ENV] 已加载: ${envPath}`);
+    } catch { /* ignore */ }
+    break; // 找到第一个存在的 .env 就停止
+  }
+}
 
 const APP_ID = process.env.FEISHU_APP_ID || "";
 const APP_SECRET = process.env.FEISHU_APP_SECRET || "";
