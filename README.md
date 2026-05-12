@@ -22,9 +22,9 @@
 ├── .env                      # 实际环境变量（需手动创建，不提交）
 └── package.json              # 根依赖（飞书 SDK）
 
-部署后额外生成：
-~/fourmeme-monitor/           # PM2 运行目录（从源码复制）
-~/flap-monitor/               # PM2 运行目录（从源码复制）
+部署模式（install.sh 自动检测）：
+- 统一部署：源码目录即 /root/monitor-suite/ 时，PM2 直接从子目录启动，不复制文件
+- 独立部署：从其他位置运行时，复制到 ~/fourmeme-monitor/ 和 ~/flap-monitor/
 ```
 
 ## 核心功能
@@ -34,7 +34,7 @@
 | 模块 | 监控内容 | 频率 |
 |------|---------|------|
 | 模块 1 | 底池配置（Pool Config） | 3s |
-| 模块 2 | 前端代码（4 页面并行，含文案 diff、`__NEXT_DATA__`、i18n、路由发现） | 15s |
+| 模块 2 | 前端代码（5 页面并行，含文案 diff、`__NEXT_DATA__`、i18n、路由发现） | 15s |
 | 模块 3/5 | API 结构（多端点并行，结构 + 值 diff） | 30s |
 | 模块 4 | GitHub 仓库变更（条件请求，ETag 缓存） | 5min |
 | 模块 6 | BSC 智能合约（RPC batch） | 3s |
@@ -108,23 +108,30 @@ sudo bash install.sh
 
 `install.sh` 会自动完成：
 - 检查并安装 Node.js 20.x 和 PM2
-- 检测源码目录即部署目录时跳过复制（避免冲突）
-- 部署 fourmeme-monitor 到 `/root/fourmeme-monitor/`
-- 部署 flap-monitor 到 `/root/flap-monitor/`
+- 自动检测部署模式（统一部署 vs 独立部署）
+- 统一部署模式：PM2 直接从 `/root/monitor-suite/` 子目录启动
+- 独立部署模式：复制到 `/root/fourmeme-monitor/` 和 `/root/flap-monitor/`
 - 创建共享目录的符号链接（`../shared/` → `/root/monitor-suite/shared/`）
 - 安装依赖并通过 PM2 启动服务
-- 安装 20+ 快捷命令到 `/usr/local/bin/`
+- 安装 20+ 快捷命令到 `/usr/local/bin/`（自动兼容两种部署路径）
 
 ### 卸载
 
 ```bash
-# 仅卸载 monitor-suite（不影响其他 PM2 进程）
+# 停止并删除 PM2 进程
 pm2 delete fourmeme-monitor 2>/dev/null
 pm2 delete flap-monitor 2>/dev/null
 pm2 delete feishu-bot 2>/dev/null
 pm2 save
+
+# 删除独立部署目录（如存在）
 rm -rf ~/fourmeme-monitor ~/flap-monitor
+
+# 删除快捷命令
 rm -f /usr/local/bin/fm-* /usr/local/bin/fl-* /usr/local/bin/bot-* /usr/local/bin/mon-* /usr/local/bin/_pm2-proc-info
+
+# 如需完全清除，删除源码目录
+# rm -rf ~/monitor-suite
 ```
 
 ### 环境变量
@@ -165,6 +172,32 @@ sudo bash install.sh
 3. 添加权限：`im:message`（发送消息）、`im:message:send_as_bot`、`im:resource`（上传文件）
 4. 将应用添加到目标群聊
 5. 获取群聊的 `chat_id`，填入 `.env`
+
+## 快捷命令
+
+安装后可在任何 shell（包括飞书 Bot）中使用：
+
+| 命令 | 说明 |
+|------|------|
+| `mon-status` | 所有进程 + 数据摘要 + 磁盘占用 |
+| `mon-log [N]` | 所有进程日志（默认 80 行，倒序） |
+| `mon-restart` | 重启全部进程 |
+| `mon-stop` | 停止全部进程 |
+| `mon-ai` | 查看/切换 AI 模型 |
+| `mon-help` | 显示所有快捷命令 |
+| `fm-status` | Four.meme 进程 + 7 模块数据摘要 |
+| `fm-log [N]` | 日志（默认 80 行，倒序） |
+| `fm-restart` | 重启 |
+| `fm-check` | SIGUSR1 触发全量检测 |
+| `fm-daily` | 日报开关（on/off/on 20） |
+| `fm-heartbeat` | 心跳间隔设置（分钟数） |
+| `fl-status` | Flap.sh 进程 + 页面/资源/i18n 摘要 |
+| `fl-log [N]` | 日志 |
+| `fl-restart` | 重启 |
+| `fl-check` | SIGUSR1 触发检测 |
+| `bot-status` | 飞书 Bot 进程状态 |
+| `bot-log [N]` | Bot 日志 |
+| `bot-restart` | 重启 Bot |
 
 ## 信号
 
