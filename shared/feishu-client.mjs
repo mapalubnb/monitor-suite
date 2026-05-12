@@ -20,10 +20,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 
-/* ── .env 加载（多路径搜索，确保 symlink 部署下也能正确加载）── */
+/* ── .env 加载（多路径搜索，确保各种部署方式下都能正确加载）── */
 const ENV_PATHS = [
-  join(__dirname, "..", ".env"),           // 相对路径: /opt/monitor-suite/.env
-  "/opt/monitor-suite/.env",              // 绝对路径: 主配置
+  join(__dirname, "..", ".env"),           // 相对路径（跟随 __dirname 解析）
+  "/opt/monitor-suite/.env",              // install.sh 部署路径
+  "/root/monitor-suite/.env",             // 源码目录（用户手动编辑的位置）
   "/opt/fourmeme-monitor/../.env",        // symlink 路径
 ];
 
