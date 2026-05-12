@@ -42,6 +42,42 @@ const CHAT_ID = process.env.FEISHU_CHAT_ID || "";
    ══════════════════════════════════════════ */
 let _client = null;
 
+/* ── 手动 Token 管理（绕过 SDK 内部 tokenManager 的兼容性问题）── */
+let _tenantToken = "";
+let _tokenExpireAt = 0;
+
+/**
+ * 手动获取 tenant_access_token
+ * 某些版本的 SDK 内部 token manager 存在兼容问题，
+ * 此方法直接调用飞书 API 获取 token，确保稳定性。
+ */
+async function ensureTenantToken() {
+  const now = Date.now();
+  // token 有效期内直接复用（提前 5 分钟刷新）
+  if (_tenantToken && now < _tokenExpireAt - 300_000) {
+    return _tenantToken;
+  }
+  try {
+    const res = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
+    });
+    const json = await res.json();
+    if (json.code === 0 && json.tenant_access_token) {
+      _tenantToken = json.tenant_access_token;
+      _tokenExpireAt = now + json.expire * 1000;
+      log(`[飞书SDK] token 已刷新（有效期 ${json.expire}s）`);
+      return _tenantToken;
+    }
+    log(`[飞书SDK] token 获取失败: code=${json.code} msg=${json.msg}`);
+    return "";
+  } catch (err) {
+    log(`[飞书SDK] token 获取网络异常: ${err.message}`);
+    return "";
+  }
+}
+
 /**
  * 获取飞书 SDK Client 单例
  * @returns {lark.Client|null}
@@ -57,10 +93,38 @@ export function getClient() {
     appSecret: APP_SECRET,
     appType: lark.AppType.SelfBuild,
     domain: lark.Domain.Feishu,
+    disableTokenCache: true,  // 禁用 SDK 内部 token 缓存，使用我们自己的管理
+    loggerLevel: lark.LoggerLevel.error,
   });
-  log("[飞书SDK] Client 已初始化");
+  log("[飞书SDK] Client 已初始化（手动 token 管理模式）");
   return _client;
 }
+
+/**
+ * 获取 SDK 调用时的 token 选项
+ * 使用 lark.withTenantToken 将手动获取的 token 注入请求
+ */
+async function withToken() {
+  const token = await ensureTenantToken();
+  if (!token) throw new Error("无法获取 tenant_access_token，请检查飞书凭证");
+  return lark.withTenantToken(token);
+}
+
+/**
+ * 启动时主动验证飞书凭证
+ */
+async function verifyCredentials() {
+  if (!APP_ID || !APP_SECRET) return;
+  const token = await ensureTenantToken();
+  if (token) {
+    log(`[飞书SDK] 凭证验证通过 ✓`);
+  } else {
+    log(`[飞书SDK] ⚠ 凭证验证失败，请检查 FEISHU_APP_ID(${APP_ID.slice(0,8)}...) 和 FEISHU_APP_SECRET`);
+  }
+}
+
+// 启动时异步验证（不阻塞模块加载）
+verifyCredentials();
 
 export { lark };
 
@@ -118,6 +182,7 @@ export async function sendCard(title, content, template = "red", opts = {}) {
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
   const cardJson = buildCardJson(title, content, template, opts.diffFilePath);
+  const tokenOpt = await withToken();
   const res = await client.im.message.create({
     params: { receive_id_type: "chat_id" },
     data: {
@@ -125,7 +190,7 @@ export async function sendCard(title, content, template = "red", opts = {}) {
       content: cardJson,
       msg_type: "interactive",
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
   const messageId = res.data?.message_id;
   log(`[飞书SDK] 卡片已发送 → ${messageId}`);
@@ -141,6 +206,7 @@ export async function sendText(text, opts = {}) {
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
+  const tokenOpt = await withToken();
   const res = await client.im.message.create({
     params: { receive_id_type: "chat_id" },
     data: {
@@ -148,7 +214,7 @@ export async function sendText(text, opts = {}) {
       content: JSON.stringify({ text }),
       msg_type: "text",
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
   return res.data?.message_id;
 }
@@ -163,13 +229,14 @@ export async function replyText(messageId, text) {
   const truncated = text.length > maxLen
     ? text.slice(0, maxLen) + "\n\n... (输出已截断)"
     : text;
+  const tokenOpt = await withToken();
   const res = await client.im.message.reply({
     path: { message_id: messageId },
     data: {
       content: JSON.stringify({ text: truncated }),
       msg_type: "text",
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) {
     log(`[飞书SDK] 回复失败 code=${res.code}: ${res.msg}`);
   }
@@ -193,13 +260,14 @@ export async function replyCard(messageId, title, content, color = "blue") {
       { tag: "note", elements: [{ tag: "plain_text", content: ts() }] },
     ],
   });
+  const tokenOpt = await withToken();
   const res = await client.im.message.reply({
     path: { message_id: messageId },
     data: {
       content: card,
       msg_type: "interactive",
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) {
     log(`[飞书SDK] 回复卡片失败 code=${res.code}: ${res.msg}`);
   }
@@ -212,12 +280,13 @@ export async function replyCard(messageId, title, content, color = "blue") {
 export async function patchCard(messageId, title, content, template = "red", opts = {}) {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
+  const tokenOpt = await withToken();
   const res = await client.im.message.patch({
     path: { message_id: messageId },
     data: {
       content: buildCardJson(title, content, template, opts.diffFilePath),
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
 }
 
@@ -228,13 +297,14 @@ export async function uploadFile(fileName, content) {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
   const buf = typeof content === "string" ? Buffer.from(content, "utf-8") : content;
+  const tokenOpt = await withToken();
   const res = await client.im.file.create({
     data: {
       file_type: "stream",
       file_name: fileName,
       file: buf,
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) throw new Error(`文件上传失败: ${res.msg}`);
   return res.data?.file_key;
 }
@@ -248,6 +318,7 @@ export async function sendFile(fileKey, opts = {}) {
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
+  const tokenOpt = await withToken();
   const res = await client.im.message.create({
     params: { receive_id_type: "chat_id" },
     data: {
@@ -255,7 +326,7 @@ export async function sendFile(fileKey, opts = {}) {
       content: JSON.stringify({ file_key: fileKey }),
       msg_type: "file",
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) throw new Error(`发送文件消息失败: ${res.msg}`);
   return res.data?.message_id;
 }
@@ -266,13 +337,14 @@ export async function sendFile(fileKey, opts = {}) {
 export async function replyFile(messageId, fileKey) {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
+  const tokenOpt = await withToken();
   const res = await client.im.message.reply({
     path: { message_id: messageId },
     data: {
       content: JSON.stringify({ file_key: fileKey }),
       msg_type: "file",
     },
-  });
+  }, tokenOpt);
   if (res.code !== 0) {
     log(`[飞书SDK] 文件回复失败 code=${res.code}: ${res.msg}`);
   }
@@ -287,9 +359,10 @@ export async function pinMessage(messageId) {
   const client = getClient();
   if (!client) return;
   try {
+    const tokenOpt = await withToken();
     const res = await client.im.pin.create({
       data: { message_id: messageId },
-    });
+    }, tokenOpt);
     if (res.code !== 0) {
       log(`[Pin] 置顶失败 code=${res.code}: ${res.msg}`);
       return;
