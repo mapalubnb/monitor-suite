@@ -5,10 +5,12 @@
  *   1. 从 ai-models.json 加载模型配置（热加载，5s 缓存）
  *   2. 支持 OpenAI 兼容格式 + Anthropic (Claude) 格式
  *   3. ENV:XXX 语法自动从环境变量解析 API Key
- *   4. 提供 chatCompletion / switchProvider / listProviders 等公共 API
+ *   4. 仅展示已配置 API Key 的可用提供商
+ *   5. 支持从 API 动态获取模型列表（listRemoteModels）
+ *   6. 提供 chatCompletion / switchProvider / listProviders 等公共 API
  *
  * 用法：
- *   import { AI, aiSummarize, chatCompletion, switchProvider, listProviders } from "../shared/ai-client.mjs";
+ *   import { AI, aiSummarize, chatCompletion, switchProvider, listProviders, listRemoteModels } from "../shared/ai-client.mjs";
  */
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -80,7 +82,25 @@ function resolveApiKey(raw) {
  */
 function getCurrentProvider() {
   const config = loadModelsConfig();
-  const name = config.current || Object.keys(config.providers)[0] || "";
+  let name = config.current || "";
+
+  // 如果当前选中的 provider 没有有效 key，自动切换到第一个有 key 的
+  if (name) {
+    const provider = config.providers[name];
+    if (!provider || !resolveApiKey(provider.apiKey)) {
+      name = "";
+    }
+  }
+  if (!name) {
+    // 找第一个有有效 key 的 provider
+    for (const [n, p] of Object.entries(config.providers || {})) {
+      if (resolveApiKey(p.apiKey)) {
+        name = n;
+        break;
+      }
+    }
+  }
+
   const provider = config.providers[name];
   if (!provider) {
     return { name: "", apiUrl: "", apiKey: "", model: "", label: "", format: "openai" };
@@ -114,23 +134,142 @@ export const AI = {
 };
 
 /**
- * 列出所有可用模型
- * @returns {{ current: string, providers: Array<{name, label, model, format}> }}
+ * 列出所有可用模型（仅返回已配置 API Key 的提供商）
+ * @returns {{ current: string, providers: Array<{name, label, model, format, models}> }}
  */
 export function listProviders() {
+  const config = loadModelsConfig();
+  const providers = Object.entries(config.providers || {})
+    .filter(([, p]) => !!resolveApiKey(p.apiKey))
+    .map(([name, p]) => ({
+      name,
+      label: p.label || name,
+      model: p.model || "",
+      format: p.format || "openai",
+      models: p.models || [p.model || ""],
+      hasKey: true,
+    }));
+  return { current: config.current || "", providers };
+}
+
+/**
+ * 列出所有提供商（含无 key 的，用于管理界面展示完整列表）
+ * @returns {{ current: string, providers: Array<{name, label, model, format, hasKey, models}> }}
+ */
+export function listAllProviders() {
   const config = loadModelsConfig();
   const providers = Object.entries(config.providers || {}).map(([name, p]) => ({
     name,
     label: p.label || name,
     model: p.model || "",
     format: p.format || "openai",
+    models: p.models || [p.model || ""],
     hasKey: !!resolveApiKey(p.apiKey),
   }));
   return { current: config.current || "", providers };
 }
 
 /**
- * 切换当前 AI 模型
+ * 从 API 远程获取可用模型列表
+ * @param {string} [providerName] - 提供商名称（默认当前）
+ * @returns {Promise<{ok: boolean, models?: string[], message?: string}>}
+ */
+export async function listRemoteModels(providerName) {
+  const config = loadModelsConfig();
+  const name = providerName || config.current || "";
+  const provider = config.providers[name];
+  if (!provider) return { ok: false, message: `未知提供商: ${name}` };
+
+  const apiKey = resolveApiKey(provider.apiKey);
+  if (!apiKey) return { ok: false, message: `${name} 未配置 API Key` };
+
+  // 确定模型列表 URL
+  let modelsUrl = provider.modelsUrl || "";
+  if (!modelsUrl) {
+    // 尝试从 apiUrl 推断（OpenAI 兼容格式：替换 /chat/completions 为 /models）
+    if (provider.apiUrl?.includes("/chat/completions")) {
+      modelsUrl = provider.apiUrl.replace("/chat/completions", "/models");
+    }
+  }
+  if (!modelsUrl) {
+    // 无法获取远程列表，返回本地配置的 models
+    return { ok: true, models: provider.models || [provider.model], source: "local" };
+  }
+
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 10_000);
+
+    const headers = { "Content-Type": "application/json" };
+    // Anthropic 没有 list models API
+    if (provider.format === "anthropic") {
+      return { ok: true, models: provider.models || [provider.model], source: "local" };
+    }
+    // Gemini 使用 query param key
+    if (modelsUrl.includes("generativelanguage.googleapis.com")) {
+      const separator = modelsUrl.includes("?") ? "&" : "?";
+      modelsUrl = `${modelsUrl}${separator}key=${apiKey}`;
+    } else {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    }
+
+    const res = await fetch(modelsUrl, { headers, signal: ctrl.signal });
+    clearTimeout(timer);
+
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      return { ok: false, message: `HTTP ${res.status}: ${errText.slice(0, 100)}` };
+    }
+
+    const json = await res.json();
+
+    // 解析模型列表（不同 API 返回格式略有不同）
+    let models = [];
+    if (Array.isArray(json.data)) {
+      // OpenAI / DeepSeek / Qwen / Mistral / Groq 格式
+      models = json.data
+        .map(m => m.id || m.name || "")
+        .filter(id => id && !id.includes("embedding") && !id.includes("tts") && !id.includes("whisper") && !id.includes("dall-e"));
+    } else if (Array.isArray(json.models)) {
+      // Gemini 格式
+      models = json.models
+        .map(m => (m.name || "").replace("models/", ""))
+        .filter(id => id && !id.includes("embedding"));
+    } else if (Array.isArray(json)) {
+      models = json.map(m => m.id || m.name || "").filter(Boolean);
+    }
+
+    // 过滤只保留 chat 相关模型（排除纯 embedding/audio/image 模型）
+    models = models.filter(id =>
+      !id.includes("embed") && !id.includes("tts") && !id.includes("whisper") &&
+      !id.includes("dall-e") && !id.includes("audio") && !id.includes("image") &&
+      !id.includes("moderation")
+    );
+
+    if (models.length === 0) {
+      return { ok: true, models: provider.models || [provider.model], source: "local" };
+    }
+
+    // 排序：优先显示本地配置中的模型
+    const localModels = new Set(provider.models || []);
+    models.sort((a, b) => {
+      const aLocal = localModels.has(a) ? 0 : 1;
+      const bLocal = localModels.has(b) ? 0 : 1;
+      if (aLocal !== bLocal) return aLocal - bLocal;
+      return a.localeCompare(b);
+    });
+
+    return { ok: true, models, source: "remote" };
+  } catch (err) {
+    if (err.name === "AbortError") {
+      return { ok: false, message: "请求超时（10s）" };
+    }
+    return { ok: false, message: err.message };
+  }
+}
+
+/**
+ * 切换当前 AI 提供商和/或模型
  * @param {string} providerName - provider 名称
  * @param {string} [modelOverride] - 可选：覆盖 model 名称
  * @returns {{ ok: boolean, message: string }}
@@ -138,9 +277,24 @@ export function listProviders() {
 export function switchProvider(providerName, modelOverride) {
   const config = loadModelsConfig();
   if (!config.providers[providerName]) {
-    const available = Object.keys(config.providers).join(", ");
-    return { ok: false, message: `未知模型: ${providerName}\n可用: ${available}` };
+    // 尝试模糊匹配（忽略大小写）
+    const match = Object.keys(config.providers).find(k => k.toLowerCase() === providerName.toLowerCase());
+    if (match) {
+      providerName = match;
+    } else {
+      const available = Object.keys(config.providers)
+        .filter(k => !!resolveApiKey(config.providers[k].apiKey))
+        .join(", ");
+      return { ok: false, message: `未知提供商: ${providerName}\n可用: ${available || "(无，请先配置 API Key)"}` };
+    }
   }
+
+  // 检查是否有有效 key
+  const provider = config.providers[providerName];
+  if (!resolveApiKey(provider.apiKey)) {
+    return { ok: false, message: `${providerName} 未配置 API Key，无法切换` };
+  }
+
   config.current = providerName;
   if (modelOverride) {
     config.providers[providerName].model = modelOverride;
@@ -149,10 +303,9 @@ export function switchProvider(providerName, modelOverride) {
     writeFileSync(MODELS_FILE, JSON.stringify(config, null, 2), "utf-8");
     // 清除缓存使立即生效
     _configCache = { data: config, ts: Date.now() };
-    const p = config.providers[providerName];
-    const model = modelOverride || p.model;
+    const model = modelOverride || provider.model;
     log(`[AI] 模型已切换为: ${providerName} (${model})`);
-    return { ok: true, message: `已切换为 ${p.label || providerName} (${model})` };
+    return { ok: true, message: `已切换为 ${provider.label || providerName} (${model})` };
   } catch (err) {
     return { ok: false, message: `写入配置失败: ${err.message}` };
   }
@@ -192,6 +345,26 @@ export async function chatCompletion({
   const timeout = timeoutMs || provider.timeoutMs || 30_000;
   const isAnthropic = provider.format === "anthropic";
 
+  // Gemini OpenAI 兼容模式需要在 URL 中追加 key 参数
+  let apiUrl = provider.apiUrl;
+  let authHeaders;
+  if (apiUrl.includes("generativelanguage.googleapis.com")) {
+    const separator = apiUrl.includes("?") ? "&" : "?";
+    apiUrl = `${apiUrl}${separator}key=${provider.apiKey}`;
+    authHeaders = { "Content-Type": "application/json" };
+  } else if (isAnthropic) {
+    authHeaders = {
+      "Content-Type": "application/json",
+      "x-api-key": provider.apiKey,
+      "anthropic-version": "2023-06-01",
+    };
+  } else {
+    authHeaders = {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${provider.apiKey}`,
+    };
+  }
+
   for (let attempt = 0; attempt <= retries; attempt++) {
     if (attempt > 0) {
       log(`[AI] 第 ${attempt + 1} 次重试...`);
@@ -204,13 +377,9 @@ export async function chatCompletion({
     try {
       let res;
       if (isAnthropic) {
-        res = await fetch(provider.apiUrl, {
+        res = await fetch(apiUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-api-key": provider.apiKey,
-            "anthropic-version": "2023-06-01",
-          },
+          headers: authHeaders,
           body: JSON.stringify({
             model: provider.model,
             system: systemPrompt,
@@ -221,13 +390,10 @@ export async function chatCompletion({
           signal: ctrl.signal,
         });
       } else {
-        // OpenAI 兼容格式（豆包/DeepSeek/千问/智谱/OpenAI/...）
-        res = await fetch(provider.apiUrl, {
+        // OpenAI 兼容格式（豆包/DeepSeek/千问/智谱/OpenAI/Gemini/Mistral/Groq/...）
+        res = await fetch(apiUrl, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${provider.apiKey}`,
-          },
+          headers: authHeaders,
           body: JSON.stringify({
             model: provider.model,
             messages: [
@@ -329,5 +495,5 @@ const p = getCurrentProvider();
 if (p.name) {
   log(`[AI] 初始模型：${p.name} / ${p.model}（${p.label}）热加载自 ${MODELS_FILE}`);
 } else {
-  log(`[AI] 警告：未找到有效的 AI 模型配置，请检查 ${MODELS_FILE}`);
+  log(`[AI] 警告：未找到有效的 AI 模型配置（无已配置 Key 的提供商），请检查 .env`);
 }

@@ -22,7 +22,7 @@ import {
   replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile, sendFile as _sdkSendFile,
   getClient, getChatId, lark,
 } from "../shared/feishu-client.mjs";
-import { AI, chatCompletion, listProviders, switchProvider } from "../shared/ai-client.mjs";
+import { AI, chatCompletion, listProviders, listRemoteModels, switchProvider } from "../shared/ai-client.mjs";
 
 const execAsync = promisify(execCb);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -160,13 +160,18 @@ async function handleMessage(messageId, rawText) {
       case "ask": {
         // 检查是否为模型管理子命令
         const aiSubCmd = (args[0] || "").toLowerCase();
-        if (["model", "模型", "switch", "切换", "list", "列表"].includes(aiSubCmd)) {
-          reply = cmdAiModel(aiSubCmd, args.slice(1));
-          await replyCard(messageId, "AI 模型", reply, "purple");
-          return;
+        if (["model", "模型", "switch", "切换", "list", "列表", "models", "remote", "远程"].includes(aiSubCmd)) {
+          reply = await cmdAiModel(aiSubCmd, args.slice(1));
+          if (reply) {
+            await replyCard(messageId, "AI 模型", reply, "purple");
+            return;
+          }
+          // reply === null 意味着非模型管理指令，继续当做 AI 问题处理
         }
-        reply = await cmdAi(args.join(" "));
-        await replyCard(messageId, "AI 助手", reply, "blue");
+        if (!reply) {
+          reply = await cmdAi(args.join(" "));
+          await replyCard(messageId, "AI 助手", reply, "blue");
+        }
         return;
       }
 
@@ -666,33 +671,63 @@ async function cmdAi(question) {
 /**
  * AI 模型管理子命令
  */
-function cmdAiModel(subCmd, args) {
+async function cmdAiModel(subCmd, args) {
   switch (subCmd) {
     case "model":
     case "模型":
     case "": {
       const { current, providers } = listProviders();
-      const lines = [`**当前模型：** ${current} (${AI_CONFIG.model})`, ""];
-      lines.push("**可用模型：**");
+      if (providers.length === 0) {
+        return "⚠ 未配置任何 AI API Key\n请编辑 `.env` 填入至少一个 Key（如 DOUBAO_API_KEY、DEEPSEEK_API_KEY 等）";
+      }
+      const lines = [`**当前：** ${current || "(无)"} / \`${AI_CONFIG.model || "N/A"}\``, ""];
+      lines.push("**可用提供商：**");
       for (const p of providers) {
         const icon = p.name === current ? "●" : "○";
-        const keyStatus = p.hasKey ? "" : " ⚠无Key";
-        lines.push(`  ${icon} \`${p.name}\`　${p.label}　\`${p.model}\`${keyStatus}`);
+        const modelList = p.models.length > 1 ? `  可选: ${p.models.slice(0, 4).join(", ")}${p.models.length > 4 ? "..." : ""}` : "";
+        lines.push(`  ${icon} \`${p.name}\`　${p.label}　当前: \`${p.model}\``);
+        if (modelList) lines.push(`  ${modelList}`);
       }
+      lines.push("");
+      lines.push("**指令：**");
+      lines.push("`ai switch <提供商> [模型]` 切换");
+      lines.push("`ai models [提供商]` 查看远程模型列表");
       return lines.join("\n");
     }
     case "switch":
     case "切换": {
       const name = args[0];
       const modelOverride = args[1];
-      if (!name) return "用法：`ai switch <模型名> [model名称]`";
+      if (!name) return "用法：`ai switch <提供商名> [模型名]`\n示例：`ai switch deepseek deepseek-reasoner`";
       const result = switchProvider(name, modelOverride);
       return result.message;
     }
     case "list":
     case "列表": {
       const { providers } = listProviders();
-      return providers.map(p => `\`${p.name}\` — ${p.label} (${p.model})`).join("\n");
+      if (providers.length === 0) return "⚠ 无可用提供商（未配置 API Key）";
+      const lines = providers.map(p => {
+        const models = p.models.slice(0, 5).map(m => `\`${m}\``).join(", ");
+        return `**${p.label}** (\`${p.name}\`)\n  当前: \`${p.model}\` | 可选: ${models}`;
+      });
+      return lines.join("\n\n");
+    }
+    case "models":
+    case "remote":
+    case "远程": {
+      const providerName = args[0] || "";
+      const result = await listRemoteModels(providerName || undefined);
+      if (!result.ok) return `获取模型列表失败：${result.message}`;
+      const source = result.source === "remote" ? "远程 API" : "本地配置";
+      const models = result.models.slice(0, 30);
+      const lines = [`**模型列表（来源: ${source}）：**`, ""];
+      for (const m of models) {
+        lines.push(`  \`${m}\``);
+      }
+      if (result.models.length > 30) lines.push(`  ... 还有 ${result.models.length - 30} 个`);
+      lines.push("");
+      lines.push("切换：`ai switch <提供商> <模型名>`");
+      return lines.join("\n");
     }
     default:
       return null; // 非模型管理指令，当作普通 AI 问题处理
@@ -742,9 +777,10 @@ function cmdHelp() {
     "**内置指令：**",
     "`help`　　　　显示此帮助",
     "`ai <问题>`　 AI 助手（别名：问、ask）",
-    "`ai model`　　查看当前 AI 模型",
-    "`ai switch <名称>` 切换 AI 模型",
-    "`ai list`　　 列出所有可用模型",
+    "`ai model`　　查看当前 AI 提供商和模型",
+    "`ai switch <提供商> [模型]` 切换提供商/模型",
+    "`ai list`　　 列出所有可用提供商及模型",
+    "`ai models [提供商]` 从 API 获取远程模型列表",
     "`history [N]` 最近变更记录（默认 10）",
     "`report`　　　生成并发送日报",
     "",

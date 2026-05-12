@@ -731,17 +731,27 @@ EOF
 
 cat > "$BIN_DIR/mon-ai" << 'AIEOF'
 #!/usr/bin/env node
-// mon-ai — 动态读取 ai-models.json 的 AI 模型管理命令
+// mon-ai — AI 模型管理命令（仅显示已配置 Key 的提供商）
 const fs = require("fs");
-const MODELS_FILE = "/root/fourmeme-monitor/../ai-models.json".replace(/\.\./, "");
-const REAL_MODELS = "/root/monitor-suite/ai-models.json";
-// 兼容两种安装路径
-const modelsPath = fs.existsSync(REAL_MODELS) ? REAL_MODELS
-  : fs.existsSync("/root/fourmeme-monitor/ai-models.json") ? "/root/fourmeme-monitor/ai-models.json"
-  : null;
+const path = require("path");
+
+// ── .env 加载 ──
+const ENV_PATHS = ["/root/monitor-suite/.env", "/root/fourmeme-monitor/../.env"];
+for (const envPath of ENV_PATHS) {
+  if (fs.existsSync(envPath)) {
+    try {
+      for (const line of fs.readFileSync(envPath, "utf-8").split("\n")) {
+        const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+        if (m && !(m[1] in process.env)) {
+          process.env[m[1]] = m[2].replace(/^["']|["']$/g, "").trim();
+        }
+      }
+    } catch {}
+    break;
+  }
+}
 
 function loadConfig() {
-  // 尝试多个路径
   const paths = [
     "/root/monitor-suite/ai-models.json",
     "/root/fourmeme-monitor/../ai-models.json",
@@ -755,55 +765,97 @@ function loadConfig() {
   process.exit(1);
 }
 
+function resolveKey(raw) {
+  if (!raw) return "";
+  if (raw.startsWith("ENV:")) return process.env[raw.slice(4)] || "";
+  return raw;
+}
+
+function getAvailable(providers) {
+  return Object.entries(providers).filter(([, cfg]) => !!resolveKey(cfg.apiKey));
+}
+
 const arg = process.argv[2] || "";
 const modelOverride = process.argv[3] || "";
 
 if (!arg) {
-  // 显示当前状态 + 所有可用模型
-  const { data, path } = loadConfig();
+  const { data, path: cfgPath } = loadConfig();
   const current = data.current || "(未设置)";
   const providers = data.providers || {};
+  const available = getAvailable(providers);
   const p = providers[current];
   console.log("====== AI 模型管理 ======");
   console.log("");
-  console.log("当前: " + current + (p ? " (" + p.model + ") — " + (p.label || "") : ""));
+  if (p && resolveKey(p.apiKey)) {
+    console.log("当前: " + current + " (" + p.model + ") — " + (p.label || ""));
+  } else {
+    console.log("当前: (无可用提供商)");
+  }
   console.log("");
-  console.log("可用模型:");
-  for (const [name, cfg] of Object.entries(providers)) {
-    const icon = name === current ? "●" : "○";
-    const label = (cfg.label || "").padEnd(16);
-    const model = cfg.model || "";
-    const fmt = cfg.format === "anthropic" ? " [Anthropic]" : "";
-    console.log("  " + icon + " " + name.padEnd(16) + label + model + fmt);
+  if (available.length === 0) {
+    console.log("⚠ 未配置任何 API Key，请编辑 .env");
+  } else {
+    console.log("可用提供商（已配置 Key）:");
+    for (const [name, cfg] of available) {
+      const icon = name === current ? "●" : "○";
+      const label = (cfg.label || "").padEnd(12);
+      const model = cfg.model || "";
+      const models = (cfg.models || []).slice(0, 4).join(", ");
+      const fmt = cfg.format === "anthropic" ? " [Anthropic]" : "";
+      console.log("  " + icon + " " + name.padEnd(12) + label + "当前: " + model + fmt);
+      if (models) console.log("    " + "".padEnd(12) + "可选: " + models);
+    }
   }
   console.log("");
   console.log("用法:");
-  console.log("  mon-ai <名称>           切换模型");
-  console.log("  mon-ai <名称> <model>   切换并覆盖 model 名称");
+  console.log("  mon-ai <提供商>              切换提供商");
+  console.log("  mon-ai <提供商> <模型名>     切换并指定模型");
+  console.log("  mon-ai list                 列出所有可用提供商");
   console.log("");
-  console.log("配置文件: " + path);
+  console.log("配置文件: " + cfgPath);
   console.log("切换即时生效（5s 内），无需重启。");
   console.log("=========================================");
 } else if (arg === "list") {
   const { data } = loadConfig();
-  for (const [name, cfg] of Object.entries(data.providers || {})) {
-    console.log(name + " — " + (cfg.label || "") + " (" + (cfg.model || "") + ")");
+  const available = getAvailable(data.providers || {});
+  if (available.length === 0) {
+    console.log("⚠ 无可用提供商（未配置 API Key）");
+  } else {
+    for (const [name, cfg] of available) {
+      const models = (cfg.models || [cfg.model]).join(", ");
+      console.log(name + " — " + (cfg.label || "") + " (当前: " + cfg.model + ", 可选: " + models + ")");
+    }
   }
 } else {
-  // 切换模型
-  const { data, path } = loadConfig();
-  if (!data.providers[arg]) {
-    console.log("未知模型: " + arg);
-    console.log("可用: " + Object.keys(data.providers).join(", "));
+  const { data, path: cfgPath } = loadConfig();
+  // 模糊匹配
+  let providerName = arg;
+  if (!data.providers[providerName]) {
+    const match = Object.keys(data.providers).find(k => k.toLowerCase() === providerName.toLowerCase());
+    if (match) providerName = match;
+  }
+  if (!data.providers[providerName]) {
+    console.log("未知提供商: " + arg);
+    const available = getAvailable(data.providers).map(([n]) => n);
+    console.log("可用: " + (available.join(", ") || "(无，请先配置 API Key)"));
     process.exit(1);
   }
-  data.current = arg;
-  if (modelOverride) {
-    data.providers[arg].model = modelOverride;
+  const cfg = data.providers[providerName];
+  if (!resolveKey(cfg.apiKey)) {
+    console.log("⚠ " + providerName + " 未配置 API Key，无法切换");
+    console.log("请在 .env 中设置对应的 Key 变量");
+    process.exit(1);
   }
-  fs.writeFileSync(path, JSON.stringify(data, null, 2), "utf-8");
-  const p = data.providers[arg];
-  console.log("[" + new Date().toTimeString().slice(0,8) + "] AI 模型已切换为: " + arg + " (" + p.model + ") — " + (p.label || ""));
+  data.current = providerName;
+  if (modelOverride) {
+    data.providers[providerName].model = modelOverride;
+  }
+  fs.writeFileSync(cfgPath, JSON.stringify(data, null, 2), "utf-8");
+  const model = modelOverride || cfg.model;
+  console.log("[" + new Date().toTimeString().slice(0,8) + "] 已切换为: " + providerName + " (" + model + ") — " + (cfg.label || ""));
+  if (cfg.models && cfg.models.length > 1) {
+    console.log("可选模型: " + cfg.models.join(", "));
+  }
   console.log("已即时生效，无需重启。");
   console.log("=========================================");
 }
