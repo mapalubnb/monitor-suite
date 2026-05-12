@@ -1,7 +1,9 @@
 {
   "name": "flap-monitor",
   "version": "1.0.0",
+  "description": "Flap.sh 页面监控（前端/i18n/API/路由）",
   "type": "module",
+  "private": true,
   "scripts": {
     "start": "node monitor.mjs",
     "check": "node monitor.mjs check"

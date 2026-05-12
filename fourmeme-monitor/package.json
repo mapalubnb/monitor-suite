@@ -1,7 +1,9 @@
 {
   "name": "fourmeme-monitor",
   "version": "1.0.0",
+  "description": "Four.meme 全面监控（底池/前端/API/GitHub/合约/链上参数）",
   "type": "module",
+  "private": true,
   "scripts": {
     "start": "node monitor.mjs",
     "bot": "node feishu-bot.mjs"

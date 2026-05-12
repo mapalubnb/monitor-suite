@@ -34,8 +34,8 @@
 | 模块 | 监控内容 | 频率 |
 |------|---------|------|
 | 模块 1 | 底池配置（Pool Config） | 3s |
-| 模块 2 | 前端代码（4 页面并行，含文案 diff、`__NEXT_DATA__`、i18n、路由发现） | 45s |
-| 模块 3/5 | API 结构（多端点并行，结构 + 值 diff） | 15s |
+| 模块 2 | 前端代码（4 页面并行，含文案 diff、`__NEXT_DATA__`、i18n、路由发现） | 15s |
+| 模块 3/5 | API 结构（多端点并行，结构 + 值 diff） | 30s |
 | 模块 4 | GitHub 仓库变更（条件请求，ETag 缓存） | 5min |
 | 模块 6 | BSC 智能合约（RPC batch） | 3s |
 | 模块 7 | 链上参数（RPC batch） | 3s |
@@ -48,8 +48,9 @@
 
 ### 飞书 Bot (`fourmeme-monitor/feishu-bot.mjs`)
 
+- WebSocket 长连接（无需公网 IP，无需配置事件订阅）
 - 群聊指令交互（查看状态、切换 AI 模型、手动触发检测等）
-- 卡片回调（如下载 Diff 文件按钮）
+- 远程 Shell 执行（含危险命令拦截）
 - 每日报告（可选）
 
 ### AI 变更摘要 (`shared/ai-client.mjs`)

@@ -46,7 +46,7 @@ const CONFIG = {
   feishuAppSecret: process.env.FEISHU_APP_SECRET || "",
   feishuChatId: process.env.FEISHU_CHAT_ID || "",
 
-  // 轮询间隔（毫秒）— 提速：从 2s 降到 1.5s
+  // 轮询间隔（毫秒）
   pollIntervalMs: 1_500,
 
   fetchTimeoutMs: 8_000,

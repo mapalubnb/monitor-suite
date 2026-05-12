@@ -23,7 +23,7 @@ fi
 
 # ── 1. 检查 Node.js ──
 echo ""
-echo "[1/5] 检查 Node.js..."
+echo "[1/6] 检查 Node.js..."
 if ! command -v node &>/dev/null; then
   echo "  安装 Node.js 20.x..."
   curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
@@ -32,17 +32,17 @@ fi
 echo "  Node.js $(node -v)"
 
 # ── 2. 检查 pm2 ──
-echo "[2/5] 检查 pm2..."
+echo "[2/6] 检查 pm2..."
 if ! command -v pm2 &>/dev/null; then
   echo "  安装 pm2..."
   npm install -g pm2
 fi
 echo "  pm2 $(pm2 -v)"
 
-# ── 2.5. 部署共享模块 + 配置 ──
+# ── 3. 部署共享模块 + 配置 ──
 SUITE_DIR="/root/monitor-suite"
 SHARED_DIR="$SUITE_DIR/shared"
-echo "[2.5/5] 部署共享模块 → ${SHARED_DIR}"
+echo "[3/6] 部署共享模块 → ${SHARED_DIR}"
 mkdir -p "$SHARED_DIR"
 # 如果当前目录就是 SUITE_DIR，跳过复制（避免 cp same file 错误）
 CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -68,8 +68,8 @@ if [ ! -f "$SUITE_DIR/.env" ]; then
   echo "  .env 模板已生成，请编辑填入真实密钥: $SUITE_DIR/.env"
 fi
 
-# ── 3. 部署 fourmeme-monitor ──
-echo "[3/5] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
+# ── 4. 部署 fourmeme-monitor ──
+echo "[4/6] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
 mkdir -p "$FOURMEME_DIR"
 # 如果源目录和目标不同才复制
 if [ "$(cd fourmeme-monitor && pwd)" != "$(cd "$FOURMEME_DIR" 2>/dev/null && pwd)" ]; then
@@ -94,8 +94,8 @@ pm2 start "$FOURMEME_DIR/feishu-bot.mjs" --name feishu-bot --time
 
 echo "  fourmeme-monitor ✓"
 
-# ── 4. 部署 flap-monitor ──
-echo "[4/5] 部署 flap-monitor → ${FLAP_DIR}"
+# ── 5. 部署 flap-monitor ──
+echo "[5/6] 部署 flap-monitor → ${FLAP_DIR}"
 mkdir -p "$FLAP_DIR"
 # 如果源目录和目标不同才复制
 if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; then
@@ -121,8 +121,8 @@ else
   echo "  ⚠ pm2 开机自启配置失败（可能不支持 systemd），请手动配置"
 fi
 
-# ── 5. 安装快捷命令（可执行脚本，非 alias）──
-echo "[5/5] 安装快捷命令到 /usr/local/bin/..."
+# ── 6. 安装快捷命令（可执行脚本，非 alias）──
+echo "[6/6] 安装快捷命令到 /usr/local/bin/..."
 
 BIN_DIR="/usr/local/bin"
 
@@ -569,19 +569,9 @@ echo "[ 进程 ]"
 pm2 jlist 2>/dev/null | _pm2-proc-info feishu-bot
 echo ""
 echo "[ 服务 ]"
-echo "  端口: 3001"
-echo "  事件回调: /feishu/event"
-echo "  卡片回调: /feishu/card"
-# 端口检测
-if command -v ss >/dev/null 2>&1; then
-  LISTEN=$(ss -tlnp 2>/dev/null | grep ':3001 ')
-elif command -v netstat >/dev/null 2>&1; then
-  LISTEN=$(netstat -tlnp 2>/dev/null | grep ':3001 ')
-fi
-echo "  状态: ${LISTEN:+已监听}${LISTEN:-未监听}"
+echo "  模式: WebSocket 长连接（无需公网 IP）"
 echo ""
 echo "飞书群发 help 查看机器人指令"
-echo "提示：卡片请求地址请配置为 http://<IP>:3001/feishu/card"
 echo "========================================="
 EOF
 
@@ -630,7 +620,7 @@ pm2 jlist 2>/dev/null | node -e "
       const services=[
         {name:'fourmeme-monitor', label:'Four.meme 监控', desc:'7模块全面监控'},
         {name:'flap-monitor',     label:'Flap.sh 监控',   desc:'页面/资源/文案监控'},
-        {name:'feishu-bot',       label:'飞书交互机器人',   desc:'端口 3001'},
+        {name:'feishu-bot',       label:'飞书交互机器人',   desc:'WebSocket 长连接'},
       ];
       for(const svc of services){
         const p=list.find(x=>x.name===svc.name);
