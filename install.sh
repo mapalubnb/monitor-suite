@@ -7,8 +7,17 @@
 
 set -euo pipefail
 
-FOURMEME_DIR="/root/fourmeme-monitor"
-FLAP_DIR="/root/flap-monitor"
+SUITE_DIR="/root/monitor-suite"
+CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# 如果从源码目录运行，PM2 直接从源码子目录启动（不复制到外面）
+if [ "$CURRENT_DIR" = "$SUITE_DIR" ]; then
+  FOURMEME_DIR="$SUITE_DIR/fourmeme-monitor"
+  FLAP_DIR="$SUITE_DIR/flap-monitor"
+else
+  FOURMEME_DIR="/root/fourmeme-monitor"
+  FLAP_DIR="/root/flap-monitor"
+fi
 
 echo "========================================="
 echo "  Monitor Suite 安装脚本"
@@ -76,11 +85,11 @@ if [ "$(cd fourmeme-monitor && pwd)" != "$(cd "$FOURMEME_DIR" 2>/dev/null && pwd
   cp fourmeme-monitor/monitor.mjs "$FOURMEME_DIR/"
   cp fourmeme-monitor/package.json "$FOURMEME_DIR/"
   cp fourmeme-monitor/feishu-bot.mjs "$FOURMEME_DIR/"
+  # 创建 shared 软链接（让 import "../shared/..." 能正确解析）
+  ln -sfn "$SHARED_DIR" "$FOURMEME_DIR/../shared"
+  ln -sfn "$SUITE_DIR/ai-models.json" "$FOURMEME_DIR/../ai-models.json"
+  ln -sfn "$SUITE_DIR/.env" "$FOURMEME_DIR/../.env"
 fi
-# 创建 shared 软链接（让 import "../shared/..." 能正确解析）
-ln -sfn "$SHARED_DIR" "$FOURMEME_DIR/../shared"
-ln -sfn "$SUITE_DIR/ai-models.json" "$FOURMEME_DIR/../ai-models.json"
-ln -sfn "$SUITE_DIR/.env" "$FOURMEME_DIR/../.env"
 cd "$FOURMEME_DIR" && npm install --omit=dev && cd - >/dev/null
 
 pm2 delete fourmeme-monitor 2>/dev/null || true
@@ -101,11 +110,11 @@ mkdir -p "$FLAP_DIR"
 if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; then
   cp flap-monitor/monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/package.json "$FLAP_DIR/"
+  # 创建 shared 软链接
+  ln -sfn "$SHARED_DIR" "$FLAP_DIR/../shared"
+  ln -sfn "$SUITE_DIR/ai-models.json" "$FLAP_DIR/../ai-models.json"
+  ln -sfn "$SUITE_DIR/.env" "$FLAP_DIR/../.env"
 fi
-# 创建 shared 软链接
-ln -sfn "$SHARED_DIR" "$FLAP_DIR/../shared"
-ln -sfn "$SUITE_DIR/ai-models.json" "$FLAP_DIR/../ai-models.json"
-ln -sfn "$SUITE_DIR/.env" "$FLAP_DIR/../.env"
 cd "$FLAP_DIR" && npm install --omit=dev && cd - >/dev/null
 
 pm2 delete flap-monitor 2>/dev/null || true
