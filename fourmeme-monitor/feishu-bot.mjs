@@ -1008,6 +1008,127 @@ function isMessageProcessed(messageId) {
   return false;
 }
 
+// ── 卡片动作去重（飞书 3s 未响应会重投，同一动作可能触发 2~3 次）──
+const processedCardActions = new Map(); // actionKey -> timestamp
+const CARD_DEDUP_TTL = 120_000; // 2 分钟
+
+function isCardActionProcessed(actionKey) {
+  if (!actionKey) return false;
+  if (processedCardActions.has(actionKey)) return true;
+  processedCardActions.set(actionKey, Date.now());
+  if (processedCardActions.size > 200) {
+    const now = Date.now();
+    for (const [k, ts] of processedCardActions) {
+      if (now - ts > CARD_DEDUP_TTL) processedCardActions.delete(k);
+    }
+  }
+  return false;
+}
+
+/* ══════════════════════════════════════════
+   卡片按钮回调：下载 Diff 详情
+   ══════════════════════════════════════════ */
+
+/**
+ * 解析 action.value —— 兼容 object / JSON string 两种格式
+ */
+function parseActionValue(raw) {
+  if (!raw) return {};
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try { return JSON.parse(raw); } catch { return {}; }
+  }
+  return {};
+}
+
+/**
+ * 从卡片事件数据中提取 open_message_id —— 兼容 v1/v2 schema
+ */
+function extractCardMessageId(data) {
+  return data?.context?.open_message_id
+      || data?.event?.context?.open_message_id
+      || data?.open_message_id
+      || data?.event?.open_message_id
+      || "";
+}
+
+/**
+ * 校验 diff 文件路径合法 —— 必须在已知监控目录下的 diffs/ 子目录内
+ * 防止通过伪造卡片按钮读取任意文件
+ */
+function isValidDiffPath(filePath) {
+  if (!filePath || typeof filePath !== "string") return false;
+  // 必须包含 /diffs/ 段且不包含路径穿越
+  if (!/\/diffs\//.test(filePath)) return false;
+  if (filePath.includes("..")) return false;
+  // 白名单前缀：源码目录 + 两种部署路径
+  const allowedPrefixes = [
+    join(CONFIG.monitorDir, "diffs") + "/",
+    "/root/fourmeme-monitor/diffs/",
+    "/root/flap-monitor/diffs/",
+    "/root/monitor-suite/fourmeme-monitor/diffs/",
+    "/root/monitor-suite/flap-monitor/diffs/",
+  ];
+  return allowedPrefixes.some(p => filePath.startsWith(p));
+}
+
+/**
+ * 处理 download_diff 按钮点击
+ * 采用"立即 ack + 异步处理"模式，避免 3 秒超时导致飞书重投
+ */
+async function handleCardDownloadDiff(data) {
+  try {
+    const val = parseActionValue(data?.action?.value ?? data?.event?.action?.value);
+    if (val.action !== "download_diff") return;
+
+    const messageId = extractCardMessageId(data);
+    const filePath = val.file;
+
+    // 去重：同一条消息的同一文件只处理一次
+    const actionKey = `download_diff:${messageId}:${filePath}`;
+    if (isCardActionProcessed(actionKey)) {
+      log(`[Diff下载] 跳过重复动作：${actionKey.slice(0, 80)}`);
+      return;
+    }
+
+    log(`[Diff下载] 请求文件：${filePath}`);
+
+    // 安全校验
+    if (!isValidDiffPath(filePath)) {
+      log(`[Diff下载] 路径非法：${filePath}`);
+      if (messageId) {
+        try { await _sdkReplyText(messageId, `⚠ Diff 路径不合法，拒绝访问：${filePath || "(空)"}`); } catch {}
+      }
+      return;
+    }
+
+    if (!existsSync(filePath)) {
+      log(`[Diff下载] 文件不存在：${filePath}`);
+      if (messageId) {
+        try { await _sdkReplyText(messageId, `⚠ Diff 文件已清理或不存在\n\`${filePath}\`\n\n（默认保留 7 天，过期后自动清理）`); } catch {}
+      }
+      return;
+    }
+
+    // 读 → 上传 → 回复文件消息
+    const content = readFileSync(filePath);
+    const fileName = filePath.split("/").pop() || "diff.txt";
+    const sizeKB = (content.length / 1024).toFixed(1);
+
+    const fileKey = await _sdkUploadFile(fileName, content);
+    if (messageId) {
+      await _sdkReplyFile(messageId, fileKey);
+    }
+    log(`[Diff下载] 发送成功：${fileName} (${sizeKB} KB)`);
+  } catch (err) {
+    log(`[Diff下载] 处理失败：${err.message}`);
+    const messageId = extractCardMessageId(data);
+    if (messageId) {
+      try { await _sdkReplyText(messageId, `⚠ Diff 下载失败：${err.message}`); } catch {}
+    }
+  }
+}
+
 // 创建事件分发器
 const eventDispatcher = new lark.EventDispatcher({}).register({
   "im.message.receive_v1": async (data) => {
@@ -1056,6 +1177,15 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       log(`消息处理失败：${err.message}`);
     }
   },
+});
+
+// ── 注册卡片交互回调（长连接模式下的按钮点击）──
+// 注册两个 key 以兼容不同 SDK 版本：1.35+ 用 "card.action.trigger"，
+// 部分老版本/新卡片 schema 下可能以 "card.action.trigger_v1" 形式推送。
+const cardActionHandler = async (data) => handleCardDownloadDiff(data);
+eventDispatcher.register({
+  "card.action.trigger": cardActionHandler,
+  "card.action.trigger_v1": cardActionHandler,
 });
 
 // 启动 WebSocket 长连接
