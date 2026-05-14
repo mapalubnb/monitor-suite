@@ -161,6 +161,14 @@ function isMinifierValue(val) {
 const BUSINESS_FIELD_HINTS = /fee|permit|swap|enabled|disabled|show|hide|support|stake|vault|dividend|amount|constraint|sugar|subscription/i;
 
 function isBusinessConfigDiff(cd) {
+  // 前置过滤：如果新旧值都是 minifier 变量，直接拒绝（无论 key 是什么）
+  if (isMinifierValue(cd.oldVal) && isMinifierValue(cd.newVal)) return false;
+  // 如果任一值是 minifier 变量，另一方也不是具体业务值，拒绝
+  if (isMinifierValue(cd.oldVal) || isMinifierValue(cd.newVal)) {
+    const otherVal = isMinifierValue(cd.oldVal) ? cd.newVal : cd.oldVal;
+    const isConcrete = /^["']/.test(otherVal) || /^0x[0-9a-fA-F]{4,}/.test(otherVal) || /^\d+(\.\d+)?$/.test(otherVal) || /^!?[01]$/.test(otherVal) || /^(null|true|false)$/.test(otherVal);
+    if (!isConcrete) return false;
+  }
   // 白名单直接通过
   if (CONFIG_BUSINESS_KEYS.has(cd.field)) return true;
   // 引号字符串值 → 业务标签/名称
@@ -205,14 +213,25 @@ function extractConfigDiffs(removedStrings, addedStrings) {
         const oldVal = oldTokens.get(key);
         const newVal = newTokens.get(key);
         if (oldVal !== newVal) {
-          // 双方都是 minifier 变量 且 key 不在业务白名单 → 跳过
-          if (isMinifierValue(oldVal) && isMinifierValue(newVal) && !CONFIG_BUSINESS_KEYS.has(key)) continue;
+          // 双方都是 minifier 变量 → 跳过（即使 key 在业务白名单中，值为单字母变量名也不是真实变更）
+          if (isMinifierValue(oldVal) && isMinifierValue(newVal)) continue;
+          // 一方是 minifier 变量、另一方也是 → 跳过（如 "l" → "n.chainId"）
+          if (isMinifierValue(oldVal) || isMinifierValue(newVal)) {
+            // 仅当另一方是具体业务值（数字、字符串、地址、布尔）时才保留
+            const otherVal = isMinifierValue(oldVal) ? newVal : oldVal;
+            const isConcrete = /^["']/.test(otherVal) || /^0x[0-9a-fA-F]{4,}/.test(otherVal) || /^\d+(\.\d+)?$/.test(otherVal) || /^!?[01]$/.test(otherVal) || /^null$/.test(otherVal) || /^(true|false)$/.test(otherVal);
+            if (!isConcrete) continue;
+          }
           configDiffs.push({ field: key, oldVal, newVal });
         }
       }
       for (const [key, val] of newTokens) {
-        if (!oldTokens.has(key) && CONFIG_BUSINESS_KEYS.has(key)) {
-          configDiffs.push({ field: key, oldVal: "(无)", newVal: val });
+        if (!oldTokens.has(key)) {
+          // 新出现的 key：白名单内直接通过，或匹配业务关键词模式也通过
+          const isBusinessKey = CONFIG_BUSINESS_KEYS.has(key) || BUSINESS_FIELD_HINTS.test(key);
+          if (isBusinessKey && !isMinifierValue(val)) {
+            configDiffs.push({ field: key, oldVal: "(无)", newVal: val });
+          }
         }
       }
       if (configDiffs.length > 0) break;
@@ -705,9 +724,9 @@ function findCommonPrefix(strings) {
 
 /**
  * 构建飞书卡片简报内容（极简，只含关键信息）
- * 展示优先级：AI 摘要 → Vault 变更 → 业务配置 → i18n 功能亮点 → 资源统计
+ * 展示优先级：AI 摘要 → Vault 变更 → 文案变更 → UI 文案(i18n) → 业务配置 → 资源统计
  */
-function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChangeCount, i18nDiffs) {
+function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges) {
   const lines = [];
 
   // AI 分析（主体）
@@ -736,7 +755,33 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     lines.push("");
   }
 
-  // ═══ 2. UI 文案变更（i18n）— 提升优先级，直接展示中文文案 ═══
+  // ═══ 2. 页面文案变更（提升优先级，展示实际内容）═══
+  if (textChanges && textChanges.length > 0) {
+    const truncSeg = (s, max = 80) => s && s.length > max ? s.slice(0, max) + "…" : s;
+    const modified = textChanges.filter(c => c.type === "modified");
+    const added = textChanges.filter(c => c.type === "added");
+    const removed = textChanges.filter(c => c.type === "removed");
+    lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
+    for (const c of modified.slice(0, 5)) {
+      lines.push(`  旧: ${truncSeg(c.oldText)}`);
+      lines.push(`  新: ${truncSeg(c.newText)}`);
+    }
+    if (modified.length > 5) lines.push(`  ... 还有 ${modified.length - 5} 处修改`);
+    for (const c of added.slice(0, 3)) {
+      lines.push(`  🟢 新增: ${truncSeg(c.text)}`);
+    }
+    if (added.length > 3) lines.push(`  ... 还有 ${added.length - 3} 处新增`);
+    for (const c of removed.slice(0, 3)) {
+      lines.push(`  🔴 删除: ${truncSeg(c.text)}`);
+    }
+    if (removed.length > 3) lines.push(`  ... 还有 ${removed.length - 3} 处删除`);
+    lines.push("");
+  } else if (textChangeCount > 0) {
+    lines.push(`**✏️ 文案变更：** ${textChangeCount} 处`);
+    lines.push("");
+  }
+
+  // ═══ 3. UI 文案变更（i18n）— 直接展示中文文案 ═══
   if (i18nDiffs && i18nDiffs.length > 0) {
     const added = i18nDiffs.filter(d => d.type === "added");
     const modified = i18nDiffs.filter(d => d.type === "modified");
@@ -775,7 +820,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     lines.push("");
   }
 
-  // ═══ 3. 业务配置变更（过滤 minifier 噪音后）═══
+  // ═══ 5. 业务配置变更（过滤 minifier 噪音后）═══
   if (assetStats?.configDiffs?.length > 0) {
     // 二次过滤：卡片层面只展示真实业务字段
     const businessDiffs = assetStats.configDiffs.filter(isBusinessConfigDiff);
@@ -791,10 +836,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     }
   }
 
-  // ═══ 4. 文案变更 ═══
-  if (textChangeCount > 0) lines.push(`**文案变更：** ${textChangeCount} 处`);
-
-  // ═══ 5. 资源统计（最后，最不重要）═══
+  // ═══ 6. 资源统计（最后，最不重要）═══
   if (assetStats) {
     const statParts = [];
     if (assetStats.modified) statParts.push(`修改 ${assetStats.modified}`);
@@ -1708,7 +1750,7 @@ function flattenKeys(obj, prefix = "", result = {}) {
 
 function diffFeatures(oldF, newF) {
   const changes = [];
-  const meta = { assetStats: null, textChangeCount: 0, i18nChangeCount: 0, i18nDiffs: [] };
+  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [] };
 
   if (oldF.nextDataHash && newF.nextDataHash && oldF.nextDataHash !== newF.nextDataHash) {
     changes.push("页面数据（__NEXT_DATA__）变更");
@@ -1849,6 +1891,7 @@ function diffFeatures(oldF, newF) {
       if (textDiff.reordered) { changes.push("页面文案顺序/标点调整（内容不变）"); }
       else {
         meta.textChangeCount = textDiff.changes.length;
+        meta.textChanges = textDiff.changes;
         const truncSeg = (s, max = 120) => s && s.length > max ? s.slice(0, max) + "…" : s;
         for (const c of textDiff.changes.slice(0, 20)) {
           const ctx = c.ctxBefore ? `  上文: ${truncSeg(c.ctxBefore, 60)}` : "";
@@ -2051,12 +2094,12 @@ async function runCheck() {
         // 桥接 i18nDiffs 到 assetStats，让 buildBriefingInput 能访问完整文案列表
         if (meta.assetStats && meta.i18nDiffs) meta.assetStats.i18nDiffs = meta.i18nDiffs;
         const briefingInput = buildBriefingInput(url, changes, meta.assetStats);
-        const cardContent = buildCardBriefing(url, null, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs);
+        const cardContent = buildCardBriefing(url, null, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges);
         appendHistory("flap-page", title, cardContent.slice(0, 300), changes.join("\n"));
         const fullDiff = `=== Flap.sh 手动检测详细 Diff ===\nURL: ${url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${changes.join("\n")}`;
         const diffFilePath = saveDiffLocally(title, fullDiff);
         await sendThenEnrichWithAi(title, cardContent, "red", `Flap.sh 页面变更 ${url}`, briefingInput, (summary) => {
-          return buildCardBriefing(url, summary, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs);
+          return buildCardBriefing(url, summary, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges);
         }, diffFilePath);
         snapshot.pages[key] = features;
         snapshot.pages[key].originalUrl = url;
@@ -2217,7 +2260,7 @@ async function startMonitor() {
             notifications.push({
               url,
               changes: [`退避恢复：此前因风控跳过 ${skipped} 次检测，退避期间的中间状态变更可能未被捕获`],
-              meta: { assetStats: null, textChangeCount: 0, i18nChangeCount: 0, i18nDiffs: [] },
+              meta: { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [] },
               title: `⚠ 退避恢复：${url}`,
               template: "yellow",
               isRecoveryNotice: true,
@@ -2324,12 +2367,12 @@ async function startMonitor() {
           // 桥接 i18nDiffs 到 assetStats
           if (n.meta.assetStats && n.meta.i18nDiffs) n.meta.assetStats.i18nDiffs = n.meta.i18nDiffs;
           const briefingInput = buildBriefingInput(n.url, n.changes, n.meta.assetStats);
-          const cardContent = buildCardBriefing(n.url, null, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs);
+          const cardContent = buildCardBriefing(n.url, null, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges);
           appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
           const fullDiff = `=== Flap.sh 详细 Diff ===\nURL: ${n.url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${n.changes.join("\n")}`;
           const diffFilePath = saveDiffLocally(n.title, fullDiff);
           await sendThenEnrichWithAi(n.title, cardContent, n.template, `Flap.sh 页面变更`, briefingInput, (summary) => {
-            return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs);
+            return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges);
           }, diffFilePath);
         }
       }
