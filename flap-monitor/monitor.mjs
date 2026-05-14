@@ -40,6 +40,7 @@ const CONFIG = {
   urls: [
     "https://flap.sh/bnb/CAstore",
     "https://flap.sh/launch",
+    "https://flap.sh/create",
   ],
   // 飞书 API（用于发送 diff 文件附件）
   feishuAppId: process.env.FEISHU_APP_ID || "",
