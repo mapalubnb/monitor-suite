@@ -180,6 +180,10 @@ function isBusinessConfigDiff(cd) {
   if (/^!?[01]$/.test(cd.oldVal) || /^!?[01]$/.test(cd.newVal)) {
     return BUSINESS_FIELD_HINTS.test(cd.field);
   }
+  // 新增配置（oldVal 为标记值）→ 字段名匹配业务关键词则通过
+  if (cd.oldVal === "(新增)" || cd.oldVal === "(无)") {
+    return BUSINESS_FIELD_HINTS.test(cd.field);
+  }
   return false;
 }
 
@@ -235,6 +239,31 @@ function extractConfigDiffs(removedStrings, addedStrings) {
         }
       }
       if (configDiffs.length > 0) break;
+    }
+  }
+
+  // ── 第二遍：扫描纯新增字符串中的业务配置（不依赖 removed 配对）──
+  // 用于捕获全新功能模块的 config（如 enablePancakeInfinityNonTax:!0）
+  const seenFields = new Set(configDiffs.map(cd => cd.field));
+  for (const added of addedStrings) {
+    const tokens = parseConfigTokens(added);
+    for (const [key, val] of tokens) {
+      if (seenFields.has(key)) continue;
+      const isBusinessKey = CONFIG_BUSINESS_KEYS.has(key) || BUSINESS_FIELD_HINTS.test(key);
+      if (!isBusinessKey) continue;
+      if (isMinifierValue(val)) continue;
+      // 确认这个 key 在所有 removed 字符串中都不存在（真正的新增）
+      let existsInOld = false;
+      for (const removed of removedStrings) {
+        if (removed.includes(key + ":") || removed.includes(key + " :")) {
+          existsInOld = true;
+          break;
+        }
+      }
+      if (!existsInOld) {
+        configDiffs.push({ field: key, oldVal: "(新增)", newVal: val });
+        seenFields.add(key);
+      }
     }
   }
   return configDiffs;
@@ -628,6 +657,28 @@ function buildBriefingInput(url, changes, assetStats) {
     lines.push("实质变更文件: " + assetStats.substantiveFileNames.join(", "));
   }
 
+  // JS 文件中的业务文案变更（给 AI 分析功能变化）
+  if (assetStats?.jsTextDiffs?.length > 0) {
+    const added = assetStats.jsTextDiffs.filter(d => d.type === "added");
+    const removed = assetStats.jsTextDiffs.filter(d => d.type === "removed");
+    lines.push("");
+    lines.push("JS 文件中的业务文案变更:");
+    if (removed.length > 0) {
+      lines.push(`  移除 ${removed.length} 条:`);
+      for (const d of removed.slice(0, 20)) {
+        const truncText = d.text.length > 100 ? d.text.slice(0, 100) + "…" : d.text;
+        lines.push(`    - ${truncText}`);
+      }
+    }
+    if (added.length > 0) {
+      lines.push(`  新增 ${added.length} 条:`);
+      for (const d of added.slice(0, 20)) {
+        const truncText = d.text.length > 100 ? d.text.slice(0, 100) + "…" : d.text;
+        lines.push(`    + ${truncText}`);
+      }
+    }
+  }
+
   let result = lines.join("\n");
   if (result.length > AI_BRIEFING_INPUT_LIMIT) {
     result = result.slice(0, AI_BRIEFING_INPUT_LIMIT) + "\n\n... (已截断)";
@@ -818,6 +869,55 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   } else if (i18nChangeCount > 0) {
     lines.push(`**📝 i18n 变更：** ${i18nChangeCount} 处`);
     lines.push("");
+  }
+
+  // ═══ 4. JS 文件中的业务文案变更（Vault 描述、功能文案等）═══
+  if (assetStats?.jsTextDiffs?.length > 0) {
+    const added = assetStats.jsTextDiffs.filter(d => d.type === "added");
+    const removed = assetStats.jsTextDiffs.filter(d => d.type === "removed");
+    // 尝试配对：removed 和 added 中相似的文案（可能是修改）
+    const paired = [];
+    const unpairedAdded = [];
+    const usedRemoved = new Set();
+    for (const a of added) {
+      let bestIdx = -1, bestScore = 0;
+      for (let i = 0; i < removed.length; i++) {
+        if (usedRemoved.has(i)) continue;
+        // 简单相似度：共同词占比
+        const aWords = new Set(a.text.split(/\s+/).map(w => w.toLowerCase()));
+        const rWords = removed[i].text.split(/\s+/).map(w => w.toLowerCase());
+        const common = rWords.filter(w => aWords.has(w)).length;
+        const score = common / Math.max(aWords.size, rWords.length);
+        if (score > bestScore && score > 0.3) { bestScore = score; bestIdx = i; }
+      }
+      if (bestIdx >= 0) {
+        usedRemoved.add(bestIdx);
+        paired.push({ oldText: removed[bestIdx].text, newText: a.text });
+      } else {
+        unpairedAdded.push(a);
+      }
+    }
+    const unpairedRemoved = removed.filter((_, i) => !usedRemoved.has(i));
+
+    const truncT = (s, max = 70) => s && s.length > max ? s.slice(0, max) + "…" : s;
+    const totalItems = paired.length + unpairedAdded.length + unpairedRemoved.length;
+    if (totalItems > 0) {
+      lines.push(`**💬 功能文案变更（${totalItems} 处）：**`);
+      for (const p of paired.slice(0, 5)) {
+        lines.push(`  旧: ${truncT(p.oldText)}`);
+        lines.push(`  新: ${truncT(p.newText)}`);
+      }
+      if (paired.length > 5) lines.push(`  ... 还有 ${paired.length - 5} 处修改`);
+      for (const a of unpairedAdded.slice(0, 5)) {
+        lines.push(`  🟢 ${truncT(a.text)}`);
+      }
+      if (unpairedAdded.length > 5) lines.push(`  ... 还有 ${unpairedAdded.length - 5} 处新增`);
+      for (const r of unpairedRemoved.slice(0, 3)) {
+        lines.push(`  🔴 ~~${truncT(r.text)}~~`);
+      }
+      if (unpairedRemoved.length > 3) lines.push(`  ... 还有 ${unpairedRemoved.length - 3} 处删除`);
+      lines.push("");
+    }
   }
 
   // ═══ 5. 业务配置变更（过滤 minifier 噪音后）═══
@@ -1795,6 +1895,32 @@ function diffFeatures(oldF, newF) {
         }
       }
 
+      // ── 提取 JS 字符串 diff 中的业务文案（中文文案、Vault 描述等）──
+      const jsTextDiffs = [];
+      // 判断一条字符串是否为有意义的业务文案（非代码、非 minifier、含中文或有意义的英文）
+      const isBusinessText = (s) => {
+        if (!s || s.length < 4) return false;
+        // 含中文字符 → 业务文案
+        if (/[\u4e00-\u9fff]/.test(s)) return true;
+        // 含有意义的英文短语（至少 3 个单词，且不像代码）
+        const words = s.split(/\s+/).filter(w => w.length > 1);
+        if (words.length >= 3 && !/[{}()=>;]/.test(s) && !/^[a-z]\.\w/.test(s)) return true;
+        return false;
+      };
+
+      for (const sf of substantiveFiles) {
+        for (const s of sf.realRemoved) {
+          if (isBusinessText(s)) {
+            jsTextDiffs.push({ type: "removed", text: s, file: sf.oldFile || sf.newFile });
+          }
+        }
+        for (const s of sf.realAdded) {
+          if (isBusinessText(s)) {
+            jsTextDiffs.push({ type: "added", text: s, file: sf.newFile || sf.oldFile });
+          }
+        }
+      }
+
       // Vault 结构化对比
       const oldVaults = [], newVaults = [];
       for (const data of Object.values(oldF.assetContents)) {
@@ -1819,6 +1945,7 @@ function diffFeatures(oldF, newF) {
         substantiveFileNames: substantiveFiles.map(f => f.newFile || f.oldFile),
         configDiffs: allConfigDiffs,
         vaultDiffs,
+        jsTextDiffs,
       };
 
       // ── 详细 diff 输出（存文件用）──
