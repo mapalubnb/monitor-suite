@@ -369,10 +369,13 @@ async function sendFileToChat(fileKey) {
 
 /**
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
+ * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
-async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath) {
+async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url) {
+  // 卡片最上方加入监控目标网址
+  const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
   // 1. 立即推送裸 diff（秒级送达）
-  const messageId = await sendCardViaApi(title, content, template, diffFilePath);
+  const messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
 
   // 2. 异步调用 AI → 编辑原消息补充摘要（不阻塞调用方）
   if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
@@ -383,7 +386,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
       if (messageId) {
         try {
-          await patchCardViaApi(messageId, title, enriched, template, diffFilePath);
+          await patchCardViaApi(messageId, title, urlLine + enriched, template, diffFilePath);
           log(`[AI→更新] ${title} 已补充 AI 摘要`);
         } catch (err) {
           log(`[AI→更新] 编辑失败(${err.message})，追加发送`);
@@ -3131,7 +3134,7 @@ async function flushExpiredPoolRemovals() {
       log(`[底池] ${expired.length} 个移除事件已确认（缓存过期）`);
       const content = formatPoolChanges(expired);
       appendHistory("pool", `底池移除（${expired.length}项）`, content.slice(0, 300), content);
-      await sendThenEnrichWithAi(`底池移除（${expired.length}项）`, content, "red", "Four.meme 底池配置变更");
+      await sendThenEnrichWithAi(`底池移除（${expired.length}项）`, content, "red", "Four.meme 底池配置变更", undefined, undefined, undefined, CONFIG.siteUrl);
     }
   } finally {
     snapshotMutex.release();
@@ -3263,7 +3266,7 @@ async function runPoolCheck() {
     snapshot.poolConfig = poolData;
     await saveSnapshot(snapshot);
     appendHistory("pool", `底池变更（${poolChanges.length}项）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`底池变更（${poolChanges.length}项）`, content, "red", "Four.meme 底池配置变更");
+    await sendThenEnrichWithAi(`底池变更（${poolChanges.length}项）`, content, "red", "Four.meme 底池配置变更", undefined, undefined, undefined, CONFIG.siteUrl);
   } else {
     // 即使没有推送的变更，也要更新快照（底池数据可能只是顺序变了）
     snapshot.poolConfig = poolData;
@@ -3429,7 +3432,7 @@ async function runFrontendCheck() {
       // 构建详细 diff 文件（复用已计算的 assetDiff）
       const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, [], oldData.assetContents, newData.assetContents);
 
-      notifications.push({ title: `前端变更：${label}`, content, template: "orange", fullDiff });
+      notifications.push({ title: `前端变更：${label}`, content, template: "orange", fullDiff, url: newData.originalUrl });
     }
 
     // 在所有 diff 完成后更新快照
@@ -3465,7 +3468,7 @@ async function runFrontendCheck() {
     for (const n of dedupedNotifications) {
       appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
       const diffFilePath = n.fullDiff ? saveDiffLocally(n.title, n.fullDiff) : null;
-      await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, undefined, undefined, diffFilePath);
+      await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, undefined, undefined, diffFilePath, n.url);
     }
   } else if (snapshotDirty || failCountChanged) {
     await saveSnapshot(snapshot);
@@ -3515,7 +3518,7 @@ async function runApiCheck() {
     const content = notifications.join("\n\n");
     await saveSnapshot(snapshot);
     appendHistory("api", "API 变更", content.slice(0, 300), content);
-    await sendThenEnrichWithAi("API 变更", content, "purple", "Four.meme API 变更");
+    await sendThenEnrichWithAi("API 变更", content, "purple", "Four.meme API 变更", undefined, undefined, undefined, CONFIG.apiBase);
   } else {
     await saveSnapshot(snapshot);
   }
@@ -3542,7 +3545,7 @@ async function runGithubCheck() {
     snapshot.githubSha = newSha;
     await saveSnapshot(snapshot);
     appendHistory("github", `GitHub 新提交（${newCommits.length}个）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`GitHub 新提交（${newCommits.length}个）`, content, "turquoise", "Four.meme GitHub 仓库新提交");
+    await sendThenEnrichWithAi(`GitHub 新提交（${newCommits.length}个）`, content, "turquoise", "Four.meme GitHub 仓库新提交", undefined, undefined, undefined, `https://github.com/${CONFIG.githubRepo}`);
   } else {
     // ETag 变了也保存（即使无新提交）
     await saveSnapshot(snapshot);
@@ -3568,7 +3571,7 @@ async function runContractCheck() {
     snapshot.contractFingerprints = newFp;
     await saveSnapshot(snapshot);
     appendHistory("contract", `合约变更（${contractChanges.length}项）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`合约变更（${contractChanges.length}项）`, content, "red", "Four.meme 智能合约变更");
+    await sendThenEnrichWithAi(`合约变更（${contractChanges.length}项）`, content, "red", "Four.meme 智能合约变更", undefined, undefined, undefined, CONFIG.siteUrl);
   } else {
     // 无变更也更新快照（保持数据新鲜，防止重启后重复 diff）
     snapshot.contractFingerprints = newFp;
@@ -3597,7 +3600,7 @@ async function runOnchainCheck() {
     snapshot.onchainParams = newParams;
     await saveSnapshot(snapshot);
     appendHistory("onchain", `链上参数变更（${paramChanges.length}项）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`链上参数变更（${paramChanges.length}项）`, content, "yellow", "Four.meme 链上参数变更");
+    await sendThenEnrichWithAi(`链上参数变更（${paramChanges.length}项）`, content, "yellow", "Four.meme 链上参数变更", undefined, undefined, undefined, CONFIG.siteUrl);
   } else {
     // 无变更也更新快照
     snapshot.onchainParams = newParams;
@@ -3763,6 +3766,8 @@ async function startAllModules() {
   global.__moduleTimers = moduleTimers;
 
   // 心跳定时器（低优先级：仅在队列空闲时推送，避免被变更通知挤掉）
+  // 合并 fourmeme + flap 两个监控的心跳到一张卡片
+  const FLAP_HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
   setInterval(() => {
     try {
       const upSec = Math.floor((Date.now() - startTime) / 1000);
@@ -3772,6 +3777,7 @@ async function startAllModules() {
       log(`运行正常，已运行 ${h}h${m}m，总检测 ${total} 次`);
 
       const lines = [
+        `**── Four.meme ──**`,
         `运行 **${h}h${m}m**，总检测 **${total}** 次`,
         Object.entries(modulePollCounts).map(([k, v]) => `  ${k}: ${v}`).join("\n"),
         `当前底池：**${poolCount}** 个`,
@@ -3822,6 +3828,32 @@ async function startAllModules() {
       if (errorLines.length === 0 && backoffLines.length === 0) {
         lines.push("");
         lines.push("✅ 全部模块运行正常");
+      }
+
+      // ── 读取 Flap 心跳数据，合并到同一张卡片 ──
+      lines.push("");
+      lines.push("---");
+      lines.push("");
+      lines.push(`**── Flap.sh ──**`);
+      try {
+        if (existsSync(FLAP_HEARTBEAT_FILE)) {
+          const flapData = JSON.parse(readFileSync(FLAP_HEARTBEAT_FILE, "utf-8"));
+          // 检查数据是否过期（超过 2 倍心跳周期视为过期）
+          const maxAge = CONFIG.heartbeatMs * 2;
+          if (Date.now() - flapData.ts > maxAge) {
+            lines.push("⚠ Flap 心跳数据已过期，进程可能未运行");
+            if (color === "green") color = "yellow";
+          } else {
+            lines.push(flapData.content);
+            if (flapData.color === "yellow" && color === "green") color = "yellow";
+          }
+        } else {
+          lines.push("⚠ Flap 心跳文件不存在，进程可能未启动");
+          if (color === "green") color = "yellow";
+        }
+      } catch (err) {
+        lines.push(`⚠ 读取 Flap 心跳失败：${err.message}`);
+        if (color === "green") color = "yellow";
       }
 
       sendHeartbeat("监控心跳", lines.join("\n"), color);
