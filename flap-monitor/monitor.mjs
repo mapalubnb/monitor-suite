@@ -455,9 +455,12 @@ async function sendFileToChat(fileKey) {
 
 /**
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
+ * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
-async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath) {
-  const messageId = await sendCardViaApi(title, content, template, diffFilePath);
+async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url) {
+  // 卡片最上方加入监控目标网址
+  const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
+  const messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
 
   if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
     aiSummarize(aiInput || content, moduleContext).then(async (summary) => {
@@ -467,7 +470,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
       if (messageId) {
         try {
-          await patchCardViaApi(messageId, title, enriched, template, diffFilePath);
+          await patchCardViaApi(messageId, title, urlLine + enriched, template, diffFilePath);
           log(`[AI→更新] ${title} 已补充 AI 摘要`);
         } catch (err) {
           log(`[AI→更新] 编辑失败(${err.message})，追加发送`);
@@ -2228,7 +2231,7 @@ async function runCheck() {
         const diffFilePath = saveDiffLocally(title, fullDiff);
         await sendThenEnrichWithAi(title, cardContent, "red", `Flap.sh 页面变更 ${url}`, briefingInput, (summary) => {
           return buildCardBriefing(url, summary, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges);
-        }, diffFilePath);
+        }, diffFilePath, url);
         snapshot.pages[key] = features;
         snapshot.pages[key].originalUrl = url;
       } else {
@@ -2423,7 +2426,7 @@ async function startMonitor() {
                 appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
                 // 直接推送，不走普通页面变更通知流程；新增金库时置顶
                 const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
-                const vfMsgId = await sendCardViaApi(vfTitle, vfContent, vfTemplate);
+                const vfMsgId = await sendCardViaApi(vfTitle, `🔗 [${url}](${url})\n\n` + vfContent, vfTemplate);
                 if (vfChanges.added.length > 0 && vfMsgId) {
                   await pinMessage(vfMsgId);
                 }
@@ -2501,7 +2504,7 @@ async function startMonitor() {
           const diffFilePath = saveDiffLocally(n.title, fullDiff);
           await sendThenEnrichWithAi(n.title, cardContent, n.template, `Flap.sh 页面变更`, briefingInput, (summary) => {
             return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges);
-          }, diffFilePath);
+          }, diffFilePath, n.url);
         }
       }
 
@@ -2551,6 +2554,8 @@ async function startMonitor() {
   scheduleNext();
 
   // 独立心跳定时器（不受轮询耗时影响）
+  // 不再直接发送卡片，改为写入共享文件，由 fourmeme-monitor 合并推送
+  const HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
   setInterval(async () => {
     log(`运行正常，已轮询 ${pollCount} 次`);
     cleanOldSnapshots();
@@ -2609,7 +2614,18 @@ async function startMonitor() {
       lines.push("✅ 全部页面监控正常");
     }
 
-    await sendFeishu("监控心跳", lines.join("\n"), color);
+    // 写入共享心跳文件，供 fourmeme-monitor 合并推送
+    try {
+      writeFileSync(HEARTBEAT_FILE, JSON.stringify({
+        ts: Date.now(),
+        content: lines.join("\n"),
+        color,
+        pollCount,
+      }), "utf-8");
+      log("[心跳] 已写入共享心跳文件，等待合并推送");
+    } catch (err) {
+      log(`[心跳] 写入共享心跳文件失败：${err.message}`);
+    }
   }, CONFIG.heartbeatMs);
 }
 
