@@ -1341,9 +1341,10 @@ function extractI18nFromStreamingHtml(html) {
     if (Object.keys(allStrings).length < 20) return null;
     // 日志移至调用方，仅在 hash 变化时输出，避免每轮重复刷屏
     // 排序 keys 后再生成 hash，避免 namespace 遍历顺序变化导致假阳性
+    // 使用归一化值计算 hash，过滤 RSC 指针编号抖动
     const sortedKeys = Object.keys(allStrings).sort();
     const sortedObj = {};
-    for (const k of sortedKeys) sortedObj[k] = allStrings[k];
+    for (const k of sortedKeys) sortedObj[k] = normalizeI18nValue(allStrings[k]);
     return { i18nStrings: allStrings, i18nHash: md5(JSON.stringify(sortedObj)) };
   } catch (err) {
     log(`  [i18n] streaming 解析失败：${err.message}`);
@@ -1385,10 +1386,10 @@ async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
       if (!data || typeof data !== "object") return null;
       const strings = flattenI18n(data, "");
       if (Object.keys(strings).length < 20) return null;
-      // 排序 keys 确保 hash 确定性
+      // 排序 keys 确保 hash 确定性，归一化值过滤 RSC 指针抖动
       const sortedKeys = Object.keys(strings).sort();
       const sortedObj = {};
-      for (const k of sortedKeys) sortedObj[k] = strings[k];
+      for (const k of sortedKeys) sortedObj[k] = normalizeI18nValue(strings[k]);
       return { i18nStrings: strings, i18nHash: md5(JSON.stringify(sortedObj)), i18nChunk: url };
     } catch { return null; }
   });
@@ -1411,6 +1412,22 @@ async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
   return null;
 }
 
+/**
+ * 归一化 i18n 值：将 React Server Components 内部序列化指针 ($11, $L12, $Sreact.suspense 等)
+ * 替换为统一占位符，避免 SSR 渲染时指针编号抖动产生假阳性 diff。
+ * 只归一化 $+数字 和 $L+数字 形式（RSC 引用指针），保留 $100 这种可能是真实金额的模式。
+ * 判断依据：如果 $ 后跟 1-3 位数字且前后无其他数字/字母上下文，视为 RSC 指针。
+ */
+function normalizeI18nValue(value) {
+  if (typeof value !== "string") return value;
+  // $L11, $L12 等 RSC lazy 引用 → $L_REF
+  // $11, $12 等 RSC chunk 引用（仅匹配独立出现的，如 "$11" 或 "...$11..."，排除 "$100.00" 这种金额）
+  return value
+    .replace(/\$L\d{1,4}/g, "$L_REF")
+    .replace(/\$S[a-z][a-z0-9.]+/g, "$S_REF")
+    .replace(/(?<![0-9.])\$(\d{1,3})(?!\d|\.?\d)/g, "$_REF");
+}
+
 function diffI18nStrings(oldStrings, newStrings) {
   if (!oldStrings || !newStrings) return [];
   const changes = [];
@@ -1418,7 +1435,12 @@ function diffI18nStrings(oldStrings, newStrings) {
   const newKeys = new Set(Object.keys(newStrings));
   for (const key of oldKeys) {
     if (newKeys.has(key) && oldStrings[key] !== newStrings[key]) {
-      changes.push({ type: "modified", key, oldValue: oldStrings[key], newValue: newStrings[key] });
+      // 归一化后再比较：过滤 RSC 指针编号抖动
+      const oldNorm = normalizeI18nValue(oldStrings[key]);
+      const newNorm = normalizeI18nValue(newStrings[key]);
+      if (oldNorm !== newNorm) {
+        changes.push({ type: "modified", key, oldValue: oldStrings[key], newValue: newStrings[key] });
+      }
     }
   }
   for (const key of newKeys) {
@@ -1519,10 +1541,17 @@ function diffRoutes(oldRoutes, newRoutes) {
   if (!oldRoutes || oldRoutes.length === 0) return { added: newRoutes, removed: [] };
   const oldSet = new Set(oldRoutes);
   const newSet = new Set(newRoutes);
-  return {
-    added: newRoutes.filter(r => !oldSet.has(r)),
-    removed: oldRoutes.filter(r => !newSet.has(r)),
-  };
+  const added = newRoutes.filter(r => !oldSet.has(r));
+  let removed = oldRoutes.filter(r => !newSet.has(r));
+  // SSR 抖动保护：如果路由只有移除、没有新增，且移除数量较少（≤3），
+  // 很可能是 SSR/CDN 边缘节点返回了不完整的 HTML 导致部分 href 未被渲染。
+  // 此时忽略移除，避免假阳性。真实的路由删除通常伴随新路由的新增（重构）
+  // 或大批量移除（下线功能），不会只少 1-2 个。
+  if (removed.length > 0 && removed.length <= 3 && added.length === 0) {
+    log(`[路由] 忽略疑似 SSR 抖动：${removed.length} 个路由短暂消失 (${removed.join(", ")})`);
+    removed = [];
+  }
+  return { added, removed };
 }
 
 function formatRouteChanges(routeDiff) {
@@ -3421,6 +3450,15 @@ async function runFrontendCheck() {
     if (routeDiff.added.length > 0 || routeDiff.removed.length > 0) {
       const routeFormatted = formatRouteChanges(routeDiff);
       if (routeFormatted) contentParts.push(routeFormatted);
+    }
+    // 路由抖动保护：如果 diffRoutes 内部抑制了移除（removed 被清空），
+    // 将旧路由合并回 newData，避免下一轮对比时这些路由"复现"被报为新增
+    if (oldData.routes && newData.routes) {
+      const newSet = new Set(newData.routes);
+      const suppressed = (oldData.routes || []).filter(r => !newSet.has(r));
+      if (suppressed.length > 0 && routeDiff.removed.length === 0) {
+        newData.routes = [...new Set([...newData.routes, ...suppressed])].sort();
+      }
     }
 
     // ── 汇总：只要有任何变更就推送 ──
