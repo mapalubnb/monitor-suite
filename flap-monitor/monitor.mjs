@@ -2135,7 +2135,7 @@ function cleanOldSnapshots(maxFiles = 100) {
       .sort((a, b) => b.time - a.time);
     if (files.length > maxFiles) {
       for (const f of files.slice(maxFiles)) {
-        unlinkSync(join(CONFIG.snapshotDir, f));
+        unlinkSync(join(CONFIG.snapshotDir, f.name));
       }
       log(`[清理] 删除 ${files.length - maxFiles} 个旧快照文件`);
     }
