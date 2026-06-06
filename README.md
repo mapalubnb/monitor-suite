@@ -54,7 +54,7 @@
 - 路由/端点发现覆盖 `/api/`、`/meme-api/`、`/mapi/`、`/v1/`、`/blog/v1/` 和站内完整 URL
 - 纯资源列表小抖动会在同一轮 2.5 秒后快速复抓确认；真实变化立即推送，短暂恢复则静默忽略
 - API 探针覆盖 Four.meme public 配置、地址、公告、blog banner、KOL、token ranking/search 及关键 private 错误结构
-- 链上创建者动作监听只过滤创建者/手动配置地址作为 `tx.from` 发起的交易，不监听普通用户对工厂合约的创建代币调用；配置 Etherscan API V2 key（`ETHERSCAN_V2_API_KEY` 或 `ETHERSCAN_API_KEY`，BSC 使用 `chainid=56`）后会自动补充合约 deployer；旧变量 `BSCSCAN_API_KEY` 仍兼容，配置 `FOURMEME_WATCH_ACTORS` 或 `FOURMEME_WATCH_CREATORS` 可手动加入重点钱包。
+- 链上创建者动作监听只过滤创建者/手动配置地址作为 `tx.from` 发起的交易，不监听普通用户对工厂合约的创建代币调用；配置 Etherscan API V2 key（`ETHERSCAN_V2_API_KEY` 或 `ETHERSCAN_API_KEY`，BSC 使用 `chainid=56`）后会自动补充合约 deployer，查询失败会冷却重试避免刷日志；旧变量 `BSCSCAN_API_KEY` 仍兼容，配置 `FOURMEME_WATCH_ACTORS` 或 `FOURMEME_WATCH_CREATORS` 可手动加入重点钱包。
 
 ### 飞书 Bot (`fourmeme-monitor/feishu-bot.mjs`)
 

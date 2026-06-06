@@ -3984,19 +3984,29 @@ function buildWatchedContractEntries() {
   return [...contracts.values()];
 }
 
-async function fetchContractCreatorActors(contractEntries, state) {
+function cachedCreatorMap(state) {
   const result = {};
+  for (const [contract, data] of Object.entries(state.creators || {})) {
+    if (normalizeAddress(data?.creator)) result[contract] = data;
+  }
+  return result;
+}
+
+async function fetchContractCreatorActors(contractEntries, state) {
   const apiKey = CONFIG.actorMonitor.explorerApiKey;
-  if (!apiKey || contractEntries.length === 0) return result;
+  if (!apiKey || contractEntries.length === 0) return cachedCreatorMap(state);
+
+  const lookupState = state.creatorLookup || (state.creatorLookup = {});
+  const now = Date.now();
+  if (lookupState.nextRetryAt && now < lookupState.nextRetryAt) {
+    return cachedCreatorMap(state);
+  }
 
   const missing = contractEntries
     .map(c => normalizeAddress(c.address))
     .filter(addr => addr && !state.creators[addr]);
   if (missing.length === 0) {
-    for (const [contract, data] of Object.entries(state.creators)) {
-      if (normalizeAddress(data?.creator)) result[contract] = data;
-    }
-    return result;
+    return cachedCreatorMap(state);
   }
 
   const chunkSize = 5;
@@ -4013,7 +4023,8 @@ async function fetchContractCreatorActors(contractEntries, state) {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const json = await res.json();
       if (json?.status === "0" && !Array.isArray(json.result)) {
-        throw new Error(json?.message || JSON.stringify(json?.result || "").slice(0, 120));
+        const detail = typeof json.result === "string" ? json.result : JSON.stringify(json.result || "");
+        throw new Error(`${json?.message || "NOTOK"}${detail ? `: ${detail.slice(0, 160)}` : ""}`);
       }
       for (const item of Array.isArray(json.result) ? json.result : []) {
         const contract = normalizeAddress(item.contractAddress || item.contractaddress);
@@ -4024,21 +4035,25 @@ async function fetchContractCreatorActors(contractEntries, state) {
           txHash: String(item.txHash || item.transactionHash || "").toLowerCase(),
           updatedAt: ts(),
         };
-        result[contract] = state.creators[contract];
       }
     } catch (err) {
-      log(`[actor] explorer creator lookup failed: ${err.message}`);
+      const message = err.message || String(err);
+      lookupState.lastError = message;
+      lookupState.lastErrorAt = ts();
+      lookupState.nextRetryAt = now + 30 * 60_000;
+      if (lookupState.lastLoggedError !== message || now - (lookupState.lastLogAt || 0) > 30 * 60_000) {
+        log(`[actor] explorer creator lookup failed, pause 30m: ${message}`);
+        lookupState.lastLoggedError = message;
+        lookupState.lastLogAt = now;
+      }
       break;
     }
   }
 
-  for (const [contract, data] of Object.entries(state.creators)) {
-    if (normalizeAddress(data?.creator)) result[contract] = data;
-  }
-  return result;
+  return cachedCreatorMap(state);
 }
 
-async function fetchControlActors(contractEntries, state) {
+async function fetchActorContext(contractEntries, state) {
   const actorMap = new Map();
   const contractMap = new Map();
   for (const c of contractEntries) addContractEntry(contractMap, c.labels?.[0] || "", c.address, c.sources?.[0] || "");
@@ -4048,43 +4063,6 @@ async function fetchControlActors(contractEntries, state) {
   for (const c of contractEntries) {
     const creator = creatorMap[normalizeAddress(c.address)];
     if (creator?.creator) addActorRole(actorMap, creator.creator, "creator", c.labels.join("/"), "explorer");
-  }
-
-  const calls = [];
-  const meta = [];
-  for (const c of contractEntries) {
-    calls.push({ method: "eth_call", params: [{ to: c.address, data: "0x8da5cb5b" }, "latest"] }); // owner()
-    meta.push({ type: "owner", contract: c });
-    calls.push({ method: "eth_getStorageAt", params: [c.address, CONFIG.eip1967AdminSlot, "latest"] });
-    meta.push({ type: "proxyAdmin", contract: c });
-  }
-
-  const results = await bscRpcBatch(calls);
-  const proxyAdmins = new Map();
-  for (let i = 0; i < meta.length; i++) {
-    const addr = decodeRpcAddress(results[i]);
-    if (!addr) continue;
-    const label = meta[i].contract.labels.join("/");
-    if (meta[i].type === "owner") {
-      addActorRole(actorMap, addr, "owner", label, "owner()");
-    } else {
-      addActorRole(actorMap, addr, "proxyAdmin", label, "EIP-1967 admin slot");
-      addContractEntry(contractMap, `ProxyAdmin(${label})`, addr, "proxyAdmin");
-      proxyAdmins.set(addr, label);
-    }
-  }
-
-  if (proxyAdmins.size > 0) {
-    const adminCalls = [...proxyAdmins.keys()].map(addr => ({
-      method: "eth_call",
-      params: [{ to: addr, data: "0x8da5cb5b" }, "latest"],
-    }));
-    const adminOwners = await bscRpcBatch(adminCalls);
-    let i = 0;
-    for (const [admin, label] of proxyAdmins.entries()) {
-      const owner = decodeRpcAddress(adminOwners[i++]);
-      if (owner) addActorRole(actorMap, owner, "proxyAdminOwner", label, `owner(${admin})`);
-    }
   }
 
   return { actors: actorMap, contracts: contractMap };
@@ -4252,7 +4230,7 @@ async function runActorCheck() {
     return;
   }
 
-  const context = await fetchControlActors(contractEntries, state);
+  const context = await fetchActorContext(contractEntries, state);
   const actorList = formatActorWatchList(context);
   state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
   state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
