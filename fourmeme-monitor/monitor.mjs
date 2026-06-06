@@ -2926,6 +2926,16 @@ function stabilizeApiStructuresForEmptyArrays(oldStruct, newStruct) {
   return { structures, suppressed };
 }
 
+function shouldLogApiEmptyArrayPreserve(item) {
+  const key = `${item.endpoint}:${(item.prefixes || []).join("/") || "array"}`;
+  const now = Date.now();
+  const minIntervalMs = Number.parseInt(process.env.API_EMPTY_ARRAY_LOG_INTERVAL_MS || "", 10) || 600_000;
+  const last = apiEmptyArrayLogState.get(key) || 0;
+  if (now - last < minIntervalMs) return false;
+  apiEmptyArrayLogState.set(key, now);
+  return true;
+}
+
 function diffApiStructures(oldStruct, newStruct) {
   const changes = [];
   if (!oldStruct || !newStruct) return changes;
@@ -4731,6 +4741,7 @@ async function runActorCheck() {
 let snapshot = loadSnapshot();
 let startTime = Date.now();
 let modulePollCounts = { pool: 0, frontend: 0, api: 0, github: 0, contract: 0, onchain: 0, actor: 0 };
+const apiEmptyArrayLogState = new Map();
 
 /* ── 已移除底池缓存（防止 API 短暂返回不完整数据导致误报）── */
 const removedPoolsCache = new Map(); // poolKey -> { data, expireAt }
@@ -5234,10 +5245,11 @@ async function runApiCheck() {
   const { structures: newStruct, suppressed: suppressedEmptyArrayStructs } =
     stabilizeApiStructuresForEmptyArrays(snapshot.apiStructure || {}, rawNewStruct);
   if (suppressedEmptyArrayStructs.length > 0) {
-    const summary = suppressedEmptyArrayStructs
+    const loggableEmptyArrayStructs = suppressedEmptyArrayStructs.filter(shouldLogApiEmptyArrayPreserve);
+    const summary = loggableEmptyArrayStructs
       .map(item => `${item.endpoint}:${item.prefixes.join("/") || "array"}(${item.preserved})`)
       .join(", ");
-    log(`[API] empty array sample, preserved previous item structure: ${summary}`);
+    if (summary) log(`[API] empty array sample, preserved previous item structure: ${summary}`);
   }
   if (!snapshot.apiStructure) {
     snapshot.apiStructure = newStruct;
