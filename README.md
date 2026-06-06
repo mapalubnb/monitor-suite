@@ -152,6 +152,9 @@ rm -f /usr/local/bin/fm-* /usr/local/bin/fl-* /usr/local/bin/bot-* /usr/local/bi
 | `FEISHU_APP_ID` | 是 | 飞书自建应用 App ID |
 | `FEISHU_APP_SECRET` | 是 | 飞书自建应用 App Secret |
 | `FEISHU_CHAT_ID` | 是 | 目标群聊 Chat ID |
+| `FEISHU_CARD_CHUNK_LIMIT` | 否 | 飞书卡片分片长度，默认 3500；超长卡片会分多张发送，不截断 |
+| `FEISHU_TEXT_CHUNK_LIMIT` | 否 | 飞书文本分片长度，默认 3500；超长文本会分多条发送，不截断 |
+| `FEISHU_BOT_EXEC_MAX_BUFFER` | 否 | 飞书 Bot 执行命令输出缓冲，默认 16777216（16MB） |
 | `DOUBAO_API_KEY` | 否 | 豆包 API Key |
 | `DEEPSEEK_API_KEY` | 否 | DeepSeek API Key |
 | `GITHUB_TOKEN` | 否 | GitHub Token（提升 rate limit）|

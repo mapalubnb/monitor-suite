@@ -171,6 +171,54 @@ export function buildCardJson(title, content, template, diffFilePath) {
   });
 }
 
+const FEISHU_TEXT_CHUNK_LIMIT = normalizeChunkLimit(process.env.FEISHU_TEXT_CHUNK_LIMIT, 3500);
+const FEISHU_CARD_CHUNK_LIMIT = normalizeChunkLimit(process.env.FEISHU_CARD_CHUNK_LIMIT, 3500);
+
+function normalizeChunkLimit(value, fallback) {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 500 ? Math.floor(n) : fallback;
+}
+
+function splitMessageContent(value, limit) {
+  const text = String(value ?? "");
+  if (text.length <= limit) return [text];
+
+  const chunks = [];
+  let current = "";
+  for (const line of text.split("\n")) {
+    const next = current ? `${current}\n${line}` : line;
+    if (next.length <= limit) {
+      current = next;
+      continue;
+    }
+    if (current) chunks.push(current);
+    if (line.length <= limit) {
+      current = line;
+      continue;
+    }
+    for (let i = 0; i < line.length; i += limit) {
+      chunks.push(line.slice(i, i + limit));
+    }
+    current = "";
+  }
+  if (current || chunks.length === 0) chunks.push(current);
+  return chunks;
+}
+
+function partTitle(title, index, total) {
+  return total > 1 ? `${title} (${index}/${total})` : title;
+}
+
+function partText(text, index, total) {
+  return total > 1 ? `(${index}/${total})\n${text}` : text;
+}
+
+async function pauseBetweenChunks(index, total) {
+  if (total > 1 && index < total) {
+    await new Promise(resolve => setTimeout(resolve, 260));
+  }
+}
+
 /* ══════════════════════════════════════════
    消息发送 API
    ══════════════════════════════════════════ */
@@ -192,20 +240,31 @@ export async function sendCard(title, content, template = "red", opts = {}) {
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
-  const cardJson = buildCardJson(title, content, template, opts.diffFilePath);
+  const chunks = splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT);
   const tokenOpt = await withToken();
-  const res = await client.im.message.create({
-    params: { receive_id_type: "chat_id" },
-    data: {
-      receive_id: targetChatId,
-      content: cardJson,
-      msg_type: "interactive",
-    },
-  }, tokenOpt);
-  if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
-  const messageId = res.data?.message_id;
-  log(`[飞书SDK] 卡片已发送 → ${messageId}`);
-  return messageId;
+  let firstMessageId = "";
+  for (let i = 0; i < chunks.length; i++) {
+    const cardJson = buildCardJson(
+      partTitle(title, i + 1, chunks.length),
+      chunks[i],
+      template,
+      i === 0 ? opts.diffFilePath : undefined,
+    );
+    const res = await client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: targetChatId,
+        content: cardJson,
+        msg_type: "interactive",
+      },
+    }, tokenOpt);
+    if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
+    const messageId = res.data?.message_id;
+    if (!firstMessageId) firstMessageId = messageId;
+    log(`[飞书SDK] 卡片已发送${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""} → ${messageId}`);
+    await pauseBetweenChunks(i + 1, chunks.length);
+  }
+  return firstMessageId;
 }
 
 /**
@@ -217,17 +276,23 @@ export async function sendText(text, opts = {}) {
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
+  const chunks = splitMessageContent(text, FEISHU_TEXT_CHUNK_LIMIT);
   const tokenOpt = await withToken();
-  const res = await client.im.message.create({
-    params: { receive_id_type: "chat_id" },
-    data: {
-      receive_id: targetChatId,
-      content: JSON.stringify({ text }),
-      msg_type: "text",
-    },
-  }, tokenOpt);
-  if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
-  return res.data?.message_id;
+  let firstMessageId = "";
+  for (let i = 0; i < chunks.length; i++) {
+    const res = await client.im.message.create({
+      params: { receive_id_type: "chat_id" },
+      data: {
+        receive_id: targetChatId,
+        content: JSON.stringify({ text: partText(chunks[i], i + 1, chunks.length) }),
+        msg_type: "text",
+      },
+    }, tokenOpt);
+    if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
+    if (!firstMessageId) firstMessageId = res.data?.message_id;
+    await pauseBetweenChunks(i + 1, chunks.length);
+  }
+  return firstMessageId;
 }
 
 /**
@@ -236,22 +301,24 @@ export async function sendText(text, opts = {}) {
 export async function replyText(messageId, text) {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
-  const maxLen = 3500;
-  const truncated = text.length > maxLen
-    ? text.slice(0, maxLen) + "\n\n... (输出已截断)"
-    : text;
+  const chunks = splitMessageContent(text, FEISHU_TEXT_CHUNK_LIMIT);
   const tokenOpt = await withToken();
-  const res = await client.im.message.reply({
-    path: { message_id: messageId },
-    data: {
-      content: JSON.stringify({ text: truncated }),
-      msg_type: "text",
-    },
-  }, tokenOpt);
-  if (res.code !== 0) {
-    log(`[飞书SDK] 回复失败 code=${res.code}: ${res.msg}`);
+  let firstRes = null;
+  for (let i = 0; i < chunks.length; i++) {
+    const res = await client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        content: JSON.stringify({ text: partText(chunks[i], i + 1, chunks.length) }),
+        msg_type: "text",
+      },
+    }, tokenOpt);
+    if (!firstRes) firstRes = res;
+    if (res.code !== 0) {
+      log(`[飞书SDK] 回复失败 code=${res.code}: ${res.msg}`);
+    }
+    await pauseBetweenChunks(i + 1, chunks.length);
   }
-  return res;
+  return firstRes;
 }
 
 /**
@@ -260,29 +327,25 @@ export async function replyText(messageId, text) {
 export async function replyCard(messageId, title, content, color = "blue") {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
-  const maxLen = 3500;
-  const truncated = content.length > maxLen
-    ? content.slice(0, maxLen) + "\n\n... (输出已截断，完整日志见下方文件)"
-    : content;
-  const card = JSON.stringify({
-    header: { title: { tag: "plain_text", content: title }, template: color },
-    elements: [
-      { tag: "markdown", content: truncated },
-      { tag: "note", elements: [{ tag: "plain_text", content: ts() }] },
-    ],
-  });
+  const chunks = splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT);
   const tokenOpt = await withToken();
-  const res = await client.im.message.reply({
-    path: { message_id: messageId },
-    data: {
-      content: card,
-      msg_type: "interactive",
-    },
-  }, tokenOpt);
-  if (res.code !== 0) {
-    log(`[飞书SDK] 回复卡片失败 code=${res.code}: ${res.msg}`);
+  let firstRes = null;
+  for (let i = 0; i < chunks.length; i++) {
+    const card = buildCardJson(partTitle(title, i + 1, chunks.length), chunks[i], color);
+    const res = await client.im.message.reply({
+      path: { message_id: messageId },
+      data: {
+        content: card,
+        msg_type: "interactive",
+      },
+    }, tokenOpt);
+    if (!firstRes) firstRes = res;
+    if (res.code !== 0) {
+      log(`[飞书SDK] 回复卡片失败 code=${res.code}: ${res.msg}`);
+    }
+    await pauseBetweenChunks(i + 1, chunks.length);
   }
-  return res;
+  return firstRes;
 }
 
 /**

@@ -262,16 +262,15 @@ if [ -f "$SNAP" ]; then
     console.log('');
     console.log('[ 模块2: 前端监控 ]');
     console.log('  页面: '+pageEntries.length+' 个（基础 '+baseFrontendUrls.length+'，自动发现 '+discovered.length+' 个）');
-    for(const url of discovered.slice(0,6)) console.log('  自动发现: '+url);
-    if(discovered.length>6) console.log('  ... 及其余 '+(discovered.length-6)+' 个自动发现页面');
+    for(const url of discovered) console.log('  自动发现: '+url);
     for(const [k,p] of pageEntries){
       const url=p.originalUrl||k;
       const files=(p.assetFiles||[]).length;
       const dlCount=Object.keys(p.assetContents||{}).length;
       const text=(p.textContent||'').length;
-      const hash=(p.contentHash||'').slice(0,8)||'-';
+      const hash=(p.contentHash||'')||'-';
       const i18n=p.i18nStrings?Object.keys(p.i18nStrings).length:0;
-      const nextData=p.nextDataHash?'有':'无';
+      const nextData=p.nextDataHash?'有 ('+p.nextDataHash+')':'无';
       console.log('  '+url);
       console.log('    JS/CSS: '+files+' 文件（已下载 '+dlCount+'）  |  文案: '+text+' 字  |  hash: '+hash);
       console.log('    i18n: '+i18n+' 键  |  __NEXT_DATA__: '+nextData);
@@ -308,7 +307,7 @@ if [ -f "$SNAP" ]; then
     }
 
     // 模块 4：GitHub
-    const sha=(s.githubSha||'').slice(0,8)||'N/A';
+    const sha=(s.githubSha||'')||'N/A';
     console.log('');
     console.log('[ 模块4: GitHub ]');
     console.log('  仓库: four-meme-community/four-meme-ai');
@@ -322,17 +321,17 @@ if [ -f "$SNAP" ]; then
     console.log('  合约: '+fpKeys.length+' 个');
     for(const k of fpKeys){
       const c=fp[k];
-      const hash=(c.codeHash||'').slice(0,8);
-      const addr=(c.address||'').slice(0,10)+'...';
+      const hash=(c.codeHash||'')||'-';
+      const addr=(c.address||'-');
       let line='  '+k.padEnd(22)+addr+'  code='+hash;
       if(c.implAddress){
-        const impl=(c.implAddress||'').slice(0,10)+'...';
-        const ih=(c.implCodeHash||'').slice(0,8);
+        const impl=(c.implAddress||'-');
+        const ih=(c.implCodeHash||'-');
         line+='  impl='+impl+' ('+ih+')';
       }
       if(c.source&&c.source!=='static') line+='  src='+c.source;
-      if(c.linkedCore) line+='  core='+c.linkedCore.slice(0,10)+'...';
-      if(c.linkedFeeRouter) line+='  feeRouter='+c.linkedFeeRouter.slice(0,10)+'...';
+      if(c.linkedCore) line+='  core='+c.linkedCore;
+      if(c.linkedFeeRouter) line+='  feeRouter='+c.linkedFeeRouter;
       console.log(line);
     }
 
@@ -342,10 +341,9 @@ if [ -f "$SNAP" ]; then
     console.log('[ 模块7: 链上参数 ]');
     console.log('  Agent NFT 数量: '+(op.agentNftCount??'N/A'));
     const nfts=op.agentNfts||[];
-    for(const n of nfts.slice(0,10)){
+    for(const n of nfts){
       console.log('  '+n);
     }
-    if(nfts.length>10) console.log('  ... 及其余 '+(nfts.length-10)+' 个');
 
     // 模块 8：创建者动作
     const am=s.chainActorMonitor||{};
@@ -362,11 +360,10 @@ if [ -f "$SNAP" ]; then
     if(modes.length===0) modes.push('仅缓存/手动配置');
     console.log('  创建者来源: '+modes.join(' + ')+' | 缓存 '+cachedCreators+' 个');
     if(am.lastBlock) console.log('  已扫描至确认块: '+am.lastBlock);
-    for(const a of actors.slice(0,8)){
+    for(const a of actors){
       const item=allActors[a]||{};
-      console.log('  '+a.slice(0,10)+'...  '+((item.roles||[]).join(',')||'actor'));
+      console.log('  '+a+'  '+((item.roles||[]).join(',')||'actor'));
     }
-    if(actors.length>8) console.log('  ... 及其余 '+(actors.length-8)+' 个');
   " 2>/dev/null
   echo ""
   echo "------"

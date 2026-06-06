@@ -52,10 +52,7 @@ const CONFIG = {
 
   // exec 命令超时（毫秒）
   execTimeout: 30_000,
-
-
-  // 飞书消息最大长度（超出截断）
-  maxReplyLen: 3500,
+  execMaxBuffer: Number(process.env.FEISHU_BOT_EXEC_MAX_BUFFER || 16 * 1024 * 1024),
 
   // 允许的发送者（open_id）白名单
   allowedSenders: (process.env.FEISHU_ALLOWED_SENDERS || "").split(",").filter(Boolean),
@@ -341,8 +338,7 @@ function buildMonitorContext() {
       // 前端
       const { entries: pages, discovered, baseCount } = activeFrontendPageEntries(snap);
       parts.push(`\n前端页面: ${pages.length} 个（基础 ${baseCount}，自动发现 ${discovered.length} 个）`);
-      for (const url of discovered.slice(0, 6)) parts.push(`  自动发现: ${url}`);
-      if (discovered.length > 6) parts.push(`  ... 及其余 ${discovered.length - 6} 个`);
+      for (const url of discovered) parts.push(`  自动发现: ${url}`);
 
       // API
       const apis = Object.keys(snap.apiStructure || {});
@@ -350,17 +346,17 @@ function buildMonitorContext() {
       for (const key of apis) parts.push(`  ${apiEndpointStatusLink(key)}`);
 
       // GitHub
-      parts.push(`GitHub SHA: ${(snap.githubSha || "").slice(0, 8) || "N/A"}`);
+      parts.push(`GitHub SHA: ${snap.githubSha || "N/A"}`);
 
       // 合约
       const contracts = snap.contractFingerprints || {};
       parts.push(`\n智能合约:`);
       for (const [label, data] of Object.entries(contracts)) {
-        let line = `  ${label}: code=${(data.codeHash || "").slice(0, 8)}`;
-        if (data.implAddress) line += ` impl=${data.implAddress.slice(0, 12)}...`;
+        let line = `  ${label}: code=${data.codeHash || "-"}`;
+        if (data.implAddress) line += ` impl=${data.implAddress}`;
         if (data.source && data.source !== "static") line += ` src=${data.source}`;
-        if (data.linkedCore) line += ` core=${data.linkedCore.slice(0, 10)}...`;
-        if (data.linkedFeeRouter) line += ` feeRouter=${data.linkedFeeRouter.slice(0, 10)}...`;
+        if (data.linkedCore) line += ` core=${data.linkedCore}`;
+        if (data.linkedFeeRouter) line += ` feeRouter=${data.linkedFeeRouter}`;
         parts.push(line);
       }
 
@@ -368,8 +364,7 @@ function buildMonitorContext() {
       const op = snap.onchainParams || {};
       parts.push(`\nAgent NFT: ${op.agentNftCount ?? "N/A"} 个`);
       if (op.agentNfts?.length > 0) {
-        for (const nft of op.agentNfts.slice(0, 5)) parts.push(`  ${nft}`);
-        if (op.agentNfts.length > 5) parts.push(`  ... 及其余 ${op.agentNfts.length - 5} 个`);
+        for (const nft of op.agentNfts) parts.push(`  ${nft}`);
       }
 
       const actorState = snap.chainActorMonitor || {};
@@ -1041,7 +1036,7 @@ async function cmdExec(command) {
   try {
     const { stdout, stderr } = await execAsync(command, {
       timeout: CONFIG.execTimeout,
-      maxBuffer: 1024 * 1024,
+      maxBuffer: CONFIG.execMaxBuffer,
       cwd: CONFIG.monitorDir,
       env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` },
     });
