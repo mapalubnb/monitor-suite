@@ -340,7 +340,7 @@ function buildMonitorContext() {
       for (const key of apis) parts.push(`  ${apiEndpointStatusLink(key)}`);
 
       // GitHub
-      parts.push(`GitHub SHA: ${snap.githubSha || "N/A"}`);
+      parts.push(`GitHub SHA: ${snap.githubSha || "未知"}`);
 
       // 合约
       const contracts = snap.contractFingerprints || {};
@@ -356,7 +356,7 @@ function buildMonitorContext() {
 
       // 链上
       const op = snap.onchainParams || {};
-      parts.push(`\nAgent NFT: ${op.agentNftCount ?? "N/A"} 个`);
+      parts.push(`\nAgent NFT: ${op.agentNftCount ?? "未知"} 个`);
       if (op.agentNfts?.length > 0) {
         for (const nft of op.agentNfts) parts.push(`  ${nft}`);
       }
@@ -384,7 +384,7 @@ function buildMonitorContext() {
     try {
       const snap = JSON.parse(readFileSync(flSnapPath, "utf-8"));
       parts.push("\n=== Flap.sh 监控快照 ===");
-      parts.push(`最后检测: ${snap.lastCheck || "N/A"}`);
+      parts.push(`最后检测: ${snap.lastCheck || "未知"}`);
       const pages = snap.pages || {};
       parts.push(`页面: ${Object.keys(pages).length} 个`);
       for (const [key, data] of Object.entries(pages)) {
@@ -751,7 +751,7 @@ async function cmdAiModel(subCmd, args) {
       if (providers.length === 0) {
         return "⚠ 未配置任何 AI API Key\n请编辑 `.env` 填入至少一个 Key（如 DOUBAO_API_KEY、DEEPSEEK_API_KEY 等）";
       }
-      const lines = [`**当前：** ${current || "(无)"} / \`${AI_CONFIG.model || "N/A"}\``, ""];
+      const lines = [`**当前：** ${current || "(无)"} / \`${AI_CONFIG.model || "未知"}\``, ""];
       lines.push("**可用提供商：**");
       for (const p of providers) {
         const icon = p.name === current ? "●" : "○";
@@ -926,7 +926,7 @@ function readFullPm2Log(command) {
       try {
         const content = readFileSync(filePath, "utf-8");
         if (content.trim()) {
-          const label = f.endsWith("error.log") ? "ERROR LOG" : "STDOUT LOG";
+          const label = f.endsWith("error.log") ? "错误日志" : "标准输出日志";
           parts.push(`=== ${label}: ${f} ===\n${content}`);
         }
       } catch {}
@@ -1036,7 +1036,7 @@ async function cmdExec(command) {
     });
     let result = "";
     if (stdout.trim()) result += stdout;
-    if (stderr.trim()) result += (result ? "\n\n" : "") + "STDERR:\n" + stderr;
+    if (stderr.trim()) result += (result ? "\n\n" : "") + "标准错误：\n" + stderr;
     if (!result.trim()) result = "(命令已执行，无输出)";
     return { ok: true, text: cleanShellOutput(stripAnsi(result)) };
   } catch (err) {

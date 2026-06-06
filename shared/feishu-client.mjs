@@ -537,7 +537,7 @@ export async function sendCardQueued(title, content, template = "red", opts = {}
       }
     });
     processQueue().catch(err => {
-      log(`[飞书] processQueue 异常：${err.message}`);
+      log(`[飞书] 消息队列处理异常：${err.message}`);
     });
   });
 }
@@ -552,7 +552,7 @@ export function sendHeartbeatQueued(title, content, template = "green") {
   log(`[心跳] 已挂起，等待队列空闲（当前队列: ${messageThrottle.queue.length} 条）`);
   if (messageThrottle.queue.length === 0) {
     processQueue().catch(err => {
-      log(`[心跳] processQueue 异常：${err.message}`);
+      log(`[心跳] 消息队列处理异常：${err.message}`);
     });
   }
 }

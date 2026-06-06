@@ -5,7 +5,7 @@
  *   1. 各模块独立定时器，互不阻塞
  *   2. BSC RPC batch 请求（模块 6/7 提速 ~10x）
  *   3. 前端/API 并行抓取（模块 2/3/5 提速 ~3-4x）
- *   4. 全面反风控：UA 轮换、per-domain 自适应退避、请求抖动、GitHub 条件请求
+ *   4. 全面反风控：UA 轮换、按域名自适应退避、请求抖动、GitHub 条件请求
  *
  * 模块与频率：
  *   模块1: 底池配置   — 每 3s（纯 API，轻量，退避保护）
@@ -426,7 +426,7 @@ function migrateSnapshot(data) {
   }
   if (ver < 5) {
     if (pruneFrontendSnapshot(data)) {
-      log("[snapshot migrate] v4 -> v5: pruned stale frontend pages");
+      log("[快照迁移] v4 → v5：清理过期前端页面");
     }
   } else {
     pruneFrontendSnapshot(data);
@@ -755,13 +755,13 @@ const rpcItemErrorLogState = new Map();
 const RPC_ITEM_ERROR_LOG_COOLDOWN_MS = 30 * 60_000;
 
 function formatRpcCallSample(call) {
-  const method = call?.method || "unknown";
+  const method = call?.method || "未知方法";
   const params = Array.isArray(call?.params) ? call.params.slice(0, 2).join(",") : "";
   return params ? `${method} ${params}` : method;
 }
 
 function shouldLogRpcItemError(call, message) {
-  const key = `${call?.method || "unknown"}:${message}`;
+  const key = `${call?.method || "未知方法"}:${message}`;
   const now = Date.now();
   const state = rpcItemErrorLogState.get(key) || { lastLogAt: 0, suppressed: 0 };
   const shouldLog = !state.lastLogAt || now - state.lastLogAt >= RPC_ITEM_ERROR_LOG_COOLDOWN_MS;
@@ -790,8 +790,8 @@ async function bscRpcBatch(calls) {
     } catch (err) {
       const info = shouldLogRpcItemError(calls[0], err.message);
       if (info.shouldLog) {
-        const suffix = info.suppressed ? ` (suppressed ${info.suppressed} similar)` : "";
-        log(`[RPC] single-call ${formatRpcCallSample(calls[0])} error: ${err.message}${suffix}`);
+        const suffix = info.suppressed ? `（已合并 ${info.suppressed} 条同类错误）` : "";
+        log(`[RPC] 单次调用 ${formatRpcCallSample(calls[0])} 失败：${err.message}${suffix}`);
       }
       return [null];
     }
@@ -823,8 +823,8 @@ async function bscRpcBatch(calls) {
           const message = r.error.message || JSON.stringify(r.error);
           const info = shouldLogRpcItemError(call, message);
           if (info.shouldLog) {
-            const suffix = info.suppressed ? ` (suppressed ${info.suppressed} similar)` : "";
-            log(`[RPC] batch item #${r.id} ${formatRpcCallSample(call)} error: ${message}${suffix}`);
+            const suffix = info.suppressed ? `（已合并 ${info.suppressed} 条同类错误）` : "";
+            log(`[RPC] 批量第 ${r.id} 项 ${formatRpcCallSample(call)} 失败：${message}${suffix}`);
           }
           return null;
         }
@@ -1018,7 +1018,7 @@ function printPoolList(list) {
   let i = 1;
   for (const [, item] of map) {
     const status = item.status === "PUBLISH" ? "✓" : item.status || "?";
-    console.log(`  ${String(i++).padStart(2)}. ${(item.symbol || "?").padEnd(8)} [${status}]  b0=${item.b0Amount || "-"}  total=${item.totalBAmount || "-"}  fee=${item.buyFee || "-"}/${item.sellFee || "-"}  addr=${(item.symbolAddress || "").slice(0, 10)}...`);
+    console.log(`  ${String(i++).padStart(2)}. ${(item.symbol || "?").padEnd(8)} [${status}]  底池余额=${item.b0Amount || "-"}  总量=${item.totalBAmount || "-"}  手续费=${item.buyFee || "-"}/${item.sellFee || "-"}  地址=${(item.symbolAddress || "").slice(0, 10)}...`);
   }
   log(`────────────────────────`);
 }
@@ -2014,7 +2014,7 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
     const extra = await fetchAllFrontendData(oldPages, discoveredUrls, assetCache);
     Object.assign(result.pages, extra.pages);
     if (extra.failedUrls.length > 0) {
-      log(`[frontend] discovery candidates failed and were not monitored: ${extra.failedUrls.map(urlLabel).join(", ")}`);
+      log(`[前端] 自动发现候选页抓取失败，未纳入监控：${extra.failedUrls.map(urlLabel).join(", ")}`);
     }
     allDiscoveredUrls.push(...discoveredUrls.filter(url => extra.pages[urlToKey(url)]));
   }
@@ -3292,7 +3292,7 @@ function formatGithubChanges(newCommits) {
   lines.push("---");
   for (const c of newCommits) {
     const sha = c.sha.slice(0, 8);
-    const author = c.commit.author?.name || "unknown";
+    const author = c.commit.author?.name || "未知";
     const date = c.commit.author?.date || "";
     const msg = c.commit.message.split("\n")[0];
     const fullMsg = c.commit.message.trim();
@@ -3729,7 +3729,7 @@ async function buildContractTargets() {
   }
   const cachedPublicTargets = previousPublicAddressContractTargets();
   const publicTargetsPromise = fetchPublicAddressContractTargets().catch(err => {
-    log(`[contract] public address fetch failed, reusing ${cachedPublicTargets.length} cached targets: ${err.message}`);
+    log(`[合约] 公共地址接口获取失败，复用 ${cachedPublicTargets.length} 个缓存目标：${err.message}`);
     return cachedPublicTargets;
   });
   let onchainTargets = [];
@@ -3737,7 +3737,7 @@ async function buildContractTargets() {
   try {
     onchainTargets = await fetchOnchainOpenFourTargets(cachedPublicTargets);
   } catch (err) {
-    log(`[contract] OpenFour on-chain discovery failed, falling back to public/cached targets: ${err.message}`);
+    log(`[合约] OpenFour 链上发现失败，改用公共/缓存目标：${err.message}`);
   }
 
   const publicTargets = await publicTargetsPromise;
@@ -3751,7 +3751,7 @@ async function buildContractTargets() {
     try {
       onchainTargets = await fetchOnchainOpenFourTargets(publicTargets);
     } catch (err) {
-      log(`[contract] OpenFour public-seeded discovery failed, keeping cached/config discovery: ${err.message}`);
+      log(`[合约] OpenFour 公共地址补种发现失败，保留缓存/配置发现结果：${err.message}`);
     }
   }
 
@@ -4283,7 +4283,8 @@ function logCreatorLookupError(lookupState, scope, message, now) {
   const logAtKey = `${scope}LastLogAt`;
   const cooldownMs = CONFIG.actorMonitor.creatorLookupCooldownMs;
   if (lookupState[logMessageKey] !== message || now - (lookupState[logAtKey] || 0) > cooldownMs) {
-    log(`[actor] ${scope} creator lookup failed, pause ${Math.round(cooldownMs / 60_000)}m: ${message}`);
+    const scopeLabel = { rpc: "RPC 反查", page: "BscScan 页面抓取", api: "Etherscan API" }[scope] || scope;
+    log(`[创建者] ${scopeLabel}失败，暂停 ${Math.round(cooldownMs / 60_000)} 分钟：${message}`);
     lookupState[logMessageKey] = message;
     lookupState[logAtKey] = now;
   }
@@ -4379,7 +4380,7 @@ async function fetchCreatorsViaRecentChain(missing, state, lookupState, now) {
     if (found > 0) {
       lookupState.chainLastSuccessAt = ts();
       lookupState.chainFoundCount = (lookupState.chainFoundCount || 0) + found;
-      log(`[actor] creator rpc lookup found ${found}/${missing.length} in blocks ${fromBlock}-${toBlock}`);
+      log(`[创建者] RPC 反查找到 ${found}/${missing.length} 个创建者，区块 ${fromBlock}-${toBlock}`);
     }
     if (fromBlock <= lowerBound) {
       lookupState.chainCursorBlock = 0;
@@ -4429,7 +4430,7 @@ async function fetchCreatorsViaBscScanPages(missing, state, lookupState, now) {
   if (found > 0) {
     lookupState.pageLastSuccessAt = ts();
     lookupState.pageFoundCount = (lookupState.pageFoundCount || 0) + found;
-    log(`[actor] creator page lookup found ${found}/${targets.length}`);
+    log(`[创建者] BscScan 页面抓取找到 ${found}/${targets.length} 个创建者`);
   }
   if (firstError) {
     lookupState.pageLastError = firstError;
@@ -4566,19 +4567,19 @@ function classifyActorTx(tx, context) {
   let reason = "";
   if (isDeployment) {
     risk = "high";
-    reason = "watched actor deployed a new contract";
+    reason = "已监听创建者部署新合约";
   } else if (safeExec && (safeTarget || safeSelectorInfo?.risk === "high")) {
     risk = "high";
-    reason = `watched control contract execTransaction -> ${safeTarget?.labels.join("/") || safeExec.to}`;
+    reason = `已监听控制合约执行 execTransaction → ${safeTarget?.labels.join("/") || safeExec.to}`;
   } else if (toContract && fromActor) {
     risk = selectorInfo?.risk === "high" ? "high" : "high";
-    reason = `watched creator called monitored contract ${toContract.labels.join("/")}`;
+    reason = `已监听创建者调用受监控合约 ${toContract.labels.join("/")}`;
   } else if (selectorInfo?.risk === "high") {
     risk = "high";
-    reason = "watched creator used high-risk selector";
+    reason = "已监听创建者使用高风险函数选择器";
   } else if (fromActor && selector) {
     risk = "medium";
-    reason = "watched creator called an external contract";
+    reason = "已监听创建者调用外部合约";
   } else {
     return null;
   }
@@ -4593,7 +4594,7 @@ function classifyActorTx(tx, context) {
     fromActor,
     toContract,
     selector,
-    method: selectorInfo?.name || (isDeployment ? "contract creation" : ""),
+    method: selectorInfo?.name || (isDeployment ? "合约创建" : ""),
     safeTarget: safeExec?.to || "",
     safeTargetLabel: safeTarget?.labels.join("/") || "",
     safeSelector: safeExec?.selector || "",
@@ -4651,20 +4652,21 @@ function formatActorWatchList(context) {
 
 function formatActorActions(actions) {
   const riskIcon = { high: "🚨", medium: "⚠️", low: "ℹ️" };
+  const riskLabel = { high: "高风险", medium: "中风险", low: "低风险" };
   const lines = [];
   for (const a of actions.slice(0, 12)) {
-    lines.push(`**${riskIcon[a.risk] || "⚠️"} ${a.risk.toUpperCase()}：${a.method || "watched actor tx"}**`);
+    lines.push(`**${riskIcon[a.risk] || "⚠️"} ${riskLabel[a.risk] || "未知风险"}：${a.method || "已监听地址交易"}**`);
     lines.push("```");
-    lines.push(`block: ${a.blockNumber}`);
-    lines.push(`from:  ${a.from}`);
-    if (a.fromActor) lines.push(`role:  ${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`);
-    if (a.to) lines.push(`to:    ${a.to}${a.toContract ? ` (${a.toContract.labels.join("/")})` : ""}`);
-    if (a.selector) lines.push(`selector: ${a.selector}`);
-    if (a.safeTarget) lines.push(`safeTarget: ${a.safeTarget}${a.safeTargetLabel ? ` (${a.safeTargetLabel})` : ""}`);
-    if (a.safeSelector) lines.push(`safeSelector: ${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`);
-    if (a.contractAddress) lines.push(`newContract: ${a.contractAddress}`);
-    if (a.status) lines.push(`status: ${a.status === "0x1" ? "success" : a.status}`);
-    lines.push(`reason: ${a.reason}`);
+    lines.push(`区块: ${a.blockNumber}`);
+    lines.push(`发起地址: ${a.from}`);
+    if (a.fromActor) lines.push(`角色: ${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`);
+    if (a.to) lines.push(`目标地址: ${a.to}${a.toContract ? ` (${a.toContract.labels.join("/")})` : ""}`);
+    if (a.selector) lines.push(`函数选择器: ${a.selector}`);
+    if (a.safeTarget) lines.push(`内部目标: ${a.safeTarget}${a.safeTargetLabel ? ` (${a.safeTargetLabel})` : ""}`);
+    if (a.safeSelector) lines.push(`内部选择器: ${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`);
+    if (a.contractAddress) lines.push(`新合约: ${a.contractAddress}`);
+    if (a.status) lines.push(`状态: ${a.status === "0x1" ? "成功" : a.status}`);
+    lines.push(`原因: ${a.reason}`);
     lines.push("```");
     lines.push(`[交易链接](https://bscscan.com/tx/${a.hash})`);
     if (a.contractAddress) lines.push(`[新合约](https://bscscan.com/address/${a.contractAddress})`);
@@ -4681,7 +4683,7 @@ async function runActorCheck() {
   const stateBefore = JSON.stringify(state);
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
-    log("[actor] no contract fingerprints yet, waiting for contract module baseline");
+    log("[创建者] 尚无合约指纹，等待合约模块建立基线");
     return;
   }
 
@@ -4700,7 +4702,7 @@ async function runActorCheck() {
   const safeLatest = Math.max(0, latest - CONFIG.actorMonitor.confirmations);
   if (!state.lastBlock) {
     state.lastBlock = Math.max(0, safeLatest - CONFIG.actorMonitor.bootstrapLookbackBlocks);
-    log(`[actor] 初始化区块游标：${state.lastBlock}（latest=${latest}, safe=${safeLatest}）`);
+    log(`[创建者] 初始化区块游标：${state.lastBlock}（最新块=${latest}，确认块=${safeLatest}）`);
   }
 
   if (state.lastBlock >= safeLatest) {
@@ -4719,17 +4721,17 @@ async function runActorCheck() {
   if (actions.length === 0) return;
 
   const highCount = actions.filter(a => a.risk === "high").length;
-  log(`[actor] 捕获 ${actions.length} 条创建者动作（high=${highCount}），区块 ${fromBlock}-${toBlock}`);
+  log(`[创建者] 捕获 ${actions.length} 条创建者动作（高风险 ${highCount} 条），区块 ${fromBlock}-${toBlock}`);
   const content = formatActorActions(actions);
   appendHistory("actor", `链上创建者动作（${actions.length}项）`, content.slice(0, 300), content);
   const color = highCount > 0 ? "red" : "yellow";
   await sendThenEnrichWithAi(`链上创建者动作（${actions.length}项）`, content, color, "Four.meme 合约创建者动作", undefined, undefined, undefined, `https://bscscan.com/block/${toBlock}`);
 
   try {
-    log("[actor] 创建者动作已触发，立即复查合约状态");
+    log("[创建者] 创建者动作已触发，立即复查合约状态");
     await runContractCheck();
   } catch (err) {
-    log(`[actor] 触发合约复查失败：${err.message}`);
+    log(`[创建者] 触发合约复查失败：${err.message}`);
   }
 }
 
@@ -5249,7 +5251,7 @@ async function runApiCheck() {
     const summary = loggableEmptyArrayStructs
       .map(item => `${item.endpoint}:${item.prefixes.join("/") || "array"}(${item.preserved})`)
       .join(", ");
-    if (summary) log(`[API] empty array sample, preserved previous item structure: ${summary}`);
+    if (summary) log(`[API] 空数组样本保护：已保留上一轮数组项结构 ${summary}`);
   }
   if (!snapshot.apiStructure) {
     snapshot.apiStructure = newStruct;
@@ -5520,11 +5522,11 @@ async function startAllModules() {
       `  资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
-      `**GitHub:** ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "N/A"}) — 每 ${CONFIG.intervals.github / 1000}s`,
-      `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s (RPC Batch + OpenFour 链上发现)`,
-      `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "N/A"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s (RPC Batch)`,
-      `**创建者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s (只过滤 tx.from，命中后合约复查)`,
-      `**反风控:** UA轮换 + per-domain自适应退避 + 请求抖动`,
+      `**GitHub:** ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
+      `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
+      `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
+      `**创建者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s（只过滤交易发起地址 tx.from，命中后合约复查）`,
+      `**反风控:** UA轮换 + 按域名自适应退避 + 请求抖动`,
       `**心跳:** 每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送） | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
     ].join("\n"),
     "blue"
@@ -5695,7 +5697,7 @@ process.on("SIGUSR1", () => {
 // 启动
 startAllModules().catch(err => {
   log(`启动异常：${err.message}`);
-  console.error(err);
+  log(`[启动异常详情]\n${err?.stack || err}`);
   process.exit(1);
 });
 

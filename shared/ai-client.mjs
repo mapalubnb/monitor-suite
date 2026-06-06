@@ -429,9 +429,9 @@ export async function chatCompletion({
       }
 
       const reason = isAnthropic
-        ? json.stop_reason || "unknown"
-        : json.choices?.[0]?.finish_reason || "unknown";
-      log(`[AI] 响应中无有效内容 (reason=${reason}, model=${provider.model})`);
+        ? json.stop_reason || "未知"
+        : json.choices?.[0]?.finish_reason || "未知";
+      log(`[AI] 响应中无有效内容（原因=${reason}，模型=${provider.model}）`);
       if (reason === "content_filter") {
         log("[AI] 内容被安全过滤，跳过重试");
         return null;

@@ -181,6 +181,14 @@ cat > "$BIN_DIR/_pm2-proc-info" << 'HELPER_EOF'
 const name = process.argv[2];
 const brief = process.argv.includes("--brief");
 let d = "";
+const statusText = (status) => ({
+  online: "在线",
+  stopped: "已停止",
+  errored: "异常",
+  launching: "启动中",
+  stopping: "停止中",
+  waiting: "等待中",
+}[status] || "未知");
 process.stdin.on("data", c => d += c);
 process.stdin.on("end", () => {
   try {
@@ -189,17 +197,17 @@ process.stdin.on("end", () => {
     if (!p) { console.log(brief ? "  未找到进程" : "  状态: 未运行"); return; }
     const env = p.pm2_env || {};
     if (brief) {
-      console.log("  状态: " + (env.status || "unknown"));
+      console.log("  状态: " + statusText(env.status));
       console.log("  PID: " + p.pid);
       console.log("  重启次数: " + (env.restart_time ?? 0));
       return;
     }
-    const mem = p.monit?.memory ? (p.monit.memory / 1024 / 1024).toFixed(1) + " MB" : "N/A";
-    const cpu = p.monit?.cpu ?? "N/A";
+    const mem = p.monit?.memory ? (p.monit.memory / 1024 / 1024).toFixed(1) + " MB" : "未知";
+    const cpu = p.monit?.cpu ?? "未知";
     const up = env.pm_uptime ? Math.floor((Date.now() - env.pm_uptime) / 1000) : 0;
     const h = Math.floor(up / 3600), m = Math.floor((up % 3600) / 60), s = up % 60;
     const icon = env.status === "online" ? "●" : "○";
-    console.log("  " + icon + " 状态: " + env.status);
+    console.log("  " + icon + " 状态: " + statusText(env.status));
     console.log("  PID: " + p.pid);
     console.log("  内存: " + mem + "  |  CPU: " + cpu + "%");
     console.log("  运行时间: " + h + "h " + m + "m " + s + "s");
@@ -301,7 +309,7 @@ if [ -f "$SNAP" ]; then
     }
 
     // 模块 4：GitHub
-    const sha=(s.githubSha||'')||'N/A';
+    const sha=(s.githubSha||'')||'未知';
     console.log('');
     console.log('[ 模块4: GitHub ]');
     console.log('  仓库: four-meme-community/four-meme-ai');
@@ -333,7 +341,7 @@ if [ -f "$SNAP" ]; then
     const op=s.onchainParams||{};
     console.log('');
     console.log('[ 模块7: 链上参数 ]');
-    console.log('  Agent NFT 数量: '+(op.agentNftCount??'N/A'));
+    console.log('  Agent NFT 数量: '+(op.agentNftCount??'未知'));
     const nfts=op.agentNfts||[];
     for(const n of nfts){
       console.log('  '+n);
@@ -356,7 +364,7 @@ if [ -f "$SNAP" ]; then
     if(am.lastBlock) console.log('  已扫描至确认块: '+am.lastBlock);
     for(const a of actors){
       const item=allActors[a]||{};
-      console.log('  '+a+'  '+((item.roles||[]).join(',')||'actor'));
+      console.log('  '+a+'  '+((item.roles||[]).join(',')||'创建者'));
     }
   " 2>/dev/null
   echo ""
@@ -366,7 +374,7 @@ if [ -f "$SNAP" ]; then
   if [ -f "$LASTPOLL" ]; then
     echo "最后检测: $(cat "$LASTPOLL")"
   else
-    echo "最后检测: N/A"
+    echo "最后检测: 未知"
   fi
   echo "快照更新: $(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
 fi
@@ -603,7 +611,7 @@ if [ -f "$SNAP" ]; then
   if [ -f "$LASTPOLL" ]; then
     echo "最后检测: $(cat "$LASTPOLL")"
   else
-    echo "最后检测: N/A"
+    echo "最后检测: 未知"
   fi
   echo "快照更新: $(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
 fi
@@ -710,13 +718,21 @@ echo "╚═══════════════════════�
 echo ""
 echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
 echo "主机: $(hostname) ($(uname -r))"
-echo "负载: $(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}' || echo 'N/A')"
+echo "负载: $(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}' || echo '未知')"
 echo ""
 echo "[ 进程状态 ]"
 pm2 jlist 2>/dev/null | node -e "
   let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
     try{
       const list=JSON.parse(d);
+      const statusText=(status)=>({
+        online:'在线',
+        stopped:'已停止',
+        errored:'异常',
+        launching:'启动中',
+        stopping:'停止中',
+        waiting:'等待中',
+      }[status]||'未知');
       const services=[
         {name:'fourmeme-monitor', label:'Four.meme 监控', desc:'7模块全面监控'},
         {name:'flap-monitor',     label:'Flap.sh 监控',   desc:'页面/资源/文案监控'},
@@ -733,7 +749,7 @@ pm2 jlist 2>/dev/null | node -e "
         const upStr=d>0?d+'d '+h+'h '+m+'m':h+'h '+m+'m';
         const icon=env.status==='online'?'●':'○';
         const restarts=env.restart_time||0;
-        console.log('  '+icon+' '+svc.label.padEnd(18)+' '+(env.status||'unknown').padEnd(10)+' PID:'+String(p.pid).padEnd(8)+' '+mem.padEnd(10)+cpu.padEnd(6)+upStr);
+        console.log('  '+icon+' '+svc.label.padEnd(18)+' '+statusText(env.status).padEnd(10)+' PID:'+String(p.pid).padEnd(8)+' '+mem.padEnd(10)+cpu.padEnd(6)+upStr);
         if(restarts>0) console.log('    '+''.padEnd(18)+' 重启: '+restarts+'次');
       }
     }catch(e){console.log('  解析失败: '+e.message)}
