@@ -2651,22 +2651,22 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, recoveredAsset
    模块 3/5：多端点 API 结构监控（并行探测）
    ══════════════════════════════════════════ */
 
-function extractStructure(obj, prefix = "") {
+function extractStructure(obj, prefix = "", endpoint = "") {
   const result = {};
   if (obj === null || obj === undefined) return result;
   if (Array.isArray(obj)) {
     result[prefix + "[]"] = "array";
     for (const item of obj.slice(0, 10)) {
-      Object.assign(result, extractStructure(item, prefix + "[0]."));
+      Object.assign(result, extractStructure(item, prefix + "[0].", endpoint));
     }
   } else if (typeof obj === "object") {
     for (const [k, v] of Object.entries(obj)) {
       const path = prefix + k;
-      result[path] = Array.isArray(v) ? "array" : typeof v;
+      result[path] = normalizeApiStructureValueType(endpoint, path, v);
       if (typeof v === "object" && v !== null && !Array.isArray(v)) {
-        Object.assign(result, extractStructure(v, path + "."));
+        Object.assign(result, extractStructure(v, path + ".", endpoint));
       } else if (Array.isArray(v)) {
-        Object.assign(result, extractStructure(v, path));
+        Object.assign(result, extractStructure(v, path, endpoint));
       }
     }
   }
@@ -2787,7 +2787,7 @@ async function fetchApiData() {
       return {
         key: ep.key,
         label: ep.label,
-        structure: shouldRecordStructure ? extractStructure(payload) : null,
+        structure: shouldRecordStructure ? extractStructure(payload, "", ep.key) : null,
         apiValues: shouldRecordValues ? extractApiValues(payload) : null,
         success: isSuccess,
       };
@@ -2816,9 +2816,46 @@ const API_STRUCTURE_SKIP_ENDPOINTS = new Set([
   "nonce_generate",  // 成功时有 data，某些边界条件下无 data，结构抖动
 ]);
 
+const API_TOKEN_LIST_ENDPOINTS = new Set([
+  "token_ranking_cap",
+  "token_ranking_binance",
+  "token_search_new",
+  "token_search_cap",
+]);
+
+const API_TOKEN_TEXT_FIELD_RE = /^data\[0\]\.(?:name|shortName|symbol)$/;
+const API_NUMERIC_STRING_RE = /^-?(?:\d+|\d*\.\d+)(?:e[+-]?\d+)?$/i;
+
+function isNumericLikeString(value) {
+  return typeof value === "string" && API_NUMERIC_STRING_RE.test(value.trim());
+}
+
+function normalizeApiStructureFieldType(endpoint, field, type) {
+  const name = normalizeStructureFieldName(field);
+  if (API_TOKEN_LIST_ENDPOINTS.has(endpoint)) {
+    if (API_TOKEN_TEXT_FIELD_RE.test(name) && (type === "string" || type === "number")) return "string";
+    if (type === "number" || type === "numeric-string") return "number";
+  }
+  return type;
+}
+
+function normalizeApiStructureValueType(endpoint, field, value) {
+  if (Array.isArray(value)) return "array";
+  const rawType = typeof value;
+  const normalizedType = isNumericLikeString(value) ? "numeric-string" : rawType;
+  return normalizeApiStructureFieldType(endpoint, field, normalizedType);
+}
+
+const TOKEN_LIST_VOLATILE_FIELD_PATTERNS = [
+  /^data\[0\]\.min\d+Increase$/,
+  /^data\[0\]\.(?:taxFee|taxFeeSell|feeBurn)$/,
+];
+
 const API_STRUCTURE_VOLATILE_FIELD_PATTERNS = new Map([
-  ["token_search_new", [/^data\[0\]\.min\d+Increase$/]],
-  ["token_search_cap", [/^data\[0\]\.min\d+Increase$/]],
+  ["token_ranking_cap", TOKEN_LIST_VOLATILE_FIELD_PATTERNS],
+  ["token_ranking_binance", TOKEN_LIST_VOLATILE_FIELD_PATTERNS],
+  ["token_search_new", TOKEN_LIST_VOLATILE_FIELD_PATTERNS],
+  ["token_search_cap", TOKEN_LIST_VOLATILE_FIELD_PATTERNS],
 ]);
 
 function normalizeStructureFieldName(field) {
@@ -2893,8 +2930,12 @@ function diffApiStructures(oldStruct, newStruct) {
     const added = [], removed = [], changed = [];
     for (const [key, type] of Object.entries(newFields)) {
       if (isVolatileApiStructureField(endpoint, key)) continue;
+      const normalizedNewType = normalizeApiStructureFieldType(endpoint, key, type);
       if (!(key in oldFields)) added.push(`${key} (${type})`);
-      else if (oldFields[key] !== type) changed.push(`${key}: ${oldFields[key]} → ${type}`);
+      else {
+        const normalizedOldType = normalizeApiStructureFieldType(endpoint, key, oldFields[key]);
+        if (normalizedOldType !== normalizedNewType) changed.push(`${key}: ${oldFields[key]} → ${type}`);
+      }
     }
     for (const key of Object.keys(oldFields)) {
       if (isVolatileApiStructureField(endpoint, key)) continue;
