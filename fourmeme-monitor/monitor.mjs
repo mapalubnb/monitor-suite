@@ -134,7 +134,7 @@ const CONFIG = {
       /^\/v\d+\/resolve-ens$/i,
     ],
   },
-  apiProbeStaggerMs: 700,
+  apiProbeStaggerMs: 350,
 
   // ── BSC RPC ──
   bscRpcUrls: [
@@ -368,6 +368,7 @@ function sleep(ms) {
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
+const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
 const CURRENT_SCHEMA_VERSION = 6;
@@ -792,6 +793,34 @@ async function bscRpcCall(method, params) {
   throw lastErr || new Error("所有 BSC RPC 节点均不可用");
 }
 
+const rpcItemErrorLogState = new Map();
+const RPC_ITEM_ERROR_LOG_COOLDOWN_MS = 30 * 60_000;
+
+function formatRpcCallSample(call) {
+  const method = call?.method || "unknown";
+  const params = Array.isArray(call?.params) ? call.params.slice(0, 2).join(",") : "";
+  return params ? `${method} ${params}` : method;
+}
+
+function shouldLogRpcItemError(call, message) {
+  const key = `${call?.method || "unknown"}:${message}`;
+  const now = Date.now();
+  const state = rpcItemErrorLogState.get(key) || { lastLogAt: 0, suppressed: 0 };
+  const shouldLog = !state.lastLogAt || now - state.lastLogAt >= RPC_ITEM_ERROR_LOG_COOLDOWN_MS;
+  if (shouldLog) {
+    const suppressed = state.suppressed;
+    rpcItemErrorLogState.set(key, { lastLogAt: now, suppressed: 0 });
+    if (rpcItemErrorLogState.size > 200) {
+      const oldest = rpcItemErrorLogState.keys().next().value;
+      if (oldest) rpcItemErrorLogState.delete(oldest);
+    }
+    return { shouldLog: true, suppressed };
+  }
+  state.suppressed++;
+  rpcItemErrorLogState.set(key, state);
+  return { shouldLog: false, suppressed: state.suppressed };
+}
+
 // --- Batch RPC：一次 HTTP 调用执行多个 RPC ---
 async function bscRpcBatch(calls) {
   if (calls.length === 0) return [];
@@ -801,7 +830,11 @@ async function bscRpcBatch(calls) {
       const result = await bscRpcCall(calls[0].method, calls[0].params);
       return [result];
     } catch (err) {
-      log(`[RPC] single-call error: ${err.message}`);
+      const info = shouldLogRpcItemError(calls[0], err.message);
+      if (info.shouldLog) {
+        const suffix = info.suppressed ? ` (suppressed ${info.suppressed} similar)` : "";
+        log(`[RPC] single-call ${formatRpcCallSample(calls[0])} error: ${err.message}${suffix}`);
+      }
       return [null];
     }
   }
@@ -828,7 +861,13 @@ async function bscRpcBatch(calls) {
       results.sort((a, b) => a.id - b.id);
       return results.map(r => {
         if (r.error) {
-          log(`[RPC] batch item #${r.id} error: ${r.error.message || JSON.stringify(r.error)}`);
+          const call = calls[r.id - 1];
+          const message = r.error.message || JSON.stringify(r.error);
+          const info = shouldLogRpcItemError(call, message);
+          if (info.shouldLog) {
+            const suffix = info.suppressed ? ` (suppressed ${info.suppressed} similar)` : "";
+            log(`[RPC] batch item #${r.id} ${formatRpcCallSample(call)} error: ${message}${suffix}`);
+          }
           return null;
         }
         return r.result;
@@ -1271,33 +1310,46 @@ function extractStrings(content, ext) {
  * 批量下载资源文件内容（带并发控制和错开延迟）
  * 返回: { [filename]: { contentHash, size, strings, ext } }
  */
-async function downloadAssetContents(assetUrls) {
+async function downloadAssetContents(assetUrls, sharedCache = null) {
   const results = {};
   const BATCH = 6;        // 每批并发数
   const STAGGER = 80;     // 批内请求间隔 ms
   const entries = [...assetUrls.entries()]; // [[filename, url], ...]
+
+  async function fetchAsset(filename, url) {
+    if (sharedCache?.has(url)) {
+      const cached = await sharedCache.get(url);
+      return cached ? { ...cached, filename } : null;
+    }
+
+    const promise = (async () => {
+      try {
+        const res = await fetchSafe(url, {
+          headers: { ...browserHeaders(), "Accept": "*/*" },
+        }, 8_000);
+        if (!res.ok) return null;
+        const content = await res.text();
+        const ext = filename.endsWith(".css") ? "css" : "js";
+        return {
+          contentHash: md5(content),
+          size: content.length,
+          strings: extractStrings(content, ext).slice(0, 200),
+          ext,
+        };
+      } catch {
+        return null;
+      }
+    })();
+
+    if (sharedCache) sharedCache.set(url, promise);
+    const data = await promise;
+    return data ? { ...data, filename } : null;
+  }
+
   for (let i = 0; i < entries.length; i += BATCH) {
     const batch = entries.slice(i, i + BATCH);
     const tasks = batch.map(([filename, url], idx) =>
-      sleep(idx * STAGGER).then(async () => {
-        try {
-          const res = await fetchSafe(url, {
-            headers: { ...browserHeaders(), "Accept": "*/*" },
-          }, 8_000);
-          if (!res.ok) return null;
-          const content = await res.text();
-          const ext = filename.endsWith(".css") ? "css" : "js";
-          return {
-            filename,
-            contentHash: md5(content),
-            size: content.length,
-            strings: extractStrings(content, ext).slice(0, 200),
-            ext,
-          };
-        } catch {
-          return null;
-        }
-      })
+      sleep(idx * STAGGER).then(() => fetchAsset(filename, url))
     );
     const batchResults = await Promise.allSettled(tasks);
     for (const r of batchResults) {
@@ -1887,7 +1939,7 @@ function extractPageFeatures(html, url) {
  * 抓取单个页面：HTML 解析 + 按需下载资源。
  * oldFeatures: 上一轮的快照数据（用于 assetHash 比对决定是否跳过下载）
  */
-async function fetchFrontendData(url, oldFeatures = null) {
+async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   let features = null;
   try {
     const res = await fetchSafe(url, { headers: browserHeaders() });
@@ -1931,7 +1983,7 @@ async function fetchFrontendData(url, oldFeatures = null) {
   } else {
     // assetHash 变了（或首次）→ 下载资源
     try {
-      features.assetContents = await downloadAssetContents(features.assetUrlMap);
+      features.assetContents = await downloadAssetContents(features.assetUrlMap, assetCache);
     } catch (err) {
       features.assetContents = null;
       log(`  [${urlLabel(url)}] 资源下载异常：${err.message}`);
@@ -1965,14 +2017,14 @@ async function fetchFrontendData(url, oldFeatures = null) {
  * 并行扫描所有监控页面（加随机延迟错开请求，降低同一 IP 并发触发风控的风险）
  * oldPages: 上一轮的快照（用于 assetHash 缓存决策）
  */
-async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls()) {
+async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls(), assetCache = null) {
   const pages = {};
   const failedUrls = [];
   const tasks = urls.map((url, i) => {
     return sleep(i * 300).then(async () => {  // 每个页面错开 300ms
       const key = urlToKey(url);
       const oldFeatures = oldPages[key] || null;
-      const data = await fetchFrontendData(url, oldFeatures);
+      const data = await fetchFrontendData(url, oldFeatures, assetCache);
       if (!data) { failedUrls.push(url); return { key, data: null }; } // HTML 抓取失败
       return { key, data: { ...data, originalUrl: url } };
     });
@@ -1987,8 +2039,9 @@ async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls
 }
 
 async function fetchFrontendDataWithDiscovery(oldPages = {}) {
+  const assetCache = new Map();
   const baseUrls = getFrontendMonitorUrls();
-  const result = await fetchAllFrontendData(oldPages, baseUrls);
+  const result = await fetchAllFrontendData(oldPages, baseUrls, assetCache);
   const knownUrls = new Set([
     ...baseUrls,
     ...Object.values(result.pages).map(p => p.originalUrl),
@@ -2000,7 +2053,7 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
     if (discoveredUrls.length === 0) break;
     log(`[前端] 自动发现 ${discoveredUrls.length} 个新页面，立即纳入本轮抓取：${discoveredUrls.map(urlLabel).join(", ")}`);
     for (const url of discoveredUrls) knownUrls.add(canonicalFrontendUrl(url));
-    const extra = await fetchAllFrontendData(oldPages, discoveredUrls);
+    const extra = await fetchAllFrontendData(oldPages, discoveredUrls, assetCache);
     Object.assign(result.pages, extra.pages);
     if (extra.failedUrls.length > 0) {
       log(`[frontend] discovery candidates failed and were not monitored: ${extra.failedUrls.map(urlLabel).join(", ")}`);
@@ -2727,14 +2780,15 @@ async function fetchApiData() {
       } catch (err) {
         payload = buildApiProbeErrorPayload(err);
       }
-      // 公共 API 记录成功结构；私有探测/风控/非 JSON 响应也记录错误 envelope，
-      // 避免接口从 JSON 变成 Cloudflare 1015 或错误结构时完全漏报。
-      const shouldRecordStructure = isSuccess || ep.recordErrorStructure || payload?._http || payload?._probeError;
+      // 公共 API 只用成功响应更新结构/值，避免短暂超时、风控页、非 JSON 响应污染快照。
+      // 私有探针显式 recordErrorStructure 时仍记录错误 envelope，用于监控登录/创建接口错误结构。
+      const shouldRecordStructure = isSuccess || ep.recordErrorStructure;
+      const shouldRecordValues = isSuccess || ep.recordErrorStructure;
       return {
         key: ep.key,
         label: ep.label,
         structure: shouldRecordStructure ? extractStructure(payload) : null,
-        apiValues: extractApiValues(payload),
+        apiValues: shouldRecordValues ? extractApiValues(payload) : null,
         success: isSuccess,
       };
     });
@@ -2747,8 +2801,9 @@ async function fetchApiData() {
       if (r.value.structure) {
         structures[r.value.key] = r.value.structure;
       }
-      // 值：无论成功失败都记录（用于检测 code/msg 变化）
-      values[r.value.key] = r.value.apiValues;
+      if (r.value.apiValues) {
+        values[r.value.key] = r.value.apiValues;
+      }
     } else {
       log(`  [API] 探测失败：${r.reason?.message || r.reason}`);
     }
@@ -2998,6 +3053,24 @@ const DYNAMIC_VALUE_PATTERNS = [
 
 function isDynamicField(key) {
   return DYNAMIC_VALUE_PATTERNS.some(re => re.test(key));
+}
+
+function stableApiValuesForSnapshot(endpoint, values) {
+  if (!values || API_VALUE_SKIP_ENDPOINTS.has(endpoint)) return null;
+  const stable = {};
+  for (const [key, value] of Object.entries(values)) {
+    if (!isDynamicField(key)) stable[key] = value;
+  }
+  return stable;
+}
+
+function stableApiValuesSnapshot(valuesByEndpoint) {
+  const result = {};
+  for (const [endpoint, values] of Object.entries(valuesByEndpoint || {})) {
+    const stableValues = stableApiValuesForSnapshot(endpoint, values);
+    if (stableValues !== null) result[endpoint] = stableValues;
+  }
+  return result;
 }
 
 function extractApiValues(obj, prefix = "", depth = 0) {
@@ -3321,19 +3394,6 @@ const KNOWN_SELECTORS = {
   "0xf29ebf61": "feeRouter()",
   "0xf2f4eb26": "core()",
 };
-
-function describeSelectors(selectors) {
-  const known = [];
-  const unknownCount = { total: selectors.length, identified: 0 };
-  for (const sel of selectors) {
-    const name = KNOWN_SELECTORS[sel.toLowerCase()];
-    if (name) {
-      known.push(`${sel} → ${name}`);
-      unknownCount.identified++;
-    }
-  }
-  return { known, total: selectors.length, identified: unknownCount.identified };
-}
 
 function isValidAddress(addr) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(addr || ""));
@@ -3680,7 +3740,7 @@ async function fetchContractFingerprints() {
   if (implCalls.length > 0) {
     const implResults = await bscRpcBatch(implCalls);
     for (let i = 0; i < implMapping.length; i++) {
-      const implCode = implResults[i];
+      const implCode = implResults[i] || "0x";
       const implSize = implCode ? Math.floor((implCode.length - 2) / 2) : 0;
       result[implMapping[i].label].implCodeHash = md5(implCode);
       result[implMapping[i].label].implCodeSize = implSize;
@@ -4543,6 +4603,7 @@ function formatActorActions(actions) {
 async function runActorCheck() {
   if (!CONFIG.actorMonitor.enabled) return;
   const state = ensureActorMonitorState();
+  const stateBefore = JSON.stringify(state);
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
     log("[actor] no contract fingerprints yet, waiting for contract module baseline");
@@ -4568,7 +4629,7 @@ async function runActorCheck() {
   }
 
   if (state.lastBlock >= safeLatest) {
-    await saveSnapshot(snapshot);
+    if (stateBefore !== JSON.stringify(state)) await saveSnapshot(snapshot);
     return;
   }
 
@@ -4816,9 +4877,10 @@ async function runPoolCheck() {
     appendHistory("pool", `底池变更（${poolChanges.length}项）`, content.slice(0, 300), content);
     await sendThenEnrichWithAi(`底池变更（${poolChanges.length}项）`, content, "red", "Four.meme 底池配置变更", undefined, undefined, undefined, CONFIG.siteUrl);
   } else {
-    // 即使没有推送的变更，也要更新快照（底池数据可能只是顺序变了）
-    snapshot.poolConfig = poolData;
-    await saveSnapshot(snapshot);
+    if (!jsonEqual(snapshot.poolConfig, poolData)) {
+      snapshot.poolConfig = poolData;
+      await saveSnapshot(snapshot);
+    }
   }
 }
 
@@ -5110,10 +5172,10 @@ async function runApiCheck() {
   }
   if (!snapshot.apiStructure) {
     snapshot.apiStructure = newStruct;
-    snapshot.apiValues = newValues;
+    snapshot.apiValues = stableApiValuesSnapshot(newValues);
     await saveSnapshot(snapshot);
     const epDetails = Object.entries(newStruct).map(([key, fields]) =>
-      `  ${key}: ${Object.keys(fields).length} 个字段，${Object.keys(newValues[key] || {}).length} 个值`
+      `  ${key}: ${Object.keys(fields).length} 个字段，${Object.keys(snapshot.apiValues[key] || {}).length} 个稳定值`
     );
     log(`[API] 首次记录：${Object.keys(newStruct).length} 个端点\n${epDetails.join("\n")}`);
     return;
@@ -5134,22 +5196,27 @@ async function runApiCheck() {
     notifications.push(formatApiValueChanges(valueChanges));
   }
 
-  // 无论是否有通知，都更新快照（避免被跳过的动态端点导致快照漂移）
+  // 仅保存稳定结构/稳定值，避免动态字段和高频列表导致快照每轮漂移。
   if (!snapshot.apiStructure) snapshot.apiStructure = {};
   if (!snapshot.apiValues) snapshot.apiValues = {};
+  const apiStructureBefore = JSON.stringify(snapshot.apiStructure);
+  const apiValuesBefore = JSON.stringify(snapshot.apiValues);
   for (const [key, val] of Object.entries(newStruct)) {
     snapshot.apiStructure[key] = val;
   }
   for (const [key, val] of Object.entries(newValues)) {
-    snapshot.apiValues[key] = val;
+    const stableValues = stableApiValuesForSnapshot(key, val);
+    if (stableValues !== null) snapshot.apiValues[key] = stableValues;
   }
+  const apiSnapshotChanged = apiStructureBefore !== JSON.stringify(snapshot.apiStructure)
+    || apiValuesBefore !== JSON.stringify(snapshot.apiValues);
 
   if (notifications.length > 0) {
     const content = notifications.join("\n\n");
     await saveSnapshot(snapshot);
     appendHistory("api", "API 变更", content.slice(0, 300), content);
     await sendThenEnrichWithAi("API 变更", content, "purple", "Four.meme API 变更", undefined, undefined, undefined, CONFIG.apiBase);
-  } else {
+  } else if (apiSnapshotChanged) {
     await saveSnapshot(snapshot);
   }
 }
@@ -5203,9 +5270,10 @@ async function runContractCheck() {
     appendHistory("contract", `合约变更（${contractChanges.length}项）`, content.slice(0, 300), content);
     await sendThenEnrichWithAi(`合约变更（${contractChanges.length}项）`, content, "red", "Four.meme 智能合约变更", undefined, undefined, undefined, CONFIG.siteUrl);
   } else {
-    // 无变更也更新快照（保持数据新鲜，防止重启后重复 diff）
-    snapshot.contractFingerprints = newFp;
-    await saveSnapshot(snapshot);
+    if (!jsonEqual(snapshot.contractFingerprints, newFp)) {
+      snapshot.contractFingerprints = newFp;
+      await saveSnapshot(snapshot);
+    }
   }
 }
 
@@ -5232,9 +5300,10 @@ async function runOnchainCheck() {
     appendHistory("onchain", `链上参数变更（${paramChanges.length}项）`, content.slice(0, 300), content);
     await sendThenEnrichWithAi(`链上参数变更（${paramChanges.length}项）`, content, "yellow", "Four.meme 链上参数变更", undefined, undefined, undefined, CONFIG.siteUrl);
   } else {
-    // 无变更也更新快照
-    snapshot.onchainParams = newParams;
-    await saveSnapshot(snapshot);
+    if (!jsonEqual(snapshot.onchainParams, newParams)) {
+      snapshot.onchainParams = newParams;
+      await saveSnapshot(snapshot);
+    }
   }
 }
 
