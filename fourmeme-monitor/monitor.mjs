@@ -1954,8 +1954,10 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
     for (const url of discoveredUrls) knownUrls.add(canonicalFrontendUrl(url));
     const extra = await fetchAllFrontendData(oldPages, discoveredUrls);
     Object.assign(result.pages, extra.pages);
-    result.failedUrls.push(...extra.failedUrls);
-    allDiscoveredUrls.push(...discoveredUrls);
+    if (extra.failedUrls.length > 0) {
+      log(`[frontend] discovery candidates failed and were not monitored: ${extra.failedUrls.map(urlLabel).join(", ")}`);
+    }
+    allDiscoveredUrls.push(...discoveredUrls.filter(url => extra.pages[urlToKey(url)]));
   }
 
   result.discoveredUrls = allDiscoveredUrls;
