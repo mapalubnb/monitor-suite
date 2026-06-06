@@ -2779,6 +2779,51 @@ function isVolatileApiStructureField(endpoint, field) {
   return patterns.some(re => re.test(name));
 }
 
+function mergeOldArrayItemFieldsForEmptySamples(oldFields, newFields) {
+  const merged = { ...newFields };
+  const newKeys = Object.keys(newFields || {});
+  const oldKeys = Object.keys(oldFields || {});
+  const prefixes = [];
+  let preserved = 0;
+
+  for (const key of newKeys) {
+    if (!key.endsWith("[]")) continue;
+    const arrayPrefix = key.slice(0, -2);
+    const itemPrefix = `${arrayPrefix}[0].`;
+    const oldItemKeys = oldKeys.filter(k => k.startsWith(itemPrefix));
+    if (oldItemKeys.length === 0) continue;
+    const newHasItemSample = newKeys.some(k => k.startsWith(itemPrefix));
+    if (newHasItemSample) continue;
+    prefixes.push(arrayPrefix);
+    for (const itemKey of oldItemKeys) {
+      if (!(itemKey in merged)) {
+        merged[itemKey] = oldFields[itemKey];
+        preserved++;
+      }
+    }
+  }
+
+  return { fields: merged, preserved, prefixes };
+}
+
+function stabilizeApiStructuresForEmptyArrays(oldStruct, newStruct) {
+  const structures = {};
+  const suppressed = [];
+  for (const [endpoint, newFields] of Object.entries(newStruct || {})) {
+    const oldFields = oldStruct?.[endpoint];
+    if (!oldFields) {
+      structures[endpoint] = newFields;
+      continue;
+    }
+    const result = mergeOldArrayItemFieldsForEmptySamples(oldFields, newFields);
+    structures[endpoint] = result.fields;
+    if (result.preserved > 0) {
+      suppressed.push({ endpoint, preserved: result.preserved, prefixes: result.prefixes });
+    }
+  }
+  return { structures, suppressed };
+}
+
 function diffApiStructures(oldStruct, newStruct) {
   const changes = [];
   if (!oldStruct || !newStruct) return changes;
@@ -5053,8 +5098,16 @@ async function runFrontendCheck() {
 }
 
 async function runApiCheck() {
-  const { structures: newStruct, values: newValues } = await fetchApiData();
+  const { structures: rawNewStruct, values: newValues } = await fetchApiData();
   if (!snapshot) snapshot = {};
+  const { structures: newStruct, suppressed: suppressedEmptyArrayStructs } =
+    stabilizeApiStructuresForEmptyArrays(snapshot.apiStructure || {}, rawNewStruct);
+  if (suppressedEmptyArrayStructs.length > 0) {
+    const summary = suppressedEmptyArrayStructs
+      .map(item => `${item.endpoint}:${item.prefixes.join("/") || "array"}(${item.preserved})`)
+      .join(", ");
+    log(`[API] empty array sample, preserved previous item structure: ${summary}`);
+  }
   if (!snapshot.apiStructure) {
     snapshot.apiStructure = newStruct;
     snapshot.apiValues = newValues;
