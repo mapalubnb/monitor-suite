@@ -261,7 +261,7 @@ const CONFIG = {
     maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 8),
     bootstrapLookbackBlocks: readPositiveIntEnv("FOURMEME_ACTOR_BOOTSTRAP_BLOCKS", 6),
     extraActors: parseEnvAddressList(`${process.env.FOURMEME_WATCH_ACTORS || ""},${process.env.FOURMEME_WATCH_CREATORS || ""}`),
-    explorerApiKey: process.env.BSCSCAN_API_KEY || process.env.ETHERSCAN_API_KEY || "",
+    explorerApiKey: process.env.ETHERSCAN_V2_API_KEY || process.env.ETHERSCAN_API_KEY || process.env.BSCSCAN_API_KEY || "",
     explorerApiBase: process.env.ETHERSCAN_API_BASE || "https://api.etherscan.io/v2/api",
   },
 };
