@@ -2745,6 +2745,34 @@ function buildApiProbeErrorPayload(err) {
   };
 }
 
+function hasTransientApiErrorMarkers(obj) {
+  if (!obj || typeof obj !== "object") return false;
+  const keys = new Set(Object.keys(obj).map(k => normalizeStructureFieldName(k)));
+  return keys.has("_probeError.message")
+    || keys.has("_probeError.name")
+    || keys.has("_http.status")
+    || keys.has("_http.errorCode")
+    || keys.has("cloudflare_error")
+    || keys.has("ray_id")
+    || keys.has("error_category")
+    || keys.has("owner_action_required")
+    || keys.has("retry_after")
+    || keys.has("footer");
+}
+
+function isTransientApiProbePayload(payload, res) {
+  if (!payload || typeof payload !== "object") return true;
+  if (payload._probeError) return true;
+  const status = Number(res?.status || payload._http?.status || payload.status || payload.error_code || 0);
+  if (status === 408 || status === 425 || status === 429 || status >= 500) return true;
+  if (payload._http?.bodyKind === "non_json") return true;
+  if (payload.cloudflare_error === true) return true;
+  if (payload.error_category === "origin" || payload.ray_id) return true;
+  if (typeof payload.title === "string" && /^Error\s+\d+:/i.test(payload.title)) return true;
+  if (typeof payload.type === "string" && /cloudflare.*5xx|error-\d+/i.test(payload.type)) return true;
+  return false;
+}
+
 /**
  * 并行探测所有 API 端点（加随机延迟错开，降低同域并发风控风险）
  * 返回 { structures, values } — 结构类型 + 实际响应值
@@ -2757,6 +2785,7 @@ async function fetchApiData() {
     return sleep(i * CONFIG.apiProbeStaggerMs).then(async () => {  // 错开请求，避免同域并发触发风控
       let payload;
       let isSuccess = false;
+      let res = null;
       try {
         const opts = {
           method: ep.method || "GET",
@@ -2770,7 +2799,7 @@ async function fetchApiData() {
           },
         };
         if (ep.method === "POST" && ep.body) opts.body = JSON.stringify(ep.body);
-        const res = await fetchProbe(ep.url, opts, 15_000);
+        res = await fetchProbe(ep.url, opts, 15_000);
         const text = await res.text();
         const json = tryParseJson(text);
         payload = json === null ? buildNonJsonApiPayload(res, text) : normalizeApiPayload(json, 0, ep.sampleArrayItems || 0);
@@ -2781,9 +2810,15 @@ async function fetchApiData() {
         payload = buildApiProbeErrorPayload(err);
       }
       // 公共 API 只用成功响应更新结构/值，避免短暂超时、风控页、非 JSON 响应污染快照。
-      // 私有探针显式 recordErrorStructure 时仍记录错误 envelope，用于监控登录/创建接口错误结构。
-      const shouldRecordStructure = isSuccess || ep.recordErrorStructure;
-      const shouldRecordValues = isSuccess || ep.recordErrorStructure;
+      // 私有探针只记录稳定的业务错误 envelope；Cloudflare/5xx/429/网络异常不污染 API 快照。
+      const transientError = !isSuccess && isTransientApiProbePayload(payload, res);
+      const shouldRecordErrorStructure = !!ep.recordErrorStructure && !transientError;
+      if (ep.recordErrorStructure && transientError) {
+        const status = res?.status || payload?._http?.status || payload?.status || payload?.error_code || payload?._probeError?.name || "transient";
+        log(`  [API] ${ep.label} 临时错误已忽略，不更新结构快照：${status}`);
+      }
+      const shouldRecordStructure = isSuccess || shouldRecordErrorStructure;
+      const shouldRecordValues = isSuccess || shouldRecordErrorStructure;
       return {
         key: ep.key,
         label: ep.label,
@@ -2925,6 +2960,14 @@ function diffApiStructures(oldStruct, newStruct) {
     if (!oldFields) {
       const allFields = Object.entries(newFields).map(([k, t]) => `${k} (${t})`);
       changes.push({ type: "新接口结构", endpoint, added: allFields, removed: [], changed: [] });
+      continue;
+    }
+    if (hasTransientApiErrorMarkers(oldFields) && !hasTransientApiErrorMarkers(newFields)) {
+      log(`  [API] ${apiEndpointLabel(endpoint)} 旧快照为临时错误结构，已静默恢复`);
+      continue;
+    }
+    if (hasTransientApiErrorMarkers(newFields)) {
+      log(`  [API] ${apiEndpointLabel(endpoint)} 临时错误结构已忽略`);
       continue;
     }
     const added = [], removed = [], changed = [];
@@ -3148,8 +3191,16 @@ function diffApiValues(oldValues, newValues) {
   for (const [endpoint, newVals] of Object.entries(newValues)) {
     // 跳过已知的动态端点
     if (API_VALUE_SKIP_ENDPOINTS.has(endpoint)) continue;
+    if (hasTransientApiErrorMarkers(newVals)) {
+      log(`  [API] ${apiEndpointLabel(endpoint)} 临时错误响应值已忽略`);
+      continue;
+    }
     const oldVals = oldValues[endpoint];
     if (!oldVals) { changes.push({ type: "新端点值", endpoint, values: newVals }); continue; }
+    if (hasTransientApiErrorMarkers(oldVals) && !hasTransientApiErrorMarkers(newVals)) {
+      log(`  [API] ${apiEndpointLabel(endpoint)} 旧响应值为临时错误，已静默恢复`);
+      continue;
+    }
     const fieldChanges = [];
     for (const [key, val] of Object.entries(newVals)) {
       // 跳过已知的动态字段
