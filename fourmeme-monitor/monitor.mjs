@@ -262,6 +262,7 @@ const CONFIG = {
     maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 8),
     bootstrapLookbackBlocks: readPositiveIntEnv("FOURMEME_ACTOR_BOOTSTRAP_BLOCKS", 6),
     extraActors: parseEnvAddressList(`${process.env.FOURMEME_WATCH_ACTORS || ""},${process.env.FOURMEME_WATCH_CREATORS || ""}`),
+    creatorLookupEnabled: process.env.FOURMEME_CREATOR_LOOKUP === "true",
     explorerApiKey: process.env.ETHERSCAN_V2_API_KEY || process.env.ETHERSCAN_API_KEY || process.env.BSCSCAN_API_KEY || "",
     explorerApiBase: process.env.ETHERSCAN_API_BASE || "https://api.etherscan.io/v2/api",
   },
@@ -3994,7 +3995,9 @@ function cachedCreatorMap(state) {
 
 async function fetchContractCreatorActors(contractEntries, state) {
   const apiKey = CONFIG.actorMonitor.explorerApiKey;
-  if (!apiKey || contractEntries.length === 0) return cachedCreatorMap(state);
+  if (!CONFIG.actorMonitor.creatorLookupEnabled || !apiKey || contractEntries.length === 0) {
+    return cachedCreatorMap(state);
+  }
 
   const lookupState = state.creatorLookup || (state.creatorLookup = {});
   const now = Date.now();
@@ -4235,6 +4238,7 @@ async function runActorCheck() {
   state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
   state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
   state.contractCount = contractEntries.length;
+  state.creatorLookupEnabled = CONFIG.actorMonitor.creatorLookupEnabled;
 
   const latestHex = await bscRpcCall("eth_blockNumber", []);
   const latest = hexToNumber(latestHex);
