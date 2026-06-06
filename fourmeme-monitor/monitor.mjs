@@ -333,6 +333,8 @@ let snapshotWriteQueue = Promise.resolve();
 
 const REMOVED_FRONTEND_URLS = new Set([
   "https://four.meme/zh-TW/create-token?entry=X-mode",
+  "https://four.meme/zh-TW/ja",
+  "https://four.meme/zh-TW/vi",
 ].map(canonicalFrontendUrl));
 
 /**
@@ -1029,10 +1031,12 @@ function normalizeRouteString(raw) {
 
 function isTrackableRouteString(route) {
   if (!route || route[0] !== "/") return false;
+  if (route === "/") return false;
   if (route.startsWith("//")) return false;
   if (route.startsWith("/_next/") || route.startsWith("/static/")) return false;
   if (/\.(js|css|png|svg|ico|jpg|jpeg|gif|webp|woff2?|ttf|eot|map)$/i.test(route.split("?")[0])) return false;
-  if (/^\/docs\//i.test(route) || /^\/a\/i$/i.test(route) || /^\/v\d+\/resolve-ens$/i.test(route)) return false;
+  if (isLocaleRootRoute(route)) return false;
+  if (/^\/docs(?:\/|$)/i.test(route) || /^\/a\/i$/i.test(route) || /^\/v\d+\/resolve-ens$/i.test(route)) return false;
   return true;
 }
 
@@ -1040,14 +1044,22 @@ function isApiOrEndpointRoute(route) {
   return /^\/(?:api|meme-api|mapi|v\d+|blog\/v\d+)\//i.test(route);
 }
 
+function isLocaleRootRoute(route) {
+  return /^\/[a-z]{2}(?:-[a-z]{2})?$/i.test((route || "").split("?")[0].replace(/\/+$/, ""));
+}
+
+function isUnsupportedLocalePrefixedRoute(route) {
+  const path = (route || "").split("?")[0];
+  return /^\/[a-z]{2}(?:-[a-z]{2})?(?:\/|$)/i.test(path) && !/^\/(?:en|zh-TW)(?:\/|$)/i.test(path);
+}
+
 function routeToFrontendUrl(route) {
   if (!CONFIG.frontendDiscovery.enabled) return null;
   const normalized = normalizeRouteString(route).split("?")[0].replace(/\/+$/, "") || "/";
   if (!isTrackableRouteString(normalized)) return null;
   if (isApiOrEndpointRoute(normalized)) return null;
+  if (isUnsupportedLocalePrefixedRoute(normalized)) return null;
   if (CONFIG.frontendDiscovery.excludeRoutes.some(re => re.test(normalized))) return null;
-  if (normalized === "/") return canonicalFrontendUrl(CONFIG.siteUrl);
-  if (/^\/(?:en|zh-TW)$/i.test(normalized)) return canonicalFrontendUrl(CONFIG.siteUrl);
   if (/^\/(?:en|zh-TW)(?:\/|$)/i.test(normalized)) {
     return canonicalFrontendUrl(CONFIG.siteUrl + normalized);
   }
@@ -1693,9 +1705,15 @@ function extractRoutes(html, assetContents, nextData) {
 
   // 1. 从已解析的 __NEXT_DATA__ 中提取页面路由和 manifest
   if (nextData) {
-    if (nextData.page) routes.add(nextData.page);
+    if (nextData.page) {
+      const pageRoute = normalizeRouteString(nextData.page).split("?")[0];
+      if (isTrackableRouteString(pageRoute)) routes.add(pageRoute);
+    }
     if (nextData.props?.pageProps?.pages) {
-      for (const p of nextData.props.pageProps.pages) routes.add(p);
+      for (const p of nextData.props.pageProps.pages) {
+        const pageRoute = normalizeRouteString(p).split("?")[0];
+        if (isTrackableRouteString(pageRoute)) routes.add(pageRoute);
+      }
     }
   }
 
@@ -1732,12 +1750,14 @@ function extractRoutes(html, assetContents, nextData) {
 }
 
 function diffRoutes(oldRoutes, newRoutes) {
-  if (!newRoutes || newRoutes.length === 0) return { added: [], removed: [] };
-  if (!oldRoutes || oldRoutes.length === 0) return { added: newRoutes, removed: [] };
-  const oldSet = new Set(oldRoutes);
-  const newSet = new Set(newRoutes);
-  const added = newRoutes.filter(r => !oldSet.has(r));
-  let removed = oldRoutes.filter(r => !newSet.has(r));
+  const cleanOldRoutes = sanitizeRouteListForDiff(oldRoutes);
+  const cleanNewRoutes = sanitizeRouteListForDiff(newRoutes);
+  if (!cleanNewRoutes.length) return { added: [], removed: [] };
+  if (!cleanOldRoutes.length) return { added: cleanNewRoutes, removed: [] };
+  const oldSet = new Set(cleanOldRoutes);
+  const newSet = new Set(cleanNewRoutes);
+  const added = cleanNewRoutes.filter(r => !oldSet.has(r));
+  let removed = cleanOldRoutes.filter(r => !newSet.has(r));
   // SSR 抖动保护：如果路由只有移除、没有新增，且移除数量较少（≤3），
   // 很可能是 SSR/CDN 边缘节点返回了不完整的 HTML 导致部分 href 未被渲染。
   // 此时忽略移除，避免假阳性。真实的路由删除通常伴随新路由的新增（重构）
@@ -1747,6 +1767,13 @@ function diffRoutes(oldRoutes, newRoutes) {
     removed = [];
   }
   return { added, removed };
+}
+
+function sanitizeRouteListForDiff(routes) {
+  return [...new Set((routes || [])
+    .map(route => normalizeRouteString(route).split("?")[0].replace(/\/+$/, "") || "/")
+    .filter(route => isApiOrEndpointRoute(route) || isTrackableRouteString(route))
+  )].sort();
 }
 
 function formatRouteChanges(routeDiff) {
@@ -3919,10 +3946,13 @@ async function runFrontendCheck() {
     // 路由抖动保护：如果 diffRoutes 内部抑制了移除（removed 被清空），
     // 将旧路由合并回 newData，避免下一轮对比时这些路由"复现"被报为新增
     if (oldData.routes && newData.routes) {
-      const newSet = new Set(newData.routes);
-      const suppressed = (oldData.routes || []).filter(r => !newSet.has(r));
+      const cleanNewRoutes = sanitizeRouteListForDiff(newData.routes);
+      const newSet = new Set(cleanNewRoutes);
+      const suppressed = sanitizeRouteListForDiff(oldData.routes).filter(r => !newSet.has(r));
       if (suppressed.length > 0 && routeDiff.removed.length === 0) {
-        newData.routes = [...new Set([...newData.routes, ...suppressed])].sort();
+        newData.routes = [...new Set([...cleanNewRoutes, ...suppressed])].sort();
+      } else {
+        newData.routes = cleanNewRoutes;
       }
     }
 

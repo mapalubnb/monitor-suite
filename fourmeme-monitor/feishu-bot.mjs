@@ -94,6 +94,8 @@ const BASE_FRONTEND_URLS = [
 
 const REMOVED_FRONTEND_URLS = new Set([
   "https://four.meme/zh-TW/create-token?entry=X-mode",
+  "https://four.meme/zh-TW/ja",
+  "https://four.meme/zh-TW/vi",
 ].map(canonicalFrontendUrl));
 
 function apiEndpointStatusLink(key) {

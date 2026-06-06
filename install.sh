@@ -209,7 +209,11 @@ if [ -f "$SNAP" ]; then
       'https://four.meme/zh-TW/agentic',
       'https://four.meme/zh-TW/announcement'
     ].map(canonicalFrontendUrl);
-    const removedFrontendUrls=new Set(['https://four.meme/zh-TW/create-token?entry=X-mode'].map(canonicalFrontendUrl));
+    const removedFrontendUrls=new Set([
+      'https://four.meme/zh-TW/create-token?entry=X-mode',
+      'https://four.meme/zh-TW/ja',
+      'https://four.meme/zh-TW/vi'
+    ].map(canonicalFrontendUrl));
     const discovered=(s._frontendDiscoveredUrls||[]).map(canonicalFrontendUrl).filter(u=>!removedFrontendUrls.has(u));
     const activeFrontendUrls=new Set([...baseFrontendUrls,...discovered]);
     const pageEntries=Object.entries(s.frontendPages||{}).filter(([k,p])=>{
