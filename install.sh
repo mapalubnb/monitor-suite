@@ -307,6 +307,19 @@ if [ -f "$SNAP" ]; then
       console.log('  '+n);
     }
     if(nfts.length>10) console.log('  ... 及其余 '+(nfts.length-10)+' 个');
+
+    // 模块 8：控制者动作
+    const am=s.chainActorMonitor||{};
+    const actors=Object.keys(am.actors||{});
+    console.log('');
+    console.log('[ 模块8: 控制者动作 ]');
+    console.log('  监听地址: '+actors.length+' 个');
+    if(am.lastBlock) console.log('  已扫描至确认块: '+am.lastBlock);
+    for(const a of actors.slice(0,8)){
+      const item=am.actors[a]||{};
+      console.log('  '+a.slice(0,10)+'...  '+((item.roles||[]).join(',')||'actor'));
+    }
+    if(actors.length>8) console.log('  ... 及其余 '+(actors.length-8)+' 个');
   " 2>/dev/null
   echo ""
   echo "------"
@@ -705,11 +718,12 @@ if [ -f "$FM_SNAP" ]; then
     const apis=Object.keys(s.apiStructure||{}).length;
     const sha=(s.githubSha||'').slice(0,8)||'-';
     const contracts=Object.keys(s.contractFingerprints||{}).length;
+    const actors=Object.keys((s.chainActorMonitor||{}).actors||{}).length;
     const nfts=(s.onchainParams||{}).agentNftCount??'-';
     console.log('  Four.meme:');
     console.log('    底池: '+pools+' 个 ('+netStr+')');
     console.log('    前端: '+pages+' 页面  |  API: '+apis+' 端点  |  GitHub: '+sha);
-    console.log('    合约: '+contracts+' 个  |  Agent NFT: '+nfts+' 个');
+    console.log('    合约: '+contracts+' 个  |  控制者: '+actors+' 个  |  Agent NFT: '+nfts+' 个');
   " 2>/dev/null
   FM_LASTPOLL="/root/monitor-suite/fourmeme-monitor/lastpoll.txt"
   [ -f "$FM_LASTPOLL" ] || FM_LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"

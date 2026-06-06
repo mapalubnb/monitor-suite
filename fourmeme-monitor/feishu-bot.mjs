@@ -371,6 +371,11 @@ function buildMonitorContext() {
         for (const nft of op.agentNfts.slice(0, 5)) parts.push(`  ${nft}`);
         if (op.agentNfts.length > 5) parts.push(`  ... 及其余 ${op.agentNfts.length - 5} 个`);
       }
+
+      const actorState = snap.chainActorMonitor || {};
+      const actorCount = Object.keys(actorState.actors || {}).length;
+      parts.push(`\n控制者动作监听: ${actorCount} 个地址`);
+      if (actorState.lastBlock) parts.push(`  已扫描至确认块: ${actorState.lastBlock}`);
     } catch (err) {
       parts.push(`Four.meme 快照读取失败: ${err.message}`);
     }
@@ -593,7 +598,8 @@ async function buildDailyReport() {
         const contracts = Object.keys(snap.contractFingerprints || {}).length;
         const sha = (snap.githubSha || "").slice(0, 8) || "-";
         const nfts = snap.onchainParams?.agentNftCount ?? "-";
-        parts.push(`Four.meme：底池${pools} | 合约${contracts} | NFT${nfts} | SHA:\`${sha}\``);
+        const actors = Object.keys(snap.chainActorMonitor?.actors || {}).length;
+        parts.push(`Four.meme：底池${pools} | 合约${contracts} | 控制者${actors} | NFT${nfts} | SHA:\`${sha}\``);
       } catch { /* ignore */ }
     }
 

@@ -14,6 +14,7 @@
  *   模块4: GitHub     — 每 5min（条件请求，自带 ETag 缓存）
  *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 3s（RPC batch，单次请求）
+ *   模块8: 控制者动作 — 每 3s（扫新区块，监听创建者/owner/admin 交易）
  *
  * 用法：node monitor.mjs
  * 信号：kill -USR1 <PID>  立即触发全量检测
@@ -40,6 +41,19 @@ if (existsSync(ENV_FILE)) {
 /* ══════════════════════════════════════════
    配置
    ══════════════════════════════════════════ */
+
+function parseEnvAddressList(value) {
+  return String(value || "")
+    .split(/[,\s]+/)
+    .map(v => v.trim().toLowerCase())
+    .filter(v => /^0x[a-f0-9]{40}$/.test(v));
+}
+
+function readPositiveIntEnv(name, fallback) {
+  const n = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 const CONFIG = {
   // Four.meme
   apiBase: "https://four.meme/meme-api",
@@ -70,6 +84,7 @@ const CONFIG = {
     github:   300_000, // 模块4: GitHub（5min，未认证限额 60/h）
     contract: 3_000,   // 模块6: 智能合约
     onchain:  3_000,   // 模块7: 链上参数
+    actor:    3_000,   // 模块8: 合约创建者/管理员动作
   },
 
   // 心跳间隔（毫秒）— 支持环境变量 HEARTBEAT_MINUTES 覆盖（单位：分钟）
@@ -239,6 +254,16 @@ const CONFIG = {
     },
   ],
   eip1967Slot: "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
+  eip1967AdminSlot: "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103",
+  actorMonitor: {
+    enabled: process.env.FOURMEME_ACTOR_MONITOR !== "false",
+    confirmations: readPositiveIntEnv("FOURMEME_ACTOR_CONFIRMATIONS", 2),
+    maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 8),
+    bootstrapLookbackBlocks: readPositiveIntEnv("FOURMEME_ACTOR_BOOTSTRAP_BLOCKS", 6),
+    extraActors: parseEnvAddressList(`${process.env.FOURMEME_WATCH_ACTORS || ""},${process.env.FOURMEME_WATCH_CREATORS || ""}`),
+    explorerApiKey: process.env.BSCSCAN_API_KEY || process.env.ETHERSCAN_API_KEY || "",
+    explorerApiBase: process.env.ETHERSCAN_API_BASE || "https://api.etherscan.io/v2/api",
+  },
 };
 
 /* ══════════════════════════════════════════
@@ -330,7 +355,7 @@ const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 let snapshotWriteQueue = Promise.resolve();
 
 const REMOVED_FRONTEND_URLS = new Set([
@@ -431,6 +456,12 @@ function migrateSnapshot(data) {
     }
   } else {
     pruneFrontendSnapshot(data);
+  }
+  if (ver < 6) {
+    if (!data.chainActorMonitor) data.chainActorMonitor = {};
+    if (!data.chainActorMonitor.creators) data.chainActorMonitor.creators = {};
+    if (!Array.isArray(data.chainActorMonitor.seenTxs)) data.chainActorMonitor.seenTxs = [];
+    log("[快照迁移] v5 → v6：补充合约创建者/管理员动作监听字段");
   }
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
@@ -3872,13 +3903,405 @@ function formatOnchainChanges(changes) {
 }
 
 /* ══════════════════════════════════════════
+   模块 8：合约创建者 / 管理员动作监听
+   ══════════════════════════════════════════ */
+
+const ACTOR_SELECTOR_INFO = {
+  "0x3659cfe6": { name: "upgradeTo(address)", risk: "high" },
+  "0x4f1ef286": { name: "upgradeToAndCall(address,bytes)", risk: "high" },
+  "0x8f283970": { name: "changeAdmin(address)", risk: "high" },
+  "0xf2fde38b": { name: "transferOwnership(address)", risk: "high" },
+  "0x2f2ff15d": { name: "grantRole(bytes32,address)", risk: "high" },
+  "0xd547741f": { name: "revokeRole(bytes32,address)", risk: "high" },
+  "0x8456cb59": { name: "pause()", risk: "high" },
+  "0x3f4ba83a": { name: "unpause()", risk: "high" },
+  "0x6a761202": { name: "Safe.execTransaction(...)", risk: "high" },
+  "0x610b5925": { name: "execTransactionFromModule(address,uint256,bytes,uint8)", risk: "high" },
+};
+
+function ensureActorMonitorState() {
+  if (!snapshot) snapshot = {};
+  if (!snapshot.chainActorMonitor) snapshot.chainActorMonitor = {};
+  const state = snapshot.chainActorMonitor;
+  if (!state.creators) state.creators = {};
+  if (!Array.isArray(state.seenTxs)) state.seenTxs = [];
+  if (!state.actors) state.actors = {};
+  return state;
+}
+
+function blockTag(n) {
+  return "0x" + BigInt(n).toString(16);
+}
+
+function hexToNumber(hex) {
+  if (!hex) return 0;
+  return Number(BigInt(hex));
+}
+
+function txSelector(input) {
+  return typeof input === "string" && input.length >= 10 ? input.slice(0, 10).toLowerCase() : "";
+}
+
+function addActorRole(actorMap, address, role, label, source = "") {
+  const addr = normalizeAddress(address);
+  if (!addr) return;
+  if (!actorMap.has(addr)) {
+    actorMap.set(addr, { address: addr, roles: [], labels: [], sources: [] });
+  }
+  const actor = actorMap.get(addr);
+  if (role && !actor.roles.includes(role)) actor.roles.push(role);
+  if (label && !actor.labels.includes(label)) actor.labels.push(label);
+  if (source && !actor.sources.includes(source)) actor.sources.push(source);
+}
+
+function addContractEntry(contractMap, label, address, source = "") {
+  const addr = normalizeAddress(address);
+  if (!addr) return;
+  const old = contractMap.get(addr);
+  if (old) {
+    if (label && !old.labels.includes(label)) old.labels.push(label);
+    if (source && !old.sources.includes(source)) old.sources.push(source);
+  } else {
+    contractMap.set(addr, { address: addr, labels: label ? [label] : [], sources: source ? [source] : [] });
+  }
+}
+
+function buildWatchedContractEntries() {
+  const contracts = new Map();
+  for (const c of staticContractTargets()) addContractEntry(contracts, c.label, c.addr, c.source || "static");
+  for (const [label, data] of Object.entries(snapshot?.contractFingerprints || {})) {
+    addContractEntry(contracts, label, data.address, data.source || "snapshot");
+    if (data.implAddress) addContractEntry(contracts, `${label}.implementation`, data.implAddress, "implementation");
+    for (const field of ["linkedRegistry", "linkedCore", "linkedFeeRouter"]) {
+      if (data[field]) addContractEntry(contracts, `${label}.${field}`, data[field], "linked");
+    }
+  }
+  return [...contracts.values()];
+}
+
+async function fetchContractCreatorActors(contractEntries, state) {
+  const result = {};
+  const apiKey = CONFIG.actorMonitor.explorerApiKey;
+  if (!apiKey || contractEntries.length === 0) return result;
+
+  const missing = contractEntries
+    .map(c => normalizeAddress(c.address))
+    .filter(addr => addr && !state.creators[addr]);
+  if (missing.length === 0) {
+    for (const [contract, data] of Object.entries(state.creators)) {
+      if (normalizeAddress(data?.creator)) result[contract] = data;
+    }
+    return result;
+  }
+
+  const chunkSize = 5;
+  for (let i = 0; i < missing.length; i += chunkSize) {
+    const chunk = missing.slice(i, i + chunkSize);
+    try {
+      const url = new URL(CONFIG.actorMonitor.explorerApiBase);
+      url.searchParams.set("chainid", "56");
+      url.searchParams.set("module", "contract");
+      url.searchParams.set("action", "getcontractcreation");
+      url.searchParams.set("contractaddresses", chunk.join(","));
+      url.searchParams.set("apikey", apiKey);
+      const res = await fetchSafe(url.toString(), { headers: { "User-Agent": nextUA(), "Accept": "application/json" } }, 5_000);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      if (json?.status === "0" && !Array.isArray(json.result)) {
+        throw new Error(json?.message || JSON.stringify(json?.result || "").slice(0, 120));
+      }
+      for (const item of Array.isArray(json.result) ? json.result : []) {
+        const contract = normalizeAddress(item.contractAddress || item.contractaddress);
+        const creator = normalizeAddress(item.contractCreator || item.contractCreatorAddress || item.creator);
+        if (!contract || !creator) continue;
+        state.creators[contract] = {
+          creator,
+          txHash: String(item.txHash || item.transactionHash || "").toLowerCase(),
+          updatedAt: ts(),
+        };
+        result[contract] = state.creators[contract];
+      }
+    } catch (err) {
+      log(`[actor] explorer creator lookup failed: ${err.message}`);
+      break;
+    }
+  }
+
+  for (const [contract, data] of Object.entries(state.creators)) {
+    if (normalizeAddress(data?.creator)) result[contract] = data;
+  }
+  return result;
+}
+
+async function fetchControlActors(contractEntries, state) {
+  const actorMap = new Map();
+  const contractMap = new Map();
+  for (const c of contractEntries) addContractEntry(contractMap, c.labels?.[0] || "", c.address, c.sources?.[0] || "");
+  for (const addr of CONFIG.actorMonitor.extraActors) addActorRole(actorMap, addr, "manual", "FOURMEME_WATCH_ACTORS", "env");
+
+  const creatorMap = await fetchContractCreatorActors(contractEntries, state);
+  for (const c of contractEntries) {
+    const creator = creatorMap[normalizeAddress(c.address)];
+    if (creator?.creator) addActorRole(actorMap, creator.creator, "creator", c.labels.join("/"), "explorer");
+  }
+
+  const calls = [];
+  const meta = [];
+  for (const c of contractEntries) {
+    calls.push({ method: "eth_call", params: [{ to: c.address, data: "0x8da5cb5b" }, "latest"] }); // owner()
+    meta.push({ type: "owner", contract: c });
+    calls.push({ method: "eth_getStorageAt", params: [c.address, CONFIG.eip1967AdminSlot, "latest"] });
+    meta.push({ type: "proxyAdmin", contract: c });
+  }
+
+  const results = await bscRpcBatch(calls);
+  const proxyAdmins = new Map();
+  for (let i = 0; i < meta.length; i++) {
+    const addr = decodeRpcAddress(results[i]);
+    if (!addr) continue;
+    const label = meta[i].contract.labels.join("/");
+    if (meta[i].type === "owner") {
+      addActorRole(actorMap, addr, "owner", label, "owner()");
+    } else {
+      addActorRole(actorMap, addr, "proxyAdmin", label, "EIP-1967 admin slot");
+      addContractEntry(contractMap, `ProxyAdmin(${label})`, addr, "proxyAdmin");
+      proxyAdmins.set(addr, label);
+    }
+  }
+
+  if (proxyAdmins.size > 0) {
+    const adminCalls = [...proxyAdmins.keys()].map(addr => ({
+      method: "eth_call",
+      params: [{ to: addr, data: "0x8da5cb5b" }, "latest"],
+    }));
+    const adminOwners = await bscRpcBatch(adminCalls);
+    let i = 0;
+    for (const [admin, label] of proxyAdmins.entries()) {
+      const owner = decodeRpcAddress(adminOwners[i++]);
+      if (owner) addActorRole(actorMap, owner, "proxyAdminOwner", label, `owner(${admin})`);
+    }
+  }
+
+  return { actors: actorMap, contracts: contractMap };
+}
+
+function decodeSafeExecTransaction(input) {
+  if (txSelector(input) !== "0x6a761202") return null;
+  const clean = input.startsWith("0x") ? input.slice(2) : input;
+  const args = clean.slice(8);
+  if (args.length < 64 * 3) return null;
+  const word = n => args.slice(n * 64, n * 64 + 64);
+  const to = normalizeAddress("0x" + word(0).slice(24));
+  let dataOffset;
+  try {
+    dataOffset = Number(BigInt("0x" + word(2)));
+  } catch {
+    return { to, selector: "" };
+  }
+  const lenStart = dataOffset * 2;
+  if (args.length < lenStart + 64) return { to, selector: "" };
+  let dataLen = 0;
+  try {
+    dataLen = Number(BigInt("0x" + args.slice(lenStart, lenStart + 64)));
+  } catch {
+    return { to, selector: "" };
+  }
+  const dataStart = lenStart + 64;
+  const dataHex = args.slice(dataStart, dataStart + dataLen * 2);
+  return { to, selector: dataHex.length >= 8 ? "0x" + dataHex.slice(0, 8).toLowerCase() : "" };
+}
+
+function classifyActorTx(tx, context) {
+  const from = normalizeAddress(tx.from);
+  const to = normalizeAddress(tx.to);
+  const selector = txSelector(tx.input);
+  const fromActor = context.actors.get(from);
+  const toActor = context.actors.get(to);
+  const toContract = context.contracts.get(to);
+  if (!fromActor && !toActor) return null;
+
+  const selectorInfo = ACTOR_SELECTOR_INFO[selector] || (selector ? { name: KNOWN_SELECTORS[selector] || selector, risk: "medium" } : null);
+  const isDeployment = !to;
+  const safeExec = decodeSafeExecTransaction(tx.input || "");
+  const safeTarget = safeExec?.to ? context.contracts.get(safeExec.to) : null;
+  const safeSelectorInfo = safeExec?.selector ? (ACTOR_SELECTOR_INFO[safeExec.selector] || { name: KNOWN_SELECTORS[safeExec.selector] || safeExec.selector, risk: "medium" }) : null;
+
+  let risk = "low";
+  let reason = "";
+  if (isDeployment) {
+    risk = "high";
+    reason = "watched actor deployed a new contract";
+  } else if (safeExec && (safeTarget || safeSelectorInfo?.risk === "high")) {
+    risk = "high";
+    reason = `watched control contract execTransaction -> ${safeTarget?.labels.join("/") || safeExec.to}`;
+  } else if (toContract && fromActor) {
+    risk = selectorInfo?.risk === "high" ? "high" : "high";
+    reason = `watched actor called monitored contract ${toContract.labels.join("/")}`;
+  } else if (selectorInfo?.risk === "high") {
+    risk = "high";
+    reason = "watched actor used high-risk selector";
+  } else if (toActor && selector) {
+    risk = "medium";
+    reason = "transaction sent to watched owner/admin contract";
+  } else if (fromActor && selector) {
+    risk = "medium";
+    reason = "watched actor called an external contract";
+  } else {
+    return null;
+  }
+
+  return {
+    risk,
+    reason,
+    hash: String(tx.hash || "").toLowerCase(),
+    blockNumber: hexToNumber(tx.blockNumber),
+    from,
+    to: to || "",
+    fromActor,
+    toActor,
+    toContract,
+    selector,
+    method: selectorInfo?.name || (isDeployment ? "contract creation" : ""),
+    safeTarget: safeExec?.to || "",
+    safeTargetLabel: safeTarget?.labels.join("/") || "",
+    safeSelector: safeExec?.selector || "",
+    safeMethod: safeSelectorInfo?.name || "",
+    value: tx.value || "0x0",
+  };
+}
+
+async function fetchActorBlockActions(fromBlock, toBlock, context, state) {
+  const blockCalls = [];
+  for (let n = fromBlock; n <= toBlock; n++) {
+    blockCalls.push({ method: "eth_getBlockByNumber", params: [blockTag(n), true] });
+  }
+  const blocks = await bscRpcBatch(blockCalls);
+  const seen = new Set(state.seenTxs || []);
+  const actions = [];
+  for (const block of blocks) {
+    if (!block?.transactions) continue;
+    for (const tx of block.transactions) {
+      const hash = String(tx.hash || "").toLowerCase();
+      if (!hash || seen.has(hash)) continue;
+      const action = classifyActorTx(tx, context);
+      if (!action) continue;
+      actions.push(action);
+      seen.add(hash);
+    }
+  }
+
+  if (actions.length > 0) {
+    const receiptResults = await bscRpcBatch(actions.map(a => ({ method: "eth_getTransactionReceipt", params: [a.hash] })));
+    for (let i = 0; i < actions.length; i++) {
+      const receipt = receiptResults[i];
+      actions[i].status = receipt?.status || "";
+      actions[i].contractAddress = normalizeAddress(receipt?.contractAddress);
+      actions[i].logsCount = Array.isArray(receipt?.logs) ? receipt.logs.length : 0;
+    }
+  }
+  return actions;
+}
+
+function rememberActorTxs(state, actions) {
+  const merged = [...(state.seenTxs || []), ...actions.map(a => a.hash).filter(Boolean)];
+  state.seenTxs = [...new Set(merged)].slice(-500);
+}
+
+function formatActorWatchList(context) {
+  return [...context.actors.values()].map(actor => ({
+    address: actor.address,
+    roles: actor.roles,
+    labels: actor.labels.slice(0, 8),
+    sources: actor.sources,
+  }));
+}
+
+function formatActorActions(actions) {
+  const riskIcon = { high: "🚨", medium: "⚠️", low: "ℹ️" };
+  const lines = [];
+  for (const a of actions.slice(0, 12)) {
+    lines.push(`**${riskIcon[a.risk] || "⚠️"} ${a.risk.toUpperCase()}：${a.method || "watched actor tx"}**`);
+    lines.push("```");
+    lines.push(`block: ${a.blockNumber}`);
+    lines.push(`from:  ${a.from}`);
+    if (a.fromActor) lines.push(`role:  ${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`);
+    if (a.to) lines.push(`to:    ${a.to}${a.toContract ? ` (${a.toContract.labels.join("/")})` : ""}`);
+    if (a.toActor && !a.toContract) lines.push(`toRole:${a.toActor.roles.join(",")} (${a.toActor.labels.slice(0, 4).join("/")})`);
+    if (a.selector) lines.push(`selector: ${a.selector}`);
+    if (a.safeTarget) lines.push(`safeTarget: ${a.safeTarget}${a.safeTargetLabel ? ` (${a.safeTargetLabel})` : ""}`);
+    if (a.safeSelector) lines.push(`safeSelector: ${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`);
+    if (a.contractAddress) lines.push(`newContract: ${a.contractAddress}`);
+    if (a.status) lines.push(`status: ${a.status === "0x1" ? "success" : a.status}`);
+    lines.push(`reason: ${a.reason}`);
+    lines.push("```");
+    lines.push(`[交易链接](https://bscscan.com/tx/${a.hash})`);
+    if (a.contractAddress) lines.push(`[新合约](https://bscscan.com/address/${a.contractAddress})`);
+    lines.push("---");
+  }
+  if (actions.length > 12) lines.push(`还有 ${actions.length - 12} 条动作未展开。`);
+  lines.push(`监控时间：${ts()}`);
+  return lines.join("\n");
+}
+
+async function runActorCheck() {
+  if (!CONFIG.actorMonitor.enabled) return;
+  const state = ensureActorMonitorState();
+  const contractEntries = buildWatchedContractEntries();
+  if (contractEntries.length === 0) {
+    log("[actor] no contract fingerprints yet, waiting for contract module baseline");
+    return;
+  }
+
+  const context = await fetchControlActors(contractEntries, state);
+  state.actors = Object.fromEntries(formatActorWatchList(context).map(actor => [actor.address, actor]));
+  state.contractCount = contractEntries.length;
+
+  const latestHex = await bscRpcCall("eth_blockNumber", []);
+  const latest = hexToNumber(latestHex);
+  const safeLatest = Math.max(0, latest - CONFIG.actorMonitor.confirmations);
+  if (!state.lastBlock) {
+    state.lastBlock = Math.max(0, safeLatest - CONFIG.actorMonitor.bootstrapLookbackBlocks);
+    log(`[actor] 初始化区块游标：${state.lastBlock}（latest=${latest}, safe=${safeLatest}）`);
+  }
+
+  if (state.lastBlock >= safeLatest) {
+    await saveSnapshot(snapshot);
+    return;
+  }
+
+  const fromBlock = state.lastBlock + 1;
+  const toBlock = Math.min(safeLatest, fromBlock + CONFIG.actorMonitor.maxBlocksPerRun - 1);
+  const actions = await fetchActorBlockActions(fromBlock, toBlock, context, state);
+  state.lastBlock = toBlock;
+  state.lastBlockAt = ts();
+  rememberActorTxs(state, actions);
+  await saveSnapshot(snapshot);
+
+  if (actions.length === 0) return;
+
+  const highCount = actions.filter(a => a.risk === "high").length;
+  log(`[actor] 捕获 ${actions.length} 条控制者动作（high=${highCount}），区块 ${fromBlock}-${toBlock}`);
+  const content = formatActorActions(actions);
+  appendHistory("actor", `链上控制者动作（${actions.length}项）`, content.slice(0, 300), content);
+  const color = highCount > 0 ? "red" : "yellow";
+  await sendThenEnrichWithAi(`链上控制者动作（${actions.length}项）`, content, color, "Four.meme 合约创建者/管理员动作", undefined, undefined, undefined, `https://bscscan.com/block/${toBlock}`);
+
+  try {
+    log("[actor] 控制者动作已触发，立即复查合约状态");
+    await runContractCheck();
+  } catch (err) {
+    log(`[actor] 触发合约复查失败：${err.message}`);
+  }
+}
+
+/* ══════════════════════════════════════════
    模块运行器（独立定时器 + 防重入）
    ══════════════════════════════════════════ */
 
 /* ── 全局状态 ── */
 let snapshot = loadSnapshot();
 let startTime = Date.now();
-let modulePollCounts = { pool: 0, frontend: 0, api: 0, github: 0, contract: 0, onchain: 0 };
+let modulePollCounts = { pool: 0, frontend: 0, api: 0, github: 0, contract: 0, onchain: 0, actor: 0 };
 
 /* ── 已移除底池缓存（防止 API 短暂返回不完整数据导致误报）── */
 const removedPoolsCache = new Map(); // poolKey -> { data, expireAt }
@@ -4515,6 +4938,7 @@ const modules = [
   createModuleRunner("github",   runGithubCheck,    CONFIG.intervals.github),
   createModuleRunner("contract", runContractCheck,  CONFIG.intervals.contract),
   createModuleRunner("onchain",  runOnchainCheck,   CONFIG.intervals.onchain),
+  createModuleRunner("actor",    runActorCheck,     CONFIG.intervals.actor),
 ];
 
 /**
@@ -4623,6 +5047,7 @@ async function startAllModules() {
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
   const discoveredCount = (snapshot?._frontendDiscoveredUrls || []).length;
   const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
+  const actorCount = Object.keys(snapshot?.chainActorMonitor?.actors || {}).length;
   await sendFeishu("Four.meme 全面监控 v2 已启动",
     [
       `**架构:** 独立定时器 + RPC Batch + 并行抓取`,
@@ -4635,6 +5060,7 @@ async function startAllModules() {
       `**GitHub:** ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "N/A"}) — 每 ${CONFIG.intervals.github / 1000}s`,
       `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s (RPC Batch + OpenFour 链上发现)`,
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "N/A"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s (RPC Batch)`,
+      `**控制者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s (区块扫描 + 命中后合约复查)`,
       `**反风控:** UA轮换 + per-domain自适应退避 + 请求抖动`,
       `**心跳:** 每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送） | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
     ].join("\n"),
