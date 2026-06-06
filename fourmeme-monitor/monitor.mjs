@@ -200,14 +200,16 @@ const CONFIG = {
       label: "/v1/public/token/search NEW",
       url: "https://four.meme/meme-api/v1/public/token/search",
       method: "POST",
-      body: { pageIndex: 1, pageSize: 5, type: "NEW" },
+      body: { pageIndex: 1, pageSize: 20, type: "NEW" },
+      sampleArrayItems: 10,
     },
     {
       key: "token_search_cap",
       label: "/v1/public/token/search CAP",
       url: "https://four.meme/meme-api/v1/public/token/search",
       method: "POST",
-      body: { pageIndex: 1, pageSize: 5, type: "CAP", sort: "DESC", keyword: "BNB" },
+      body: { pageIndex: 1, pageSize: 20, type: "CAP", sort: "DESC", keyword: "BNB" },
+      sampleArrayItems: 10,
     },
     {
       key: "nonce_generate",
@@ -2484,15 +2486,17 @@ function extractStructure(obj, prefix = "") {
   if (obj === null || obj === undefined) return result;
   if (Array.isArray(obj)) {
     result[prefix + "[]"] = "array";
-    if (obj.length > 0) Object.assign(result, extractStructure(obj[0], prefix + "[0]."));
+    for (const item of obj.slice(0, 10)) {
+      Object.assign(result, extractStructure(item, prefix + "[0]."));
+    }
   } else if (typeof obj === "object") {
     for (const [k, v] of Object.entries(obj)) {
       const path = prefix + k;
       result[path] = Array.isArray(v) ? "array" : typeof v;
       if (typeof v === "object" && v !== null && !Array.isArray(v)) {
         Object.assign(result, extractStructure(v, path + "."));
-      } else if (Array.isArray(v) && v.length > 0 && typeof v[0] === "object") {
-        Object.assign(result, extractStructure(v[0], path + "[0]."));
+      } else if (Array.isArray(v)) {
+        Object.assign(result, extractStructure(v, path));
       }
     }
   }
@@ -2629,6 +2633,24 @@ const API_STRUCTURE_SKIP_ENDPOINTS = new Set([
   "nonce_generate",  // 成功时有 data，某些边界条件下无 data，结构抖动
 ]);
 
+const API_STRUCTURE_VOLATILE_FIELD_PATTERNS = new Map([
+  ["token_search_new", [/^data\[0\]\.min\d+Increase$/]],
+  ["token_search_cap", [/^data\[0\]\.min\d+Increase$/]],
+]);
+
+function normalizeStructureFieldName(field) {
+  return String(field || "")
+    .replace(/\s*\([^)]*\)$/, "")
+    .replace(/:\s*.+$/, "");
+}
+
+function isVolatileApiStructureField(endpoint, field) {
+  const patterns = API_STRUCTURE_VOLATILE_FIELD_PATTERNS.get(endpoint);
+  if (!patterns) return false;
+  const name = normalizeStructureFieldName(field);
+  return patterns.some(re => re.test(name));
+}
+
 function diffApiStructures(oldStruct, newStruct) {
   const changes = [];
   if (!oldStruct || !newStruct) return changes;
@@ -2642,10 +2664,12 @@ function diffApiStructures(oldStruct, newStruct) {
     }
     const added = [], removed = [], changed = [];
     for (const [key, type] of Object.entries(newFields)) {
+      if (isVolatileApiStructureField(endpoint, key)) continue;
       if (!(key in oldFields)) added.push(`${key} (${type})`);
       else if (oldFields[key] !== type) changed.push(`${key}: ${oldFields[key]} → ${type}`);
     }
     for (const key of Object.keys(oldFields)) {
+      if (isVolatileApiStructureField(endpoint, key)) continue;
       if (!(key in newFields)) removed.push(key);
     }
     if (added.length || removed.length || changed.length) {
