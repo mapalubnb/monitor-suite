@@ -39,7 +39,7 @@
 | 模块 4 | GitHub 仓库变更（条件请求，ETag 缓存） | 5min |
 | 模块 6 | BSC 智能合约（静态核心合约 + OpenFour 链上发现，`/v1/public/address` 作为种子/兜底，RPC batch） | 3s |
 | 模块 7 | 链上参数（RPC batch） | 3s |
-| 模块 8 | 合约创建者动作（扫新区块，只监听 deployer/手动配置地址作为 `tx.from` 发起的交易，命中后立即复查合约） | 3s |
+| 模块 8 | 合约创建者动作（合约地址页读取 + RPC 近期反查兜底，自动缓存 deployer，只监听 deployer/手动配置地址作为 `tx.from` 发起的交易，命中后立即复查合约） | 3s |
 
 ### Flap.sh 监控 (`flap-monitor/monitor.mjs`)
 
@@ -54,7 +54,7 @@
 - 路由/端点发现覆盖 `/api/`、`/meme-api/`、`/mapi/`、`/v1/`、`/blog/v1/` 和站内完整 URL
 - 纯资源列表小抖动会在同一轮 2.5 秒后快速复抓确认；真实变化立即推送，短暂恢复则静默忽略
 - API 探针覆盖 Four.meme public 配置、地址、公告、blog banner、KOL、token ranking/search 及关键 private 错误结构
-- 链上创建者动作监听只过滤创建者/手动配置地址作为 `tx.from` 发起的交易，不监听普通用户对工厂合约的创建代币调用；推荐配置 `FOURMEME_WATCH_CREATORS` 手动加入重点创建者钱包。历史 deployer 无法通过普通 RPC 直接反查，如需用 Etherscan API V2 自动查询可设置 `FOURMEME_CREATOR_LOOKUP=true` 并配置 `ETHERSCAN_V2_API_KEY` / `ETHERSCAN_API_KEY`（BSC `chainid=56` 可能需要 paid tier，失败会冷却重试避免刷日志）；旧变量 `BSCSCAN_API_KEY` 仍兼容。
+- 链上创建者动作监听只过滤合约 deployer/手动配置地址作为 `tx.from` 发起的交易，不监听普通用户对工厂合约的创建代币调用；默认直接从 BscScan 合约地址页读取 `Contract Creator` 并缓存 deployer（`FOURMEME_CREATOR_PAGE_LOOKUP=true`）。如果页面抓取被封，新合约会用 BSC RPC 在近期区块中反查创建交易兜底（`FOURMEME_CREATOR_CHAIN_LOOKUP=true`，默认回看约 24 小时）。历史 deployer 无法通过普通 RPC 无限期反查，`FOURMEME_WATCH_CREATORS` 仅作为手动补充；如页面抓取被封且 API key 支持 BSC `getcontractcreation`，可设置 `FOURMEME_CREATOR_LOOKUP=true` 并配置 `ETHERSCAN_V2_API_KEY` / `ETHERSCAN_API_KEY` 作为备用，失败会冷却重试避免刷日志；旧变量 `BSCSCAN_API_KEY` 仍兼容。
 
 ### 飞书 Bot (`fourmeme-monitor/feishu-bot.mjs`)
 

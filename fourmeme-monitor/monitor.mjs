@@ -55,6 +55,12 @@ function readPositiveIntEnv(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function readBoolEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  return !["0", "false", "no", "off"].includes(String(raw).trim().toLowerCase());
+}
+
 const CONFIG = {
   // Four.meme
   apiBase: "https://four.meme/meme-api",
@@ -262,9 +268,16 @@ const CONFIG = {
     maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 8),
     bootstrapLookbackBlocks: readPositiveIntEnv("FOURMEME_ACTOR_BOOTSTRAP_BLOCKS", 6),
     extraActors: parseEnvAddressList(`${process.env.FOURMEME_WATCH_ACTORS || ""},${process.env.FOURMEME_WATCH_CREATORS || ""}`),
+    creatorChainLookupEnabled: readBoolEnv("FOURMEME_CREATOR_CHAIN_LOOKUP", true),
+    creatorChainLookbackBlocks: readPositiveIntEnv("FOURMEME_CREATOR_CHAIN_LOOKBACK_BLOCKS", 30000),
+    creatorChainMaxBlocksPerRun: readPositiveIntEnv("FOURMEME_CREATOR_CHAIN_MAX_BLOCKS_PER_RUN", 120),
+    creatorPageLookupEnabled: readBoolEnv("FOURMEME_CREATOR_PAGE_LOOKUP", true),
+    creatorPageMaxPerRun: readPositiveIntEnv("FOURMEME_CREATOR_PAGE_MAX_PER_RUN", 8),
+    creatorLookupCooldownMs: readPositiveIntEnv("FOURMEME_CREATOR_LOOKUP_COOLDOWN_MINUTES", 30) * 60_000,
     creatorLookupEnabled: process.env.FOURMEME_CREATOR_LOOKUP === "true",
     explorerApiKey: process.env.ETHERSCAN_V2_API_KEY || process.env.ETHERSCAN_API_KEY || process.env.BSCSCAN_API_KEY || "",
     explorerApiBase: process.env.ETHERSCAN_API_BASE || "https://api.etherscan.io/v2/api",
+    explorerPageBase: (process.env.BSCSCAN_WEB_BASE || "https://bscscan.com").replace(/\/+$/, ""),
   },
 };
 
@@ -3993,24 +4006,269 @@ function cachedCreatorMap(state) {
   return result;
 }
 
-async function fetchContractCreatorActors(contractEntries, state) {
+function missingCreatorAddresses(contractEntries, state) {
+  const seen = new Set();
+  const missing = [];
+  for (const c of contractEntries || []) {
+    const addr = normalizeAddress(c.address);
+    if (!addr || seen.has(addr)) continue;
+    seen.add(addr);
+    if (!normalizeAddress(state.creators?.[addr]?.creator)) missing.push(addr);
+  }
+  return missing;
+}
+
+function decodeHtmlEntities(input) {
+  return String(input || "").replace(/&(#x[0-9a-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (match, entity) => {
+    const key = String(entity || "").toLowerCase();
+    if (key === "amp") return "&";
+    if (key === "lt") return "<";
+    if (key === "gt") return ">";
+    if (key === "quot") return '"';
+    if (key === "apos") return "'";
+    if (key === "nbsp") return " ";
+    if (key.startsWith("#x")) {
+      const code = Number.parseInt(key.slice(2), 16);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    if (key.startsWith("#")) {
+      const code = Number.parseInt(key.slice(1), 10);
+      return Number.isFinite(code) ? String.fromCodePoint(code) : match;
+    }
+    return match;
+  });
+}
+
+function creatorCandidateFromSnippet(snippet, contractAddress) {
+  const contract = normalizeAddress(contractAddress);
+  const addresses = [];
+  const seen = new Set();
+  const addressRe = /(?:\/address\/|address=|data-clipboard-text=["'])(0x[a-fA-F0-9]{40})/gi;
+  let match;
+  while ((match = addressRe.exec(snippet))) {
+    const addr = normalizeAddress(match[1]);
+    if (!addr || addr === contract || addr === ZERO_ADDRESS || seen.has(addr)) continue;
+    seen.add(addr);
+    addresses.push(addr);
+  }
+  if (addresses.length === 0) {
+    const rawAddressRe = /(^|[^a-fA-F0-9])(0x[a-fA-F0-9]{40})(?![a-fA-F0-9])/g;
+    while ((match = rawAddressRe.exec(snippet))) {
+      const addr = normalizeAddress(match[2]);
+      if (!addr || addr === contract || addr === ZERO_ADDRESS || seen.has(addr)) continue;
+      seen.add(addr);
+      addresses.push(addr);
+    }
+  }
+  if (addresses.length === 0) return null;
+
+  const txMatch = snippet.match(/(?:\/tx\/|txnHash=)(0x[a-fA-F0-9]{64})/i) || snippet.match(/0x[a-fA-F0-9]{64}/);
+  return {
+    creator: addresses[0],
+    txHash: String(txMatch?.[1] || txMatch?.[0] || "").toLowerCase(),
+  };
+}
+
+function extractCreatorFromBscScanHtml(html, contractAddress) {
+  const compact = decodeHtmlEntities(html).replace(/\s+/g, " ");
+  const snippets = [];
+  const labelRe = /(Contract\s*Creator|Creator\s*Address|Created\s*by)/ig;
+  let match;
+  while ((match = labelRe.exec(compact)) && snippets.length < 6) {
+    snippets.push(compact.slice(match.index, match.index + 6_000));
+  }
+  if (snippets.length === 0) return null;
+
+  for (const snippet of snippets) {
+    const candidate = creatorCandidateFromSnippet(snippet, contractAddress);
+    if (candidate?.creator) return candidate;
+  }
+  return null;
+}
+
+async function fetchCreatorViaBscScanPage(contractAddress) {
+  const contract = normalizeAddress(contractAddress);
+  if (!contract) return null;
+  const url = `${CONFIG.actorMonitor.explorerPageBase}/address/${contract}`;
+  const res = await fetchSafe(url, { headers: browserHeaders() }, 8_000);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const html = await res.text();
+  const creator = extractCreatorFromBscScanHtml(html, contract);
+  if (!creator?.creator) throw new Error(`creator not found on page ${contract.slice(0, 10)}...`);
+  return creator;
+}
+
+function logCreatorLookupError(lookupState, scope, message, now) {
+  const logMessageKey = `${scope}LastLoggedError`;
+  const logAtKey = `${scope}LastLogAt`;
+  const cooldownMs = CONFIG.actorMonitor.creatorLookupCooldownMs;
+  if (lookupState[logMessageKey] !== message || now - (lookupState[logAtKey] || 0) > cooldownMs) {
+    log(`[actor] ${scope} creator lookup failed, pause ${Math.round(cooldownMs / 60_000)}m: ${message}`);
+    lookupState[logMessageKey] = message;
+    lookupState[logAtKey] = now;
+  }
+}
+
+function creatorMissingKey(missing) {
+  return [...missing].sort().join(",");
+}
+
+async function fetchCreatorsViaRecentChain(missing, state, lookupState, now) {
+  if (!CONFIG.actorMonitor.creatorChainLookupEnabled || missing.length === 0) return;
+  if (lookupState.chainNextRetryAt && now < lookupState.chainNextRetryAt) return;
+
+  const missingKey = creatorMissingKey(missing);
+  try {
+    const latestHex = await bscRpcCall("eth_blockNumber", []);
+    const latest = hexToNumber(latestHex);
+    const safeLatest = Math.max(0, latest - CONFIG.actorMonitor.confirmations);
+    const lowerBound = Math.max(0, safeLatest - CONFIG.actorMonitor.creatorChainLookbackBlocks + 1);
+
+    if (lookupState.chainMissingKey !== missingKey) {
+      lookupState.chainMissingKey = missingKey;
+      lookupState.chainCursorBlock = safeLatest;
+      lookupState.chainNextRetryAt = 0;
+    }
+
+    let cursor = Number.isFinite(lookupState.chainCursorBlock) ? lookupState.chainCursorBlock : safeLatest;
+    if (cursor > safeLatest || cursor < lowerBound) cursor = safeLatest;
+    const toBlock = cursor;
+    const fromBlock = Math.max(lowerBound, toBlock - CONFIG.actorMonitor.creatorChainMaxBlocksPerRun + 1);
+    if (toBlock < fromBlock) return;
+
+    const targetSet = new Set(missing);
+    const receiptBlockCalls = [];
+    for (let n = fromBlock; n <= toBlock; n++) {
+      receiptBlockCalls.push({ method: "eth_getBlockReceipts", params: [blockTag(n)] });
+    }
+    const blockReceipts = await bscRpcBatch(receiptBlockCalls);
+    let found = 0;
+    let receiptBlockSupported = false;
+    for (const receipts of blockReceipts) {
+      if (!Array.isArray(receipts)) continue;
+      receiptBlockSupported = true;
+      for (const receipt of receipts) {
+        const contract = normalizeAddress(receipt?.contractAddress);
+        if (!contract || !targetSet.has(contract)) continue;
+        const creator = normalizeAddress(receipt.from);
+        const txHash = String(receipt.transactionHash || "").toLowerCase();
+        if (!creator || !txHash) continue;
+        state.creators[contract] = {
+          creator,
+          txHash,
+          blockNumber: hexToNumber(receipt.blockNumber),
+          source: "rpc_block_receipts",
+          updatedAt: ts(),
+        };
+        found++;
+      }
+    }
+
+    if (!receiptBlockSupported) {
+      const blockCalls = [];
+      for (let n = fromBlock; n <= toBlock; n++) {
+        blockCalls.push({ method: "eth_getBlockByNumber", params: [blockTag(n), true] });
+      }
+      const blocks = await bscRpcBatch(blockCalls);
+      const creationTxs = [];
+      for (const block of blocks) {
+        for (const tx of block?.transactions || []) {
+          if (tx?.to) continue;
+          const hash = String(tx.hash || "").toLowerCase();
+          const from = normalizeAddress(tx.from);
+          if (hash && from) creationTxs.push({ hash, from, blockNumber: hexToNumber(tx.blockNumber || block.number) });
+        }
+      }
+      const receipts = await bscRpcBatch(creationTxs.map(tx => ({ method: "eth_getTransactionReceipt", params: [tx.hash] })));
+      for (let i = 0; i < creationTxs.length; i++) {
+        const tx = creationTxs[i];
+        const receipt = receipts[i];
+        const contract = normalizeAddress(receipt?.contractAddress);
+        if (!contract || !targetSet.has(contract)) continue;
+        state.creators[contract] = {
+          creator: tx.from,
+          txHash: tx.hash,
+          blockNumber: tx.blockNumber,
+          source: "rpc_recent_creation",
+          updatedAt: ts(),
+        };
+        found++;
+      }
+    }
+
+    if (found > 0) {
+      lookupState.chainLastSuccessAt = ts();
+      lookupState.chainFoundCount = (lookupState.chainFoundCount || 0) + found;
+      log(`[actor] creator rpc lookup found ${found}/${missing.length} in blocks ${fromBlock}-${toBlock}`);
+    }
+    if (fromBlock <= lowerBound) {
+      lookupState.chainCursorBlock = 0;
+      lookupState.chainExhaustedAt = ts();
+      lookupState.chainNextRetryAt = Date.now() + CONFIG.actorMonitor.creatorLookupCooldownMs;
+    } else {
+      lookupState.chainCursorBlock = fromBlock - 1;
+      lookupState.chainNextRetryAt = 0;
+    }
+    lookupState.chainLastRange = `${fromBlock}-${toBlock}`;
+    lookupState.chainLastError = "";
+  } catch (err) {
+    const message = err.message || String(err);
+    const nextNow = Date.now();
+    lookupState.chainLastError = message;
+    lookupState.chainLastErrorAt = ts();
+    lookupState.chainNextRetryAt = nextNow + CONFIG.actorMonitor.creatorLookupCooldownMs;
+    logCreatorLookupError(lookupState, "rpc", message, nextNow);
+  }
+}
+
+async function fetchCreatorsViaBscScanPages(missing, state, lookupState, now) {
+  if (!CONFIG.actorMonitor.creatorPageLookupEnabled || missing.length === 0) return;
+  if (lookupState.pageNextRetryAt && now < lookupState.pageNextRetryAt) return;
+
+  const targets = missing.slice(0, CONFIG.actorMonitor.creatorPageMaxPerRun);
+  let found = 0;
+  let firstError = "";
+  for (const contract of targets) {
+    try {
+      const data = await fetchCreatorViaBscScanPage(contract);
+      if (!data?.creator) continue;
+      state.creators[contract] = {
+        creator: data.creator,
+        txHash: data.txHash || "",
+        source: "bscscan_page",
+        updatedAt: ts(),
+      };
+      found++;
+    } catch (err) {
+      firstError ||= err.message || String(err);
+    }
+    await sleep(250);
+  }
+
+  const nextNow = Date.now();
+  if (found > 0) {
+    lookupState.pageLastSuccessAt = ts();
+    lookupState.pageFoundCount = (lookupState.pageFoundCount || 0) + found;
+    log(`[actor] creator page lookup found ${found}/${targets.length}`);
+  }
+  if (firstError) {
+    lookupState.pageLastError = firstError;
+    lookupState.pageLastErrorAt = ts();
+    lookupState.pageNextRetryAt = nextNow + CONFIG.actorMonitor.creatorLookupCooldownMs;
+    logCreatorLookupError(lookupState, "page", firstError, nextNow);
+  } else if (missing.length > targets.length) {
+    lookupState.pageNextRetryAt = nextNow + 60_000;
+  } else {
+    lookupState.pageNextRetryAt = 0;
+    lookupState.pageLastError = "";
+  }
+}
+
+async function fetchCreatorsViaExplorerApi(missing, state, lookupState, now) {
   const apiKey = CONFIG.actorMonitor.explorerApiKey;
-  if (!CONFIG.actorMonitor.creatorLookupEnabled || !apiKey || contractEntries.length === 0) {
-    return cachedCreatorMap(state);
-  }
-
-  const lookupState = state.creatorLookup || (state.creatorLookup = {});
-  const now = Date.now();
-  if (lookupState.nextRetryAt && now < lookupState.nextRetryAt) {
-    return cachedCreatorMap(state);
-  }
-
-  const missing = contractEntries
-    .map(c => normalizeAddress(c.address))
-    .filter(addr => addr && !state.creators[addr]);
-  if (missing.length === 0) {
-    return cachedCreatorMap(state);
-  }
+  if (!CONFIG.actorMonitor.creatorLookupEnabled || !apiKey || missing.length === 0) return;
+  const nextRetryAt = lookupState.apiNextRetryAt || lookupState.nextRetryAt || 0;
+  if (nextRetryAt && now < nextRetryAt) return;
 
   const chunkSize = 5;
   for (let i = 0; i < missing.length; i += chunkSize) {
@@ -4036,22 +4294,35 @@ async function fetchContractCreatorActors(contractEntries, state) {
         state.creators[contract] = {
           creator,
           txHash: String(item.txHash || item.transactionHash || "").toLowerCase(),
+          source: "etherscan_v2_api",
           updatedAt: ts(),
         };
       }
     } catch (err) {
       const message = err.message || String(err);
-      lookupState.lastError = message;
-      lookupState.lastErrorAt = ts();
-      lookupState.nextRetryAt = now + 30 * 60_000;
-      if (lookupState.lastLoggedError !== message || now - (lookupState.lastLogAt || 0) > 30 * 60_000) {
-        log(`[actor] explorer creator lookup failed, pause 30m: ${message}`);
-        lookupState.lastLoggedError = message;
-        lookupState.lastLogAt = now;
-      }
+      const nextNow = Date.now();
+      lookupState.apiLastError = message;
+      lookupState.apiLastErrorAt = ts();
+      lookupState.apiNextRetryAt = nextNow + CONFIG.actorMonitor.creatorLookupCooldownMs;
+      lookupState.nextRetryAt = lookupState.apiNextRetryAt;
+      logCreatorLookupError(lookupState, "api", message, nextNow);
       break;
     }
   }
+}
+
+async function fetchContractCreatorActors(contractEntries, state) {
+  if (contractEntries.length === 0) return cachedCreatorMap(state);
+
+  const lookupState = state.creatorLookup || (state.creatorLookup = {});
+  let missing = missingCreatorAddresses(contractEntries, state);
+  await fetchCreatorsViaBscScanPages(missing, state, lookupState, Date.now());
+
+  missing = missingCreatorAddresses(contractEntries, state);
+  await fetchCreatorsViaRecentChain(missing, state, lookupState, Date.now());
+
+  missing = missingCreatorAddresses(contractEntries, state);
+  await fetchCreatorsViaExplorerApi(missing, state, lookupState, Date.now());
 
   return cachedCreatorMap(state);
 }
@@ -4238,7 +4509,10 @@ async function runActorCheck() {
   state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
   state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
   state.contractCount = contractEntries.length;
-  state.creatorLookupEnabled = CONFIG.actorMonitor.creatorLookupEnabled;
+  state.creatorChainLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled;
+  state.creatorPageLookupEnabled = CONFIG.actorMonitor.creatorPageLookupEnabled;
+  state.creatorApiLookupEnabled = CONFIG.actorMonitor.creatorLookupEnabled;
+  state.creatorLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled || CONFIG.actorMonitor.creatorPageLookupEnabled || CONFIG.actorMonitor.creatorLookupEnabled;
 
   const latestHex = await bscRpcCall("eth_blockNumber", []);
   const latest = hexToNumber(latestHex);

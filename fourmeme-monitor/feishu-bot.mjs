@@ -376,6 +376,13 @@ function buildMonitorContext() {
       const actorCount = actorState.actionActorCount
         ?? Object.values(actorState.actors || {}).filter(actor => actor.actionWatched).length;
       parts.push(`\n创建者动作监听: ${actorCount} 个地址`);
+      const cachedCreators = Object.values(actorState.creators || {}).filter(item => item?.creator).length;
+      const lookupModes = [];
+      if (actorState.creatorChainLookupEnabled) lookupModes.push("RPC近期反查");
+      if (actorState.creatorPageLookupEnabled) lookupModes.push("BscScan页面自动抓取");
+      if (actorState.creatorApiLookupEnabled) lookupModes.push("Etherscan API备用");
+      if (lookupModes.length === 0) lookupModes.push("仅缓存/手动配置");
+      parts.push(`  创建者来源: ${lookupModes.join(" + ")} | 缓存 ${cachedCreators} 个`);
       if (actorState.lastBlock) parts.push(`  已扫描至确认块: ${actorState.lastBlock}`);
     } catch (err) {
       parts.push(`Four.meme 快照读取失败: ${err.message}`);

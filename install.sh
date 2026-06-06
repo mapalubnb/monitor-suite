@@ -354,6 +354,13 @@ if [ -f "$SNAP" ]; then
     console.log('');
     console.log('[ 模块8: 创建者动作 ]');
     console.log('  监听地址: '+actors.length+' 个');
+    const cachedCreators=Object.values(am.creators||{}).filter(x=>x&&x.creator).length;
+    const modes=[];
+    if(am.creatorChainLookupEnabled) modes.push('RPC近期反查');
+    if(am.creatorPageLookupEnabled) modes.push('BscScan页面自动抓取');
+    if(am.creatorApiLookupEnabled) modes.push('Etherscan API备用');
+    if(modes.length===0) modes.push('仅缓存/手动配置');
+    console.log('  创建者来源: '+modes.join(' + ')+' | 缓存 '+cachedCreators+' 个');
     if(am.lastBlock) console.log('  已扫描至确认块: '+am.lastBlock);
     for(const a of actors.slice(0,8)){
       const item=allActors[a]||{};
