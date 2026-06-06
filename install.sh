@@ -202,15 +202,26 @@ if [ -f "$SNAP" ]; then
     }
 
     // 模块 2：前端
-    const pages=Object.keys(s.frontendPages||{});
-    const discovered=s._frontendDiscoveredUrls||[];
+    const canonicalFrontendUrl=(url)=>{try{const u=new URL(url,'https://four.meme');u.hash='';if(u.pathname!=='/'&&u.pathname.endsWith('/'))u.pathname=u.pathname.replace(/\/+$/,'');return u.origin+(u.pathname==='/'?'':u.pathname)+u.search}catch{return url}};
+    const baseFrontendUrls=[
+      'https://four.meme',
+      'https://four.meme/zh-TW/create-token',
+      'https://four.meme/zh-TW/agentic',
+      'https://four.meme/zh-TW/announcement'
+    ].map(canonicalFrontendUrl);
+    const removedFrontendUrls=new Set(['https://four.meme/zh-TW/create-token?entry=X-mode'].map(canonicalFrontendUrl));
+    const discovered=(s._frontendDiscoveredUrls||[]).map(canonicalFrontendUrl).filter(u=>!removedFrontendUrls.has(u));
+    const activeFrontendUrls=new Set([...baseFrontendUrls,...discovered]);
+    const pageEntries=Object.entries(s.frontendPages||{}).filter(([k,p])=>{
+      const url=p&&p.originalUrl?canonicalFrontendUrl(p.originalUrl):'';
+      return url&&!removedFrontendUrls.has(url)&&activeFrontendUrls.has(url);
+    });
     console.log('');
     console.log('[ 模块2: 前端监控 ]');
-    console.log('  页面: '+pages.length+' 个（自动发现 '+discovered.length+' 个）');
+    console.log('  页面: '+pageEntries.length+' 个（基础 '+baseFrontendUrls.length+'，自动发现 '+discovered.length+' 个）');
     for(const url of discovered.slice(0,6)) console.log('  自动发现: '+url);
     if(discovered.length>6) console.log('  ... 及其余 '+(discovered.length-6)+' 个自动发现页面');
-    for(const k of pages){
-      const p=s.frontendPages[k];
+    for(const [k,p] of pageEntries){
       const url=p.originalUrl||k;
       const files=(p.assetFiles||[]).length;
       const dlCount=Object.keys(p.assetContents||{}).length;

@@ -328,8 +328,12 @@ const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
 let snapshotWriteQueue = Promise.resolve();
+
+const REMOVED_FRONTEND_URLS = new Set([
+  "https://four.meme/zh-TW/create-token?entry=X-mode",
+].map(canonicalFrontendUrl));
 
 /**
  * 简易异步互斥锁：保护 snapshot 的 read-mutate-save 周期，
@@ -367,6 +371,33 @@ function loadSnapshot() {
 /**
  * 快照版本迁移：确保旧快照兼容新代码
  */
+function pruneFrontendSnapshot(data) {
+  if (!data || !data.frontendPages) return false;
+
+  let changed = false;
+  const monitorUrls = new Set(CONFIG.monitorUrls.map(canonicalFrontendUrl));
+  const discoveredUrls = (Array.isArray(data._frontendDiscoveredUrls) ? data._frontendDiscoveredUrls : [])
+    .map(canonicalFrontendUrl)
+    .filter(url => !REMOVED_FRONTEND_URLS.has(url));
+  const allowedUrls = new Set([...monitorUrls, ...discoveredUrls]);
+
+  if (discoveredUrls.length !== (data._frontendDiscoveredUrls || []).length) {
+    data._frontendDiscoveredUrls = discoveredUrls;
+    changed = true;
+  }
+
+  for (const [key, page] of Object.entries(data.frontendPages)) {
+    const canonical = page?.originalUrl ? canonicalFrontendUrl(page.originalUrl) : "";
+    if (!canonical || REMOVED_FRONTEND_URLS.has(canonical) || !allowedUrls.has(canonical)) {
+      delete data.frontendPages[key];
+      if (data._frontendFailCounts) delete data._frontendFailCounts[key];
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
 function migrateSnapshot(data) {
   const ver = data._schemaVersion || 1;
   if (ver < 2) {
@@ -389,6 +420,13 @@ function migrateSnapshot(data) {
     if (!Array.isArray(data._frontendDiscoveredUrls)) data._frontendDiscoveredUrls = [];
     if (data._frontendAssetPending) delete data._frontendAssetPending;
     log("[快照迁移] v3 → v4：补充前端自动发现页面字段，清理旧资源待确认缓存");
+  }
+  if (ver < 5) {
+    if (pruneFrontendSnapshot(data)) {
+      log("[snapshot migrate] v4 -> v5: pruned stale frontend pages");
+    }
+  } else {
+    pruneFrontendSnapshot(data);
   }
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
@@ -991,6 +1029,7 @@ function normalizeRouteString(raw) {
 
 function isTrackableRouteString(route) {
   if (!route || route[0] !== "/") return false;
+  if (route.startsWith("//")) return false;
   if (route.startsWith("/_next/") || route.startsWith("/static/")) return false;
   if (/\.(js|css|png|svg|ico|jpg|jpeg|gif|webp|woff2?|ttf|eot|map)$/i.test(route.split("?")[0])) return false;
   if (/^\/docs\//i.test(route) || /^\/a\/i$/i.test(route) || /^\/v\d+\/resolve-ens$/i.test(route)) return false;
@@ -1008,6 +1047,7 @@ function routeToFrontendUrl(route) {
   if (isApiOrEndpointRoute(normalized)) return null;
   if (CONFIG.frontendDiscovery.excludeRoutes.some(re => re.test(normalized))) return null;
   if (normalized === "/") return canonicalFrontendUrl(CONFIG.siteUrl);
+  if (/^\/(?:en|zh-TW)$/i.test(normalized)) return canonicalFrontendUrl(CONFIG.siteUrl);
   if (/^\/(?:en|zh-TW)(?:\/|$)/i.test(normalized)) {
     return canonicalFrontendUrl(CONFIG.siteUrl + normalized);
   }
@@ -1660,7 +1700,7 @@ function extractRoutes(html, assetContents, nextData) {
   }
 
   // 2. 从 HTML 中提取内部链接（排除静态资源路径）
-  const hrefRe = /href=["'](\/[a-zA-Z0-9][^"']*?)["']/g;
+  const hrefRe = /\bhref=["']([^"']+)["']/g;
   let m;
   while ((m = hrefRe.exec(html)) !== null) {
     const path = normalizeRouteString(m[1]).split("?")[0];
@@ -3674,6 +3714,7 @@ async function runPoolCheck() {
 
 async function runFrontendCheck() {
   if (!snapshot) snapshot = {};
+  const prunedBeforeRun = pruneFrontendSnapshot(snapshot);
   const oldPages = snapshot.frontendPages || {};
   const { pages: newPages, failedUrls, discoveredUrls } = await fetchFrontendDataWithDiscovery(oldPages);
 
@@ -3718,7 +3759,7 @@ async function runFrontendCheck() {
   }
 
   const notifications = [];
-  let snapshotDirty = false;
+  let snapshotDirty = prunedBeforeRun;
 
   if (CONFIG.frontendDiscovery.enabled) {
     const oldDiscovered = new Set(snapshot._frontendDiscoveredUrls || []);

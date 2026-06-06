@@ -85,10 +85,45 @@ const API_ENDPOINT_LINKS = {
   token_create: { label: "/v1/private/token/create", url: "https://four.meme/meme-api/v1/private/token/create" },
 };
 
+const BASE_FRONTEND_URLS = [
+  "https://four.meme",
+  "https://four.meme/zh-TW/create-token",
+  "https://four.meme/zh-TW/agentic",
+  "https://four.meme/zh-TW/announcement",
+];
+
+const REMOVED_FRONTEND_URLS = new Set([
+  "https://four.meme/zh-TW/create-token?entry=X-mode",
+].map(canonicalFrontendUrl));
+
 function apiEndpointStatusLink(key) {
   const ep = API_ENDPOINT_LINKS[key];
   if (!ep) return key;
   return `[${ep.label}](${ep.url})`;
+}
+
+function canonicalFrontendUrl(url) {
+  try {
+    const u = new URL(url, "https://four.meme");
+    u.hash = "";
+    if (u.pathname !== "/" && u.pathname.endsWith("/")) u.pathname = u.pathname.replace(/\/+$/, "");
+    return u.origin + (u.pathname === "/" ? "" : u.pathname) + u.search;
+  } catch {
+    return url;
+  }
+}
+
+function activeFrontendPageEntries(snap) {
+  const baseUrls = BASE_FRONTEND_URLS.map(canonicalFrontendUrl);
+  const discovered = (snap._frontendDiscoveredUrls || [])
+    .map(canonicalFrontendUrl)
+    .filter(url => !REMOVED_FRONTEND_URLS.has(url));
+  const activeUrls = new Set([...baseUrls, ...discovered]);
+  const entries = Object.entries(snap.frontendPages || {}).filter(([, page]) => {
+    const url = page?.originalUrl ? canonicalFrontendUrl(page.originalUrl) : "";
+    return url && !REMOVED_FRONTEND_URLS.has(url) && activeUrls.has(url);
+  });
+  return { entries, discovered, baseCount: baseUrls.length };
 }
 
 const rateLimiter = { counts: new Map(), windowMs: 60_000, maxPerWindow: 20 };
@@ -302,9 +337,8 @@ function buildMonitorContext() {
       }
 
       // 前端
-      const pages = Object.keys(snap.frontendPages || {});
-      const discovered = snap._frontendDiscoveredUrls || [];
-      parts.push(`\n前端页面: ${pages.length} 个（自动发现 ${discovered.length} 个）`);
+      const { entries: pages, discovered, baseCount } = activeFrontendPageEntries(snap);
+      parts.push(`\n前端页面: ${pages.length} 个（基础 ${baseCount}，自动发现 ${discovered.length} 个）`);
       for (const url of discovered.slice(0, 6)) parts.push(`  自动发现: ${url}`);
       if (discovered.length > 6) parts.push(`  ... 及其余 ${discovered.length - 6} 个`);
 
