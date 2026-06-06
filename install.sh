@@ -196,12 +196,9 @@ if [ -f "$SNAP" ]; then
     console.log('  总计: '+total+' 个 ('+netStr+')');
     const bsc=allPools.filter(p=>p.networkCode==='BSC');
     for(const p of bsc){
-      const sym=p.symbol||'?';
-      const fee=p.buyFee||'?';
-      const b0=p.b0Amount||'?';
-      const tb=p.totalBAmount||'?';
+      const sym=p.symbol||p.nativeSymbol||'?';
       const st=p.status||'?';
-      console.log('  '+sym.padEnd(12)+' fee='+fee+' b0='+b0+' total='+tb+' ['+st+']');
+      console.log('  '+sym+' ['+st+']');
     }
 
     // 模块 2：前端
@@ -229,13 +226,31 @@ if [ -f "$SNAP" ]; then
     // 模块 3/5：API
     const api=s.apiStructure||{};
     const apiKeys=Object.keys(api);
+    const apiLinks={
+      public_config:['/v1/public/config','https://four.meme/meme-api/v1/public/config'],
+      public_address:['/v1/public/address','https://four.meme/meme-api/v1/public/address'],
+      public_file_host:['/v1/public/file/host','https://four.meme/meme-api/v1/public/file/host'],
+      announce_list:['/blog/v1/public/announce/list','https://four.meme/meme-api/blog/v1/public/announce/list?&pageIndex=1&pageSize=6'],
+      announce_detail_sample:['/blog/v1/public/announce/get','https://four.meme/meme-api/blog/v1/public/announce/get?id=100000056'],
+      blog_banner_list:['/blog/v1/public/blog/banner/list','https://four.meme/meme-api/blog/v1/public/blog/banner/list'],
+      kol_teams:['/v1/public/kol/teams','https://four.meme/meme-api/v1/public/kol/teams?tcs=fm25'],
+      kol_traders:['/v1/public/kol/traders','https://four.meme/meme-api/v1/public/kol/traders?tcs=fm25'],
+      token_ranking_cap:['/v1/public/token/ranking CAP','https://four.meme/meme-api/v1/public/token/ranking'],
+      token_ranking_binance:['/v1/public/token/ranking BINANCE','https://four.meme/meme-api/v1/public/token/ranking'],
+      token_search_new:['/v1/public/token/search NEW','https://four.meme/meme-api/v1/public/token/search'],
+      token_search_cap:['/v1/public/token/search CAP','https://four.meme/meme-api/v1/public/token/search'],
+      nonce_generate:['/v1/private/user/nonce/generate','https://four.meme/meme-api/v1/private/user/nonce/generate'],
+      user_login:['/v1/private/user/login/dex','https://four.meme/meme-api/v1/private/user/login/dex'],
+      token_create:['/v1/private/token/create','https://four.meme/meme-api/v1/private/token/create']
+    };
     console.log('');
     console.log('[ 模块3/5: API结构 ]');
     console.log('  端点: '+apiKeys.length+' 个');
     for(const k of apiKeys){
       const a=api[k];
       const fields=typeof a==='object'?Object.keys(a).length:'?';
-      console.log('  '+k+' ('+fields+' 个顶层字段)');
+      const link=apiLinks[k]?'['+apiLinks[k][0]+']('+apiLinks[k][1]+')':k;
+      console.log('  '+link+' ('+fields+' 个顶层字段)');
     }
 
     // 模块 4：GitHub

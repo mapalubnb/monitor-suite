@@ -2508,6 +2508,17 @@ function apiEndpointLabel(endpointKey) {
   return ep?.label || endpointKey;
 }
 
+function apiEndpointUrl(endpointKey) {
+  const ep = CONFIG.apiProbeEndpoints.find(item => item.key === endpointKey);
+  return ep?.url || "";
+}
+
+function apiEndpointLink(endpointKey) {
+  const label = apiEndpointLabel(endpointKey);
+  const url = apiEndpointUrl(endpointKey);
+  return url ? `[${label}](${url})` : label;
+}
+
 function tryParseJson(text) {
   if (typeof text !== "string" || !text.trim()) return null;
   try { return JSON.parse(text); } catch { return null; }
@@ -2778,7 +2789,8 @@ function formatApiChanges(changes, apiValues) {
   const lines = [];
   for (const c of changes) {
     const label = apiEndpointLabel(c.endpoint);
-    lines.push(`**📡 API ${c.type}：${label}**`);
+    const link = apiEndpointLink(c.endpoint);
+    lines.push(`**📡 API ${c.type}：${link}**`);
     if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
     if (c.added?.length || c.removed?.length || c.changed?.length) {
       lines.push("```");
@@ -2889,7 +2901,8 @@ function formatApiValueChanges(changes) {
   for (const c of changes) {
     if (c.type === "新端点值" && c.values) {
       const label = apiEndpointLabel(c.endpoint);
-      lines.push(`**📊 API 新端点响应值：${label}**`);
+      const link = apiEndpointLink(c.endpoint);
+      lines.push(`**📊 API 新端点响应值：${link}**`);
       if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
       const entries = Object.entries(c.values).filter(([k]) => !isDynamicField(k));
       if (entries.length > 0) {
@@ -2903,7 +2916,8 @@ function formatApiValueChanges(changes) {
       }
     } else {
       const label = apiEndpointLabel(c.endpoint);
-      lines.push(`**📊 API 响应值变更：${label}**`);
+      const link = apiEndpointLink(c.endpoint);
+      lines.push(`**📊 API 响应值变更：${link}**`);
       if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
       if (c.fieldChanges) {
         lines.push("```");

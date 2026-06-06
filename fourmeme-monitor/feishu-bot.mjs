@@ -67,6 +67,30 @@ const CONFIG = {
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 
+const API_ENDPOINT_LINKS = {
+  public_config: { label: "/v1/public/config", url: "https://four.meme/meme-api/v1/public/config" },
+  public_address: { label: "/v1/public/address", url: "https://four.meme/meme-api/v1/public/address" },
+  public_file_host: { label: "/v1/public/file/host", url: "https://four.meme/meme-api/v1/public/file/host" },
+  announce_list: { label: "/blog/v1/public/announce/list", url: "https://four.meme/meme-api/blog/v1/public/announce/list?&pageIndex=1&pageSize=6" },
+  announce_detail_sample: { label: "/blog/v1/public/announce/get", url: "https://four.meme/meme-api/blog/v1/public/announce/get?id=100000056" },
+  blog_banner_list: { label: "/blog/v1/public/blog/banner/list", url: "https://four.meme/meme-api/blog/v1/public/blog/banner/list" },
+  kol_teams: { label: "/v1/public/kol/teams", url: "https://four.meme/meme-api/v1/public/kol/teams?tcs=fm25" },
+  kol_traders: { label: "/v1/public/kol/traders", url: "https://four.meme/meme-api/v1/public/kol/traders?tcs=fm25" },
+  token_ranking_cap: { label: "/v1/public/token/ranking CAP", url: "https://four.meme/meme-api/v1/public/token/ranking" },
+  token_ranking_binance: { label: "/v1/public/token/ranking BINANCE", url: "https://four.meme/meme-api/v1/public/token/ranking" },
+  token_search_new: { label: "/v1/public/token/search NEW", url: "https://four.meme/meme-api/v1/public/token/search" },
+  token_search_cap: { label: "/v1/public/token/search CAP", url: "https://four.meme/meme-api/v1/public/token/search" },
+  nonce_generate: { label: "/v1/private/user/nonce/generate", url: "https://four.meme/meme-api/v1/private/user/nonce/generate" },
+  user_login: { label: "/v1/private/user/login/dex", url: "https://four.meme/meme-api/v1/private/user/login/dex" },
+  token_create: { label: "/v1/private/token/create", url: "https://four.meme/meme-api/v1/private/token/create" },
+};
+
+function apiEndpointStatusLink(key) {
+  const ep = API_ENDPOINT_LINKS[key];
+  if (!ep) return key;
+  return `[${ep.label}](${ep.url})`;
+}
+
 const rateLimiter = { counts: new Map(), windowMs: 60_000, maxPerWindow: 20 };
 
 function checkRateLimit(senderId) {
@@ -274,7 +298,7 @@ function buildMonitorContext() {
       const pools = (snap.poolConfig || []).filter(p => p.networkCode === "BSC");
       parts.push(`\n底池(BSC): ${pools.length} 个`);
       for (const p of pools) {
-        parts.push(`  ${p.symbol || "?"}: buyFee=${p.buyFee || "-"} sellFee=${p.sellFee || "-"} b0=${p.b0Amount || "-"} total=${p.totalBAmount || "-"} status=${p.status || "-"}`);
+        parts.push(`  ${p.symbol || p.nativeSymbol || "?"} [${p.status || "-"}]`);
       }
 
       // 前端
@@ -286,7 +310,8 @@ function buildMonitorContext() {
 
       // API
       const apis = Object.keys(snap.apiStructure || {});
-      parts.push(`API端点: ${apis.length} 个 (${apis.join(", ")})`);
+      parts.push(`API端点: ${apis.length} 个`);
+      for (const key of apis) parts.push(`  ${apiEndpointStatusLink(key)}`);
 
       // GitHub
       parts.push(`GitHub SHA: ${(snap.githubSha || "").slice(0, 8) || "N/A"}`);
