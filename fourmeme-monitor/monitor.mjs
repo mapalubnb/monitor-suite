@@ -29,12 +29,13 @@ import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, waitQueueDrai
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-// 加载本地 .env 文件（快捷命令写入的配置）
-const ENV_FILE = join(__dirname, ".env");
-if (existsSync(ENV_FILE)) {
-  for (const line of readFileSync(ENV_FILE, "utf-8").split("\n")) {
-    const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
-    if (m && !(m[1] in process.env)) process.env[m[1]] = m[2];
+// 加载共享 .env + 本地 .env（兼容统一部署和独立部署）
+for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) {
+  if (existsSync(envPath)) {
+    for (const line of readFileSync(envPath, "utf-8").split("\n")) {
+      const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
+      if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");
+    }
   }
 }
 

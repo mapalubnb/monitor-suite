@@ -119,6 +119,7 @@ sudo bash install.sh
 `install.sh` 会自动完成：
 - 检查并安装 Node.js 20.x 和 PM2
 - 自动检测部署模式（统一部署 vs 独立部署）
+- 自动补齐 `.env.example` 中新增但现有 `.env` 缺失的配置项（不覆盖已有密钥）
 - 统一部署模式：PM2 直接从 `/root/monitor-suite/` 子目录启动
 - 独立部署模式：复制到 `/root/fourmeme-monitor/` 和 `/root/flap-monitor/`
 - 创建共享目录的符号链接（`../shared/` → `/root/monitor-suite/shared/`）

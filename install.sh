@@ -19,6 +19,47 @@ else
   FLAP_DIR="/root/flap-monitor"
 fi
 
+sync_env_template_keys() {
+  local env_file="$1"
+  local template_file="$2"
+
+  if [ ! -f "$template_file" ]; then
+    return
+  fi
+
+  if [ ! -f "$env_file" ]; then
+    cp "$template_file" "$env_file"
+    echo "  .env 模板已生成，请编辑填入真实密钥: $env_file"
+    return
+  fi
+
+  local missing_file
+  missing_file="$(mktemp)"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ""|\#*) continue ;;
+      *=*)
+        key="${line%%=*}"
+        if ! grep -qE "^${key}=" "$env_file"; then
+          printf '%s\n' "$line" >> "$missing_file"
+        fi
+        ;;
+    esac
+  done < "$template_file"
+
+  if [ -s "$missing_file" ]; then
+    {
+      echo ""
+      echo "# ---- Added by install.sh $(date '+%Y-%m-%d %H:%M:%S') from .env.example ----"
+      cat "$missing_file"
+    } >> "$env_file"
+    echo "  .env 已补齐缺失配置项: $env_file"
+  else
+    echo "  .env 已存在且配置项完整: $env_file"
+  fi
+  rm -f "$missing_file"
+}
+
 echo "========================================="
 echo "  Monitor Suite 安装脚本"
 echo "  - fourmeme-monitor (four.meme)"
@@ -58,6 +99,7 @@ CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/ai-client.mjs "$SHARED_DIR/"
   cp shared/feishu-client.mjs "$SHARED_DIR/"
+  cp .env.example "$SUITE_DIR/.env.example"
   if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
     cp ai-models.json "$SUITE_DIR/"
     echo "  ai-models.json 已安装"
@@ -71,11 +113,8 @@ fi
 # 安装共享依赖（@larksuiteoapi/node-sdk 等）
 echo "  安装共享依赖..."
 cd "$SUITE_DIR" && npm install --omit=dev && cd - >/dev/null
-# .env：如果不存在则从 .env.example 生成空模板
-if [ ! -f "$SUITE_DIR/.env" ]; then
-  cp .env.example "$SUITE_DIR/.env"
-  echo "  .env 模板已生成，请编辑填入真实密钥: $SUITE_DIR/.env"
-fi
+# .env：不存在则生成，已存在则补齐 .env.example 中新增的配置项
+sync_env_template_keys "$SUITE_DIR/.env" "$SUITE_DIR/.env.example"
 
 # ── 4. 部署 fourmeme-monitor ──
 echo "[4/6] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
