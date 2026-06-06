@@ -116,6 +116,7 @@ const CONFIG = {
 
   // ── BSC RPC ──
   bscRpcUrls: [
+    "https://bsc.publicnode.com",
     "https://bsc-dataseed.binance.org/",
     "https://bsc-dataseed1.defibit.io/",
     "https://bsc-dataseed2.defibit.io/",
@@ -125,6 +126,7 @@ const CONFIG = {
     tokenManagerV2:  "0x5c952063c7fc8610FFDB798152D69F0B9550762b",
     helper3BSC:      "0xF251F83e40a78868FcfA3FA4599Dad6494E46034",
     agentIdentifier: "0x09B44A633de9F9EBF6FB9Bdd5b5629d3DD2cef13",
+    openFourRegistry:"0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94",
   },
   helper3Cross: {
     ArbitrumOne: "0x02287dc3CcA964a025DAaB1111135A46C10D3A57",
@@ -3223,6 +3225,10 @@ const KNOWN_SELECTORS = {
   [SEL._tokenInfos.toLowerCase()]:    "_tokenInfos(address)",
   [SEL._tokenInfoEx1s.toLowerCase()]: "_tokenInfoEx1s(address)",
   [SEL.templates.toLowerCase()]:      "templates()",
+  "0x7ba9413c": "openFourCore()",
+  "0x7b103999": "registry()",
+  "0xf29ebf61": "feeRouter()",
+  "0xf2f4eb26": "core()",
 };
 
 function describeSelectors(selectors) {
@@ -3246,6 +3252,28 @@ function normalizeAddress(addr) {
   return isValidAddress(addr) ? String(addr).toLowerCase() : "";
 }
 
+const ZERO_ADDRESS = "0x" + "0".repeat(40);
+const OPEN_FOUR_LABELS = {
+  registry: "OpenFourRegistry",
+  core: "OpenFourCore",
+  feeRouter: "OpenFourFeeRouter",
+  tools: "OpenFourTools",
+};
+const OPEN_FOUR_SELECTORS = {
+  openFourCore: "0x7ba9413c", // openFourCore()
+  registry:     "0x7b103999", // registry()
+  feeRouter:    "0xf29ebf61", // feeRouter()
+  core:         "0xf2f4eb26", // core()
+};
+
+function decodeRpcAddress(hex, offset = 0) {
+  const clean = typeof hex === "string" && hex.startsWith("0x") ? hex.slice(2) : "";
+  const start = offset * 64;
+  if (clean.length < start + 64) return "";
+  const addr = normalizeAddress("0x" + clean.slice(start + 24, start + 64));
+  return addr && addr !== ZERO_ADDRESS ? addr : "";
+}
+
 function normalizeContractLabel(name) {
   return String(name || "")
     .trim()
@@ -3266,7 +3294,7 @@ function staticContractTargets() {
 async function fetchPublicAddressContractTargets() {
   const res = await fetchSafe(`${CONFIG.apiBase}/v1/public/address`, {
     headers: { "User-Agent": nextUA(), "Accept": "application/json" },
-  }, 10_000);
+  }, 3_000);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
   if (json?.code !== 0 && json?.code !== "0") {
@@ -3293,34 +3321,220 @@ async function fetchPublicAddressContractTargets() {
 function previousPublicAddressContractTargets() {
   const oldFp = snapshot?.contractFingerprints || {};
   return Object.entries(oldFp)
-    .filter(([, data]) => data?.source === "public_address" && isValidAddress(data.address))
+    .filter(([label, data]) => {
+      const source = String(data?.source || "");
+      return isValidAddress(data?.address)
+        && (source.startsWith("public_address")
+          || source.startsWith("onchain")
+          || label.startsWith("OpenFour"));
+    })
     .map(([label, data]) => ({
       label,
       addr: normalizeAddress(data.address),
-      source: "public_address",
+      source: data.source || "public_address",
       networkCode: data.networkCode || CONFIG.networkCode,
+      cached: true,
     }));
 }
 
+function findContractTargetByLabel(targets, label) {
+  return targets.find(t => t?.label === label && normalizeAddress(t.addr));
+}
+
+function previousContractTargetByLabel(label) {
+  const data = snapshot?.contractFingerprints?.[label];
+  const addr = normalizeAddress(data?.address);
+  if (!addr) return null;
+  return {
+    label,
+    addr,
+    source: data.source || "snapshot",
+    networkCode: data.networkCode || CONFIG.networkCode,
+  };
+}
+
+function setContractTarget(targets, target) {
+  const addr = normalizeAddress(target?.addr);
+  const label = target?.label;
+  if (!addr || !label) return;
+  const normalized = { ...target, addr, networkCode: target.networkCode || CONFIG.networkCode };
+  const idx = targets.findIndex(t => t.label === label);
+  if (idx >= 0) targets[idx] = { ...targets[idx], ...normalized };
+  else targets.push(normalized);
+}
+
+function addUniqueContractTarget(targets, seenLabels, seenAddresses, target) {
+  const addr = normalizeAddress(target?.addr);
+  const label = target?.label;
+  if (!addr || !label) return false;
+  if (seenLabels.has(label) || seenAddresses.has(addr)) return false;
+  targets.push({ ...target, addr, networkCode: target.networkCode || CONFIG.networkCode });
+  seenLabels.add(label);
+  seenAddresses.add(addr);
+  return true;
+}
+
+async function fetchOnchainOpenFourTargets(publicTargets = []) {
+  const targets = [];
+  const publicRegistry = findContractTargetByLabel(publicTargets, OPEN_FOUR_LABELS.registry);
+  const cachedRegistry = previousContractTargetByLabel(OPEN_FOUR_LABELS.registry);
+  const configuredRegistry = normalizeAddress(CONFIG.contracts.openFourRegistry);
+  const registryAddr = normalizeAddress(publicRegistry?.addr || cachedRegistry?.addr || configuredRegistry);
+  if (!registryAddr) return targets;
+  const registrySource = publicRegistry ? (publicRegistry.cached ? "snapshot_seed" : "public_address_seed") : (cachedRegistry ? "snapshot_seed" : "configured_registry_seed");
+  const registryVia = publicRegistry ? (publicRegistry.cached ? "snapshot seed" : "/v1/public/address seed") : (cachedRegistry ? "snapshot seed" : "CONFIG.contracts.openFourRegistry");
+
+  setContractTarget(targets, {
+    label: OPEN_FOUR_LABELS.registry,
+    addr: registryAddr,
+    source: registrySource,
+    discoveredVia: registryVia,
+  });
+
+  const fallbackCore = findContractTargetByLabel(publicTargets, OPEN_FOUR_LABELS.core)
+    || previousContractTargetByLabel(OPEN_FOUR_LABELS.core);
+  const fallbackFeeRouter = findContractTargetByLabel(publicTargets, OPEN_FOUR_LABELS.feeRouter)
+    || previousContractTargetByLabel(OPEN_FOUR_LABELS.feeRouter);
+  const fallbackTools = findContractTargetByLabel(publicTargets, OPEN_FOUR_LABELS.tools)
+    || previousContractTargetByLabel(OPEN_FOUR_LABELS.tools);
+
+  const [coreHex] = await bscRpcBatch([{
+    method: "eth_call",
+    params: [{ to: registryAddr, data: OPEN_FOUR_SELECTORS.openFourCore }, "latest"],
+  }]);
+  let coreAddr = decodeRpcAddress(coreHex);
+  if (coreAddr) {
+    setContractTarget(targets, {
+      label: OPEN_FOUR_LABELS.core,
+      addr: coreAddr,
+      source: "onchain_registry",
+      discoveredVia: "OpenFourRegistry.openFourCore()",
+      linkedRegistry: registryAddr,
+    });
+  } else if (fallbackCore?.addr) {
+    coreAddr = normalizeAddress(fallbackCore.addr);
+    setContractTarget(targets, {
+      ...fallbackCore,
+      source: `${fallbackCore.source || "public_address"}_fallback`,
+      discoveredVia: "fallback: OpenFourRegistry.openFourCore() unavailable",
+    });
+  }
+
+  let feeRouterAddr = "";
+  if (coreAddr) {
+    const [coreRegistryHex, feeRouterHex] = await bscRpcBatch([
+      { method: "eth_call", params: [{ to: coreAddr, data: OPEN_FOUR_SELECTORS.registry }, "latest"] },
+      { method: "eth_call", params: [{ to: coreAddr, data: OPEN_FOUR_SELECTORS.feeRouter }, "latest"] },
+    ]);
+    const linkedRegistry = decodeRpcAddress(coreRegistryHex);
+    feeRouterAddr = decodeRpcAddress(feeRouterHex);
+    const coreTarget = findContractTargetByLabel(targets, OPEN_FOUR_LABELS.core);
+    if (coreTarget) {
+      if (linkedRegistry) coreTarget.linkedRegistry = linkedRegistry;
+      if (feeRouterAddr) coreTarget.linkedFeeRouter = feeRouterAddr;
+    }
+
+    if (feeRouterAddr) {
+      setContractTarget(targets, {
+        label: OPEN_FOUR_LABELS.feeRouter,
+        addr: feeRouterAddr,
+        source: "onchain_core",
+        discoveredVia: "OpenFourCore.feeRouter()",
+        linkedCore: coreAddr,
+        linkedRegistry: linkedRegistry || registryAddr,
+      });
+    }
+  }
+
+  if (!feeRouterAddr && fallbackFeeRouter?.addr) {
+    feeRouterAddr = normalizeAddress(fallbackFeeRouter.addr);
+    setContractTarget(targets, {
+      ...fallbackFeeRouter,
+      source: `${fallbackFeeRouter.source || "public_address"}_fallback`,
+      discoveredVia: "fallback: OpenFourCore.feeRouter() unavailable",
+    });
+  }
+
+  if (feeRouterAddr) {
+    const [routerCoreHex, routerRegistryHex] = await bscRpcBatch([
+      { method: "eth_call", params: [{ to: feeRouterAddr, data: OPEN_FOUR_SELECTORS.core }, "latest"] },
+      { method: "eth_call", params: [{ to: feeRouterAddr, data: OPEN_FOUR_SELECTORS.registry }, "latest"] },
+    ]);
+    const routerCore = decodeRpcAddress(routerCoreHex);
+    const routerRegistry = decodeRpcAddress(routerRegistryHex);
+    const routerTarget = findContractTargetByLabel(targets, OPEN_FOUR_LABELS.feeRouter);
+    if (routerTarget) {
+      if (routerCore) routerTarget.linkedCore = routerCore;
+      if (routerRegistry) routerTarget.linkedRegistry = routerRegistry;
+      if (!routerTarget.source?.startsWith("onchain") && routerCore && coreAddr && routerCore === coreAddr) {
+        routerTarget.source = "public_address_onchain_verified";
+        routerTarget.discoveredVia = "OpenFourFeeRouter.core() -> OpenFourCore";
+      }
+    }
+  }
+
+  if (fallbackTools?.addr) {
+    let toolsCore = "";
+    if (coreAddr) {
+      const [toolsCoreHex] = await bscRpcBatch([{
+        method: "eth_call",
+        params: [{ to: normalizeAddress(fallbackTools.addr), data: OPEN_FOUR_SELECTORS.core }, "latest"],
+      }]);
+      toolsCore = decodeRpcAddress(toolsCoreHex);
+    }
+    const verified = Boolean(toolsCore && coreAddr && toolsCore === coreAddr);
+    setContractTarget(targets, {
+      ...fallbackTools,
+      source: verified ? "public_address_onchain_verified" : (fallbackTools.source || "public_address"),
+      discoveredVia: verified ? "OpenFourTools.core() -> OpenFourCore" : "public address fallback",
+      linkedCore: toolsCore || undefined,
+    });
+  }
+
+  return targets;
+}
+
 async function buildContractTargets() {
-  const targets = staticContractTargets();
-  const seenLabels = new Set(targets.map(c => c.label));
-  const seenAddresses = new Set(targets.map(c => c.addr));
-  let publicTargets = [];
+  const targets = [];
+  const seenLabels = new Set();
+  const seenAddresses = new Set();
+  for (const target of staticContractTargets()) {
+    addUniqueContractTarget(targets, seenLabels, seenAddresses, target);
+  }
+  const cachedPublicTargets = previousPublicAddressContractTargets();
+  const publicTargetsPromise = fetchPublicAddressContractTargets().catch(err => {
+    log(`[contract] public address fetch failed, reusing ${cachedPublicTargets.length} cached targets: ${err.message}`);
+    return cachedPublicTargets;
+  });
+  let onchainTargets = [];
 
   try {
-    publicTargets = await fetchPublicAddressContractTargets();
+    onchainTargets = await fetchOnchainOpenFourTargets(cachedPublicTargets);
   } catch (err) {
-    publicTargets = previousPublicAddressContractTargets();
-    log(`[contract] public address fetch failed, reusing ${publicTargets.length} cached targets: ${err.message}`);
+    log(`[contract] OpenFour on-chain discovery failed, falling back to public/cached targets: ${err.message}`);
+  }
+
+  const publicTargets = await publicTargetsPromise;
+  const discoveredRegistry = findContractTargetByLabel(onchainTargets, OPEN_FOUR_LABELS.registry);
+  const publicRegistry = findContractTargetByLabel(publicTargets, OPEN_FOUR_LABELS.registry);
+  const hasVerifiedTools = Boolean(findContractTargetByLabel(onchainTargets, OPEN_FOUR_LABELS.tools));
+  const hasPublicTools = Boolean(findContractTargetByLabel(publicTargets, OPEN_FOUR_LABELS.tools));
+  const shouldRefreshFromPublic = (publicRegistry?.addr && publicRegistry.addr !== discoveredRegistry?.addr)
+    || (hasPublicTools && !hasVerifiedTools);
+  if (shouldRefreshFromPublic) {
+    try {
+      onchainTargets = await fetchOnchainOpenFourTargets(publicTargets);
+    } catch (err) {
+      log(`[contract] OpenFour public-seeded discovery failed, keeping cached/config discovery: ${err.message}`);
+    }
+  }
+
+  for (const target of onchainTargets) {
+    addUniqueContractTarget(targets, seenLabels, seenAddresses, target);
   }
 
   for (const target of publicTargets) {
-    if (!target.addr || !target.label) continue;
-    if (seenLabels.has(target.label) || seenAddresses.has(target.addr)) continue;
-    targets.push(target);
-    seenLabels.add(target.label);
-    seenAddresses.add(target.addr);
+    addUniqueContractTarget(targets, seenLabels, seenAddresses, target);
   }
 
   return targets;
@@ -3356,6 +3570,9 @@ async function fetchContractFingerprints() {
       networkCode: c.networkCode || CONFIG.networkCode,
       selectors: extractSelectors(code),
     };
+    for (const field of ["discoveredVia", "linkedRegistry", "linkedCore", "linkedFeeRouter"]) {
+      if (c[field]) result[c.label][field] = c[field];
+    }
 
     const impl = "0x" + rawSlot.slice(26);
     const isProxy = impl !== "0x0000000000000000000000000000000000000000"
@@ -3395,6 +3612,12 @@ function diffContractFingerprints(oldFp, newFp) {
       removed: (oldSels || []).filter(s => !newSet.has(s)),
     };
   }
+  function withContractMeta(entry, data) {
+    for (const field of ["discoveredVia", "linkedRegistry", "linkedCore", "linkedFeeRouter"]) {
+      if (data?.[field]) entry[field] = data[field];
+    }
+    return entry;
+  }
 
   for (const [label, newData] of Object.entries(newFp)) {
     const oldData = oldFp[label];
@@ -3402,6 +3625,7 @@ function diffContractFingerprints(oldFp, newFp) {
       const entry = { type: "新合约", label, address: newData.address };
       // 对新合约也展示其函数选择器，帮助理解用途
       entry.source = newData.source;
+      withContractMeta(entry, newData);
       const sels = newData.selectors || newData.implSelectors || [];
       if (sels.length > 0) {
         entry.selectorDiff = { added: sels, removed: [] };
@@ -3410,42 +3634,62 @@ function diffContractFingerprints(oldFp, newFp) {
       continue;
     }
     if (normalizeAddress(oldData.address) !== normalizeAddress(newData.address)) {
-      changes.push({
+      changes.push(withContractMeta({
         type: "合约地址变更", label,
         oldAddress: oldData.address,
         address: newData.address,
         source: newData.source,
-      });
+      }, newData));
     }
     if (oldData.codeHash !== newData.codeHash) {
-      const entry = {
+      const entry = withContractMeta({
         type: "Bytecode 变更", label, address: newData.address,
         source: newData.source,
         oldHash: oldData.codeHash, newHash: newData.codeHash,
         oldSize: oldData.codeSize, newSize: newData.codeSize,
         selectorDiff: selectorDiff(oldData.selectors, newData.selectors),
-      };
+      }, newData);
       changes.push(entry);
     }
     if (oldData.implAddress && newData.implAddress && oldData.implAddress !== newData.implAddress) {
-      changes.push({
+      changes.push(withContractMeta({
         type: "代理升级（Implementation 变更）", label, address: newData.address,
         source: newData.source,
         oldImpl: oldData.implAddress, newImpl: newData.implAddress,
         oldSize: oldData.implCodeSize, newSize: newData.implCodeSize,
         selectorDiff: selectorDiff(oldData.implSelectors, newData.implSelectors),
-      });
+      }, newData));
     }
     if (oldData.implCodeHash && newData.implCodeHash && oldData.implCodeHash !== newData.implCodeHash
         && oldData.implAddress === newData.implAddress) {
-      changes.push({
+      changes.push(withContractMeta({
         type: "Implementation Bytecode 变更", label,
         address: newData.implAddress || newData.address,
         source: newData.source,
         oldHash: oldData.implCodeHash, newHash: newData.implCodeHash,
         oldSize: oldData.implCodeSize, newSize: newData.implCodeSize,
         selectorDiff: selectorDiff(oldData.implSelectors, newData.implSelectors),
-      });
+      }, newData));
+    }
+
+    for (const [field, title] of [
+      ["linkedRegistry", "linkedRegistry"],
+      ["linkedCore", "linkedCore"],
+      ["linkedFeeRouter", "linkedFeeRouter"],
+    ]) {
+      const oldValue = normalizeAddress(oldData[field]);
+      const newValue = normalizeAddress(newData[field]);
+      if (oldValue && newValue && oldValue !== newValue) {
+        changes.push(withContractMeta({
+          type: "链上关系变更",
+          label,
+          address: newData.address,
+          source: newData.source,
+          relationField: title,
+          oldRelation: oldValue,
+          relation: newValue,
+        }, newData));
+      }
     }
   }
   for (const label of Object.keys(oldFp)) {
@@ -3466,6 +3710,14 @@ function formatContractChanges(changes) {
       lines.push(`  address: ${c.address}`);
     }
     if (c.source) lines.push(`  source: ${c.source}`);
+    if (c.discoveredVia) lines.push(`  via: ${c.discoveredVia}`);
+    if (c.oldRelation && c.relation) {
+      lines.push(`- ${c.relationField}: ${c.oldRelation}`);
+      lines.push(`+ ${c.relationField}: ${c.relation}`);
+    }
+    if (c.linkedRegistry) lines.push(`  linkedRegistry: ${c.linkedRegistry}`);
+    if (c.linkedCore) lines.push(`  linkedCore: ${c.linkedCore}`);
+    if (c.linkedFeeRouter) lines.push(`  linkedFeeRouter: ${c.linkedFeeRouter}`);
     if (c.oldHash && c.newHash) { lines.push(`- codeHash: ${c.oldHash}`); lines.push(`+ codeHash: ${c.newHash}`); }
     if (c.oldImpl && c.newImpl) { lines.push(`- impl: ${c.oldImpl}`); lines.push(`+ impl: ${c.newImpl}`); }
     if (c.oldSize !== undefined && c.newSize !== undefined) {
@@ -4381,7 +4633,7 @@ async function startAllModules() {
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
       `**GitHub:** ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "N/A"}) — 每 ${CONFIG.intervals.github / 1000}s`,
-      `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s (RPC Batch)`,
+      `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s (RPC Batch + OpenFour 链上发现)`,
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "N/A"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s (RPC Batch)`,
       `**反风控:** UA轮换 + per-domain自适应退避 + 请求抖动`,
       `**心跳:** 每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送） | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,

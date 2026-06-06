@@ -291,6 +291,9 @@ if [ -f "$SNAP" ]; then
         const ih=(c.implCodeHash||'').slice(0,8);
         line+='  impl='+impl+' ('+ih+')';
       }
+      if(c.source&&c.source!=='static') line+='  src='+c.source;
+      if(c.linkedCore) line+='  core='+c.linkedCore.slice(0,10)+'...';
+      if(c.linkedFeeRouter) line+='  feeRouter='+c.linkedFeeRouter.slice(0,10)+'...';
       console.log(line);
     }
 

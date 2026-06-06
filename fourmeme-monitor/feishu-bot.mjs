@@ -358,6 +358,9 @@ function buildMonitorContext() {
       for (const [label, data] of Object.entries(contracts)) {
         let line = `  ${label}: code=${(data.codeHash || "").slice(0, 8)}`;
         if (data.implAddress) line += ` impl=${data.implAddress.slice(0, 12)}...`;
+        if (data.source && data.source !== "static") line += ` src=${data.source}`;
+        if (data.linkedCore) line += ` core=${data.linkedCore.slice(0, 10)}...`;
+        if (data.linkedFeeRouter) line += ` feeRouter=${data.linkedFeeRouter.slice(0, 10)}...`;
         parts.push(line);
       }
 
