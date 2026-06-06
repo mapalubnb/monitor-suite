@@ -3238,14 +3238,97 @@ function describeSelectors(selectors) {
   return { known, total: selectors.length, identified: unknownCount.identified };
 }
 
+function isValidAddress(addr) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(addr || ""));
+}
+
+function normalizeAddress(addr) {
+  return isValidAddress(addr) ? String(addr).toLowerCase() : "";
+}
+
+function normalizeContractLabel(name) {
+  return String(name || "")
+    .trim()
+    .replace(/[^\w.-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 80);
+}
+
+function staticContractTargets() {
+  return [
+    { label: "TokenManager_V1",  addr: CONFIG.contracts.tokenManagerV1, source: "static" },
+    { label: "TokenManager2_V2", addr: CONFIG.contracts.tokenManagerV2, source: "static" },
+    { label: "Helper3_BSC",      addr: CONFIG.contracts.helper3BSC, source: "static" },
+    { label: "AgentIdentifier",  addr: CONFIG.contracts.agentIdentifier, source: "static" },
+  ].map(c => ({ ...c, addr: normalizeAddress(c.addr) })).filter(c => c.addr);
+}
+
+async function fetchPublicAddressContractTargets() {
+  const res = await fetchSafe(`${CONFIG.apiBase}/v1/public/address`, {
+    headers: { "User-Agent": nextUA(), "Accept": "application/json" },
+  }, 10_000);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (json?.code !== 0 && json?.code !== "0") {
+    throw new Error(`API code=${json?.code}: ${json?.message || json?.msg || ""}`);
+  }
+  if (!Array.isArray(json.data)) throw new Error("public address data is not an array");
+
+  const targets = [];
+  for (const item of json.data) {
+    if (item?.networkCode && item.networkCode !== CONFIG.networkCode) continue;
+    const addr = normalizeAddress(item?.address);
+    const label = normalizeContractLabel(item?.name);
+    if (!addr || !label) continue;
+    targets.push({
+      label,
+      addr,
+      source: "public_address",
+      networkCode: item.networkCode || CONFIG.networkCode,
+    });
+  }
+  return targets;
+}
+
+function previousPublicAddressContractTargets() {
+  const oldFp = snapshot?.contractFingerprints || {};
+  return Object.entries(oldFp)
+    .filter(([, data]) => data?.source === "public_address" && isValidAddress(data.address))
+    .map(([label, data]) => ({
+      label,
+      addr: normalizeAddress(data.address),
+      source: "public_address",
+      networkCode: data.networkCode || CONFIG.networkCode,
+    }));
+}
+
+async function buildContractTargets() {
+  const targets = staticContractTargets();
+  const seenLabels = new Set(targets.map(c => c.label));
+  const seenAddresses = new Set(targets.map(c => c.addr));
+  let publicTargets = [];
+
+  try {
+    publicTargets = await fetchPublicAddressContractTargets();
+  } catch (err) {
+    publicTargets = previousPublicAddressContractTargets();
+    log(`[contract] public address fetch failed, reusing ${publicTargets.length} cached targets: ${err.message}`);
+  }
+
+  for (const target of publicTargets) {
+    if (!target.addr || !target.label) continue;
+    if (seenLabels.has(target.label) || seenAddresses.has(target.addr)) continue;
+    targets.push(target);
+    seenLabels.add(target.label);
+    seenAddresses.add(target.addr);
+  }
+
+  return targets;
+}
+
 async function fetchContractFingerprints() {
   const result = {};
-  const bscContracts = [
-    { label: "TokenManager_V1",  addr: CONFIG.contracts.tokenManagerV1 },
-    { label: "TokenManager2_V2", addr: CONFIG.contracts.tokenManagerV2 },
-    { label: "Helper3_BSC",      addr: CONFIG.contracts.helper3BSC },
-    { label: "AgentIdentifier",  addr: CONFIG.contracts.agentIdentifier },
-  ];
+  const bscContracts = await buildContractTargets();
 
   // Phase 1: batch 获取所有合约的 code + storage slot
   const calls = [];
@@ -3269,6 +3352,8 @@ async function fetchContractFingerprints() {
       codeHash: md5(code),
       codeSize,
       address: c.addr,
+      source: c.source || "static",
+      networkCode: c.networkCode || CONFIG.networkCode,
       selectors: extractSelectors(code),
     };
 
@@ -3316,6 +3401,7 @@ function diffContractFingerprints(oldFp, newFp) {
     if (!oldData) {
       const entry = { type: "新合约", label, address: newData.address };
       // 对新合约也展示其函数选择器，帮助理解用途
+      entry.source = newData.source;
       const sels = newData.selectors || newData.implSelectors || [];
       if (sels.length > 0) {
         entry.selectorDiff = { added: sels, removed: [] };
@@ -3323,9 +3409,18 @@ function diffContractFingerprints(oldFp, newFp) {
       changes.push(entry);
       continue;
     }
+    if (normalizeAddress(oldData.address) !== normalizeAddress(newData.address)) {
+      changes.push({
+        type: "合约地址变更", label,
+        oldAddress: oldData.address,
+        address: newData.address,
+        source: newData.source,
+      });
+    }
     if (oldData.codeHash !== newData.codeHash) {
       const entry = {
         type: "Bytecode 变更", label, address: newData.address,
+        source: newData.source,
         oldHash: oldData.codeHash, newHash: newData.codeHash,
         oldSize: oldData.codeSize, newSize: newData.codeSize,
         selectorDiff: selectorDiff(oldData.selectors, newData.selectors),
@@ -3335,6 +3430,7 @@ function diffContractFingerprints(oldFp, newFp) {
     if (oldData.implAddress && newData.implAddress && oldData.implAddress !== newData.implAddress) {
       changes.push({
         type: "代理升级（Implementation 变更）", label, address: newData.address,
+        source: newData.source,
         oldImpl: oldData.implAddress, newImpl: newData.implAddress,
         oldSize: oldData.implCodeSize, newSize: newData.implCodeSize,
         selectorDiff: selectorDiff(oldData.implSelectors, newData.implSelectors),
@@ -3345,6 +3441,7 @@ function diffContractFingerprints(oldFp, newFp) {
       changes.push({
         type: "Implementation Bytecode 变更", label,
         address: newData.implAddress || newData.address,
+        source: newData.source,
         oldHash: oldData.implCodeHash, newHash: newData.implCodeHash,
         oldSize: oldData.implCodeSize, newSize: newData.implCodeSize,
         selectorDiff: selectorDiff(oldData.implSelectors, newData.implSelectors),
@@ -3352,7 +3449,7 @@ function diffContractFingerprints(oldFp, newFp) {
     }
   }
   for (const label of Object.keys(oldFp)) {
-    if (!(label in newFp)) changes.push({ type: "合约消失", label, address: oldFp[label].address });
+    if (!(label in newFp)) changes.push({ type: "合约消失", label, address: oldFp[label].address, source: oldFp[label].source });
   }
   return changes;
 }
@@ -3362,7 +3459,13 @@ function formatContractChanges(changes) {
   for (const c of changes) {
     lines.push(`**🔧 ${c.type}：${c.label}**`);
     lines.push("```");
-    lines.push(`  address: ${c.address}`);
+    if (c.oldAddress) {
+      lines.push(`- address: ${c.oldAddress}`);
+      lines.push(`+ address: ${c.address}`);
+    } else {
+      lines.push(`  address: ${c.address}`);
+    }
+    if (c.source) lines.push(`  source: ${c.source}`);
     if (c.oldHash && c.newHash) { lines.push(`- codeHash: ${c.oldHash}`); lines.push(`+ codeHash: ${c.newHash}`); }
     if (c.oldImpl && c.newImpl) { lines.push(`- impl: ${c.oldImpl}`); lines.push(`+ impl: ${c.newImpl}`); }
     if (c.oldSize !== undefined && c.newSize !== undefined) {
