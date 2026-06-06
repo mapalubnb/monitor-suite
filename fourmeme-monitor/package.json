@@ -6,6 +6,7 @@
   "private": true,
   "scripts": {
     "start": "node monitor.mjs",
-    "bot": "node feishu-bot.mjs"
+    "bot": "node feishu-bot.mjs",
+    "check": "node --check monitor.mjs"
   }
 }

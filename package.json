@@ -4,6 +4,10 @@
   "description": "Four.meme 和 Flap.sh 平台变更自动化监控系统",
   "type": "module",
   "private": true,
+  "scripts": {
+    "check": "node --check fourmeme-monitor/monitor.mjs && node --check fourmeme-monitor/feishu-bot.mjs && node --check flap-monitor/monitor.mjs",
+    "check:fourmeme": "node --check fourmeme-monitor/monitor.mjs"
+  },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.35.0"
   }
