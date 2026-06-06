@@ -14,7 +14,7 @@
  *   模块4: GitHub     — 每 5min（条件请求，自带 ETag 缓存）
  *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 3s（RPC batch，单次请求）
- *   模块8: 控制者动作 — 每 3s（扫新区块，监听创建者/owner/admin 交易）
+ *   模块8: 创建者动作 — 每 3s（扫新区块，只监听创建者/手动配置地址发起的交易）
  *
  * 用法：node monitor.mjs
  * 信号：kill -USR1 <PID>  立即触发全量检测
@@ -85,7 +85,7 @@ const CONFIG = {
     github:   300_000, // 模块4: GitHub（5min，未认证限额 60/h）
     contract: 3_000,   // 模块6: 智能合约
     onchain:  3_000,   // 模块7: 链上参数
-    actor:    3_000,   // 模块8: 合约创建者/管理员动作
+    actor:    3_000,   // 模块8: 合约创建者动作
   },
 
   // 心跳间隔（毫秒）— 支持环境变量 HEARTBEAT_MINUTES 覆盖（单位：分钟）
@@ -462,7 +462,7 @@ function migrateSnapshot(data) {
     if (!data.chainActorMonitor) data.chainActorMonitor = {};
     if (!data.chainActorMonitor.creators) data.chainActorMonitor.creators = {};
     if (!Array.isArray(data.chainActorMonitor.seenTxs)) data.chainActorMonitor.seenTxs = [];
-    log("[快照迁移] v5 → v6：补充合约创建者/管理员动作监听字段");
+    log("[快照迁移] v5 → v6：补充合约创建者动作监听字段");
   }
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
@@ -3904,7 +3904,7 @@ function formatOnchainChanges(changes) {
 }
 
 /* ══════════════════════════════════════════
-   模块 8：合约创建者 / 管理员动作监听
+   模块 8：合约创建者动作监听
    ══════════════════════════════════════════ */
 
 const ACTOR_SELECTOR_INFO = {
@@ -3953,6 +3953,10 @@ function addActorRole(actorMap, address, role, label, source = "") {
   if (role && !actor.roles.includes(role)) actor.roles.push(role);
   if (label && !actor.labels.includes(label)) actor.labels.push(label);
   if (source && !actor.sources.includes(source)) actor.sources.push(source);
+}
+
+function isCreatorActionActor(actor) {
+  return Boolean(actor?.roles?.some(role => role === "creator" || role === "manual"));
 }
 
 function addContractEntry(contractMap, label, address, source = "") {
@@ -4117,9 +4121,8 @@ function classifyActorTx(tx, context) {
   const to = normalizeAddress(tx.to);
   const selector = txSelector(tx.input);
   const fromActor = context.actors.get(from);
-  const toActor = context.actors.get(to);
   const toContract = context.contracts.get(to);
-  if (!fromActor && !toActor) return null;
+  if (!isCreatorActionActor(fromActor)) return null;
 
   const selectorInfo = ACTOR_SELECTOR_INFO[selector] || (selector ? { name: KNOWN_SELECTORS[selector] || selector, risk: "medium" } : null);
   const isDeployment = !to;
@@ -4137,16 +4140,13 @@ function classifyActorTx(tx, context) {
     reason = `watched control contract execTransaction -> ${safeTarget?.labels.join("/") || safeExec.to}`;
   } else if (toContract && fromActor) {
     risk = selectorInfo?.risk === "high" ? "high" : "high";
-    reason = `watched actor called monitored contract ${toContract.labels.join("/")}`;
+    reason = `watched creator called monitored contract ${toContract.labels.join("/")}`;
   } else if (selectorInfo?.risk === "high") {
     risk = "high";
-    reason = "watched actor used high-risk selector";
-  } else if (toActor && selector) {
-    risk = "medium";
-    reason = "transaction sent to watched owner/admin contract";
+    reason = "watched creator used high-risk selector";
   } else if (fromActor && selector) {
     risk = "medium";
-    reason = "watched actor called an external contract";
+    reason = "watched creator called an external contract";
   } else {
     return null;
   }
@@ -4159,7 +4159,6 @@ function classifyActorTx(tx, context) {
     from,
     to: to || "",
     fromActor,
-    toActor,
     toContract,
     selector,
     method: selectorInfo?.name || (isDeployment ? "contract creation" : ""),
@@ -4214,6 +4213,7 @@ function formatActorWatchList(context) {
     roles: actor.roles,
     labels: actor.labels.slice(0, 8),
     sources: actor.sources,
+    actionWatched: isCreatorActionActor(actor),
   }));
 }
 
@@ -4227,7 +4227,6 @@ function formatActorActions(actions) {
     lines.push(`from:  ${a.from}`);
     if (a.fromActor) lines.push(`role:  ${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`);
     if (a.to) lines.push(`to:    ${a.to}${a.toContract ? ` (${a.toContract.labels.join("/")})` : ""}`);
-    if (a.toActor && !a.toContract) lines.push(`toRole:${a.toActor.roles.join(",")} (${a.toActor.labels.slice(0, 4).join("/")})`);
     if (a.selector) lines.push(`selector: ${a.selector}`);
     if (a.safeTarget) lines.push(`safeTarget: ${a.safeTarget}${a.safeTargetLabel ? ` (${a.safeTargetLabel})` : ""}`);
     if (a.safeSelector) lines.push(`safeSelector: ${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`);
@@ -4254,7 +4253,9 @@ async function runActorCheck() {
   }
 
   const context = await fetchControlActors(contractEntries, state);
-  state.actors = Object.fromEntries(formatActorWatchList(context).map(actor => [actor.address, actor]));
+  const actorList = formatActorWatchList(context);
+  state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
+  state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
   state.contractCount = contractEntries.length;
 
   const latestHex = await bscRpcCall("eth_blockNumber", []);
@@ -4281,14 +4282,14 @@ async function runActorCheck() {
   if (actions.length === 0) return;
 
   const highCount = actions.filter(a => a.risk === "high").length;
-  log(`[actor] 捕获 ${actions.length} 条控制者动作（high=${highCount}），区块 ${fromBlock}-${toBlock}`);
+  log(`[actor] 捕获 ${actions.length} 条创建者动作（high=${highCount}），区块 ${fromBlock}-${toBlock}`);
   const content = formatActorActions(actions);
-  appendHistory("actor", `链上控制者动作（${actions.length}项）`, content.slice(0, 300), content);
+  appendHistory("actor", `链上创建者动作（${actions.length}项）`, content.slice(0, 300), content);
   const color = highCount > 0 ? "red" : "yellow";
-  await sendThenEnrichWithAi(`链上控制者动作（${actions.length}项）`, content, color, "Four.meme 合约创建者/管理员动作", undefined, undefined, undefined, `https://bscscan.com/block/${toBlock}`);
+  await sendThenEnrichWithAi(`链上创建者动作（${actions.length}项）`, content, color, "Four.meme 合约创建者动作", undefined, undefined, undefined, `https://bscscan.com/block/${toBlock}`);
 
   try {
-    log("[actor] 控制者动作已触发，立即复查合约状态");
+    log("[actor] 创建者动作已触发，立即复查合约状态");
     await runContractCheck();
   } catch (err) {
     log(`[actor] 触发合约复查失败：${err.message}`);
@@ -5048,7 +5049,8 @@ async function startAllModules() {
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
   const discoveredCount = (snapshot?._frontendDiscoveredUrls || []).length;
   const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
-  const actorCount = Object.keys(snapshot?.chainActorMonitor?.actors || {}).length;
+  const actorCount = snapshot?.chainActorMonitor?.actionActorCount
+    ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
   await sendFeishu("Four.meme 全面监控 v2 已启动",
     [
       `**架构:** 独立定时器 + RPC Batch + 并行抓取`,
@@ -5061,7 +5063,7 @@ async function startAllModules() {
       `**GitHub:** ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "N/A"}) — 每 ${CONFIG.intervals.github / 1000}s`,
       `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s (RPC Batch + OpenFour 链上发现)`,
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "N/A"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s (RPC Batch)`,
-      `**控制者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s (区块扫描 + 命中后合约复查)`,
+      `**创建者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s (只过滤 tx.from，命中后合约复查)`,
       `**反风控:** UA轮换 + per-domain自适应退避 + 请求抖动`,
       `**心跳:** 每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送） | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
     ].join("\n"),
