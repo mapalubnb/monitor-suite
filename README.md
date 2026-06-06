@@ -34,8 +34,8 @@
 | 模块 | 监控内容 | 频率 |
 |------|---------|------|
 | 模块 1 | 底池配置（Pool Config） | 3s |
-| 模块 2 | 前端代码（5 页面并行，含文案 diff、`__NEXT_DATA__`、i18n、路由发现） | 15s |
-| 模块 3/5 | API 结构（多端点并行，结构 + 值 diff） | 30s |
+| 模块 2 | 前端代码（基础页面 + 自动发现页面，含文案 diff、`__NEXT_DATA__`、i18n、路由/端点发现） | 15s |
+| 模块 3/5 | API 结构（多端点并行，结构 + 值 diff，覆盖 public/blog/mapi 端点发现） | 30s |
 | 模块 4 | GitHub 仓库变更（条件请求，ETag 缓存） | 5min |
 | 模块 6 | BSC 智能合约（RPC batch） | 3s |
 | 模块 7 | 链上参数（RPC batch） | 3s |
@@ -45,6 +45,14 @@
 - 页面并行抓取（含错开延迟避免风控）
 - i18n chunk 并行下载与 diff
 - 前端路由发现 + API 结构监控
+
+### Four.meme 前端/API 覆盖策略
+
+- 基础监控页面：`/`、`/zh-TW/create-token`、`/zh-TW/agentic`、`/zh-TW/announcement`
+- 自动从 HTML、`__NEXT_DATA__`、JS 资源字符串中发现新页面，并在同一轮纳入监控
+- 路由/端点发现覆盖 `/api/`、`/meme-api/`、`/mapi/`、`/v1/`、`/blog/v1/` 和站内完整 URL
+- 纯资源列表小抖动会在同一轮 2.5 秒后快速复抓确认；真实变化立即推送，短暂恢复则静默忽略
+- API 探针覆盖 Four.meme public 配置、地址、公告、blog banner、KOL、token ranking/search 及关键 private 错误结构
 
 ### 飞书 Bot (`fourmeme-monitor/feishu-bot.mjs`)
 

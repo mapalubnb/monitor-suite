@@ -9,7 +9,7 @@
  *
  * 模块与频率：
  *   模块1: 底池配置   — 每 3s（纯 API，轻量，退避保护）
- *   模块2: 前端代码   — 每 15s（4 页面并行，含文案 diff、__NEXT_DATA__、i18n、路由发现）
+ *   模块2: 前端代码   — 每 15s（基础页面 + 自动发现页面，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
  *   模块3/5: API 结构  — 每 30s（多端点并行，含结构+值 diff）
  *   模块4: GitHub     — 每 5min（条件请求，自带 ETag 缓存）
  *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
@@ -4155,13 +4155,15 @@ async function startAllModules() {
   // 发送启动通知
   const poolCount = buildPoolMap(snapshot?.poolConfig).size;
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
+  const discoveredCount = (snapshot?._frontendDiscoveredUrls || []).length;
   const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
   await sendFeishu("Four.meme 全面监控 v2 已启动",
     [
       `**架构:** 独立定时器 + RPC Batch + 并行抓取`,
       `**底池监控:** BSC ${poolCount} 个 — 每 ${CONFIG.intervals.pool / 1000}s`,
-      `**前端监控:** ${pageCount} 个页面 — 每 ${CONFIG.intervals.frontend / 1000}s`,
-      `  含 __NEXT_DATA__ / i18n / 路由发现`,
+      `**前端监控:** ${pageCount} 个页面（基础 ${CONFIG.monitorUrls.length} + 自动发现 ${discoveredCount}）— 每 ${CONFIG.intervals.frontend / 1000}s`,
+      `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面自动纳入`,
+      `  资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
       `**GitHub:** ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "N/A"}) — 每 ${CONFIG.intervals.github / 1000}s`,

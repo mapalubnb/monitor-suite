@@ -279,7 +279,10 @@ function buildMonitorContext() {
 
       // 前端
       const pages = Object.keys(snap.frontendPages || {});
-      parts.push(`\n前端页面: ${pages.length} 个`);
+      const discovered = snap._frontendDiscoveredUrls || [];
+      parts.push(`\n前端页面: ${pages.length} 个（自动发现 ${discovered.length} 个）`);
+      for (const url of discovered.slice(0, 6)) parts.push(`  自动发现: ${url}`);
+      if (discovered.length > 6) parts.push(`  ... 及其余 ${discovered.length - 6} 个`);
 
       // API
       const apis = Object.keys(snap.apiStructure || {});

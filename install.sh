@@ -206,9 +206,12 @@ if [ -f "$SNAP" ]; then
 
     // 模块 2：前端
     const pages=Object.keys(s.frontendPages||{});
+    const discovered=s._frontendDiscoveredUrls||[];
     console.log('');
     console.log('[ 模块2: 前端监控 ]');
-    console.log('  页面: '+pages.length+' 个');
+    console.log('  页面: '+pages.length+' 个（自动发现 '+discovered.length+' 个）');
+    for(const url of discovered.slice(0,6)) console.log('  自动发现: '+url);
+    if(discovered.length>6) console.log('  ... 及其余 '+(discovered.length-6)+' 个自动发现页面');
     for(const k of pages){
       const p=s.frontendPages[k];
       const url=p.originalUrl||k;
