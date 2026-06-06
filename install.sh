@@ -283,18 +283,12 @@ if [ -f "$SNAP" ]; then
       public_config:['/v1/public/config','https://four.meme/meme-api/v1/public/config'],
       public_address:['/v1/public/address','https://four.meme/meme-api/v1/public/address'],
       public_file_host:['/v1/public/file/host','https://four.meme/meme-api/v1/public/file/host'],
-      announce_list:['/blog/v1/public/announce/list','https://four.meme/meme-api/blog/v1/public/announce/list?&pageIndex=1&pageSize=6'],
-      announce_detail_sample:['/blog/v1/public/announce/get','https://four.meme/meme-api/blog/v1/public/announce/get?id=100000056'],
-      blog_banner_list:['/blog/v1/public/blog/banner/list','https://four.meme/meme-api/blog/v1/public/blog/banner/list'],
       kol_teams:['/v1/public/kol/teams','https://four.meme/meme-api/v1/public/kol/teams?tcs=fm25'],
       kol_traders:['/v1/public/kol/traders','https://four.meme/meme-api/v1/public/kol/traders?tcs=fm25'],
       token_ranking_cap:['/v1/public/token/ranking CAP','https://four.meme/meme-api/v1/public/token/ranking'],
       token_ranking_binance:['/v1/public/token/ranking BINANCE','https://four.meme/meme-api/v1/public/token/ranking'],
       token_search_new:['/v1/public/token/search NEW','https://four.meme/meme-api/v1/public/token/search'],
-      token_search_cap:['/v1/public/token/search CAP','https://four.meme/meme-api/v1/public/token/search'],
-      nonce_generate:['/v1/private/user/nonce/generate','https://four.meme/meme-api/v1/private/user/nonce/generate'],
-      user_login:['/v1/private/user/login/dex','https://four.meme/meme-api/v1/private/user/login/dex'],
-      token_create:['/v1/private/token/create','https://four.meme/meme-api/v1/private/token/create']
+      token_search_cap:['/v1/public/token/search CAP','https://four.meme/meme-api/v1/public/token/search']
     };
     console.log('');
     console.log('[ 模块3/5: API结构 ]');

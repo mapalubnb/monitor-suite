@@ -53,7 +53,7 @@
 - 自动从 HTML、`__NEXT_DATA__`、JS 资源字符串中发现新页面，并在同一轮纳入监控
 - 路由/端点发现覆盖 `/api/`、`/meme-api/`、`/mapi/`、`/v1/`、`/blog/v1/` 和站内完整 URL
 - 纯资源列表小抖动会在同一轮 2.5 秒后快速复抓确认；真实变化立即推送，短暂恢复则静默忽略
-- API 探针覆盖 Four.meme public 配置、地址、公告、blog banner、KOL、token ranking/search 及关键 private 错误结构
+- API 探针只覆盖无需登录且稳定返回 JSON 的公开端点：public 配置、地址、文件 host、KOL、token ranking/search；公告/Blog 变化由前端页面监控覆盖，登录/签名/创建类 private 接口不做结构监控
 - 链上创建者动作监听只过滤合约 deployer/手动配置地址作为 `tx.from` 发起的交易，不监听普通用户对工厂合约的创建代币调用；默认直接从 BscScan 合约地址页读取 `Contract Creator` 并缓存 deployer（`FOURMEME_CREATOR_PAGE_LOOKUP=true`）。如果页面抓取被封，新合约会用 BSC RPC 在近期区块中反查创建交易兜底（`FOURMEME_CREATOR_CHAIN_LOOKUP=true`，默认回看约 24 小时）。历史 deployer 无法通过普通 RPC 无限期反查，`FOURMEME_WATCH_CREATORS` 仅作为手动补充；如页面抓取被封且 API key 支持 BSC `getcontractcreation`，可设置 `FOURMEME_CREATOR_LOOKUP=true` 并配置 `ETHERSCAN_V2_API_KEY` / `ETHERSCAN_API_KEY` 作为备用，失败会冷却重试避免刷日志；旧变量 `BSCSCAN_API_KEY` 仍兼容。
 
 ### 飞书 Bot (`fourmeme-monitor/feishu-bot.mjs`)

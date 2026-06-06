@@ -174,24 +174,6 @@ const CONFIG = {
       method: "GET",
     },
     {
-      key: "announce_list",
-      label: "/blog/v1/public/announce/list",
-      url: "https://four.meme/meme-api/blog/v1/public/announce/list?&pageIndex=1&pageSize=6",
-      method: "GET",
-    },
-    {
-      key: "announce_detail_sample",
-      label: "/blog/v1/public/announce/get",
-      url: "https://four.meme/meme-api/blog/v1/public/announce/get?id=100000056",
-      method: "GET",
-    },
-    {
-      key: "blog_banner_list",
-      label: "/blog/v1/public/blog/banner/list",
-      url: "https://four.meme/meme-api/blog/v1/public/blog/banner/list",
-      method: "GET",
-    },
-    {
       key: "kol_teams",
       label: "/v1/public/kol/teams",
       url: "https://four.meme/meme-api/v1/public/kol/teams?tcs=fm25",
@@ -234,30 +216,6 @@ const CONFIG = {
       method: "POST",
       body: { pageIndex: 1, pageSize: 20, type: "CAP", sort: "DESC", keyword: "BNB" },
       sampleArrayItems: 10,
-    },
-    {
-      key: "nonce_generate",
-      label: "/v1/private/user/nonce/generate",
-      url: "https://four.meme/meme-api/v1/private/user/nonce/generate",
-      method: "POST",
-      body: { accountAddress: "0x0000000000000000000000000000000000000000", verifyType: "LOGIN", networkCode: "BSC" },
-      recordErrorStructure: true,
-    },
-    {
-      key: "user_login",
-      label: "/v1/private/user/login/dex",
-      url: "https://four.meme/meme-api/v1/private/user/login/dex",
-      method: "POST",
-      body: { region: "WEB", langType: "EN", loginIp: "", inviteCode: "", verifyInfo: { address: "0x0000000000000000000000000000000000000000", networkCode: "BSC", signature: "", verifyType: "LOGIN" }, walletName: "MetaMask" },
-      recordErrorStructure: true,
-    },
-    {
-      key: "token_create",
-      label: "/v1/private/token/create",
-      url: "https://four.meme/meme-api/v1/private/token/create",
-      method: "POST",
-      body: {},
-      recordErrorStructure: true,
     },
   ],
   eip1967Slot: "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc",
@@ -2689,6 +2647,25 @@ function apiEndpointLink(endpointKey) {
   return url ? `[${label}](${url})` : label;
 }
 
+function activeApiProbeKeys() {
+  return new Set(CONFIG.apiProbeEndpoints.map(ep => ep.key));
+}
+
+function pruneInactiveApiSnapshots(target) {
+  const activeKeys = activeApiProbeKeys();
+  const removed = new Set();
+  for (const section of ["apiStructure", "apiValues"]) {
+    const data = target?.[section];
+    if (!data || typeof data !== "object") continue;
+    for (const key of Object.keys(data)) {
+      if (activeKeys.has(key)) continue;
+      delete data[key];
+      removed.add(key);
+    }
+  }
+  return [...removed].sort();
+}
+
 function tryParseJson(text) {
   if (typeof text !== "string" || !text.trim()) return null;
   try { return JSON.parse(text); } catch { return null; }
@@ -2847,9 +2824,7 @@ async function fetchApiData() {
 }
 
 // 结构不稳定的端点：成功响应的字段集合本身不固定，跳过结构对比
-const API_STRUCTURE_SKIP_ENDPOINTS = new Set([
-  "nonce_generate",  // 成功时有 data，某些边界条件下无 data，结构抖动
-]);
+const API_STRUCTURE_SKIP_ENDPOINTS = new Set();
 
 const API_TOKEN_LIST_ENDPOINTS = new Set([
   "token_ranking_cap",
@@ -3115,8 +3090,6 @@ function formatApiChanges(changes, apiValues) {
 
 // 不适合做值对比的端点（每次请求返回不同数据）
 const API_VALUE_SKIP_ENDPOINTS = new Set([
-  "nonce_generate",  // nonce 每次随机
-  "user_login",      // 登录态相关，无有效 session 时返回动态错误
   "token_ranking_cap",      // 排行数据高频变化，结构监控即可
   "token_ranking_binance",
   "token_search_new",       // 列表内容高频变化，结构监控即可
@@ -5254,6 +5227,10 @@ async function runFrontendCheck() {
 async function runApiCheck() {
   const { structures: rawNewStruct, values: newValues } = await fetchApiData();
   if (!snapshot) snapshot = {};
+  const prunedApiKeys = pruneInactiveApiSnapshots(snapshot);
+  if (prunedApiKeys.length > 0) {
+    log(`[API] 已清理停用端点快照：${prunedApiKeys.join(", ")}`);
+  }
   const { structures: newStruct, suppressed: suppressedEmptyArrayStructs } =
     stabilizeApiStructuresForEmptyArrays(snapshot.apiStructure || {}, rawNewStruct);
   if (suppressedEmptyArrayStructs.length > 0) {
@@ -5300,7 +5277,8 @@ async function runApiCheck() {
     const stableValues = stableApiValuesForSnapshot(key, val);
     if (stableValues !== null) snapshot.apiValues[key] = stableValues;
   }
-  const apiSnapshotChanged = apiStructureBefore !== JSON.stringify(snapshot.apiStructure)
+  const apiSnapshotChanged = prunedApiKeys.length > 0
+    || apiStructureBefore !== JSON.stringify(snapshot.apiStructure)
     || apiValuesBefore !== JSON.stringify(snapshot.apiValues);
 
   if (notifications.length > 0) {

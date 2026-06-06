@@ -68,18 +68,12 @@ const API_ENDPOINT_LINKS = {
   public_config: { label: "/v1/public/config", url: "https://four.meme/meme-api/v1/public/config" },
   public_address: { label: "/v1/public/address", url: "https://four.meme/meme-api/v1/public/address" },
   public_file_host: { label: "/v1/public/file/host", url: "https://four.meme/meme-api/v1/public/file/host" },
-  announce_list: { label: "/blog/v1/public/announce/list", url: "https://four.meme/meme-api/blog/v1/public/announce/list?&pageIndex=1&pageSize=6" },
-  announce_detail_sample: { label: "/blog/v1/public/announce/get", url: "https://four.meme/meme-api/blog/v1/public/announce/get?id=100000056" },
-  blog_banner_list: { label: "/blog/v1/public/blog/banner/list", url: "https://four.meme/meme-api/blog/v1/public/blog/banner/list" },
   kol_teams: { label: "/v1/public/kol/teams", url: "https://four.meme/meme-api/v1/public/kol/teams?tcs=fm25" },
   kol_traders: { label: "/v1/public/kol/traders", url: "https://four.meme/meme-api/v1/public/kol/traders?tcs=fm25" },
   token_ranking_cap: { label: "/v1/public/token/ranking CAP", url: "https://four.meme/meme-api/v1/public/token/ranking" },
   token_ranking_binance: { label: "/v1/public/token/ranking BINANCE", url: "https://four.meme/meme-api/v1/public/token/ranking" },
   token_search_new: { label: "/v1/public/token/search NEW", url: "https://four.meme/meme-api/v1/public/token/search" },
   token_search_cap: { label: "/v1/public/token/search CAP", url: "https://four.meme/meme-api/v1/public/token/search" },
-  nonce_generate: { label: "/v1/private/user/nonce/generate", url: "https://four.meme/meme-api/v1/private/user/nonce/generate" },
-  user_login: { label: "/v1/private/user/login/dex", url: "https://four.meme/meme-api/v1/private/user/login/dex" },
-  token_create: { label: "/v1/private/token/create", url: "https://four.meme/meme-api/v1/private/token/create" },
 };
 
 const BASE_FRONTEND_URLS = [
