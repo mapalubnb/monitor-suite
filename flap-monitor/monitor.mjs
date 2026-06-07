@@ -1370,6 +1370,22 @@ function formatVaultFactoryChanges(changes) {
   return lines.join("\n");
 }
 
+function buildVaultFactoryChangeTitle(changes, prefix = "") {
+  const visibleAdded = changes.added.filter(v => v.showInCAStore);
+  const hiddenAdded = changes.added.filter(v => !v.showInCAStore);
+  const names = changes.added.map(v => v.name).join(", ");
+  if (visibleAdded.length > 0 && hiddenAdded.length > 0) {
+    return `${prefix}新增金库工厂：可见 ${visibleAdded.length} 个 / 隐藏 ${hiddenAdded.length} 个 (${names})`;
+  }
+  if (hiddenAdded.length > 0) {
+    return `${prefix}新增隐藏金库工厂 (${hiddenAdded.map(v => v.name).join(", ")})`;
+  }
+  if (visibleAdded.length > 0) {
+    return `${prefix}新增可见金库工厂 (${visibleAdded.map(v => v.name).join(", ")})`;
+  }
+  return `${prefix}金库工厂配置变更`;
+}
+
 /**
  * 批量下载资源文件内容（带并发控制和错开延迟）
  * @param {string[]} assetPaths - 资源路径数组（如 /_next/static/...）
@@ -2518,9 +2534,7 @@ async function runCheck() {
             if (hasVFC) {
               hasDetectedChange = true;
               const vfContent = formatVaultFactoryChanges(vfChanges);
-              const vfTitle = vfChanges.added.length > 0
-                ? `🏦 手动检测 — 新增金库工厂 (${vfChanges.added.map(v => v.name).join(", ")})`
-                : `🏦 手动检测 — 金库工厂配置变更`;
+              const vfTitle = buildVaultFactoryChangeTitle(vfChanges, "🏦 手动检测 — ");
               log(`  [金库工厂 VaultFactory] ${vfTitle}`);
               appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
               const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
@@ -2796,9 +2810,7 @@ async function startMonitor() {
               if (hasVFChanges) {
                 log(`[金库工厂 VaultFactory] 检测到变更：新增 ${vfChanges.added.length}，移除 ${vfChanges.removed.length}，修改 ${vfChanges.modified.length}`);
                 const vfContent = formatVaultFactoryChanges(vfChanges);
-                const vfTitle = vfChanges.added.length > 0
-                  ? `🏦 新增官方金库工厂 (${vfChanges.added.map(v => v.name).join(", ")})`
-                  : `🏦 金库工厂配置变更`;
+                const vfTitle = buildVaultFactoryChangeTitle(vfChanges, "🏦 ");
                 appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
                 // 直接推送，不走普通页面变更通知流程；新增金库时置顶
                 const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
@@ -2849,7 +2861,6 @@ async function startMonitor() {
               url,
               changes,
               meta,
-              diffFile,
               title: `Flap 页面变更`,
               template: "red",
               snapshotUpdate: { key, features },
