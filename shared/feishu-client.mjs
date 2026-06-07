@@ -38,7 +38,7 @@ for (const envPath of ENV_PATHS) {
           if (val) process.env[m[1]] = val;
         }
       }
-      log(`[ENV] 已加载: ${envPath}`);
+      log(`[环境 ENV] 已加载：${envPath}`);
     } catch { /* ignore */ }
     break; // 找到第一个存在的 .env 就停止
   }
@@ -78,13 +78,13 @@ async function ensureTenantToken() {
     if (json.code === 0 && json.tenant_access_token) {
       _tenantToken = json.tenant_access_token;
       _tokenExpireAt = now + json.expire * 1000;
-      log(`[飞书SDK] token 已刷新（有效期 ${json.expire}s）`);
+      log(`[飞书 SDK] token 已刷新（有效期 ${json.expire}s）`);
       return _tenantToken;
     }
-    log(`[飞书SDK] token 获取失败: code=${json.code} msg=${json.msg}`);
+    log(`[飞书 SDK] token 获取失败：code=${json.code} msg=${json.msg}`);
     return "";
   } catch (err) {
-    log(`[飞书SDK] token 获取网络异常: ${err.message}`);
+    log(`[飞书 SDK] token 获取网络异常：${err.message}`);
     return "";
   }
 }
@@ -96,7 +96,7 @@ async function ensureTenantToken() {
 export function getClient() {
   if (_client) return _client;
   if (!APP_ID || !APP_SECRET) {
-    log("[飞书SDK] 警告：FEISHU_APP_ID / FEISHU_APP_SECRET 未配置");
+    log("[飞书 SDK] 警告：FEISHU_APP_ID / FEISHU_APP_SECRET 未配置");
     return null;
   }
   _client = new lark.Client({
@@ -107,7 +107,7 @@ export function getClient() {
     disableTokenCache: true,  // 禁用 SDK 内部 token 缓存，使用我们自己的管理
     loggerLevel: lark.LoggerLevel.error,
   });
-  log("[飞书SDK] Client 已初始化（手动 token 管理模式）");
+  log("[飞书 SDK] Client 已初始化（手动 token 管理模式）");
   return _client;
 }
 
@@ -128,9 +128,9 @@ async function verifyCredentials() {
   if (!APP_ID || !APP_SECRET) return;
   const token = await ensureTenantToken();
   if (token) {
-    log(`[飞书SDK] 凭证验证通过 ✓`);
+    log(`[飞书 SDK] 凭证验证通过 ✓`);
   } else {
-    log(`[飞书SDK] ⚠ 凭证验证失败，请检查 FEISHU_APP_ID(${APP_ID.slice(0,8)}...) 和 FEISHU_APP_SECRET`);
+    log(`[飞书 SDK] ⚠ 凭证验证失败，请检查 FEISHU_APP_ID(${APP_ID.slice(0,8)}...) 和 FEISHU_APP_SECRET`);
   }
 }
 
@@ -261,7 +261,7 @@ export async function sendCard(title, content, template = "red", opts = {}) {
     if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
     const messageId = res.data?.message_id;
     if (!firstMessageId) firstMessageId = messageId;
-    log(`[飞书SDK] 卡片已发送${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""} → ${messageId}`);
+    log(`[飞书 SDK] 卡片已发送${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""} → ${messageId}`);
     await pauseBetweenChunks(i + 1, chunks.length);
   }
   return firstMessageId;
@@ -314,7 +314,7 @@ export async function replyText(messageId, text) {
     }, tokenOpt);
     if (!firstRes) firstRes = res;
     if (res.code !== 0) {
-      log(`[飞书SDK] 回复失败 code=${res.code}: ${res.msg}`);
+      log(`[飞书 SDK] 回复失败：code=${res.code}: ${res.msg}`);
     }
     await pauseBetweenChunks(i + 1, chunks.length);
   }
@@ -341,7 +341,7 @@ export async function replyCard(messageId, title, content, color = "blue") {
     }, tokenOpt);
     if (!firstRes) firstRes = res;
     if (res.code !== 0) {
-      log(`[飞书SDK] 回复卡片失败 code=${res.code}: ${res.msg}`);
+      log(`[飞书 SDK] 回复卡片失败：code=${res.code}: ${res.msg}`);
     }
     await pauseBetweenChunks(i + 1, chunks.length);
   }
@@ -392,7 +392,7 @@ export async function uploadFile(fileName, content) {
     throw new Error(`文件上传失败 code=${res.code}: ${errMsg}`);
   }
   // 兜底：无 file_key 也无错误码
-  log(`[飞书SDK] 文件上传响应异常: ${JSON.stringify(res).slice(0, 300)}`);
+  log(`[飞书 SDK] 文件上传响应异常：${JSON.stringify(res).slice(0, 300)}`);
   throw new Error("文件上传失败：响应中无 file_key");
 }
 
@@ -433,7 +433,7 @@ export async function replyFile(messageId, fileKey) {
     },
   }, tokenOpt);
   if (res.code !== 0) {
-    log(`[飞书SDK] 文件回复失败 code=${res.code}: ${res.msg}`);
+    log(`[飞书 SDK] 文件回复失败：code=${res.code}: ${res.msg}`);
   }
   return res;
 }
@@ -451,12 +451,12 @@ export async function pinMessage(messageId) {
       data: { message_id: messageId },
     }, tokenOpt);
     if (res.code !== 0) {
-      log(`[Pin] 置顶失败 code=${res.code}: ${res.msg}`);
+      log(`[置顶 Pin] 置顶失败：code=${res.code}: ${res.msg}`);
       return;
     }
-    log(`[Pin] 消息已置顶 → ${messageId}`);
+    log(`[置顶 Pin] 消息已置顶 → ${messageId}`);
   } catch (err) {
-    log(`[Pin] 置顶异常：${err.message}`);
+    log(`[置顶 Pin] 置顶异常：${err.message}`);
   }
 }
 
@@ -549,7 +549,7 @@ export function sendHeartbeatQueued(title, content, template = "green") {
   messageThrottle.pendingHeartbeat = async () => {
     await sendCard(title, content, template);
   };
-  log(`[心跳] 已挂起，等待队列空闲（当前队列: ${messageThrottle.queue.length} 条）`);
+  log(`[心跳] 已挂起，等待队列空闲（当前队列：${messageThrottle.queue.length} 条）`);
   if (messageThrottle.queue.length === 0) {
     processQueue().catch(err => {
       log(`[心跳] 消息队列处理异常：${err.message}`);
@@ -564,7 +564,7 @@ export function sendHeartbeatQueued(title, content, template = "green") {
 export async function waitQueueDrain(timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
   while (messageThrottle.queue.length > 0 && Date.now() < deadline) {
-    log(`等待 ${messageThrottle.queue.length} 条通知发送完成...`);
+    log(`等待 ${messageThrottle.queue.length} 条通知发送完成……`);
     await new Promise(r => setTimeout(r, 2_000));
   }
   messageThrottle.pendingHeartbeat = null;
@@ -575,7 +575,7 @@ export async function waitQueueDrain(timeoutMs = 30_000) {
 
 /* ── 启动日志 ── */
 if (APP_ID) {
-  log(`[飞书SDK] 应用: ${APP_ID}  群聊: ${CHAT_ID || "(未配置)"}`);
+  log(`[飞书 SDK] 应用：${APP_ID}  群聊：${CHAT_ID || "(未配置)"}`);
 } else {
-  log("[飞书SDK] 警告：FEISHU_APP_ID 未配置，飞书通知不可用");
+  log("[飞书 SDK] 警告：FEISHU_APP_ID 未配置，飞书通知不可用");
 }

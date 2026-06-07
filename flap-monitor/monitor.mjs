@@ -414,7 +414,7 @@ async function sendFeishu(title, content, template = "red", _retries = 2) {
   for (let attempt = 0; attempt <= _retries; attempt++) {
     try {
       await sendCardQueued(title, content, template);
-      return;
+      return true;
     } catch (err) {
       log(`飞书推送异常（第${attempt + 1}次）：${err.message}`);
       if (attempt < _retries) {
@@ -423,18 +423,29 @@ async function sendFeishu(title, content, template = "red", _retries = 2) {
     }
   }
   log(`飞书推送最终失败（已重试 ${_retries} 次）`);
+  return false;
 }
 
 /**
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
 async function sendCardViaApi(title, content, template = "red", diffFilePath) {
-  try {
-    return await sendCard(title, content, template, { diffFilePath });
-  } catch (err) {
-    log(`[IM API] 发送失败：${err.message}`);
-    return null;
+  const maxAttempts = 2;
+  let lastError = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await sendCard(title, content, template, { diffFilePath });
+    } catch (err) {
+      lastError = err;
+      log(`[飞书 IM API] 直接发送失败（第 ${attempt + 1}/${maxAttempts} 次）：${err.message}`);
+      if (attempt < maxAttempts - 1) await sleep(800 * (attempt + 1));
+    }
   }
+
+  log("[飞书 IM API] 直接发送失败，转入队列兜底补发");
+  const queuedMessageId = await sendCardQueued(title, content, template, { diffFilePath });
+  if (queuedMessageId) return queuedMessageId;
+  throw new Error(`飞书卡片发送失败：${lastError?.message || "队列补发失败"}`);
 }
 
 /**
@@ -442,6 +453,15 @@ async function sendCardViaApi(title, content, template = "red", diffFilePath) {
  */
 async function patchCardViaApi(messageId, title, content, template = "red", diffFilePath) {
   await patchCard(messageId, title, content, template, { diffFilePath });
+}
+
+const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
+  const n = Number(process.env.FEISHU_CARD_CHUNK_LIMIT || 3500);
+  return Number.isFinite(n) && n >= 500 ? Math.floor(n) : 3500;
+})();
+
+function isTooLongForSingleCard(content) {
+  return String(content ?? "").length > FEISHU_CARD_PATCH_SAFE_LIMIT;
 }
 
 /**
@@ -475,16 +495,22 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
       if (messageId) {
         try {
-          await patchCardViaApi(messageId, title, urlLine + enriched, template, diffFilePath);
-          log(`[AI→更新] ${title} 已补充 AI 摘要`);
+          const enrichedContent = urlLine + enriched;
+          if (isTooLongForSingleCard(urlLine + content) || isTooLongForSingleCard(enrichedContent)) {
+            log(`[AI 摘要] ${title} 正文较长，保留完整变更卡片，另发 AI 摘要卡片`);
+            await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
+          } else {
+            await patchCardViaApi(messageId, title, enrichedContent, template, diffFilePath);
+            log(`[AI 摘要→卡片更新] ${title} 已补充 AI 摘要`);
+          }
         } catch (err) {
-          log(`[AI→更新] 编辑失败(${err.message})，追加发送`);
+          log(`[AI 摘要→卡片更新] 编辑失败(${err.message})，追加发送`);
           await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
         }
       } else {
         await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
       }
-    }).catch(err => log(`[AI] 异步摘要异常：${err.message}`));
+    }).catch(err => log(`[AI 摘要] 异步摘要异常：${err.message}`));
   }
 }
 
@@ -513,7 +539,7 @@ function saveDiffLocally(title, diffText) {
     const fileName = `flap_diff_${safeName}_${dateStr}.txt`;
     const filePath = join(diffDir, fileName);
     writeFileSync(filePath, diffText, "utf-8");
-    log(`[diff文件] 已保存: ${filePath} (${diffText.length} 字)`);
+    log(`[Diff 文件] 已保存: ${filePath} (${diffText.length} 字)`);
     // 清理超过 7 天的旧 diff 文件
     try {
       const cutoff = Date.now() - 7 * 24 * 3600_000;
@@ -524,7 +550,7 @@ function saveDiffLocally(title, diffText) {
     } catch (_) {}
     return filePath;
   } catch (err) {
-    log(`[diff文件] 保存失败：${err.message}`);
+    log(`[Diff 文件] 保存失败：${err.message}`);
     return null;
   }
 }
@@ -583,7 +609,7 @@ async function withAiSummary(content, moduleContext = "", aiInput = null) {
 /**
  * 构建极简 AI 简报输入 — 只提取结构化统计，不喂原始字符串 diff
  */
-function buildBriefingInput(url, changes, assetStats) {
+function buildBriefingInput(url, changes, assetStats, caStoreVaultDiffs = []) {
   const lines = [];
   lines.push(`URL: ${url}`);
   lines.push(`时间: ${ts()}`);
@@ -594,6 +620,22 @@ function buildBriefingInput(url, changes, assetStats) {
     lines.push(`资源变更: 不变 ${assetStats.unchanged} | 重命名 ${assetStats.renamed} | 修改 ${assetStats.modified} | 新增 ${assetStats.added} | 移除 ${assetStats.removed}`);
     lines.push(`噪音文件: ${assetStats.noiseFiles} 个 (${assetStats.noiseCount} 处变量重命名/部署ID轮换)`);
     lines.push(`实质变更文件: ${assetStats.substantiveFiles} 个 (${assetStats.substantiveCount} 处)`);
+  }
+
+  if (caStoreVaultDiffs.length > 0) {
+    lines.push("");
+    lines.push("CAstore 金库变更:");
+    for (const d of caStoreVaultDiffs) {
+      if (d.type === "modified") {
+        lines.push(`  修改: ${d.name}`);
+        lines.push(`    旧文案: ${d.oldDescription || "(空)"}`);
+        lines.push(`    新文案: ${d.newDescription || "(空)"}`);
+      } else if (d.type === "added") {
+        lines.push(`  新增: ${d.name} — ${d.newDescription || "(空)"}`);
+      } else if (d.type === "removed") {
+        lines.push(`  删除: ${d.name} — ${d.oldDescription || "(空)"}`);
+      }
+    }
   }
 
   // 配置变更（过滤 minifier 噪音后再给 AI）
@@ -712,10 +754,10 @@ function saveDetailedDiff(url, changes) {
       ...changes,
     ].join("\n");
     writeFileSync(file, content, "utf-8");
-    log(`[详细diff] 已保存: ${file} (${content.length} 字)`);
+    log(`[详细 Diff] 已保存: ${file} (${content.length} 字)`);
     return file;
   } catch (err) {
-    log(`[详细diff] 保存失败：${err.message}`);
+    log(`[详细 Diff] 保存失败：${err.message}`);
     return null;
   }
 }
@@ -783,33 +825,54 @@ function findCommonPrefix(strings) {
 }
 
 /**
- * 构建飞书卡片简报内容（极简，只含关键信息）
- * 展示优先级：AI 摘要 → Vault 变更 → 文案变更 → UI 文案(i18n) → 业务配置 → 资源统计
+ * 构建飞书卡片简报内容。
+ * 展示优先级：具体变更事实 → AI 摘要 → 资源统计。
  */
-function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges) {
+function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs = []) {
   const lines = [];
 
-  // AI 分析（主体）
-  if (aiSummary) {
-    lines.push(aiSummary);
-  } else {
-    lines.push("*(AI 分析中，稍后自动更新)*");
-  }
+  lines.push(`**监控页面:** ${url}`);
+  lines.push("");
+  lines.push("**重点变更:**");
+  lines.push("");
 
-  lines.push("");
-  lines.push("---");
-  lines.push("");
+  let hasStructuredChange = false;
+
+  if (caStoreVaultDiffs.length > 0) {
+    hasStructuredChange = true;
+    lines.push(`**🏦 CAstore 金库变更（${caStoreVaultDiffs.length} 项）：**`);
+    for (const d of caStoreVaultDiffs) {
+      if (d.type === "modified") {
+        lines.push(`  ✏️ **${d.name}**`);
+        if (d.oldName && d.newName && d.oldName !== d.newName) lines.push(`  名称: ${d.oldName} → ${d.newName}`);
+        lines.push(`  旧文案: ${d.oldDescription || "(空)"}`);
+        lines.push(`  新文案: ${d.newDescription || "(空)"}`);
+      } else if (d.type === "added") {
+        lines.push(`  🟢 新增金库: **${d.name}**`);
+        lines.push(`  文案: ${d.newDescription || "(空)"}`);
+      } else if (d.type === "removed") {
+        lines.push(`  🔴 移除金库: **${d.name}**`);
+        lines.push(`  原文案: ${d.oldDescription || "(空)"}`);
+      }
+    }
+    lines.push("");
+  }
 
   // ═══ 1. Vault 变更（最高优先级）═══
   if (assetStats?.vaultDiffs?.length > 0) {
-    lines.push("**🏦 Vault 变更：**");
-    for (const vd of assetStats.vaultDiffs.slice(0, 5)) {
+    hasStructuredChange = true;
+    lines.push(`**🏦 Vault 配置变更（${assetStats.vaultDiffs.length} 项）：**`);
+    for (const vd of assetStats.vaultDiffs) {
       if (vd.type === "modified") {
-        for (const fc of vd.fieldChanges.slice(0, 5)) {
+        lines.push(`  ✏️ **${vd.name}**`);
+        for (const fc of vd.fieldChanges) {
           lines.push(`  \`${fc.key}\`: ${fc.oldVal} → ${fc.newVal}`);
         }
-      } else {
-        lines.push(`  🆕 ${vd.name}`);
+      } else if (vd.type === "added") {
+        lines.push(`  🟢 新增: **${vd.name}**`);
+        for (const [key, value] of Object.entries(vd.fields || {})) {
+          lines.push(`  \`${key}\`: ${value}`);
+        }
       }
     }
     lines.push("");
@@ -817,71 +880,68 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
 
   // ═══ 2. 页面文案变更（提升优先级，展示实际内容）═══
   if (textChanges && textChanges.length > 0) {
-    const truncSeg = (s, max = 80) => s && s.length > max ? s.slice(0, max) + "…" : s;
+    hasStructuredChange = true;
     const modified = textChanges.filter(c => c.type === "modified");
     const added = textChanges.filter(c => c.type === "added");
     const removed = textChanges.filter(c => c.type === "removed");
     lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
-    for (const c of modified.slice(0, 5)) {
-      lines.push(`  旧: ${truncSeg(c.oldText)}`);
-      lines.push(`  新: ${truncSeg(c.newText)}`);
+    for (const c of modified) {
+      lines.push("  ✏️ 修改");
+      lines.push(`  旧: ${c.oldText}`);
+      lines.push(`  新: ${c.newText}`);
+      if (c.ctxBefore) lines.push(`  上文: ${c.ctxBefore}`);
     }
-    if (modified.length > 5) lines.push(`  ... 还有 ${modified.length - 5} 处修改`);
-    for (const c of added.slice(0, 3)) {
-      lines.push(`  🟢 新增: ${truncSeg(c.text)}`);
+    for (const c of added) {
+      lines.push(`  🟢 新增: ${c.text}`);
+      if (c.ctxBefore) lines.push(`  上文: ${c.ctxBefore}`);
     }
-    if (added.length > 3) lines.push(`  ... 还有 ${added.length - 3} 处新增`);
-    for (const c of removed.slice(0, 3)) {
-      lines.push(`  🔴 删除: ${truncSeg(c.text)}`);
+    for (const c of removed) {
+      lines.push(`  🔴 删除: ${c.text}`);
+      if (c.ctxBefore) lines.push(`  上文: ${c.ctxBefore}`);
     }
-    if (removed.length > 3) lines.push(`  ... 还有 ${removed.length - 3} 处删除`);
     lines.push("");
   } else if (textChangeCount > 0) {
+    hasStructuredChange = true;
     lines.push(`**✏️ 文案变更：** ${textChangeCount} 处`);
     lines.push("");
   }
 
   // ═══ 3. UI 文案变更（i18n）— 直接展示中文文案 ═══
   if (i18nDiffs && i18nDiffs.length > 0) {
+    hasStructuredChange = true;
     const added = i18nDiffs.filter(d => d.type === "added");
     const modified = i18nDiffs.filter(d => d.type === "modified");
     const removed = i18nDiffs.filter(d => d.type === "removed");
 
-    lines.push("**📝 UI 文案变更：**");
+    lines.push(`**📝 UI 文案变更（i18n，共 ${i18nDiffs.length} 处）：**`);
     if (added.length > 0) {
       lines.push(`  **新增 ${added.length} 条：**`);
-      for (const d of added.slice(0, 20)) {
-        const shortKey = d.key.split(".").slice(-2).join(".");
-        const val = d.value.length > 70 ? d.value.slice(0, 70) + "…" : d.value;
-        lines.push(`  \`${shortKey}\` ${val}`);
+      for (const d of added) {
+        lines.push(`  🟢 \`${d.key}\`: ${d.value}`);
       }
-      if (added.length > 20) lines.push(`  ... 还有 ${added.length - 20} 条`);
     }
     if (modified.length > 0) {
       lines.push(`  **修改 ${modified.length} 条：**`);
-      for (const d of modified.slice(0, 10)) {
-        const shortKey = d.key.split(".").slice(-2).join(".");
-        const oldV = d.oldValue.length > 30 ? d.oldValue.slice(0, 30) + "…" : d.oldValue;
-        const newV = d.newValue.length > 30 ? d.newValue.slice(0, 30) + "…" : d.newValue;
-        lines.push(`  \`${shortKey}\` "${oldV}" → "${newV}"`);
+      for (const d of modified) {
+        lines.push(`  ✏️ \`${d.key}\`: "${d.oldValue}" → "${d.newValue}"`);
       }
-      if (modified.length > 10) lines.push(`  ... 还有 ${modified.length - 10} 条`);
     }
     if (removed.length > 0) {
-      lines.push(`  **删除 ${removed.length} 条**`);
-      for (const d of removed.slice(0, 5)) {
-        const shortKey = d.key.split(".").slice(-2).join(".");
-        lines.push(`  ~~\`${shortKey}\`~~ ${(d.value || "").slice(0, 50)}`);
+      lines.push(`  **删除 ${removed.length} 条：**`);
+      for (const d of removed) {
+        lines.push(`  🔴 \`${d.key}\`: ${d.value || "(空)"}`);
       }
     }
     lines.push("");
   } else if (i18nChangeCount > 0) {
+    hasStructuredChange = true;
     lines.push(`**📝 i18n 变更：** ${i18nChangeCount} 处`);
     lines.push("");
   }
 
   // ═══ 4. JS 文件中的业务文案变更（Vault 描述、功能文案等）═══
   if (assetStats?.jsTextDiffs?.length > 0) {
+    hasStructuredChange = true;
     const added = assetStats.jsTextDiffs.filter(d => d.type === "added");
     const removed = assetStats.jsTextDiffs.filter(d => d.type === "removed");
     // 尝试配对：removed 和 added 中相似的文案（可能是修改）
@@ -908,23 +968,19 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     }
     const unpairedRemoved = removed.filter((_, i) => !usedRemoved.has(i));
 
-    const truncT = (s, max = 70) => s && s.length > max ? s.slice(0, max) + "…" : s;
     const totalItems = paired.length + unpairedAdded.length + unpairedRemoved.length;
     if (totalItems > 0) {
       lines.push(`**💬 功能文案变更（${totalItems} 处）：**`);
-      for (const p of paired.slice(0, 5)) {
-        lines.push(`  旧: ${truncT(p.oldText)}`);
-        lines.push(`  新: ${truncT(p.newText)}`);
+      for (const p of paired) {
+        lines.push(`  旧: ${p.oldText}`);
+        lines.push(`  新: ${p.newText}`);
       }
-      if (paired.length > 5) lines.push(`  ... 还有 ${paired.length - 5} 处修改`);
-      for (const a of unpairedAdded.slice(0, 5)) {
-        lines.push(`  🟢 ${truncT(a.text)}`);
+      for (const a of unpairedAdded) {
+        lines.push(`  🟢 ${a.text}`);
       }
-      if (unpairedAdded.length > 5) lines.push(`  ... 还有 ${unpairedAdded.length - 5} 处新增`);
-      for (const r of unpairedRemoved.slice(0, 3)) {
-        lines.push(`  🔴 ~~${truncT(r.text)}~~`);
+      for (const r of unpairedRemoved) {
+        lines.push(`  🔴 ${r.text}`);
       }
-      if (unpairedRemoved.length > 3) lines.push(`  ... 还有 ${unpairedRemoved.length - 3} 处删除`);
       lines.push("");
     }
   }
@@ -934,19 +990,30 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     // 二次过滤：卡片层面只展示真实业务字段
     const businessDiffs = assetStats.configDiffs.filter(isBusinessConfigDiff);
     if (businessDiffs.length > 0) {
-      lines.push("**🔧 配置变更：**");
-      for (const cd of businessDiffs.slice(0, 10)) {
+      hasStructuredChange = true;
+      lines.push(`**🔧 配置变更（${businessDiffs.length} 项）：**`);
+      for (const cd of businessDiffs) {
         lines.push(`  \`${cd.field}\`: ${cd.oldVal} → ${cd.newVal}`);
-      }
-      if (businessDiffs.length > 10) {
-        lines.push(`  ... 还有 ${businessDiffs.length - 10} 项`);
       }
       lines.push("");
     }
   }
 
+  if (!hasStructuredChange) {
+    lines.push("未提取到结构化文案/金库/配置变更，查看下方资源统计和完整 Diff。");
+    lines.push("");
+  }
+
+  lines.push("---");
+  lines.push("");
+  lines.push("**AI 分析:**");
+  lines.push(aiSummary || "AI 分析中，稍后自动更新。");
+  lines.push("");
+
   // ═══ 6. 资源统计（最后，最不重要）═══
   if (assetStats) {
+    lines.push("---");
+    lines.push("");
     const statParts = [];
     if (assetStats.modified) statParts.push(`修改 ${assetStats.modified}`);
     if (assetStats.added) statParts.push(`新增 ${assetStats.added}`);
@@ -957,7 +1024,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   }
 
   lines.push("");
-  lines.push("*详细 diff 见附件*");
+  lines.push("*完整 Diff 可通过卡片按钮下载。*");
 
   return lines.join("\n");
 }
@@ -1337,7 +1404,7 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh") {
           if (ext === "js" && /(?:Vault|enabled.*constraints|constraints.*enabled|DividendBps)/i.test(content)) {
             entry.vaultConfigs = extractVaultConfigs(content);
             if (entry.vaultConfigs.length > 0) {
-              log(`  [Vault] ${filename}: 提取到 ${entry.vaultConfigs.length} 个配置对象`);
+              log(`  [金库 Vault] ${filename}: 提取到 ${entry.vaultConfigs.length} 个配置对象`);
             }
           }
           // 提取 vaultTypes 金库工厂注册列表
@@ -1345,7 +1412,7 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh") {
             const vf = extractVaultFactories(content);
             if (vf && vf.factories.length > 0) {
               entry.vaultFactories = vf;
-              log(`  [VaultFactory] ${filename}: 提取到 ${vf.factories.length} 个工厂 (vaultPortal: ${vf.vaultPortal || "N/A"})`);
+              log(`  [金库工厂 VaultFactory] ${filename}: 提取到 ${vf.factories.length} 个工厂 (vaultPortal: ${vf.vaultPortal || "N/A"})`);
             }
           }
           return entry;
@@ -1414,7 +1481,7 @@ function parseI18nFromChunk(jsContent) {
     if (hasChinese(raw)) {
       const parsed = _parseRawI18nString(raw);
       if (_isValidI18nObject(parsed)) {
-        log(`  [i18n] 命中中文语言包（${blocks.indexOf(raw) + 1}/${blocks.length}）`);
+        log(`  [国际化 i18n] 命中中文语言包（${blocks.indexOf(raw) + 1}/${blocks.length}）`);
         return parsed;
       }
     }
@@ -1501,7 +1568,7 @@ async function fetchI18nStrings(assetFiles, baseUrl = "https://flap.sh") {
   const results = await Promise.allSettled(tasks);
   for (const r of results) {
     if (r.status === "fulfilled" && r.value) {
-      log(`  i18n: 从 ${r.value.i18nChunk.split("/").pop()} 提取到 ${Object.keys(r.value.i18nStrings).length} 个 UI 字符串`);
+      log(`  [国际化 i18n] 从 ${r.value.i18nChunk.split("/").pop()} 提取到 ${Object.keys(r.value.i18nStrings).length} 个 UI 字符串`);
       return r.value;
     }
   }
@@ -1529,8 +1596,85 @@ function diffI18nStrings(oldStrings, newStrings) {
 
 /* ── 页面解析与特征提取 ── */
 
+function decodeHtmlEntities(input) {
+  return String(input || "")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+function htmlFragmentToText(fragment) {
+  return decodeHtmlEntities(fragment)
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeVaultName(name) {
+  return String(name || "")
+    .replace(/\s+/g, " ")
+    .replace(/[.。]+$/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function isCaStoreVaultHeading(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (/^(hot vaults|ca store|home|store|ai oracle|rank|profile|create|search)$/i.test(t)) return false;
+  return /vault|stocks|lista|custom vault factory|split/i.test(t);
+}
+
+function cleanVaultDescription(text) {
+  return String(text || "")
+    .replace(/\s+(Support|Docs|DeBox)(?:\s+.*)?$/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractCaStoreVaultSections(html) {
+  const headings = [];
+  const headingRe = /<h([1-4])[^>]*>([\s\S]*?)<\/h\1>/gi;
+  let m;
+  while ((m = headingRe.exec(html)) !== null) {
+    const name = htmlFragmentToText(m[2]);
+    headings.push({ level: Number(m[1]), name, start: m.index, end: headingRe.lastIndex });
+  }
+
+  const sections = [];
+  for (let i = 0; i < headings.length; i++) {
+    const h = headings[i];
+    if (!isCaStoreVaultHeading(h.name)) continue;
+    const next = headings[i + 1];
+    const rawDescription = htmlFragmentToText(html.slice(h.end, next ? next.start : html.length));
+    const description = cleanVaultDescription(rawDescription);
+    if (!description && !/custom vault factory/i.test(h.name)) continue;
+    sections.push({
+      name: h.name,
+      key: normalizeVaultName(h.name),
+      description,
+      signature: md5(`${h.name}\n${description}`),
+    });
+  }
+
+  const seen = new Set();
+  return sections.filter(section => {
+    if (!section.key || seen.has(section.key)) return false;
+    seen.add(section.key);
+    return true;
+  });
+}
+
 function extractPageFeatures(html) {
-  const features = { fullHash: md5(html), nextData: null, nextDataHash: null, assetFiles: [], assetHash: null, contentHash: null };
+  const features = { fullHash: md5(html), nextData: null, nextDataHash: null, assetFiles: [], assetHash: null, contentHash: null, caStoreVaults: [], caStoreVaultHash: null };
 
   const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (nextDataMatch) {
@@ -1550,16 +1694,73 @@ function extractPageFeatures(html) {
   features.assetFiles = [...assetSet].sort();
   features.assetHash = md5(features.assetFiles.join("\n"));
 
-  const textContent = html
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&#39;/g, "'")
-    .replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  const textContent = htmlFragmentToText(html);
   features.contentHash = md5(textContent);
   features.textContent = textContent;
+  features.caStoreVaults = extractCaStoreVaultSections(html);
+  if (features.caStoreVaults.length > 0) {
+    features.caStoreVaultHash = md5(JSON.stringify(features.caStoreVaults.map(v => [v.key, v.signature])));
+  }
   return features;
+}
+
+function diffCaStoreVaultSections(oldSections = [], newSections = []) {
+  if (!Array.isArray(oldSections) || !Array.isArray(newSections)) return [];
+  if (oldSections.length === 0 || newSections.length === 0) return [];
+
+  const oldMap = new Map(oldSections.map(v => [v.key || normalizeVaultName(v.name), v]));
+  const newMap = new Map(newSections.map(v => [v.key || normalizeVaultName(v.name), v]));
+  const changes = [];
+
+  for (const [key, nv] of newMap) {
+    const ov = oldMap.get(key);
+    if (!ov) {
+      changes.push({ type: "added", name: nv.name, newDescription: nv.description });
+      continue;
+    }
+    if ((ov.signature || md5(`${ov.name}\n${ov.description || ""}`)) !== (nv.signature || md5(`${nv.name}\n${nv.description || ""}`))) {
+      changes.push({
+        type: "modified",
+        name: nv.name || ov.name,
+        oldName: ov.name,
+        newName: nv.name,
+        oldDescription: ov.description || "",
+        newDescription: nv.description || "",
+      });
+    }
+  }
+
+  for (const [key, ov] of oldMap) {
+    if (!newMap.has(key)) {
+      changes.push({ type: "removed", name: ov.name, oldDescription: ov.description || "" });
+    }
+  }
+
+  return changes;
+}
+
+function shouldRefreshDerivedFeatureBaseline(oldFeatures, newFeatures) {
+  if (!oldFeatures || !newFeatures) return false;
+  return !oldFeatures.caStoreVaultHash && !!newFeatures.caStoreVaultHash;
+}
+
+function formatCaStoreVaultDiffsForChanges(diffs) {
+  const lines = ["🏦 CAstore 金库内容变更："];
+  for (const d of diffs) {
+    if (d.type === "modified") {
+      lines.push(`  ✏️ ${d.name}`);
+      if (d.oldName && d.newName && d.oldName !== d.newName) lines.push(`    名称: ${d.oldName} → ${d.newName}`);
+      lines.push(`    旧文案: ${d.oldDescription || "(空)"}`);
+      lines.push(`    新文案: ${d.newDescription || "(空)"}`);
+    } else if (d.type === "added") {
+      lines.push(`  🟢 新增金库: ${d.name}`);
+      lines.push(`    文案: ${d.newDescription || "(空)"}`);
+    } else if (d.type === "removed") {
+      lines.push(`  🔴 移除金库: ${d.name}`);
+      lines.push(`    原文案: ${d.oldDescription || "(空)"}`);
+    }
+  }
+  return lines;
 }
 
 const FLAP_ERROR_PAGE_PATTERNS = [
@@ -1935,7 +2136,7 @@ function flattenKeys(obj, prefix = "", result = {}) {
 
 function diffFeatures(oldF, newF) {
   const changes = [];
-  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [] };
+  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [], caStoreVaultDiffs: [] };
 
   if (oldF.nextDataHash && newF.nextDataHash && oldF.nextDataHash !== newF.nextDataHash) {
     changes.push("页面数据（__NEXT_DATA__）变更");
@@ -1948,6 +2149,13 @@ function diffFeatures(oldF, newF) {
       if (removed.length) changes.push(`  移除字段：${removed.slice(0, 10).join(", ")}`);
     }
   }
+
+  const caStoreVaultDiffs = diffCaStoreVaultSections(oldF.caStoreVaults || [], newF.caStoreVaults || []);
+  if (caStoreVaultDiffs.length > 0) {
+    meta.caStoreVaultDiffs = caStoreVaultDiffs;
+    changes.push(...formatCaStoreVaultDiffsForChanges(caStoreVaultDiffs));
+  }
+
   if (oldF.assetHash && newF.assetHash && oldF.assetHash !== newF.assetHash) {
     const hasAssetContents = oldF.assetContents && Object.keys(oldF.assetContents).length > 0
       && newF.assetContents && Object.keys(newF.assetContents).length > 0;
@@ -2234,7 +2442,8 @@ function urlToKey(url) { return url.replace(/[^a-zA-Z0-9]/g, "_"); }
 async function runCheck() {
   log("=== 手动触发检测 ===");
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
-  let hasChange = false;
+  let hasDetectedChange = false;
+  let hasNotifiedChange = false;
 
   // 并行抓取所有页面
   const tasks = CONFIG.urls.map((url, i) => sleep(i * 300).then(async () => {
@@ -2244,7 +2453,7 @@ async function runCheck() {
   const pageResults = await Promise.allSettled(tasks);
 
   for (const r of pageResults) {
-    if (r.status !== "fulfilled") { log(`  [FAIL] ${r.reason?.message}`); continue; }
+    if (r.status !== "fulfilled") { log(`  [失败] ${r.reason?.message}`); continue; }
     const { url, html } = r.value;
     const key = urlToKey(url);
     try {
@@ -2261,23 +2470,24 @@ async function runCheck() {
           const oldVFMap = snapshot.vaultFactories || {};
           if (Object.keys(oldVFMap).length === 0) {
             snapshot.vaultFactories = currentVFMap;
-            log(`  [VaultFactory] 首次记录 ${Object.keys(currentVFMap).length} 个金库工厂`);
+            log(`  [金库工厂 VaultFactory] 首次记录 ${Object.keys(currentVFMap).length} 个金库工厂`);
           } else {
             const vfChanges = diffVaultFactories(oldVFMap, currentVFMap);
             const hasVFC = vfChanges.added.length > 0 || vfChanges.removed.length > 0 || vfChanges.modified.length > 0;
             if (hasVFC) {
-              hasChange = true;
+              hasDetectedChange = true;
               const vfContent = formatVaultFactoryChanges(vfChanges);
               const vfTitle = vfChanges.added.length > 0
                 ? `🏦 手动检测 — 新增金库工厂 (${vfChanges.added.map(v => v.name).join(", ")})`
                 : `🏦 手动检测 — 金库工厂配置变更`;
-              log(`  [VaultFactory] ${vfTitle}`);
+              log(`  [金库工厂 VaultFactory] ${vfTitle}`);
               appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
               const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
               const vfMsgId = await sendCardViaApi(vfTitle, vfContent, vfTemplate);
               if (vfChanges.added.length > 0 && vfMsgId) {
                 await pinMessage(vfMsgId);
               }
+              hasNotifiedChange = true;
               snapshot.vaultFactories = currentVFMap;
             }
           }
@@ -2286,7 +2496,7 @@ async function runCheck() {
       }
 
       if (!snapshot.pages[key]) {
-        log(`  [INIT] ${url} — 首次记录`);
+        log(`  [初始化] ${url} — 首次记录`);
         snapshot.pages[key] = features;
         snapshot.pages[key].originalUrl = url;
         continue;
@@ -2294,22 +2504,23 @@ async function runCheck() {
       const oldFeatures = snapshot.pages[key];
       const oldQuality = getStoredFeatureQuality(url, oldFeatures);
       if (!oldQuality.valid) {
-        log(`  [BASELINE-REPAIR] ${url} — 旧快照无效，已用当前有效页面重建基线：${oldQuality.reasons.join("; ")}`);
+        log(`  [基线修复 Baseline Repair] ${url} — 旧快照无效，已用当前有效页面重建基线：${oldQuality.reasons.join("; ")}`);
         snapshot.pages[key] = features;
         snapshot.pages[key].originalUrl = url;
-        hasChange = true;
-        await sendFeishu(
+        hasDetectedChange = true;
+        const sent = await sendFeishu(
           "Flap 基线已修复",
           `${formatQualityIssue(url, oldQuality)}\n\n当前抓取样本有效，已重建基线；本次不按页面文案变更推送，避免旧坏快照造成误报。`,
           "yellow"
         );
+        if (sent) hasNotifiedChange = true;
         continue;
       }
       const { changes, meta } = diffFeatures(oldFeatures, features);
       if (changes.length > 0) {
-        log(`  [CHANGED] ${url}`);
+        log(`  [变更] ${url}`);
         for (const c of changes) log(`    ${c}`);
-        hasChange = true;
+        hasDetectedChange = true;
         const snapshotFile = saveHtmlSnapshot(url, html);
         // 保存详细 diff 到文件
         const diffFile = saveDetailedDiff(url, changes);
@@ -2319,23 +2530,34 @@ async function runCheck() {
         // 构建精简 AI 输入 → 先推裸卡片 → 异步 AI 补充
         // 桥接 i18nDiffs 到 assetStats，让 buildBriefingInput 能访问完整文案列表
         if (meta.assetStats && meta.i18nDiffs) meta.assetStats.i18nDiffs = meta.i18nDiffs;
-        const briefingInput = buildBriefingInput(url, changes, meta.assetStats);
-        const cardContent = buildCardBriefing(url, null, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges);
+        const briefingInput = buildBriefingInput(url, changes, meta.assetStats, meta.caStoreVaultDiffs);
+        const cardContent = buildCardBriefing(url, null, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges, meta.caStoreVaultDiffs);
         appendHistory("flap-page", title, cardContent.slice(0, 300), changes.join("\n"));
         const fullDiff = `=== Flap.sh 手动检测详细 Diff ===\nURL: ${url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${changes.join("\n")}`;
         const diffFilePath = saveDiffLocally(title, fullDiff);
         await sendThenEnrichWithAi(title, cardContent, "red", `Flap.sh 页面变更 ${url}`, briefingInput, (summary) => {
-          return buildCardBriefing(url, summary, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges);
+          return buildCardBriefing(url, summary, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges, meta.caStoreVaultDiffs);
         }, diffFilePath, url);
+        hasNotifiedChange = true;
         snapshot.pages[key] = features;
         snapshot.pages[key].originalUrl = url;
       } else {
-        log(`  [OK] ${url} — 无变化`);
+        if (shouldRefreshDerivedFeatureBaseline(oldFeatures, features)) {
+          snapshot.pages[key] = features;
+          snapshot.pages[key].originalUrl = url;
+          log(`  [基线补全] ${url} — 已保存 CAstore 金库结构，未发现业务变更`);
+        } else {
+          log(`  [正常] ${url} — 无变化`);
+        }
       }
-    } catch (err) { log(`  [FAIL] ${url} — ${err.message}`); }
+    } catch (err) { log(`  [失败] ${url} — ${err.message}`); }
   }
   saveSnapshot(snapshot);
-  log(hasChange ? "=== 检测完成：发现变更（已通知飞书）===" : "=== 检测完成：无变更 ===");
+  if (hasDetectedChange) {
+    log(hasNotifiedChange ? "=== 检测完成：发现变更（已通知飞书）===" : "=== 检测完成：发现变更，但通知未成功 ===");
+  } else {
+    log("=== 检测完成：无变更 ===");
+  }
 }
 
 /* ══════════════════════════════════════════
@@ -2350,9 +2572,9 @@ async function startMonitor() {
   let pollCount = 0;
   let isPolling = false;
 
-  log("=== Flap Monitor v2 启动 ===");
+  log("=== Flap 监控 v2 启动 ===");
   log(`轮询间隔: ${CONFIG.pollIntervalMs}ms + 抖动 ±${CONFIG.jitterMs}ms`);
-  log(`反风控: UA轮换(${UA_POOL.length}个) + per-domain自适应退避`);
+  log(`反风控：UA 轮换（${UA_POOL.length} 个）+ 按域名（per-domain）自适应退避`);
   log("监控目标:");
   for (const url of CONFIG.urls) log(`  - ${url}`);
 
@@ -2365,7 +2587,7 @@ async function startMonitor() {
   }
 
   if (needsInit) {
-    log("首次运行，建立基线（并行）...");
+    log("首次运行，正在并行建立基线……");
     const tasks = CONFIG.urls.map((url, i) => sleep(i * 300).then(async () => {
       const key = urlToKey(url);
       const html = await fetchPage(url);
@@ -2386,12 +2608,12 @@ async function startMonitor() {
         const { key, features, i18n, dlCount } = r.value;
         snapshot.pages[key] = features;
         const url = features.originalUrl;
-        log(`  ${url} — OK (assets: ${features.assetFiles.length}, downloaded: ${dlCount}, nextData: ${features.nextDataHash ? "yes" : "no"}, i18n: ${i18n ? Object.keys(i18n.i18nStrings).length + " strings" : "no"})`);
+        log(`  ${url} — 正常（资源 ${features.assetFiles.length} 个，已下载 ${dlCount} 个，Next 数据: ${features.nextDataHash ? "有" : "无"}，国际化 i18n: ${i18n ? Object.keys(i18n.i18nStrings).length + " 条" : "无"}）`);
         // 基线阶段提取 vault factories
         for (const entry of Object.values(features.assetContents || {})) {
           if (entry.vaultFactories && entry.vaultFactories.factories.length > 0) {
             snapshot.vaultFactories = factoryListToMap(entry.vaultFactories.factories);
-            log(`  [VaultFactory] 基线记录 ${Object.keys(snapshot.vaultFactories).length} 个金库工厂`);
+            log(`  [金库工厂 VaultFactory] 基线记录 ${Object.keys(snapshot.vaultFactories).length} 个金库工厂`);
             break;
           }
         }
@@ -2403,8 +2625,8 @@ async function startMonitor() {
   }
 
   await sendFeishu(
-    "Flap Monitor v2 已启动",
-    `**监控目标:**\n${CONFIG.urls.map(u => `- ${u}`).join("\n")}\n\n**轮询间隔:** ${CONFIG.pollIntervalMs}ms\n**反风控:** UA轮换 + 自适应退避 + 请求抖动\n**服务器:** ${(await import("node:os")).hostname()}`,
+    "Flap 监控 v2 已启动",
+    `**监控目标:**\n${CONFIG.urls.map(u => `- ${u}`).join("\n")}\n\n**轮询间隔:** ${CONFIG.pollIntervalMs}ms\n**反风控:** UA 轮换 + 按域名自适应退避 + 请求抖动\n**服务器:** ${(await import("node:os")).hostname()}`,
     "blue"
   );
 
@@ -2420,6 +2642,14 @@ async function startMonitor() {
 
     try {
       const notifications = [];
+
+      const applyNotificationSnapshotUpdate = (notification) => {
+        if (!notification?.snapshotUpdate) return false;
+        const { key, features } = notification.snapshotUpdate;
+        snapshot.pages[key] = features;
+        saveSnapshot(snapshot);
+        return true;
+      };
 
       // 并行抓取所有页面（加错开延迟），每个 task 携带自身 url/key，确保失败时也能归因
       const tasks = CONFIG.urls.map((url, i) => sleep(i * 200).then(async () => {
@@ -2447,7 +2677,7 @@ async function startMonitor() {
             backoffSkips[key] = (backoffSkips[key] || 0) + 1;
           }
           if (fc.count === CONFIG.failThreshold) {
-            log(`[错误] ${url} 连续 ${fc.count} 次失败: ${error.message}`);
+            log(`[错误] ${url} 连续 ${fc.count} 次失败：${error.message}`);
             notifications.push({
               title: "页面请求失败",
               content: `**URL:** ${url}\n**连续失败:** ${fc.count} 次\n**错误:** ${error.message}`,
@@ -2516,12 +2746,12 @@ async function startMonitor() {
             if (!hasOldData) {
               // 首次记录
               snapshot.vaultFactories = currentVFMap;
-              log(`[VaultFactory] 首次记录 ${Object.keys(currentVFMap).length} 个金库工厂`);
+              log(`[金库工厂 VaultFactory] 首次记录 ${Object.keys(currentVFMap).length} 个金库工厂`);
             } else {
               const vfChanges = diffVaultFactories(oldVFMap, currentVFMap);
               const hasVFChanges = vfChanges.added.length > 0 || vfChanges.removed.length > 0 || vfChanges.modified.length > 0;
               if (hasVFChanges) {
-                log(`[VaultFactory] 检测到变更: +${vfChanges.added.length} -${vfChanges.removed.length} ~${vfChanges.modified.length}`);
+                log(`[金库工厂 VaultFactory] 检测到变更：新增 ${vfChanges.added.length}，移除 ${vfChanges.removed.length}，修改 ${vfChanges.modified.length}`);
                 const vfContent = formatVaultFactoryChanges(vfChanges);
                 const vfTitle = vfChanges.added.length > 0
                   ? `🏦 新增官方金库工厂 (${vfChanges.added.map(v => v.name).join(", ")})`
@@ -2558,9 +2788,8 @@ async function startMonitor() {
               title: "Flap 基线已修复",
               template: "yellow",
               isRecoveryNotice: true,
+              snapshotUpdate: { key, features },
             });
-            snapshot.pages[key] = features;
-            saveSnapshot(snapshot);
             continue;
           }
 
@@ -2580,8 +2809,12 @@ async function startMonitor() {
               diffFile,
               title: `Flap 页面变更`,
               template: "red",
+              snapshotUpdate: { key, features },
             });
+          } else if (shouldRefreshDerivedFeatureBaseline(oldFeatures, features)) {
             snapshot.pages[key] = features;
+            saveSnapshot(snapshot);
+            log(`[基线补全] ${url} 已保存 CAstore 金库结构，未发现业务变更`);
           }
         } catch (err) {
           if (!failCounts[key]) failCounts[key] = { count: 0, lastMsg: "", lastFailTime: 0, hourlyErrors: [] };
@@ -2591,7 +2824,7 @@ async function startMonitor() {
           fc.lastFailTime = Date.now();
           fc.hourlyErrors.push(Date.now());
           if (fc.count === CONFIG.failThreshold) {
-            log(`[错误] ${url} 处理失败 ${fc.count} 次: ${err.message}`);
+            log(`[错误] ${url} 处理失败 ${fc.count} 次：${err.message}`);
             notifications.push({
               title: err.pageQuality ? "页面样本无效" : "页面处理失败",
               content: `**URL:** ${url}\n**连续失败:** ${fc.count} 次\n**错误:** ${err.message}`,
@@ -2603,13 +2836,14 @@ async function startMonitor() {
       }
 
       if (notifications.length > 0) {
-        saveSnapshot(snapshot);
         for (let ni = 0; ni < notifications.length; ni++) {
           const n = notifications[ni];
 
           // 退避恢复通知直接发送，不需要 AI 分析
           if (n.isRecoveryNotice) {
-            await sendFeishu(n.title, n.content || n.changes.join("\n"), n.template);
+            const sent = await sendFeishu(n.title, n.content || n.changes.join("\n"), n.template);
+            if (!sent) throw new Error(`飞书通知发送失败：${n.title}`);
+            applyNotificationSnapshotUpdate(n);
             continue;
           }
 
@@ -2625,14 +2859,15 @@ async function startMonitor() {
           // 构建精简 AI 输入 → 先推裸卡片 → 异步 AI 补充
           // 桥接 i18nDiffs 到 assetStats
           if (n.meta.assetStats && n.meta.i18nDiffs) n.meta.assetStats.i18nDiffs = n.meta.i18nDiffs;
-          const briefingInput = buildBriefingInput(n.url, n.changes, n.meta.assetStats);
-          const cardContent = buildCardBriefing(n.url, null, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges);
+          const briefingInput = buildBriefingInput(n.url, n.changes, n.meta.assetStats, n.meta.caStoreVaultDiffs);
+          const cardContent = buildCardBriefing(n.url, null, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
           appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
           const fullDiff = `=== Flap.sh 详细 Diff ===\nURL: ${n.url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${n.changes.join("\n")}`;
           const diffFilePath = saveDiffLocally(n.title, fullDiff);
           await sendThenEnrichWithAi(n.title, cardContent, n.template, `Flap.sh 页面变更`, briefingInput, (summary) => {
-            return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges);
+            return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
           }, diffFilePath, n.url);
+          applyNotificationSnapshotUpdate(n);
         }
       }
 
@@ -2644,7 +2879,7 @@ async function startMonitor() {
         cleanOldSnapshots();
       }
     } catch (err) {
-      log(`轮询异常: ${err.message}`);
+      log(`轮询异常：${err.message}`);
     } finally {
       isPolling = false;
       // 如果在轮询期间有新的检测请求，立即执行一次
@@ -2664,7 +2899,7 @@ async function startMonitor() {
       log("收到 SIGUSR1，当前正在轮询，将在本轮结束后立即执行");
       return;
     }
-    log("收到 SIGUSR1，立即触发检测...");
+    log("收到 SIGUSR1，立即触发检测……");
     poll().catch(err => log(`[SIGUSR1] 检测异常：${err.message}`));
   });
 
@@ -2764,7 +2999,7 @@ async function startMonitor() {
 const command = process.argv[2];
 
 if (command === "check") {
-  runCheck().then(() => process.exit(0)).catch((err) => { log(`检测异常: ${err.message}`); process.exit(1); });
+  runCheck().then(() => process.exit(0)).catch((err) => { log(`检测异常：${err.message}`); process.exit(1); });
 } else if (command === "help" || command === "-h" || command === "--help") {
   console.log(`用法:
   node monitor.mjs          启动持续监控（守护进程模式）
@@ -2785,7 +3020,7 @@ let isShuttingDown = false;
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
-  log(`收到 ${signal}，正在优雅退出...`);
+  log(`收到 ${signal}，正在优雅退出……`);
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   try { saveSnapshot(loadSnapshot() || {}); } catch {}
