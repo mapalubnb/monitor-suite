@@ -54,6 +54,11 @@ const CONFIG = {
   failThreshold: 3,
   snapshotFile: join(__dirname, "snapshot.json"),
   snapshotDir: join(__dirname, "snapshots"),
+  pageQuality: {
+    minHtmlLength: 1_000,
+    minTextLength: 20,
+    minAssetFiles: 2,
+  },
 
   // 心跳间隔（毫秒）— 支持环境变量 HEARTBEAT_MINUTES 覆盖（单位：分钟）
   heartbeatMs: process.env.HEARTBEAT_MINUTES
@@ -1557,6 +1562,82 @@ function extractPageFeatures(html) {
   return features;
 }
 
+const FLAP_ERROR_PAGE_PATTERNS = [
+  /Service Unavailable/i,
+  /not available in your region/i,
+  /Access Denied/i,
+  /Just a moment/i,
+  /enable JavaScript and cookies/i,
+  /Application error/i,
+  /server-side exception/i,
+  /Rate limit/i,
+];
+
+function getFlapPageQuality(url, html, features) {
+  const reasons = [];
+  const warnings = [];
+  const htmlText = html == null ? "" : String(html);
+  const text = String(features?.textContent || "");
+  const assetCount = (features?.assetFiles || []).length;
+
+  if (!features) {
+    reasons.push("features 为空");
+  }
+  if (html != null && htmlText.length < CONFIG.pageQuality.minHtmlLength) {
+    reasons.push(`HTML 过短(${htmlText.length})`);
+  }
+  if (text.length < CONFIG.pageQuality.minTextLength) {
+    reasons.push(`正文过短(${text.length})`);
+  }
+  if (assetCount < CONFIG.pageQuality.minAssetFiles) {
+    const hasNextData = !!features?.nextDataHash;
+    if (!hasNextData && text.length < 300) {
+      reasons.push(`Next 静态资源过少(${assetCount})且正文不足以作为有效页面`);
+    } else {
+      warnings.push(`Next 静态资源过少(${assetCount})`);
+    }
+  }
+
+  const markerText = `${htmlText.slice(0, 4000)}\n${text.slice(0, 4000)}`;
+  const matchedError = FLAP_ERROR_PAGE_PATTERNS.find(p => p.test(markerText));
+  if (matchedError) {
+    reasons.push(`疑似错误页(${matchedError.source})`);
+  }
+
+  if (/\/bnb\/CAstore/i.test(url) && !/Vault|CA STORE|STORE|Connect Wallet/i.test(text)) {
+    warnings.push("CAstore 关键文案缺失");
+  } else if (/\/(?:launch|create)(?:$|\?)/i.test(url) && !/Create|Token|Connect Wallet/i.test(text)) {
+    warnings.push("创建页关键文案缺失");
+  }
+
+  return { valid: reasons.length === 0, reasons, warnings };
+}
+
+function assertValidFlapPage(url, html, features) {
+  const quality = getFlapPageQuality(url, html, features);
+  if (!quality.valid) {
+    const err = new Error(`页面样本无效：${quality.reasons.join("; ")}`);
+    err.pageQuality = quality;
+    throw err;
+  }
+  if (quality.warnings.length > 0) {
+    log(`[质量] ${url} 警告：${quality.warnings.join("; ")}`);
+  }
+  return quality;
+}
+
+function getStoredFeatureQuality(url, features) {
+  return getFlapPageQuality(url, null, features);
+}
+
+function formatQualityIssue(url, quality) {
+  return [
+    `**URL:** ${url}`,
+    `**原因:** ${(quality?.reasons || []).join("; ") || "未知"}`,
+    quality?.warnings?.length ? `**警告:** ${quality.warnings.join("; ")}` : "",
+  ].filter(Boolean).join("\n");
+}
+
 /* ── Diff 工具 ── */
 
 function jaccard(a, b) {
@@ -2168,6 +2249,7 @@ async function runCheck() {
     const key = urlToKey(url);
     try {
       const features = extractPageFeatures(html);
+      assertValidFlapPage(url, html, features);
       const i18n = await fetchI18nStrings(features.assetFiles);
       if (i18n) { features.i18nStrings = i18n.i18nStrings; features.i18nHash = i18n.i18nHash; features.i18nChunk = i18n.i18nChunk; }
       features.assetContents = await downloadAssetContents(features.assetFiles);
@@ -2210,6 +2292,19 @@ async function runCheck() {
         continue;
       }
       const oldFeatures = snapshot.pages[key];
+      const oldQuality = getStoredFeatureQuality(url, oldFeatures);
+      if (!oldQuality.valid) {
+        log(`  [BASELINE-REPAIR] ${url} — 旧快照无效，已用当前有效页面重建基线：${oldQuality.reasons.join("; ")}`);
+        snapshot.pages[key] = features;
+        snapshot.pages[key].originalUrl = url;
+        hasChange = true;
+        await sendFeishu(
+          "Flap 基线已修复",
+          `${formatQualityIssue(url, oldQuality)}\n\n当前抓取样本有效，已重建基线；本次不按页面文案变更推送，避免旧坏快照造成误报。`,
+          "yellow"
+        );
+        continue;
+      }
       const { changes, meta } = diffFeatures(oldFeatures, features);
       if (changes.length > 0) {
         log(`  [CHANGED] ${url}`);
@@ -2276,6 +2371,7 @@ async function startMonitor() {
       const html = await fetchPage(url);
       const features = extractPageFeatures(html);
       features.originalUrl = url;
+      assertValidFlapPage(url, html, features);
       const i18n = await fetchI18nStrings(features.assetFiles);
       if (i18n) { features.i18nStrings = i18n.i18nStrings; features.i18nHash = i18n.i18nHash; features.i18nChunk = i18n.i18nChunk; }
       // 下载资源内容用于内容级 diff
@@ -2352,18 +2448,25 @@ async function startMonitor() {
           }
           if (fc.count === CONFIG.failThreshold) {
             log(`[错误] ${url} 连续 ${fc.count} 次失败: ${error.message}`);
-            notifications.push({ title: "页面请求失败", content: `**URL:** ${url}\n**连续失败:** ${fc.count} 次\n**错误:** ${error.message}`, template: "orange" });
+            notifications.push({
+              title: "页面请求失败",
+              content: `**URL:** ${url}\n**连续失败:** ${fc.count} 次\n**错误:** ${error.message}`,
+              template: "orange",
+              isRecoveryNotice: true,
+            });
           }
           continue;
         }
         try {
           const features = extractPageFeatures(html);
           features.originalUrl = url;
+          assertValidFlapPage(url, html, features);
 
           const oldFeatures = snapshot.pages[key];
+          const oldQuality = oldFeatures ? getStoredFeatureQuality(url, oldFeatures) : null;
 
           // 仅当 assetHash 未变且旧数据完整时才复用缓存（节省带宽）
-          if (oldFeatures && oldFeatures.assetContents && oldFeatures.assetHash === features.assetHash) {
+          if (oldQuality?.valid && oldFeatures.assetContents && oldFeatures.assetHash === features.assetHash) {
             features.assetContents = oldFeatures.assetContents;
             // i18n: 仅当之前成功提取过才复用，否则按衰减频率重试
             if (oldFeatures.i18nHash) {
@@ -2442,6 +2545,25 @@ async function startMonitor() {
             continue;
           }
 
+          if (!oldQuality.valid) {
+            log(`[基线修复] ${url} 旧快照无效，当前样本有效，已重建基线：${oldQuality.reasons.join("; ")}`);
+            notifications.push({
+              url,
+              changes: [
+                formatQualityIssue(url, oldQuality),
+                "",
+                "当前抓取样本有效，已重建基线；本次不按页面文案变更推送，避免旧坏快照造成误报。",
+              ],
+              meta: { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [] },
+              title: "Flap 基线已修复",
+              template: "yellow",
+              isRecoveryNotice: true,
+            });
+            snapshot.pages[key] = features;
+            saveSnapshot(snapshot);
+            continue;
+          }
+
           const { changes, meta } = diffFeatures(oldFeatures, features);
           if (changes.length > 0) {
             log(`[变更] ${url}`);
@@ -2470,6 +2592,12 @@ async function startMonitor() {
           fc.hourlyErrors.push(Date.now());
           if (fc.count === CONFIG.failThreshold) {
             log(`[错误] ${url} 处理失败 ${fc.count} 次: ${err.message}`);
+            notifications.push({
+              title: err.pageQuality ? "页面样本无效" : "页面处理失败",
+              content: `**URL:** ${url}\n**连续失败:** ${fc.count} 次\n**错误:** ${err.message}`,
+              template: "orange",
+              isRecoveryNotice: true,
+            });
           }
         }
       }
@@ -2481,7 +2609,7 @@ async function startMonitor() {
 
           // 退避恢复通知直接发送，不需要 AI 分析
           if (n.isRecoveryNotice) {
-            await sendFeishu(n.title, n.changes.join("\n"), n.template);
+            await sendFeishu(n.title, n.content || n.changes.join("\n"), n.template);
             continue;
           }
 
