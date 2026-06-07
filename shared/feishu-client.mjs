@@ -524,10 +524,11 @@ async function _doProcessQueue() {
 export async function sendCardQueued(title, content, template = "red", opts = {}) {
   return new Promise((resolve) => {
     if (messageThrottle.queue.length >= messageThrottle.maxQueueSize) {
-      messageThrottle.queue.shift();
+      const dropped = messageThrottle.queue.shift();
+      if (dropped?.onDrop) dropped.onDrop();
       log(`[飞书] 队列已满（${messageThrottle.maxQueueSize}），丢弃最早一条通知`);
     }
-    messageThrottle.queue.push(async () => {
+    const task = async () => {
       try {
         const msgId = await sendCard(title, content, template, opts);
         resolve(msgId);
@@ -535,7 +536,9 @@ export async function sendCardQueued(title, content, template = "red", opts = {}
         log(`[飞书] 发送失败：${err.message}`);
         resolve(null);
       }
-    });
+    };
+    task.onDrop = () => resolve(null);
+    messageThrottle.queue.push(task);
     processQueue().catch(err => {
       log(`[飞书] 消息队列处理异常：${err.message}`);
     });

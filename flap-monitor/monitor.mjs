@@ -4,7 +4,7 @@
  * 优化要点：
  *   1. 页面并行抓取（加错开延迟避免风控）
  *   2. i18n chunk 并行下载
- *   3. UA 轮换 + per-domain 自适应退避
+ *   3. UA 轮换 + 按页面/资源路径自适应退避
  *   4. 独立模块定时器
  *
  * 用法：
@@ -19,7 +19,7 @@ import { createHash, createHmac } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync, statSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { sendCard, sendCardQueued, patchCard, uploadFile, sendFile, pinMessage, waitQueueDrain } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard, pinMessage, waitQueueDrain } from "../shared/feishu-client.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -316,9 +316,16 @@ function browserHeaders() {
   };
 }
 
-// Per-domain 自适应退避
+// 按具体页面/资源路径自适应退避，避免一个页面风控连坐所有 flap.sh 目标
 const domainBackoff = new Map();
-function getDomain(url) { try { return new URL(url).hostname; } catch { return url; } }
+function getBackoffKey(url) {
+  try {
+    const u = new URL(url);
+    return `${u.hostname}${u.pathname}`;
+  } catch {
+    return url;
+  }
+}
 
 function shouldBackoff(domain) {
   const b = domainBackoff.get(domain);
@@ -354,7 +361,8 @@ const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 
 /* ── 快照读写 ── */
-const CURRENT_SCHEMA_VERSION = 4;
+const CURRENT_SCHEMA_VERSION = 5;
+const CA_STORE_VAULT_SCHEMA_VERSION = 2;
 
 function loadSnapshot() {
   try {
@@ -389,6 +397,9 @@ function migrateSnapshot(data) {
     if (!data.vaultFactories) data.vaultFactories = {};
     log("[快照迁移] v3 → v4：新增 vaultFactories 字段");
   }
+  if (ver < 5) {
+    log("[快照迁移] v4 → v5：CAstore 金库实例保留重复项");
+  }
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
 }
@@ -413,7 +424,8 @@ function saveSnapshot(data) {
 async function sendFeishu(title, content, template = "red", _retries = 2) {
   for (let attempt = 0; attempt <= _retries; attempt++) {
     try {
-      await sendCardQueued(title, content, template);
+      const messageId = await sendCardQueued(title, content, template);
+      if (!messageId) throw new Error("队列发送未返回 message_id");
       return true;
     } catch (err) {
       log(`飞书推送异常（第${attempt + 1}次）：${err.message}`);
@@ -462,20 +474,6 @@ const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
 
 function isTooLongForSingleCard(content) {
   return String(content ?? "").length > FEISHU_CARD_PATCH_SAFE_LIMIT;
-}
-
-/**
- * 上传文件到飞书，返回 file_key
- */
-async function uploadFileToFeishu(fileName, content) {
-  return uploadFile(fileName, content);
-}
-
-/**
- * 主动发送文件消息到群聊
- */
-async function sendFileToChat(fileKey) {
-  await sendFile(fileKey);
 }
 
 /**
@@ -559,7 +557,7 @@ function saveDiffLocally(title, diffText) {
    AI 总结（共享 ai-client，多模型热切换）
    ══════════════════════════════════════════ */
 
-import { AI, aiSummarize as _aiSummarizeBase, chatCompletion } from "../shared/ai-client.mjs";
+import { AI, aiSummarize as _aiSummarizeBase } from "../shared/ai-client.mjs";
 
 const AI_CONFIG = AI; // 兼容旧代码引用
 
@@ -598,15 +596,6 @@ async function aiSummarize(diffContent, moduleContext = "", _retries = 1) {
 }
 
 /**
- * [已弃用] 同步等待 AI 再推送 — 已被 sendThenEnrichWithAi 取代
- */
-async function withAiSummary(content, moduleContext = "", aiInput = null) {
-  const summary = await aiSummarize(aiInput || content, moduleContext);
-  if (!summary) return content + "\n\n*(AI 分析不可用)*";
-  return `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
-}
-
-/**
  * 构建极简 AI 简报输入 — 只提取结构化统计，不喂原始字符串 diff
  */
 function buildBriefingInput(url, changes, assetStats, caStoreVaultDiffs = []) {
@@ -626,14 +615,19 @@ function buildBriefingInput(url, changes, assetStats, caStoreVaultDiffs = []) {
     lines.push("");
     lines.push("CAstore 金库变更:");
     for (const d of caStoreVaultDiffs) {
-      if (d.type === "modified") {
-        lines.push(`  修改: ${d.name}`);
+      const label = d.area ? `${d.area} / ${d.name}` : d.name;
+      if (d.type === "reordered") {
+        lines.push("  排序变化:");
+        lines.push(`    旧顺序: ${(d.oldOrder || []).join(" → ")}`);
+        lines.push(`    新顺序: ${(d.newOrder || []).join(" → ")}`);
+      } else if (d.type === "modified") {
+        lines.push(`  修改: ${label}`);
         lines.push(`    旧文案: ${d.oldDescription || "(空)"}`);
         lines.push(`    新文案: ${d.newDescription || "(空)"}`);
       } else if (d.type === "added") {
-        lines.push(`  新增: ${d.name} — ${d.newDescription || "(空)"}`);
+        lines.push(`  新增: ${label} — ${d.newDescription || "(空)"}`);
       } else if (d.type === "removed") {
-        lines.push(`  删除: ${d.name} — ${d.oldDescription || "(空)"}`);
+        lines.push(`  删除: ${label} — ${d.oldDescription || "(空)"}`);
       }
     }
   }
@@ -763,68 +757,6 @@ function saveDetailedDiff(url, changes) {
 }
 
 /**
- * 将 i18n 新增 key 按公共前缀聚合，提取功能模块摘要
- * 输入: [{ type: "added", key: "page.coin.vaultInfo.relayBuy", value: "Buy" }, ...]
- * 输出: [{ prefix: "relay", fullPrefix: "page.coin.vaultInfo.relay", count: 30, samples: ["relayBuy", "relayStaking", ...] }]
- */
-function aggregateI18nByFeature(i18nDiffs) {
-  const added = i18nDiffs.filter(d => d.type === "added");
-  const modified = i18nDiffs.filter(d => d.type === "modified");
-  const removed = i18nDiffs.filter(d => d.type === "removed");
-
-  // 按最深公共前缀分组新增 key
-  const groups = new Map();
-  for (const d of added) {
-    const parts = d.key.split(".");
-    // 取倒数第二段以上作为前缀，最后一段作为 leaf
-    const prefix = parts.length > 1 ? parts.slice(0, -1).join(".") : d.key;
-    const leaf = parts[parts.length - 1];
-    if (!groups.has(prefix)) groups.set(prefix, { keys: [], values: [] });
-    groups.get(prefix).keys.push(leaf);
-    groups.get(prefix).values.push(d.value);
-  }
-
-  // 合并小组（< 3 条）到父前缀
-  const features = [];
-  for (const [prefix, data] of groups) {
-    if (data.keys.length >= 3) {
-      // 提取共享前缀词（如 relay*）
-      const commonWord = findCommonPrefix(data.keys);
-      features.push({
-        prefix: commonWord || prefix.split(".").pop(),
-        fullPrefix: prefix,
-        count: data.keys.length,
-        samples: data.keys.slice(0, 6),
-        sampleValues: data.values.filter(v => v.length > 2 && v.length <= 60).slice(0, 4),
-      });
-    }
-  }
-  // 散落的 key（不够 3 条成组的）
-  const scatteredCount = added.length - features.reduce((s, f) => s + f.count, 0);
-
-  return { features, modified: modified.length, removed: removed.length, addedTotal: added.length, scatteredCount };
-}
-
-/**
- * 找一组字符串的公共前缀（如 relayBuy, relayStaking → "relay"）
- */
-function findCommonPrefix(strings) {
-  if (strings.length === 0) return "";
-  // 找 camelCase 公共前缀
-  let prefix = strings[0];
-  for (let i = 1; i < strings.length; i++) {
-    while (!strings[i].startsWith(prefix)) {
-      // 退到上一个大写字母边界
-      const idx = prefix.slice(0, -1).search(/[A-Z][^A-Z]*$/);
-      if (idx <= 0) { prefix = ""; break; }
-      prefix = prefix.slice(0, idx);
-    }
-    if (!prefix) break;
-  }
-  return prefix.length >= 3 ? prefix : "";
-}
-
-/**
  * 构建飞书卡片简报内容。
  * 展示优先级：具体变更事实 → AI 摘要 → 资源统计。
  */
@@ -842,16 +774,21 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     hasStructuredChange = true;
     lines.push(`**🏦 CAstore 金库变更（${caStoreVaultDiffs.length} 项）：**`);
     for (const d of caStoreVaultDiffs) {
-      if (d.type === "modified") {
-        lines.push(`  ✏️ **${d.name}**`);
+      const label = d.area ? `${d.area} / ${d.name}` : d.name;
+      if (d.type === "reordered") {
+        lines.push("  🔀 **金库排序变化**");
+        lines.push(`  旧顺序: ${(d.oldOrder || []).join(" → ")}`);
+        lines.push(`  新顺序: ${(d.newOrder || []).join(" → ")}`);
+      } else if (d.type === "modified") {
+        lines.push(`  ✏️ **${label}**`);
         if (d.oldName && d.newName && d.oldName !== d.newName) lines.push(`  名称: ${d.oldName} → ${d.newName}`);
         lines.push(`  旧文案: ${d.oldDescription || "(空)"}`);
         lines.push(`  新文案: ${d.newDescription || "(空)"}`);
       } else if (d.type === "added") {
-        lines.push(`  🟢 新增金库: **${d.name}**`);
+        lines.push(`  🟢 新增金库: **${label}**`);
         lines.push(`  文案: ${d.newDescription || "(空)"}`);
       } else if (d.type === "removed") {
-        lines.push(`  🔴 移除金库: **${d.name}**`);
+        lines.push(`  🔴 移除金库: **${label}**`);
         lines.push(`  原文案: ${d.oldDescription || "(空)"}`);
       }
     }
@@ -1070,8 +1007,8 @@ function appendHistory(module, title, summary, diffSnippet = "") {
 
 /* ── HTTP 请求（含反风控 + 5xx 静默重试）── */
 async function fetchSafe(url, opts = {}) {
-  const domain = getDomain(url);
-  if (shouldBackoff(domain)) throw new Error(`[退避中] ${domain}`);
+  const backoffKey = getBackoffKey(url);
+  if (shouldBackoff(backoffKey)) throw new Error(`[退避中] ${backoffKey}`);
   const maxRetries = 2;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     const ctrl = new AbortController();
@@ -1080,7 +1017,7 @@ async function fetchSafe(url, opts = {}) {
       const res = await fetch(url, { ...opts, signal: ctrl.signal });
       if (res.status === 429 || res.status === 403) {
         try { await res.text(); } catch {}
-        recordFail(domain, res.status);
+        recordFail(backoffKey, res.status);
         throw new Error(`HTTP ${res.status} (风控)`);
       }
       if (res.status >= 500) {
@@ -1089,10 +1026,10 @@ async function fetchSafe(url, opts = {}) {
           await sleep(1_000 * (attempt + 1));
           continue;
         }
-        recordFail(domain, res.status);
+        recordFail(backoffKey, res.status);
         throw new Error(`HTTP ${res.status} (服务端错误，重试${maxRetries}次仍失败)`);
       }
-      if (res.ok) recordSuccess(domain);
+      if (res.ok) recordSuccess(backoffKey);
       return res;
     } catch (err) {
       if (err.name === "AbortError") {
@@ -1238,47 +1175,110 @@ function diffVaultConfigs(oldConfigs, newConfigs) {
  * 返回 { vaultPortal: string, factories: [{ name, factory, enabled, showInCAStore, ai, constraints }] }
  */
 function extractVaultFactories(jsContent) {
-  const marker = "vaultTypes:[";
-  const idx = jsContent.indexOf(marker);
-  if (idx === -1) return null;
+  const marker = /vaultTypes\s*:\s*\[/g;
+  const markerMatch = marker.exec(jsContent);
+  if (!markerMatch) return null;
 
   // 找到匹配的 ] 闭合
   let depth = 0;
-  const arrStart = idx + marker.length - 1;
+  const arrStart = markerMatch.index + markerMatch[0].lastIndexOf("[");
   let arrEnd = arrStart;
+  let quote = null;
+  let escaped = false;
   for (let i = arrStart; i < jsContent.length; i++) {
-    if (jsContent[i] === "[") depth++;
-    if (jsContent[i] === "]") depth--;
+    const ch = jsContent[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "[") depth++;
+    if (ch === "]") depth--;
     if (depth === 0) { arrEnd = i + 1; break; }
   }
   const arrStr = jsContent.substring(arrStart, arrEnd);
 
   // 提取 vaultPortal 地址
   let vaultPortal = null;
-  const vpMatch = jsContent.substring(Math.max(0, idx - 200), idx).match(/vaultPortal:"(0x[a-fA-F0-9]{40})"/);
+  const vpMatch = jsContent
+    .substring(Math.max(0, markerMatch.index - 500), markerMatch.index)
+    .match(/vaultPortal\s*:\s*["'](0x[a-fA-F0-9]{40})["']/);
   if (vpMatch) vaultPortal = vpMatch[1];
 
-  // 逐对象解析
+  const readStringField = (block, field) => {
+    const re = new RegExp(`${field}\\s*:\\s*["']([^"']+)["']`);
+    return block.match(re)?.[1] || null;
+  };
+  const readBoolField = (block, field) => {
+    const re = new RegExp(`${field}\\s*:\\s*(!0|!1|true|false)`);
+    const value = block.match(re)?.[1];
+    if (value == null) return false;
+    return value === "!0" || value === "true";
+  };
+  const readConstraints = (block) => {
+    const idx = block.search(/constraints\s*:\s*\{/);
+    if (idx === -1) return null;
+    const start = block.indexOf("{", idx);
+    let localDepth = 0;
+    let end = start;
+    for (let i = start; i < block.length; i++) {
+      if (block[i] === "{") localDepth++;
+      else if (block[i] === "}") localDepth--;
+      if (localDepth === 0) { end = i + 1; break; }
+    }
+    const objText = block.slice(start + 1, end - 1);
+    const obj = {};
+    const kvRe = /(\w+)\s*:\s*(\d+)/g;
+    let kv;
+    while ((kv = kvRe.exec(objText)) !== null) obj[kv[1]] = parseInt(kv[2], 10);
+    return Object.keys(obj).length > 0 ? obj : null;
+  };
+
+  const objectBlocks = [];
+  let objStart = -1;
+  depth = 0;
+  quote = null;
+  escaped = false;
+  for (let i = 0; i < arrStr.length; i++) {
+    const ch = arrStr[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") {
+      if (depth === 0) objStart = i;
+      depth++;
+    } else if (ch === "}") {
+      depth--;
+      if (depth === 0 && objStart >= 0) {
+        objectBlocks.push(arrStr.slice(objStart, i + 1));
+        objStart = -1;
+      }
+    }
+  }
+
   const factories = [];
-  const objRe = /\{name:"([^"]+)",factory:"(0x[a-fA-F0-9]{40})"([^}]*)\}/g;
-  let m;
-  while ((m = objRe.exec(arrStr)) !== null) {
-    const rest = m[3];
+  for (const block of objectBlocks) {
+    const factory = readStringField(block, "factory");
+    if (!factory || !/^0x[a-fA-F0-9]{40}$/.test(factory)) continue;
     factories.push({
-      name: m[1],
-      factory: m[2],
-      enabled: rest.includes("enabled:!0"),
-      showInCAStore: rest.includes("showInCAStore:!0"),
-      ai: rest.includes("ai:!0"),
-      constraints: (() => {
-        const cm = rest.match(/constraints:\{([^}]*)\}/);
-        if (!cm) return null;
-        const obj = {};
-        const kvRe = /(\w+):(\d+)/g;
-        let kv;
-        while ((kv = kvRe.exec(cm[1])) !== null) obj[kv[1]] = parseInt(kv[2]);
-        return Object.keys(obj).length > 0 ? obj : null;
-      })(),
+      name: readStringField(block, "name") || readStringField(block, "title") || readStringField(block, "label") || "(未知金库工厂)",
+      factory,
+      enabled: readBoolField(block, "enabled"),
+      showInCAStore: readBoolField(block, "showInCAStore"),
+      ai: readBoolField(block, "ai"),
+      constraints: readConstraints(block),
     });
   }
 
@@ -1629,8 +1629,16 @@ function normalizeVaultName(name) {
 function isCaStoreVaultHeading(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-  if (/^(hot vaults|ca store|home|store|ai oracle|rank|profile|create|search)$/i.test(t)) return false;
+  if (/^(hot vaults|ca store|home|store|ai oracle|rank|profile|create|search|support|docs|debox)$/i.test(t)) return false;
   return /vault|stocks|lista|custom vault factory|split/i.test(t);
+}
+
+function isCaStoreAreaHeading(text) {
+  const t = String(text || "").trim();
+  if (!t) return false;
+  if (isCaStoreVaultHeading(t)) return false;
+  if (/^(home|store|rank|profile|create|search|support|docs|debox)$/i.test(t)) return false;
+  return /vaults|store|featured|official|popular|hot/i.test(t);
 }
 
 function cleanVaultDescription(text) {
@@ -1650,31 +1658,41 @@ function extractCaStoreVaultSections(html) {
   }
 
   const sections = [];
+  const occurrenceByBase = new Map();
+  let currentArea = "Featured Vaults";
   for (let i = 0; i < headings.length; i++) {
     const h = headings[i];
-    if (!isCaStoreVaultHeading(h.name)) continue;
+    if (!isCaStoreVaultHeading(h.name)) {
+      if (isCaStoreAreaHeading(h.name)) currentArea = h.name;
+      continue;
+    }
     const next = headings[i + 1];
     const rawDescription = htmlFragmentToText(html.slice(h.end, next ? next.start : html.length));
     const description = cleanVaultDescription(rawDescription);
     if (!description && !/custom vault factory/i.test(h.name)) continue;
+    const areaKey = normalizeVaultName(currentArea || "Featured Vaults");
+    const nameKey = normalizeVaultName(h.name);
+    const baseKey = `${areaKey}::${nameKey}`;
+    const occurrence = (occurrenceByBase.get(baseKey) || 0) + 1;
+    occurrenceByBase.set(baseKey, occurrence);
     sections.push({
       name: h.name,
-      key: normalizeVaultName(h.name),
+      area: currentArea,
+      areaKey,
+      nameKey,
+      occurrence,
+      position: sections.length + 1,
+      key: `${baseKey}#${occurrence}`,
       description,
       signature: md5(`${h.name}\n${description}`),
     });
   }
 
-  const seen = new Set();
-  return sections.filter(section => {
-    if (!section.key || seen.has(section.key)) return false;
-    seen.add(section.key);
-    return true;
-  });
+  return sections;
 }
 
 function extractPageFeatures(html) {
-  const features = { fullHash: md5(html), nextData: null, nextDataHash: null, assetFiles: [], assetHash: null, contentHash: null, caStoreVaults: [], caStoreVaultHash: null };
+  const features = { fullHash: md5(html), nextData: null, nextDataHash: null, assetFiles: [], assetHash: null, contentHash: null, caStoreVaults: [], caStoreVaultHash: null, caStoreVaultSchemaVersion: CA_STORE_VAULT_SCHEMA_VERSION };
 
   const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (nextDataMatch) {
@@ -1712,16 +1730,29 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
   const newMap = new Map(newSections.map(v => [v.key || normalizeVaultName(v.name), v]));
   const changes = [];
 
+  const oldOrder = oldSections.map(v => v.key || normalizeVaultName(v.name));
+  const newOrder = newSections.map(v => v.key || normalizeVaultName(v.name));
+  const oldCommonOrder = oldOrder.filter(k => newMap.has(k));
+  const newCommonOrder = newOrder.filter(k => oldMap.has(k));
+  if (oldCommonOrder.length > 1 && oldCommonOrder.join("\n") !== newCommonOrder.join("\n")) {
+    changes.push({
+      type: "reordered",
+      oldOrder: oldSections.map(v => v.area ? `${v.area} / ${v.name}` : v.name),
+      newOrder: newSections.map(v => v.area ? `${v.area} / ${v.name}` : v.name),
+    });
+  }
+
   for (const [key, nv] of newMap) {
     const ov = oldMap.get(key);
     if (!ov) {
-      changes.push({ type: "added", name: nv.name, newDescription: nv.description });
+      changes.push({ type: "added", name: nv.name, area: nv.area, newDescription: nv.description });
       continue;
     }
     if ((ov.signature || md5(`${ov.name}\n${ov.description || ""}`)) !== (nv.signature || md5(`${nv.name}\n${nv.description || ""}`))) {
       changes.push({
         type: "modified",
         name: nv.name || ov.name,
+        area: nv.area || ov.area,
         oldName: ov.name,
         newName: nv.name,
         oldDescription: ov.description || "",
@@ -1732,7 +1763,7 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
 
   for (const [key, ov] of oldMap) {
     if (!newMap.has(key)) {
-      changes.push({ type: "removed", name: ov.name, oldDescription: ov.description || "" });
+      changes.push({ type: "removed", name: ov.name, area: ov.area, oldDescription: ov.description || "" });
     }
   }
 
@@ -1741,22 +1772,29 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
 
 function shouldRefreshDerivedFeatureBaseline(oldFeatures, newFeatures) {
   if (!oldFeatures || !newFeatures) return false;
-  return !oldFeatures.caStoreVaultHash && !!newFeatures.caStoreVaultHash;
+  if (!newFeatures.caStoreVaultHash) return false;
+  return !oldFeatures.caStoreVaultHash
+    || oldFeatures.caStoreVaultSchemaVersion !== CA_STORE_VAULT_SCHEMA_VERSION;
 }
 
 function formatCaStoreVaultDiffsForChanges(diffs) {
   const lines = ["🏦 CAstore 金库内容变更："];
   for (const d of diffs) {
-    if (d.type === "modified") {
-      lines.push(`  ✏️ ${d.name}`);
+    const label = d.area ? `${d.area} / ${d.name}` : d.name;
+    if (d.type === "reordered") {
+      lines.push("  🔀 金库排序变化");
+      lines.push(`    旧顺序: ${(d.oldOrder || []).join(" → ")}`);
+      lines.push(`    新顺序: ${(d.newOrder || []).join(" → ")}`);
+    } else if (d.type === "modified") {
+      lines.push(`  ✏️ ${label}`);
       if (d.oldName && d.newName && d.oldName !== d.newName) lines.push(`    名称: ${d.oldName} → ${d.newName}`);
       lines.push(`    旧文案: ${d.oldDescription || "(空)"}`);
       lines.push(`    新文案: ${d.newDescription || "(空)"}`);
     } else if (d.type === "added") {
-      lines.push(`  🟢 新增金库: ${d.name}`);
+      lines.push(`  🟢 新增金库: ${label}`);
       lines.push(`    文案: ${d.newDescription || "(空)"}`);
     } else if (d.type === "removed") {
-      lines.push(`  🔴 移除金库: ${d.name}`);
+      lines.push(`  🔴 移除金库: ${label}`);
       lines.push(`    原文案: ${d.oldDescription || "(空)"}`);
     }
   }
@@ -2150,10 +2188,13 @@ function diffFeatures(oldF, newF) {
     }
   }
 
-  const caStoreVaultDiffs = diffCaStoreVaultSections(oldF.caStoreVaults || [], newF.caStoreVaults || []);
-  if (caStoreVaultDiffs.length > 0) {
-    meta.caStoreVaultDiffs = caStoreVaultDiffs;
-    changes.push(...formatCaStoreVaultDiffsForChanges(caStoreVaultDiffs));
+  if (oldF.caStoreVaultSchemaVersion === CA_STORE_VAULT_SCHEMA_VERSION
+    && newF.caStoreVaultSchemaVersion === CA_STORE_VAULT_SCHEMA_VERSION) {
+    const caStoreVaultDiffs = diffCaStoreVaultSections(oldF.caStoreVaults || [], newF.caStoreVaults || []);
+    if (caStoreVaultDiffs.length > 0) {
+      meta.caStoreVaultDiffs = caStoreVaultDiffs;
+      changes.push(...formatCaStoreVaultDiffsForChanges(caStoreVaultDiffs));
+    }
   }
 
   if (oldF.assetHash && newF.assetHash && oldF.assetHash !== newF.assetHash) {
@@ -2505,15 +2546,17 @@ async function runCheck() {
       const oldQuality = getStoredFeatureQuality(url, oldFeatures);
       if (!oldQuality.valid) {
         log(`  [基线修复 Baseline Repair] ${url} — 旧快照无效，已用当前有效页面重建基线：${oldQuality.reasons.join("; ")}`);
-        snapshot.pages[key] = features;
-        snapshot.pages[key].originalUrl = url;
         hasDetectedChange = true;
         const sent = await sendFeishu(
           "Flap 基线已修复",
           `${formatQualityIssue(url, oldQuality)}\n\n当前抓取样本有效，已重建基线；本次不按页面文案变更推送，避免旧坏快照造成误报。`,
           "yellow"
         );
-        if (sent) hasNotifiedChange = true;
+        if (sent) {
+          hasNotifiedChange = true;
+          snapshot.pages[key] = features;
+          snapshot.pages[key].originalUrl = url;
+        }
         continue;
       }
       const { changes, meta } = diffFeatures(oldFeatures, features);
@@ -2521,9 +2564,9 @@ async function runCheck() {
         log(`  [变更] ${url}`);
         for (const c of changes) log(`    ${c}`);
         hasDetectedChange = true;
-        const snapshotFile = saveHtmlSnapshot(url, html);
+        saveHtmlSnapshot(url, html);
         // 保存详细 diff 到文件
-        const diffFile = saveDetailedDiff(url, changes);
+        saveDetailedDiff(url, changes);
         // 检测业务优先级
         const biz = detectBusinessPriority(changes);
         const title = biz.hit ? `⚡ 手动检测 — 重点变更：${biz.keywords.slice(0, 3).join("/")}` : "手动检测 — 页面变更";
@@ -2574,7 +2617,7 @@ async function startMonitor() {
 
   log("=== Flap 监控 v2 启动 ===");
   log(`轮询间隔: ${CONFIG.pollIntervalMs}ms + 抖动 ±${CONFIG.jitterMs}ms`);
-  log(`反风控：UA 轮换（${UA_POOL.length} 个）+ 按域名（per-domain）自适应退避`);
+  log(`反风控：UA 轮换（${UA_POOL.length} 个）+ 按页面/资源路径自适应退避`);
   log("监控目标:");
   for (const url of CONFIG.urls) log(`  - ${url}`);
 
@@ -2626,7 +2669,7 @@ async function startMonitor() {
 
   await sendFeishu(
     "Flap 监控 v2 已启动",
-    `**监控目标:**\n${CONFIG.urls.map(u => `- ${u}`).join("\n")}\n\n**轮询间隔:** ${CONFIG.pollIntervalMs}ms\n**反风控:** UA 轮换 + 按域名自适应退避 + 请求抖动\n**服务器:** ${(await import("node:os")).hostname()}`,
+    `**监控目标:**\n${CONFIG.urls.map(u => `- ${u}`).join("\n")}\n\n**轮询间隔:** ${CONFIG.pollIntervalMs}ms\n**反风控:** UA 轮换 + 按页面/资源路径自适应退避 + 请求抖动\n**服务器:** ${(await import("node:os")).hostname()}`,
     "blue"
   );
 
@@ -2797,11 +2840,11 @@ async function startMonitor() {
           if (changes.length > 0) {
             log(`[变更] ${url}`);
             for (const c of changes) log(`  ${c}`);
-            const snapshotFile = saveHtmlSnapshot(url, html);
+            saveHtmlSnapshot(url, html);
             // 保存旧版文案到文件，供事后查阅
             saveOldTextContent(url, oldFeatures);
             // 保存详细 diff 到文件
-            const diffFile = saveDetailedDiff(url, changes);
+            saveDetailedDiff(url, changes);
             notifications.push({
               url,
               changes,
