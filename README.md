@@ -49,7 +49,7 @@
 
 ### Four.meme 前端/API 覆盖策略
 
-- 基础监控页面：`/`、`/zh-TW/create-token`、`/zh-TW/agentic`、`/zh-TW/announcement`
+- 基础监控页面：`/`、`/zh-TW/create-token`、`/zh-TW/agentic`、`/zh-TW/contract`、`/zh-TW/announcement`
 - 自动从 HTML、`__NEXT_DATA__`、JS 资源字符串中发现新页面，并在同一轮纳入监控
 - 路由/端点发现覆盖 `/api/`、`/meme-api/`、`/mapi/`、`/v1/`、`/blog/v1/` 和站内完整 URL
 - 纯资源列表小抖动会在同一轮 2.5 秒后快速复抓确认；真实变化立即推送，短暂恢复则静默忽略

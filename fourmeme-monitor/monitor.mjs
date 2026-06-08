@@ -69,6 +69,7 @@ const CONFIG = {
     "https://four.meme",
     "https://four.meme/zh-TW/create-token",
     "https://four.meme/zh-TW/agentic",
+    "https://four.meme/zh-TW/contract",
     "https://four.meme/zh-TW/announcement",
   ],
   networkCode: "BSC",
