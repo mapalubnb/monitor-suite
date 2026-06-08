@@ -502,13 +502,16 @@ function sendHeartbeat(title, content, template = "green") {
 /**
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
-async function sendCardViaApi(title, content, template = "red", diffFilePath) {
-  try {
-    return await sendCard(title, content, template, { diffFilePath });
-  } catch (err) {
-    log(`[IM API] 发送失败：${err.message}`);
-    return null;
+async function sendCardViaApi(title, content, template = "red", diffFilePath, retries = 2) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await sendCard(title, content, template, { diffFilePath });
+    } catch (err) {
+      log(`[IM API] 发送失败（第${attempt + 1}次）：${err.message}`);
+      if (attempt < retries) await sleep(2_000 * (attempt + 1));
+    }
   }
+  return null;
 }
 
 /**
@@ -526,7 +529,11 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
   // 卡片最上方加入监控目标网址
   const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
   // 1. 立即推送裸 diff（秒级送达）
-  const messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
+  let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
+  if (!messageId) {
+    log(`[推送] 即时通道失败，切换队列兜底：${title}`);
+    messageId = await sendCardQueued(title, urlLine + content, template, { diffFilePath });
+  }
 
   // 2. 异步调用 AI → 编辑原消息补充摘要（不阻塞调用方）
   if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
@@ -2534,6 +2541,135 @@ function formatFrontendChanges(assetDiff, textDiff, pageLabel, oldAssets, newAss
     }
   }
   return lines.join("\n");
+}
+
+function hasFrontendAssetChanges(assetDiff) {
+  return Boolean(assetDiff)
+    && ((assetDiff.matched || []).length > 0
+      || (assetDiff.added || []).length > 0
+      || (assetDiff.removed || []).length > 0);
+}
+
+function frontendAssetChangeSignature(assetDiff, oldAssets, newAssets) {
+  if (!hasFrontendAssetChanges(assetDiff)) return "";
+  const contentHash = (assets, file) => assets?.[file]?.contentHash || "";
+  const matched = (assetDiff.matched || [])
+    .map(m => ({
+      oldFile: m.oldFile || "",
+      newFile: m.newFile || "",
+      oldHash: contentHash(oldAssets, m.oldFile),
+      newHash: contentHash(newAssets, m.newFile),
+      removedStrings: [...(m.removedStrings || [])].sort(),
+      addedStrings: [...(m.addedStrings || [])].sort(),
+    }))
+    .sort((a, b) => `${a.oldFile}->${a.newFile}`.localeCompare(`${b.oldFile}->${b.newFile}`));
+  return md5(JSON.stringify({
+    matched,
+    added: [...(assetDiff.added || [])].sort(),
+    removed: [...(assetDiff.removed || [])].sort(),
+  }));
+}
+
+function compactFrontendUrlList(pages) {
+  const seen = new Set();
+  const result = [];
+  for (const p of pages || []) {
+    const url = p?.url || "";
+    const label = p?.label || (url ? urlLabel(url) : "未知页面");
+    const key = url || label;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    result.push({ label, url });
+  }
+  return result;
+}
+
+function buildMergedFrontendAssetNotification(group) {
+  const pages = compactFrontendUrlList(group.pages);
+  const pageCount = pages.length;
+  const title = pageCount > 1
+    ? `前端资源变更（影响 ${pageCount} 页）`
+    : `前端变更：${pages[0]?.label || "未知页面"}`;
+  const lines = [];
+  if (pageCount > 1) {
+    lines.push(`**📄 影响页面：${pageCount} 个**`);
+    for (const p of pages) lines.push(`- ${p.label}${p.url ? `：${p.url}` : ""}`);
+    lines.push("");
+  } else if (pages[0]) {
+    lines.push(`**📄 ${pages[0].label}**`);
+    if (pages[0].url) lines.push(`URL: ${pages[0].url}`);
+    lines.push("");
+  }
+  if (group.assetContent) lines.push(group.assetContent);
+
+  const pageSpecific = group.items.filter(n => n.pageContent);
+  if (pageSpecific.length > 0) {
+    lines.push("");
+    lines.push("---");
+    lines.push("**📌 页面级附加变更：**");
+    for (const n of pageSpecific) {
+      lines.push("");
+      lines.push(`**${n.pageLabel || urlLabel(n.url)}**${n.url ? `：${n.url}` : ""}`);
+      lines.push(n.pageContent);
+    }
+  }
+
+  return {
+    title,
+    content: lines.join("\n"),
+    template: group.template || "orange",
+    fullDiff: group.fullDiffs.filter(Boolean).join("\n\n"),
+    url: pages[0]?.url || CONFIG.siteUrl,
+  };
+}
+
+function mergeFrontendNotifications(notifications) {
+  const merged = [];
+  const assetGroups = new Map();
+  const contentGroups = new Map();
+
+  for (const n of notifications || []) {
+    if (n.assetSignature) {
+      let group = assetGroups.get(n.assetSignature);
+      if (!group) {
+        group = {
+          assetContent: n.assetContent || "",
+          template: n.template,
+          pages: [],
+          items: [],
+          fullDiffs: [],
+        };
+        assetGroups.set(n.assetSignature, group);
+        merged.push({ type: "asset", group });
+      }
+      group.pages.push({ label: n.pageLabel, url: n.url });
+      group.items.push(n);
+      if (n.fullDiff) group.fullDiffs.push(n.fullDiff);
+      log(`[前端] 同轮资源合并：${n.pageLabel || urlLabel(n.url)} → ${n.assetSignature.slice(0, 8)}`);
+      continue;
+    }
+
+    const contentHash = md5(n.content || "");
+    if (contentGroups.has(contentHash)) {
+      const existing = contentGroups.get(contentHash);
+      const existingLabel = existing.title.replace("前端变更：", "");
+      const newLabel = n.title.replace("前端变更：", "");
+      if (!existing.title.includes(newLabel)) {
+        existing.mergedPages = existing.mergedPages || [existingLabel];
+        existing.mergedPages.push(newLabel);
+        existing.title = `前端变更：${existing.mergedPages.join("、")}`;
+      }
+      if (n.fullDiff) existing.fullDiff = (existing.fullDiff || "") + "\n\n" + n.fullDiff;
+      log(`[前端] 同轮内容合并：${newLabel} → 已合并到 ${existingLabel}`);
+      continue;
+    }
+    contentGroups.set(contentHash, n);
+    merged.push({ type: "single", notification: n });
+  }
+
+  return merged.map(item => item.type === "asset"
+    ? buildMergedFrontendAssetNotification(item.group)
+    : item.notification);
 }
 
 /**
@@ -5226,6 +5362,8 @@ async function runFrontendCheck() {
     }
 
     const contentParts = [];
+    const assetContentParts = [];
+    const pageContentParts = [];
     let hasNonAssetChange = false;
     let cachedAssetDiff = null; // 缓存资源 diff 结果，避免重复计算
 
@@ -5240,7 +5378,9 @@ async function runFrontendCheck() {
         cachedAssetDiff = diffFrontendAssets(oldData.assetContents, newData.assetContents);
         const hasAssetChange = cachedAssetDiff.matched.length > 0 || cachedAssetDiff.added.length > 0 || cachedAssetDiff.removed.length > 0;
         if (hasAssetChange) {
-          contentParts.push(formatFrontendChanges(cachedAssetDiff, null, null, oldData.assetContents, newData.assetContents));
+          const assetContent = formatFrontendChanges(cachedAssetDiff, null, null, oldData.assetContents, newData.assetContents);
+          contentParts.push(assetContent);
+          assetContentParts.push(assetContent);
         }
       } else {
         // 降级 fallback：仅基于文件列表 diff（类似 Flap 的 fallback）
@@ -5255,7 +5395,9 @@ async function runFrontendCheck() {
         if (!hasOldContents || !hasNewContents) {
           lines.push(`  ⚠️ 资源内容下载不完整，仅展示文件列表变更`);
         }
-        contentParts.push(lines.join("\n"));
+        const assetContent = lines.join("\n");
+        contentParts.push(assetContent);
+        assetContentParts.push(assetContent);
       }
     }
 
@@ -5265,15 +5407,20 @@ async function runFrontendCheck() {
       const i18nFormatted = formatI18nChanges(i18nChanges);
       if (i18nFormatted) {
         contentParts.push(i18nFormatted);
+        pageContentParts.push(i18nFormatted);
         hasNonAssetChange = true;
       }
     } else if (!oldData.i18nHash && newData.i18nHash && newData.i18nStrings) {
       // 首次出现 i18n 数据
       const keyCount = Object.keys(newData.i18nStrings).length;
-      contentParts.push(`**📝 i18n 国际化字符串首次检测到：** ${keyCount} 条翻译`);
+      const pageContent = `**📝 i18n 国际化字符串首次检测到：** ${keyCount} 条翻译`;
+      contentParts.push(pageContent);
+      pageContentParts.push(pageContent);
       hasNonAssetChange = true;
     } else if (oldData.i18nHash && !newData.i18nHash) {
-      contentParts.push("**📝 i18n 国际化字符串被移除**");
+      const pageContent = "**📝 i18n 国际化字符串被移除**";
+      contentParts.push(pageContent);
+      pageContentParts.push(pageContent);
       hasNonAssetChange = true;
     }
 
@@ -5283,7 +5430,9 @@ async function runFrontendCheck() {
       textDiff = diffTextContent(oldData.textContent, newData.textContent);
       if (textDiff) {
         if (textDiff.reordered) {
-          contentParts.push("**📝 页面文案顺序调整（内容不变）**");
+          const pageContent = "**📝 页面文案顺序调整（内容不变）**";
+          contentParts.push(pageContent);
+          pageContentParts.push(pageContent);
           hasNonAssetChange = true;
         } else if (textDiff.changes.length > 0) {
           const lines = ["**📝 页面文案变更：**", "```"];
@@ -5294,7 +5443,9 @@ async function runFrontendCheck() {
           }
           lines.push("```");
           if (textDiff.changes.length > 20) lines.push(`... 还有 ${textDiff.changes.length - 20} 处变更`);
-          contentParts.push(lines.join("\n"));
+          const pageContent = lines.join("\n");
+          contentParts.push(pageContent);
+          pageContentParts.push(pageContent);
           hasNonAssetChange = true;
         }
       }
@@ -5306,13 +5457,18 @@ async function runFrontendCheck() {
       const nextDataFormatted = formatNextDataChanges(nextDataChanges);
       if (nextDataFormatted) {
         contentParts.push(nextDataFormatted);
+        pageContentParts.push(nextDataFormatted);
         hasNonAssetChange = true;
       }
     } else if (oldData.nextDataHash && !newData.nextDataHash) {
-      contentParts.push("**📋 __NEXT_DATA__ 被移除**");
+      const pageContent = "**📋 __NEXT_DATA__ 被移除**";
+      contentParts.push(pageContent);
+      pageContentParts.push(pageContent);
       hasNonAssetChange = true;
     } else if (!oldData.nextDataHash && newData.nextDataHash) {
-      contentParts.push("**📋 __NEXT_DATA__ 新出现**");
+      const pageContent = "**📋 __NEXT_DATA__ 新出现**";
+      contentParts.push(pageContent);
+      pageContentParts.push(pageContent);
       hasNonAssetChange = true;
     }
 
@@ -5322,6 +5478,7 @@ async function runFrontendCheck() {
       const routeFormatted = formatRouteChanges(routeDiff);
       if (routeFormatted) {
         contentParts.push(routeFormatted);
+        pageContentParts.push(routeFormatted);
         hasNonAssetChange = true;
       }
     }
@@ -5353,7 +5510,17 @@ async function runFrontendCheck() {
       // 构建详细 diff 文件（复用已计算的 assetDiff）
       const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, [], oldData.assetContents, newData.assetContents);
 
-      notifications.push({ title: `前端变更：${label}`, content, template: "orange", fullDiff, url: newData.originalUrl });
+      notifications.push({
+        title: `前端变更：${label}`,
+        content,
+        template: "orange",
+        fullDiff,
+        url: newData.originalUrl,
+        pageLabel: label,
+        assetSignature: frontendAssetChangeSignature(cachedAssetDiff, oldData.assetContents, newData.assetContents),
+        assetContent: assetContentParts.join("\n\n"),
+        pageContent: pageContentParts.join("\n\n"),
+      });
     }
 
     // 在所有 diff 完成后更新快照
@@ -5362,28 +5529,7 @@ async function runFrontendCheck() {
   }
 
   if (notifications.length > 0) {
-    // ── 同轮跨页面合并：相同内容只保留第一条 ──
-    const dedupedNotifications = [];
-    const seenContentHashes = new Map();
-    for (const n of notifications) {
-      const contentHash = md5(n.content);
-      if (seenContentHashes.has(contentHash)) {
-        const idx = seenContentHashes.get(contentHash);
-        const existing = dedupedNotifications[idx];
-        const existingLabel = existing.title.replace("前端变更：", "");
-        const newLabel = n.title.replace("前端变更：", "");
-        if (!existing.title.includes(newLabel)) {
-          existing.mergedPages = existing.mergedPages || [existingLabel];
-          existing.mergedPages.push(newLabel);
-          existing.title = `前端变更：${existing.mergedPages.join("、")}`;
-        }
-        if (n.fullDiff) existing.fullDiff = (existing.fullDiff || "") + "\n\n" + n.fullDiff;
-        log(`[前端] 同轮合并：${newLabel} → 已合并到 ${existingLabel}`);
-      } else {
-        seenContentHashes.set(contentHash, dedupedNotifications.length);
-        dedupedNotifications.push(n);
-      }
-    }
+    const dedupedNotifications = mergeFrontendNotifications(notifications);
 
     await saveSnapshot(snapshot);
     for (const n of dedupedNotifications) {
