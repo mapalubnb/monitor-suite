@@ -66,7 +66,6 @@ const CONFIG = {
   apiBase: "https://four.meme/meme-api",
   siteUrl: "https://four.meme",
   monitorUrls: [
-    "https://four.meme",
     "https://four.meme/zh-TW/create-token",
     "https://four.meme/zh-TW/agentic",
     "https://four.meme/zh-TW/contract",
@@ -343,6 +342,7 @@ const CURRENT_SCHEMA_VERSION = 6;
 let snapshotWriteQueue = Promise.resolve();
 
 const REMOVED_FRONTEND_URLS = new Set([
+  "https://four.meme",
   "https://four.meme/en",
   "https://four.meme/zh-TW",
   "https://four.meme/en/ranking",
@@ -1132,7 +1132,8 @@ function isUnsupportedLocalePrefixedRoute(route) {
 function isDynamicFrontendRoute(route) {
   const path = normalizeRouteString(route).split("?")[0].replace(/\/+$/, "");
   return /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/0x[a-f0-9]{40}$/i.test(path)
-    || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?presale\/\d+$/i.test(path);
+    || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?presale\/\d+$/i.test(path)
+    || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?competition\/[^/?#]+$/i.test(path);
 }
 
 function routeToFrontendUrl(route) {
