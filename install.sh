@@ -310,9 +310,11 @@ if [ -f "$SNAP" ]; then
 
     // 模块 4：GitHub
     const sha=(s.githubSha||'')||'未知';
+    const repos=Object.keys(s.githubRepos||{}).length;
     console.log('');
     console.log('[ 模块4: GitHub ]');
-    console.log('  仓库: four-meme-community/four-meme-ai');
+    console.log('  账号: four-meme-community（仓库 '+repos+' 个）');
+    console.log('  主仓库: four-meme-community/four-meme-ai');
     console.log('  最新 SHA: '+sha);
 
     // 模块 6：合约
@@ -807,12 +809,13 @@ if [ -f "$FM_SNAP" ]; then
     const pages=Object.keys(s.frontendPages||{}).length;
     const apis=Object.keys(s.apiStructure||{}).length;
     const sha=(s.githubSha||'').slice(0,8)||'-';
+    const repos=Object.keys(s.githubRepos||{}).length;
     const contracts=Object.keys(s.contractFingerprints||{}).length;
     const actors=(s.chainActorMonitor||{}).actionActorCount??Object.values((s.chainActorMonitor||{}).actors||{}).filter(a=>a&&a.actionWatched).length;
     const nfts=(s.onchainParams||{}).agentNftCount??'-';
     console.log('  Four.meme:');
     console.log('    底池: '+pools+' 个 ('+netStr+')');
-    console.log('    前端: '+pages+' 页面  |  API: '+apis+' 端点  |  GitHub: '+sha);
+    console.log('    前端: '+pages+' 页面  |  API: '+apis+' 端点  |  GitHub: '+sha+' / 仓库 '+repos);
     console.log('    合约: '+contracts+' 个  |  创建者: '+actors+' 个  |  Agent NFT: '+nfts+' 个');
   " 2>/dev/null
   FM_LASTPOLL="/root/monitor-suite/fourmeme-monitor/lastpoll.txt"

@@ -81,6 +81,7 @@ const CONFIG = {
   networkCode: "BSC",
 
   // GitHub 仓库监控
+  githubOwner: "four-meme-community",
   githubRepo: "four-meme-community/four-meme-ai",
   githubApiBranch: "main",
   githubToken: process.env.GITHUB_TOKEN || "",  // 可选：填入 PAT 提升 rate limit 至 5000/h
@@ -3290,6 +3291,7 @@ function formatApiValueChanges(changes) {
 const GITHUB_API = "https://api.github.com";
 // githubETag 从 snapshot 恢复，避免重启后浪费 rate limit
 let githubETag = "";
+let githubReposETag = "";
 
 function githubHeaders() {
   const h = {
@@ -3320,11 +3322,115 @@ async function fetchLatestCommits(perPage = 30) {
   return await res.json();
 }
 
+async function fetchGithubOwnerRepos(perPage = 100) {
+  const url = `${GITHUB_API}/users/${CONFIG.githubOwner}/repos?per_page=${perPage}&sort=updated`;
+  const headers = githubHeaders();
+  if (githubReposETag) headers["If-None-Match"] = githubReposETag;
+
+  const res = await fetchSafe(url, { headers }, 10_000);
+  if (res.status === 304) return null;
+  if (!res.ok) throw new Error(`GitHub 账号仓库 API HTTP ${res.status}`);
+
+  const etag = res.headers.get("etag");
+  if (etag) githubReposETag = etag;
+
+  return await res.json();
+}
+
 async function fetchCommitDetail(sha) {
   const url = `${GITHUB_API}/repos/${CONFIG.githubRepo}/commits/${sha}`;
   const res = await fetchSafe(url, { headers: githubHeaders() }, 10_000);
   if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
   return await res.json();
+}
+
+function normalizeGithubRepos(repos) {
+  const map = {};
+  for (const r of repos || []) {
+    if (!r?.full_name) continue;
+    map[r.full_name] = {
+      name: r.name || "",
+      full_name: r.full_name,
+      html_url: r.html_url || `https://github.com/${r.full_name}`,
+      description: r.description || "",
+      default_branch: r.default_branch || "",
+      created_at: r.created_at || "",
+      updated_at: r.updated_at || "",
+      pushed_at: r.pushed_at || "",
+      archived: Boolean(r.archived),
+      disabled: Boolean(r.disabled),
+    };
+  }
+  return map;
+}
+
+function diffGithubRepos(oldRepos = {}, newRepos = {}) {
+  const added = [];
+  const removed = [];
+  const changed = [];
+  for (const [fullName, repo] of Object.entries(newRepos)) {
+    const old = oldRepos[fullName];
+    if (!old) {
+      added.push(repo);
+      continue;
+    }
+    const fields = [];
+    for (const key of ["pushed_at", "updated_at", "default_branch", "description", "archived", "disabled"]) {
+      if ((old[key] ?? "") !== (repo[key] ?? "")) {
+        fields.push({ key, old: old[key] ?? "", new: repo[key] ?? "" });
+      }
+    }
+    if (fields.length > 0) changed.push({ repo, fields });
+  }
+  for (const [fullName, repo] of Object.entries(oldRepos)) {
+    if (!newRepos[fullName]) removed.push(repo);
+  }
+  return { added, removed, changed };
+}
+
+async function checkGithubRepos(oldRepos, reportExistingNonPrimary = false) {
+  const repos = await fetchGithubOwnerRepos(100);
+  if (repos === null) return { repoMap: oldRepos || null, changes: null };
+  const repoMap = normalizeGithubRepos(repos);
+  if (!oldRepos) {
+    const added = reportExistingNonPrimary
+      ? Object.values(repoMap).filter(r => r.full_name !== CONFIG.githubRepo)
+      : [];
+    return {
+      repoMap,
+      changes: added.length > 0 ? { added, removed: [], changed: [] } : null,
+    };
+  }
+  const changes = diffGithubRepos(oldRepos, repoMap);
+  const hasChanges = changes.added.length || changes.removed.length || changes.changed.length;
+  return { repoMap, changes: hasChanges ? changes : null };
+}
+
+function formatGithubRepoChanges(changes) {
+  const lines = [];
+  lines.push(`**账号：** [${CONFIG.githubOwner}](https://github.com/${CONFIG.githubOwner})`);
+  const count = (changes.added?.length || 0) + (changes.removed?.length || 0) + (changes.changed?.length || 0);
+  lines.push(`**仓库/项目变更：** ${count} 项`);
+  lines.push("---");
+  for (const r of changes.added || []) {
+    lines.push(`🆕 **新增仓库：** [${r.full_name}](${r.html_url})`);
+    if (r.description) lines.push(`  描述：${r.description}`);
+    lines.push(`  默认分支：${r.default_branch || "未知"}　创建：${r.created_at || "未知"}　更新：${r.updated_at || "未知"}　推送：${r.pushed_at || "未知"}`);
+    lines.push("---");
+  }
+  for (const c of changes.changed || []) {
+    const r = c.repo;
+    lines.push(`🔄 **仓库更新：** [${r.full_name}](${r.html_url})`);
+    lines.push("```");
+    for (const f of c.fields) lines.push(`${f.key}: ${f.old || "空"} → ${f.new || "空"}`);
+    lines.push("```");
+    lines.push("---");
+  }
+  for (const r of changes.removed || []) {
+    lines.push(`🗑️ **移除仓库：** [${r.full_name}](${r.html_url})`);
+    lines.push("---");
+  }
+  return lines.join("\n");
 }
 
 function formatGithubChanges(newCommits) {
@@ -5362,6 +5468,27 @@ async function runGithubCheck() {
   if (!snapshot) snapshot = {};
   // 从快照恢复 ETag（避免重启后浪费 rate limit）
   if (!githubETag && snapshot.githubETag) githubETag = snapshot.githubETag;
+  if (!githubReposETag && snapshot.githubReposETag) githubReposETag = snapshot.githubReposETag;
+
+  const { repoMap, changes: repoChanges } = await checkGithubRepos(
+    snapshot.githubRepos || null,
+    Boolean(snapshot.githubSha)
+  );
+  if (githubReposETag && snapshot.githubReposETag !== githubReposETag) {
+    snapshot.githubReposETag = githubReposETag;
+  }
+  if (repoMap && !jsonEqual(snapshot.githubRepos, repoMap)) {
+    snapshot.githubRepos = repoMap;
+  }
+  if (repoChanges) {
+    const count = (repoChanges.added?.length || 0) + (repoChanges.removed?.length || 0) + (repoChanges.changed?.length || 0);
+    log(`[GitHub] 检测到 ${count} 项账号仓库/项目变更！`);
+    const content = formatGithubRepoChanges(repoChanges);
+    await saveSnapshot(snapshot);
+    appendHistory("github", `GitHub 项目变更（${count}项）`, content.slice(0, 300), content);
+    await sendThenEnrichWithAi(`GitHub 项目变更（${count}项）`, content, "turquoise", "Four.meme GitHub 项目变更", undefined, undefined, undefined, `https://github.com/${CONFIG.githubOwner}`);
+  }
+
   const { newSha, newCommits } = await checkGithub(snapshot.githubSha || "");
   // 持久化 ETag
   if (githubETag && snapshot.githubETag !== githubETag) {
@@ -5564,6 +5691,7 @@ async function startAllModules() {
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
   const discoveredCount = (snapshot?._frontendDiscoveredUrls || []).length;
   const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
+  const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
   const actorCount = snapshot?.chainActorMonitor?.actionActorCount
     ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
   await sendFeishu("Four.meme 全面监控 v2 已启动",
@@ -5575,7 +5703,7 @@ async function startAllModules() {
       `  资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
-      `**GitHub:** ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
+      `**GitHub:** ${CONFIG.githubOwner} 账号 ${githubRepoCount} 个仓库，主仓库 ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
       `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
       `**创建者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s（只过滤交易发起地址 tx.from，命中后合约复查）`,

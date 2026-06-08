@@ -36,7 +36,7 @@
 | 模块 1 | 底池配置（Pool Config） | 3s |
 | 模块 2 | 前端代码（基础页面 + 自动发现页面，含文案 diff、`__NEXT_DATA__`、i18n、路由/端点发现） | 15s |
 | 模块 3/5 | API 结构（多端点并行，结构 + 值 diff，覆盖 public/blog/mapi 端点发现） | 30s |
-| 模块 4 | GitHub 仓库变更（条件请求，ETag 缓存） | 5min |
+| 模块 4 | GitHub 仓库/项目变更（账号仓库列表 + 主仓库提交，ETag 缓存） | 5min |
 | 模块 6 | BSC 智能合约（静态核心合约 + OpenFour 链上发现，`/v1/public/address` 作为种子/兜底，RPC batch） | 3s |
 | 模块 7 | 链上参数（RPC batch） | 3s |
 | 模块 8 | 合约创建者动作（合约地址页读取 + RPC 近期反查兜底，自动缓存 deployer，只监听 deployer/手动配置地址作为 `tx.from` 发起的交易，命中后立即复查合约） | 3s |

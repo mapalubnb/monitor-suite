@@ -341,6 +341,7 @@ function buildMonitorContext() {
 
       // GitHub
       parts.push(`GitHub SHA: ${snap.githubSha || "未知"}`);
+      parts.push(`GitHub 仓库: ${Object.keys(snap.githubRepos || {}).length} 个`);
 
       // 合约
       const contracts = snap.contractFingerprints || {};
@@ -594,10 +595,11 @@ async function buildDailyReport() {
         const pools = (snap.poolConfig || []).filter(p => p.networkCode === "BSC").length;
         const contracts = Object.keys(snap.contractFingerprints || {}).length;
         const sha = (snap.githubSha || "").slice(0, 8) || "-";
+        const repos = Object.keys(snap.githubRepos || {}).length;
         const nfts = snap.onchainParams?.agentNftCount ?? "-";
         const actors = snap.chainActorMonitor?.actionActorCount
           ?? Object.values(snap.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
-        parts.push(`Four.meme：底池${pools} | 合约${contracts} | 创建者${actors} | NFT${nfts} | SHA:\`${sha}\``);
+        parts.push(`Four.meme：底池${pools} | 合约${contracts} | 创建者${actors} | NFT${nfts} | GitHub仓库${repos} | SHA:\`${sha}\``);
       } catch { /* ignore */ }
     }
 
