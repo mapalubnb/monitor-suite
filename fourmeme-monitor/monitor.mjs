@@ -2857,7 +2857,8 @@ function normalizeApiStructureValueType(endpoint, field, value) {
 }
 
 const TOKEN_LIST_VOLATILE_FIELD_PATTERNS = [
-  /^data\[0\]\.min\d+Increase$/,
+  /^data\[0\]\.(?:min|min\d+|hour|hour\d+|day\d+)Increase$/,
+  /^data\[0\]\.(?:min|min\d+|hour|hour\d+|day\d+)Vol$/,
   /^data\[0\]\.(?:taxFee|taxFeeSell|feeBurn)$/,
 ];
 
