@@ -383,7 +383,7 @@ function pruneFrontendSnapshot(data) {
   const monitorUrls = new Set(CONFIG.monitorUrls.map(canonicalFrontendUrl));
   const discoveredUrls = (Array.isArray(data._frontendDiscoveredUrls) ? data._frontendDiscoveredUrls : [])
     .map(canonicalFrontendUrl)
-    .filter(url => !REMOVED_FRONTEND_URLS.has(url));
+    .filter(url => !REMOVED_FRONTEND_URLS.has(url) && !isDynamicTokenDetailRoute(url));
   const allowedUrls = new Set([...monitorUrls, ...discoveredUrls]);
 
   if (discoveredUrls.length !== (data._frontendDiscoveredUrls || []).length) {
@@ -393,7 +393,7 @@ function pruneFrontendSnapshot(data) {
 
   for (const [key, page] of Object.entries(data.frontendPages)) {
     const canonical = page?.originalUrl ? canonicalFrontendUrl(page.originalUrl) : "";
-    if (!canonical || REMOVED_FRONTEND_URLS.has(canonical) || !allowedUrls.has(canonical)) {
+    if (!canonical || REMOVED_FRONTEND_URLS.has(canonical) || isDynamicTokenDetailRoute(canonical) || !allowedUrls.has(canonical)) {
       delete data.frontendPages[key];
       if (data._frontendFailCounts) delete data._frontendFailCounts[key];
       changed = true;
@@ -1055,7 +1055,7 @@ function canonicalFrontendUrl(url) {
 function getFrontendMonitorUrls() {
   const urls = [
     ...CONFIG.monitorUrls,
-    ...(snapshot?._frontendDiscoveredUrls || []),
+    ...(snapshot?._frontendDiscoveredUrls || []).filter(url => !isDynamicTokenDetailRoute(url)),
   ];
   return [...new Set(urls.map(canonicalFrontendUrl))];
 }
@@ -1083,6 +1083,7 @@ function isTrackableRouteString(route) {
   if (route.startsWith("/_next/") || route.startsWith("/static/")) return false;
   if (/\.(js|css|png|svg|ico|jpg|jpeg|gif|webp|woff2?|ttf|eot|map)$/i.test(route.split("?")[0])) return false;
   if (isLocaleRootRoute(route)) return false;
+  if (isDynamicTokenDetailRoute(route)) return false;
   if (/^\/docs(?:\/|$)/i.test(route) || /^\/a\/i$/i.test(route) || /^\/v\d+\/resolve-ens$/i.test(route)) return false;
   return true;
 }
@@ -1098,6 +1099,11 @@ function isLocaleRootRoute(route) {
 function isUnsupportedLocalePrefixedRoute(route) {
   const path = (route || "").split("?")[0];
   return /^\/[a-z]{2}(?:-[a-z]{2})?(?:\/|$)/i.test(path) && !/^\/(?:en|zh-TW)(?:\/|$)/i.test(path);
+}
+
+function isDynamicTokenDetailRoute(route) {
+  const path = normalizeRouteString(route).split("?")[0].replace(/\/+$/, "");
+  return /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/0x[a-f0-9]{40}$/i.test(path);
 }
 
 function routeToFrontendUrl(route) {
