@@ -51,7 +51,7 @@
 
 - 基础监控页面：`/`、`/zh-TW/create-token`、`/zh-TW/agentic`、`/zh-TW/announcement`、`/zh-TW/contract*`、`/en/contract*`
 - 自动从 HTML、`__NEXT_DATA__`、JS 资源字符串中发现新页面，并在同一轮纳入监控
-- 语言根路径和动态项目页（如 `/en`、`/zh-TW`、`/token/0x...`、`/presale/数字`）不纳入页面发现，避免新增代币/预售项目刷屏
+- 语言根路径、ranking 页面和动态项目页（如 `/en`、`/zh-TW`、`/en/ranking`、`/zh-TW/ranking`、`/token/0x...`、`/presale/数字`）不纳入页面发现，避免新增代币/预售项目刷屏
 - 路由/端点发现覆盖 `/api/`、`/meme-api/`、`/mapi/`、`/v1/`、`/blog/v1/` 和站内完整 URL
 - 纯资源列表小抖动会在同一轮 2.5 秒后快速复抓确认；真实变化立即推送，短暂恢复则静默忽略
 - API 探针只覆盖无需登录且稳定返回 JSON 的公开端点：public 配置、地址、文件 host、KOL、token ranking/search；公告/Blog 变化由前端页面监控覆盖，登录/签名/创建类 private 接口不做结构监控

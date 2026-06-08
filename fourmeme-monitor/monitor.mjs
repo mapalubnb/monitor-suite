@@ -345,6 +345,8 @@ let snapshotWriteQueue = Promise.resolve();
 const REMOVED_FRONTEND_URLS = new Set([
   "https://four.meme/en",
   "https://four.meme/zh-TW",
+  "https://four.meme/en/ranking",
+  "https://four.meme/zh-TW/ranking",
   "https://four.meme/zh-TW/create-token?entry=X-mode",
   "https://four.meme/zh-TW/ja",
   "https://four.meme/zh-TW/vi",
