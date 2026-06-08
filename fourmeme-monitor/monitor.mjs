@@ -343,6 +343,8 @@ const CURRENT_SCHEMA_VERSION = 6;
 let snapshotWriteQueue = Promise.resolve();
 
 const REMOVED_FRONTEND_URLS = new Set([
+  "https://four.meme/en",
+  "https://four.meme/zh-TW",
   "https://four.meme/zh-TW/create-token?entry=X-mode",
   "https://four.meme/zh-TW/ja",
   "https://four.meme/zh-TW/vi",
@@ -391,7 +393,7 @@ function pruneFrontendSnapshot(data) {
   const monitorUrls = new Set(CONFIG.monitorUrls.map(canonicalFrontendUrl));
   const discoveredUrls = (Array.isArray(data._frontendDiscoveredUrls) ? data._frontendDiscoveredUrls : [])
     .map(canonicalFrontendUrl)
-    .filter(url => url && !monitorUrls.has(url) && !REMOVED_FRONTEND_URLS.has(url) && !isDynamicFrontendRoute(url));
+    .filter(url => isDiscoverableFrontendUrl(url));
   const allowedUrls = new Set([...monitorUrls, ...discoveredUrls]);
 
   if (discoveredUrls.length !== (data._frontendDiscoveredUrls || []).length) {
@@ -1063,7 +1065,7 @@ function canonicalFrontendUrl(url) {
 function getFrontendMonitorUrls() {
   const urls = [
     ...CONFIG.monitorUrls,
-    ...(snapshot?._frontendDiscoveredUrls || []).filter(url => !isDynamicFrontendRoute(url) && !isConfiguredFrontendUrl(url)),
+    ...(snapshot?._frontendDiscoveredUrls || []).filter(url => isDiscoverableFrontendUrl(url)),
   ];
   return [...new Set(urls.map(canonicalFrontendUrl))];
 }
@@ -1071,6 +1073,17 @@ function getFrontendMonitorUrls() {
 function isConfiguredFrontendUrl(url) {
   const canonical = canonicalFrontendUrl(url);
   return CONFIG.monitorUrls.map(canonicalFrontendUrl).includes(canonical);
+}
+
+function isDiscoverableFrontendUrl(url) {
+  const canonical = canonicalFrontendUrl(url);
+  if (!canonical || isConfiguredFrontendUrl(canonical) || REMOVED_FRONTEND_URLS.has(canonical)) return false;
+  const route = normalizeRouteString(canonical).split("?")[0].replace(/\/+$/, "") || "/";
+  if (!isTrackableRouteString(route)) return false;
+  if (isApiOrEndpointRoute(route)) return false;
+  if (isUnsupportedLocalePrefixedRoute(route)) return false;
+  if (CONFIG.frontendDiscovery.excludeRoutes.some(re => re.test(route))) return false;
+  return true;
 }
 
 function normalizeRouteString(raw) {
@@ -5014,7 +5027,7 @@ async function runFrontendCheck() {
         ...(snapshot._frontendDiscoveredUrls || []),
         ...successfulDiscoveredUrls.map(canonicalFrontendUrl),
       ])]
-        .filter(url => !isDynamicFrontendRoute(url) && !isConfiguredFrontendUrl(url))
+        .filter(url => isDiscoverableFrontendUrl(url))
         .slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
     }
     snapshot.frontendPages = newPages;
@@ -5042,13 +5055,13 @@ async function runFrontendCheck() {
     const successfulDiscoveredUrls = (discoveredUrls || []).filter(url => newPages[urlToKey(url)]);
     for (const url of successfulDiscoveredUrls) {
       const canonical = canonicalFrontendUrl(url);
-      if (!oldDiscovered.has(canonical) && !isConfiguredFrontendUrl(canonical) && !isDynamicFrontendRoute(canonical)) {
+      if (!oldDiscovered.has(canonical) && isDiscoverableFrontendUrl(canonical)) {
         mergedDiscovered.push(canonical);
         oldDiscovered.add(canonical);
       }
     }
     const cleanedDiscovered = mergedDiscovered
-      .filter(url => !isDynamicFrontendRoute(url) && !isConfiguredFrontendUrl(url))
+      .filter(url => isDiscoverableFrontendUrl(url))
       .slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
     if (JSON.stringify(cleanedDiscovered) !== JSON.stringify(snapshot._frontendDiscoveredUrls || [])) {
       snapshot._frontendDiscoveredUrls = cleanedDiscovered;
