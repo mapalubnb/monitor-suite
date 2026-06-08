@@ -60,6 +60,8 @@ const CONFIG = {
     minAssetFiles: 2,
   },
 
+  // 心跳推送开关；默认关闭，只影响周期性状态心跳，不影响页面变更/异常告警
+  heartbeatEnabled: process.env.HEARTBEAT_ENABLED === "true",
   // 心跳间隔（毫秒）— 支持环境变量 HEARTBEAT_MINUTES 覆盖（单位：分钟）
   heartbeatMs: process.env.HEARTBEAT_MINUTES
     ? parseInt(process.env.HEARTBEAT_MINUTES, 10) * 60_000
@@ -2972,8 +2974,9 @@ async function startMonitor() {
 
   // 独立心跳定时器（不受轮询耗时影响）
   // 不再直接发送卡片，改为写入共享文件，由 fourmeme-monitor 合并推送
-  const HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
-  setInterval(async () => {
+  if (CONFIG.heartbeatEnabled) {
+    const HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
+    setInterval(async () => {
     log(`运行正常，已轮询 ${pollCount} 次`);
     cleanOldSnapshots();
 
@@ -3043,7 +3046,11 @@ async function startMonitor() {
     } catch (err) {
       log(`[心跳] 写入共享心跳文件失败：${err.message}`);
     }
-  }, CONFIG.heartbeatMs);
+    }, CONFIG.heartbeatMs);
+    log(`[心跳] 间隔 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟，写入共享心跳文件`);
+  } else {
+    log("[心跳] 已关闭（HEARTBEAT_ENABLED=false）");
+  }
 }
 
 /* ══════════════════════════════════════════

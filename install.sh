@@ -402,12 +402,18 @@ echo ""
 echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
 pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor --brief
 # 显示快捷配置状态
-CONF="/root/fourmeme-monitor/.env"
+CONF="/root/monitor-suite/.env"
+[ -f "$CONF" ] || CONF="/root/fourmeme-monitor/.env"
 if [ -f "$CONF" ]; then
+  HE=$(grep '^HEARTBEAT_ENABLED=' "$CONF" 2>/dev/null | cut -d= -f2)
   HB=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
   DR=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
   DRH=$(grep '^DAILY_REPORT_HOUR=' "$CONF" 2>/dev/null | cut -d= -f2)
-  [ -n "$HB" ] && echo "  心跳间隔: ${HB} 分钟"
+  if [ "$HE" = "true" ]; then
+    echo "  心跳: 开启（${HB:-240} 分钟）"
+  else
+    echo "  心跳: 关闭"
+  fi
   [ "$DR" = "true" ] && echo "  日报: 开启（每天 ${DRH:-9}:00）" || echo "  日报: 关闭"
 fi
 echo "========================================="
@@ -436,7 +442,8 @@ EOF
 cat > "$BIN_DIR/fm-daily" << 'EOF'
 #!/bin/sh
 echo "====== fourmeme 日报设置 ======"
-CONF="/root/fourmeme-monitor/.env"
+CONF="/root/monitor-suite/.env"
+[ -f "$CONF" ] || CONF="/root/fourmeme-monitor/.env"
 
 # 读取当前状态
 CURRENT_ENABLED=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
@@ -512,25 +519,52 @@ EOF
 
 cat > "$BIN_DIR/fm-heartbeat" << 'EOF'
 #!/bin/sh
-echo "====== fourmeme 心跳间隔设置 ======"
-CONF="/root/fourmeme-monitor/.env"
+echo "====== Monitor Suite 心跳推送设置 ======"
+CONF="/root/monitor-suite/.env"
+[ -f "$CONF" ] || CONF="/root/fourmeme-monitor/.env"
 
 # 读取当前值
+CURRENT_ENABLED=$(grep '^HEARTBEAT_ENABLED=' "$CONF" 2>/dev/null | cut -d= -f2)
+CURRENT_ENABLED="${CURRENT_ENABLED:-false}"
 CURRENT_MIN=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
 CURRENT_MIN="${CURRENT_MIN:-240}"
 
 show_status() {
-  echo "  当前心跳间隔: ${CURRENT_MIN} 分钟（每 ${CURRENT_MIN} 分钟推送一次状态）"
+  if [ "$CURRENT_ENABLED" = "true" ]; then
+    echo "  当前心跳: 开启（每 ${CURRENT_MIN} 分钟推送一次状态）"
+  else
+    echo "  当前心跳: 关闭"
+  fi
+}
+
+write_config() {
+  ENABLED="$1"
+  MINUTES="${2:-$CURRENT_MIN}"
+  touch "$CONF"
+  grep -v '^HEARTBEAT_ENABLED=' "$CONF" | grep -v '^HEARTBEAT_MINUTES=' > "$CONF.tmp" 2>/dev/null || true
+  echo "HEARTBEAT_ENABLED=$ENABLED" >> "$CONF.tmp"
+  echo "HEARTBEAT_MINUTES=$MINUTES" >> "$CONF.tmp"
+  mv "$CONF.tmp" "$CONF"
+}
+
+restart_monitors() {
+  echo ""
+  echo "  正在重启 fourmeme-monitor / flap-monitor 使配置生效..."
+  pm2 restart fourmeme-monitor --update-env 2>/dev/null || true
+  pm2 restart flap-monitor --update-env 2>/dev/null || true
+  echo "  重启完成 ✓"
+  echo "========================================="
 }
 
 usage() {
   echo ""
   echo "用法:"
-  echo "  fm-heartbeat          查看当前心跳间隔"
-  echo "  fm-heartbeat 30       设为 30 分钟"
-  echo "  fm-heartbeat 60       设为 1 小时"
-  echo "  fm-heartbeat 120      设为 2 小时"
-  echo "  fm-heartbeat 240      设为 4 小时（默认）"
+  echo "  fm-heartbeat          查看当前心跳状态"
+  echo "  fm-heartbeat off      关闭心跳推送"
+  echo "  fm-heartbeat on       开启心跳推送"
+  echo "  fm-heartbeat 30       开启并设为 30 分钟"
+  echo "  fm-heartbeat 60       开启并设为 1 小时"
+  echo "  fm-heartbeat 240      开启并设为 4 小时"
   echo ""
   show_status
   echo "========================================="
@@ -540,24 +574,26 @@ case "${1:-}" in
   "")
     usage
     ;;
+  off|false|disable|disabled)
+    write_config false "$CURRENT_MIN"
+    echo "  心跳推送已关闭"
+    restart_monitors
+    ;;
+  on|true|enable|enabled)
+    write_config true "$CURRENT_MIN"
+    echo "  心跳推送已开启（${CURRENT_MIN} 分钟）"
+    restart_monitors
+    ;;
   *)
     MINUTES="$1"
     # 验证是否为正整数
     if ! echo "$MINUTES" | grep -qE '^[0-9]+$' || [ "$MINUTES" -lt 1 ]; then
-      echo "  错误：间隔必须为正整数（分钟）"
+      echo "  错误：参数必须为 off/on 或正整数（分钟）"
       exit 1
     fi
-    # 更新 .env 文件
-    touch "$CONF"
-    grep -v '^HEARTBEAT_MINUTES=' "$CONF" > "$CONF.tmp" 2>/dev/null || true
-    echo "HEARTBEAT_MINUTES=$MINUTES" >> "$CONF.tmp"
-    mv "$CONF.tmp" "$CONF"
-    echo "  心跳间隔已设为 ${MINUTES} 分钟"
-    echo ""
-    echo "  正在重启 fourmeme-monitor 使配置生效..."
-    pm2 restart fourmeme-monitor --update-env 2>/dev/null
-    echo "  重启完成 ✓"
-    echo "========================================="
+    write_config true "$MINUTES"
+    echo "  心跳推送已开启，间隔设为 ${MINUTES} 分钟"
+    restart_monitors
     ;;
 esac
 EOF
@@ -602,7 +638,7 @@ if [ -f "$SNAP" ]; then
 
     // 检测配置
     console.log('[ 检测配置 ]');
-    console.log('  心跳间隔: 4 小时（支持 HEARTBEAT_MINUTES 环境变量覆盖）');
+    console.log('  心跳推送: 默认关闭（使用 fm-heartbeat on/数字 可开启）');
   " 2>/dev/null
   echo ""
   echo "------"
@@ -1008,7 +1044,7 @@ cat << 'INNER'
   fm-stop             停止
   fm-check            SIGUSR1 触发全量检测
   fm-daily            日报开关（on/off/on 20）
-  fm-heartbeat        心跳间隔设置（分钟数）
+  fm-heartbeat        心跳推送开关/间隔设置（off/on/分钟数）
 
 ── flap (fl-*) ──────────────────────────────────────
   fl-status           进程 + 页面/资源/i18n 摘要

@@ -83,7 +83,7 @@
 - 卡片消息 / 文本消息 / 文件消息
 - 消息回复 / 卡片编辑（更新 AI 摘要）/ 消息置顶
 - 内置 QPS 节流器（4 QPS，预留余量；飞书限 5 QPS/群）
-- 队列机制（最大 100 条）+ 低优先级心跳
+- 队列机制（最大 100 条）+ 可选低优先级心跳
 
 ## 反风控策略
 
@@ -158,7 +158,8 @@ rm -f /usr/local/bin/fm-* /usr/local/bin/fl-* /usr/local/bin/bot-* /usr/local/bi
 | `DOUBAO_API_KEY` | 否 | 豆包 API Key |
 | `DEEPSEEK_API_KEY` | 否 | DeepSeek API Key |
 | `GITHUB_TOKEN` | 否 | GitHub Token（提升 rate limit）|
-| `HEARTBEAT_MINUTES` | 否 | 心跳间隔，默认 240 分钟 |
+| `HEARTBEAT_ENABLED` | 否 | 是否启用心跳推送，默认 `false` |
+| `HEARTBEAT_MINUTES` | 否 | 心跳间隔，默认 240 分钟；仅在 `HEARTBEAT_ENABLED=true` 时生效 |
 | `DAILY_REPORT` | 否 | 是否启用每日报告，默认 `false` |
 
 完整变量列表见 `.env.example`。
@@ -204,7 +205,7 @@ sudo bash install.sh
 | `fm-restart` | 重启 |
 | `fm-check` | SIGUSR1 触发全量检测 |
 | `fm-daily` | 日报开关（on/off/on 20） |
-| `fm-heartbeat` | 心跳间隔设置（分钟数） |
+| `fm-heartbeat` | 心跳推送开关/间隔设置（off/on/分钟数） |
 | `fl-status` | Flap.sh 进程 + 页面/资源/i18n 摘要 |
 | `fl-log [N]` | 日志 |
 | `fl-restart` | 重启 |

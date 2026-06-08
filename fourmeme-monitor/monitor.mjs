@@ -94,6 +94,8 @@ const CONFIG = {
     actor:    3_000,   // 模块8: 合约创建者动作
   },
 
+  // 心跳推送开关；默认关闭，只影响周期性状态心跳，不影响变更/异常告警
+  heartbeatEnabled: process.env.HEARTBEAT_ENABLED === "true",
   // 心跳间隔（毫秒）— 支持环境变量 HEARTBEAT_MINUTES 覆盖（单位：分钟）
   heartbeatMs: process.env.HEARTBEAT_MINUTES
     ? parseInt(process.env.HEARTBEAT_MINUTES, 10) * 60_000
@@ -5528,7 +5530,7 @@ async function startAllModules() {
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
       `**创建者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s（只过滤交易发起地址 tx.from，命中后合约复查）`,
       `**反风控:** UA轮换 + 按域名自适应退避 + 请求抖动`,
-      `**心跳:** 每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送） | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
+      `**心跳:** ${CONFIG.heartbeatEnabled ? `每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送）` : "关闭"} | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
     ].join("\n"),
     "blue"
   );
@@ -5557,8 +5559,9 @@ async function startAllModules() {
 
   // 心跳定时器（低优先级：仅在队列空闲时推送，避免被变更通知挤掉）
   // 合并 fourmeme + flap 两个监控的心跳到一张卡片
-  const FLAP_HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
-  setInterval(() => {
+  if (CONFIG.heartbeatEnabled) {
+    const FLAP_HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
+    setInterval(() => {
     try {
       const upSec = Math.floor((Date.now() - startTime) / 1000);
       const h = Math.floor(upSec / 3600), m = Math.floor((upSec % 3600) / 60);
@@ -5650,7 +5653,11 @@ async function startAllModules() {
     } catch (err) {
       log(`[心跳] 构建心跳消息异常：${err.message}`);
     }
-  }, CONFIG.heartbeatMs);
+    }, CONFIG.heartbeatMs);
+    log(`[心跳] 间隔 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟，低优先级（队列空闲时推送）`);
+  } else {
+    log("[心跳] 已关闭（HEARTBEAT_ENABLED=false）");
+  }
 
   // ── 日报定时器 ──
   if (CONFIG.dailyReport.enabled) {
@@ -5675,7 +5682,6 @@ async function startAllModules() {
     log("[日报] 未开启（设置 DAILY_REPORT=true 可开启）");
   }
 
-  log(`[心跳] 间隔 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟，低优先级（队列空闲时推送）`);
 }
 
 // SIGUSR1 信号：立即触发所有模块执行一次
