@@ -1142,10 +1142,13 @@ function routeToFrontendUrl(route) {
   if (isApiOrEndpointRoute(normalized)) return null;
   if (isUnsupportedLocalePrefixedRoute(normalized)) return null;
   if (CONFIG.frontendDiscovery.excludeRoutes.some(re => re.test(normalized))) return null;
+  let candidate;
   if (/^\/(?:en|zh-TW)(?:\/|$)/i.test(normalized)) {
-    return canonicalFrontendUrl(CONFIG.siteUrl + normalized);
+    candidate = canonicalFrontendUrl(CONFIG.siteUrl + normalized);
+  } else {
+    candidate = canonicalFrontendUrl(`${CONFIG.siteUrl}/${CONFIG.frontendDiscovery.locale}${normalized}`);
   }
-  return canonicalFrontendUrl(`${CONFIG.siteUrl}/${CONFIG.frontendDiscovery.locale}${normalized}`);
+  return isDiscoverableFrontendUrl(candidate) ? candidate : null;
 }
 
 function discoverFrontendUrlsFromPages(pages, knownUrls = []) {
