@@ -70,7 +70,14 @@ const CONFIG = {
     "https://four.meme/zh-TW/create-token",
     "https://four.meme/zh-TW/agentic",
     "https://four.meme/zh-TW/contract",
+    "https://four.meme/zh-TW/contract/collection",
+    "https://four.meme/zh-TW/contract/create",
+    "https://four.meme/zh-TW/contract/profile",
     "https://four.meme/zh-TW/announcement",
+    "https://four.meme/en/contract",
+    "https://four.meme/en/contract/collection",
+    "https://four.meme/en/contract/create",
+    "https://four.meme/en/contract/profile",
   ],
   networkCode: "BSC",
 
@@ -384,7 +391,7 @@ function pruneFrontendSnapshot(data) {
   const monitorUrls = new Set(CONFIG.monitorUrls.map(canonicalFrontendUrl));
   const discoveredUrls = (Array.isArray(data._frontendDiscoveredUrls) ? data._frontendDiscoveredUrls : [])
     .map(canonicalFrontendUrl)
-    .filter(url => !REMOVED_FRONTEND_URLS.has(url) && !isDynamicTokenDetailRoute(url));
+    .filter(url => url && !monitorUrls.has(url) && !REMOVED_FRONTEND_URLS.has(url) && !isDynamicFrontendRoute(url));
   const allowedUrls = new Set([...monitorUrls, ...discoveredUrls]);
 
   if (discoveredUrls.length !== (data._frontendDiscoveredUrls || []).length) {
@@ -394,7 +401,7 @@ function pruneFrontendSnapshot(data) {
 
   for (const [key, page] of Object.entries(data.frontendPages)) {
     const canonical = page?.originalUrl ? canonicalFrontendUrl(page.originalUrl) : "";
-    if (!canonical || REMOVED_FRONTEND_URLS.has(canonical) || isDynamicTokenDetailRoute(canonical) || !allowedUrls.has(canonical)) {
+    if (!canonical || REMOVED_FRONTEND_URLS.has(canonical) || isDynamicFrontendRoute(canonical) || !allowedUrls.has(canonical)) {
       delete data.frontendPages[key];
       if (data._frontendFailCounts) delete data._frontendFailCounts[key];
       changed = true;
@@ -1056,9 +1063,14 @@ function canonicalFrontendUrl(url) {
 function getFrontendMonitorUrls() {
   const urls = [
     ...CONFIG.monitorUrls,
-    ...(snapshot?._frontendDiscoveredUrls || []).filter(url => !isDynamicTokenDetailRoute(url)),
+    ...(snapshot?._frontendDiscoveredUrls || []).filter(url => !isDynamicFrontendRoute(url) && !isConfiguredFrontendUrl(url)),
   ];
   return [...new Set(urls.map(canonicalFrontendUrl))];
+}
+
+function isConfiguredFrontendUrl(url) {
+  const canonical = canonicalFrontendUrl(url);
+  return CONFIG.monitorUrls.map(canonicalFrontendUrl).includes(canonical);
 }
 
 function normalizeRouteString(raw) {
@@ -1084,7 +1096,7 @@ function isTrackableRouteString(route) {
   if (route.startsWith("/_next/") || route.startsWith("/static/")) return false;
   if (/\.(js|css|png|svg|ico|jpg|jpeg|gif|webp|woff2?|ttf|eot|map)$/i.test(route.split("?")[0])) return false;
   if (isLocaleRootRoute(route)) return false;
-  if (isDynamicTokenDetailRoute(route)) return false;
+  if (isDynamicFrontendRoute(route)) return false;
   if (/^\/docs(?:\/|$)/i.test(route) || /^\/a\/i$/i.test(route) || /^\/v\d+\/resolve-ens$/i.test(route)) return false;
   return true;
 }
@@ -1102,9 +1114,10 @@ function isUnsupportedLocalePrefixedRoute(route) {
   return /^\/[a-z]{2}(?:-[a-z]{2})?(?:\/|$)/i.test(path) && !/^\/(?:en|zh-TW)(?:\/|$)/i.test(path);
 }
 
-function isDynamicTokenDetailRoute(route) {
+function isDynamicFrontendRoute(route) {
   const path = normalizeRouteString(route).split("?")[0].replace(/\/+$/, "");
-  return /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/0x[a-f0-9]{40}$/i.test(path);
+  return /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/0x[a-f0-9]{40}$/i.test(path)
+    || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?presale\/\d+$/i.test(path);
 }
 
 function routeToFrontendUrl(route) {
@@ -5000,7 +5013,9 @@ async function runFrontendCheck() {
       snapshot._frontendDiscoveredUrls = [...new Set([
         ...(snapshot._frontendDiscoveredUrls || []),
         ...successfulDiscoveredUrls.map(canonicalFrontendUrl),
-      ])].slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
+      ])]
+        .filter(url => !isDynamicFrontendRoute(url) && !isConfiguredFrontendUrl(url))
+        .slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
     }
     snapshot.frontendPages = newPages;
     await saveSnapshot(snapshot);
@@ -5027,13 +5042,16 @@ async function runFrontendCheck() {
     const successfulDiscoveredUrls = (discoveredUrls || []).filter(url => newPages[urlToKey(url)]);
     for (const url of successfulDiscoveredUrls) {
       const canonical = canonicalFrontendUrl(url);
-      if (!oldDiscovered.has(canonical) && !CONFIG.monitorUrls.map(canonicalFrontendUrl).includes(canonical)) {
+      if (!oldDiscovered.has(canonical) && !isConfiguredFrontendUrl(canonical) && !isDynamicFrontendRoute(canonical)) {
         mergedDiscovered.push(canonical);
         oldDiscovered.add(canonical);
       }
     }
-    if (mergedDiscovered.length !== (snapshot._frontendDiscoveredUrls || []).length) {
-      snapshot._frontendDiscoveredUrls = mergedDiscovered.slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
+    const cleanedDiscovered = mergedDiscovered
+      .filter(url => !isDynamicFrontendRoute(url) && !isConfiguredFrontendUrl(url))
+      .slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
+    if (JSON.stringify(cleanedDiscovered) !== JSON.stringify(snapshot._frontendDiscoveredUrls || [])) {
+      snapshot._frontendDiscoveredUrls = cleanedDiscovered;
       snapshotDirty = true;
     }
   }
@@ -5060,6 +5078,12 @@ async function runFrontendCheck() {
       const label = urlLabel(newData.originalUrl);
       const fileCount = (newData.assetFiles || []).length;
       const routeCount = (newData.routes || []).length;
+      if (isConfiguredFrontendUrl(newData.originalUrl)) {
+        log(`[前端] 默认监控页面已建立基线：${label}（资源 ${fileCount} 个，路由/端点 ${routeCount} 个）`);
+        snapshot.frontendPages[key] = newData;
+        snapshotDirty = true;
+        continue;
+      }
       notifications.push({
         title: `前端新增页面：${label}`,
         content: [
