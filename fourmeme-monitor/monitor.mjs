@@ -14,7 +14,7 @@
  *   模块4: GitHub     — 每 5min（条件请求，自带 ETag 缓存）
  *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 3s（RPC batch，单次请求）
- *   模块8: 创建者动作 — 每 3s（扫新区块，只监听创建者/手动配置地址发起的交易）
+ *   模块8: 创建者动作 — WebSocket 新区块驱动 + HTTP 兜底（只监听创建者/手动配置地址发起的交易）
  *
  * 用法：node monitor.mjs
  * 信号：kill -USR1 <PID>  立即触发全量检测
@@ -24,6 +24,7 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mkdirSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import WebSocket from "ws";
 
 import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
 
@@ -153,6 +154,10 @@ const CONFIG = {
     "https://bsc-dataseed1.defibit.io/",
     "https://bsc-dataseed2.defibit.io/",
   ],
+  bscWsUrls: (process.env.BSC_WS_URLS || process.env.FOURMEME_BSC_WS_URLS || "wss://bsc-rpc.publicnode.com")
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean),
   contracts: {
     tokenManagerV1:  "0xEC4549caDcE5DA21Df6E6422d448034B5233bFbC",
     tokenManagerV2:  "0x5c952063c7fc8610FFDB798152D69F0B9550762b",
@@ -232,6 +237,8 @@ const CONFIG = {
   eip1967AdminSlot: "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103",
   actorMonitor: {
     enabled: process.env.FOURMEME_ACTOR_MONITOR !== "false",
+    wsEnabled: readBoolEnv("FOURMEME_ACTOR_WS_ENABLED", true),
+    httpFallbackMs: readPositiveIntEnv("FOURMEME_ACTOR_HTTP_FALLBACK_MS", 10_000),
     confirmations: readPositiveIntEnv("FOURMEME_ACTOR_CONFIRMATIONS", 1),
     maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 80),
     catchupMaxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_CATCHUP_MAX_BLOCKS", 800),
@@ -4965,6 +4972,46 @@ function formatActorActions(actions) {
   return lines.join("\n");
 }
 
+const actorBlockFeedState = {
+  enabled: CONFIG.actorMonitor.wsEnabled,
+  connected: false,
+  urlIndex: 0,
+  reconnectAttempts: 0,
+  latestHeadBlock: 0,
+  lastHeadAt: 0,
+  lastError: "",
+  subscriptionId: "",
+  ws: null,
+  reconnectTimer: null,
+  stopping: false,
+};
+
+function actorBlockFeedMode() {
+  if (!CONFIG.actorMonitor.wsEnabled) return "http_fallback";
+  if (actorBlockFeedState.connected && Date.now() - actorBlockFeedState.lastHeadAt < 120_000) return "websocket";
+  return "http_fallback";
+}
+
+function actorBlockFeedSnapshot() {
+  return {
+    enabled: CONFIG.actorMonitor.wsEnabled,
+    mode: actorBlockFeedMode(),
+    connected: actorBlockFeedState.connected,
+    latestHeadBlock: actorBlockFeedState.latestHeadBlock || 0,
+    lastHeadAt: actorBlockFeedState.lastHeadAt ? new Date(actorBlockFeedState.lastHeadAt).toISOString() : "",
+    lastError: actorBlockFeedState.lastError || "",
+    subscriptionId: actorBlockFeedState.subscriptionId || "",
+  };
+}
+
+async function fetchLatestBlockForActorCheck() {
+  if (actorBlockFeedMode() === "websocket" && actorBlockFeedState.latestHeadBlock > 0) {
+    return actorBlockFeedState.latestHeadBlock;
+  }
+  const latestHex = await bscRpcCall("eth_blockNumber", []);
+  return hexToNumber(latestHex);
+}
+
 async function runActorCheck() {
   if (!CONFIG.actorMonitor.enabled) return;
   const state = ensureActorMonitorState();
@@ -4975,8 +5022,7 @@ async function runActorCheck() {
     return;
   }
 
-  const latestHex = await bscRpcCall("eth_blockNumber", []);
-  const latest = hexToNumber(latestHex);
+  const latest = await fetchLatestBlockForActorCheck();
   const safeLatest = Math.max(0, latest - CONFIG.actorMonitor.confirmations);
   if (!state.lastBlock) {
     state.lastBlock = Math.max(0, safeLatest - CONFIG.actorMonitor.bootstrapLookbackBlocks);
@@ -4992,6 +5038,7 @@ async function runActorCheck() {
   state.creatorPageLookupEnabled = CONFIG.actorMonitor.creatorPageLookupEnabled;
   state.creatorApiLookupEnabled = CONFIG.actorMonitor.creatorLookupEnabled;
   state.creatorLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled || CONFIG.actorMonitor.creatorPageLookupEnabled || CONFIG.actorMonitor.creatorLookupEnabled;
+  state.blockFeed = actorBlockFeedSnapshot();
 
   const cachedCreatorCount = Object.keys(cachedCreatorMap(state)).length;
   const bootstrapCreatorRefresh = cachedCreatorCount === 0 && CONFIG.actorMonitor.extraActors.length === 0;
@@ -5091,6 +5138,118 @@ async function runActorCheck() {
       log(`[创建者] 触发合约复查失败：${err.message}`);
     }
   }
+}
+
+function stopActorBlockFeed() {
+  actorBlockFeedState.stopping = true;
+  if (actorBlockFeedState.reconnectTimer) {
+    clearTimeout(actorBlockFeedState.reconnectTimer);
+    actorBlockFeedState.reconnectTimer = null;
+  }
+  if (actorBlockFeedState.ws) {
+    try { actorBlockFeedState.ws.close(); } catch {}
+    actorBlockFeedState.ws = null;
+  }
+  actorBlockFeedState.connected = false;
+}
+
+function scheduleActorBlockFeedReconnect(actorRunner, reason) {
+  if (!CONFIG.actorMonitor.wsEnabled || actorBlockFeedState.stopping || actorBlockFeedState.reconnectTimer) return;
+  actorBlockFeedState.connected = false;
+  actorBlockFeedState.lastError = reason || "";
+  const delay = Math.min(60_000, 1_000 * (2 ** Math.min(actorBlockFeedState.reconnectAttempts, 6)));
+  actorBlockFeedState.reconnectAttempts++;
+  log(`[创建者] WebSocket 新区块订阅将在 ${Math.round(delay / 1000)}s 后重连${reason ? `：${reason}` : ""}`);
+  actorBlockFeedState.reconnectTimer = setTimeout(() => {
+    actorBlockFeedState.reconnectTimer = null;
+    connectActorBlockFeed(actorRunner);
+  }, delay);
+}
+
+function handleActorBlockFeedMessage(actorRunner, raw) {
+  let msg;
+  try {
+    msg = JSON.parse(String(raw));
+  } catch {
+    return;
+  }
+  if (msg.id === 1 && msg.result) {
+    actorBlockFeedState.subscriptionId = String(msg.result);
+    log(`[创建者] WebSocket 新区块订阅已建立：${actorBlockFeedState.subscriptionId}`);
+    return;
+  }
+  const headHex = msg?.params?.result?.number;
+  if (!headHex) return;
+  const headBlock = hexToNumber(headHex);
+  if (!headBlock || headBlock <= actorBlockFeedState.latestHeadBlock) return;
+
+  actorBlockFeedState.latestHeadBlock = headBlock;
+  actorBlockFeedState.lastHeadAt = Date.now();
+  actorBlockFeedState.reconnectAttempts = 0;
+  actorRunner.run().catch(err => {
+    log(`[创建者] WebSocket 触发检测异常：${err.message}`);
+  });
+}
+
+function connectActorBlockFeed(actorRunner) {
+  const urls = CONFIG.bscWsUrls || [];
+  if (!CONFIG.actorMonitor.wsEnabled) {
+    log("[创建者] WebSocket 新区块订阅已关闭（FOURMEME_ACTOR_WS_ENABLED=false）");
+    return;
+  }
+  if (urls.length === 0) {
+    log("[创建者] 未配置 BSC WebSocket URL，创建者动作使用 HTTP 轮询兜底");
+    return;
+  }
+
+  const url = urls[actorBlockFeedState.urlIndex % urls.length];
+  actorBlockFeedState.urlIndex++;
+  actorBlockFeedState.lastError = "";
+  log(`[创建者] 正在连接 WebSocket 新区块订阅：${url.replace(/\/\/[^/@]+@/, "//***@")}`);
+
+  const ws = new WebSocket(url, { handshakeTimeout: 10_000 });
+  actorBlockFeedState.ws = ws;
+
+  ws.on("open", () => {
+    actorBlockFeedState.connected = true;
+    actorBlockFeedState.lastError = "";
+    ws.send(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_subscribe", params: ["newHeads"] }));
+  });
+
+  ws.on("message", (raw) => handleActorBlockFeedMessage(actorRunner, raw));
+
+  ws.on("close", (code, reason) => {
+    if (actorBlockFeedState.ws === ws) actorBlockFeedState.ws = null;
+    actorBlockFeedState.connected = false;
+    actorBlockFeedState.subscriptionId = "";
+    scheduleActorBlockFeedReconnect(actorRunner, `close ${code}${reason ? ` ${reason}` : ""}`);
+  });
+
+  ws.on("error", (err) => {
+    actorBlockFeedState.lastError = err.message || String(err);
+    log(`[创建者] WebSocket 新区块订阅异常：${actorBlockFeedState.lastError}`);
+  });
+
+  ws.on("pong", () => {
+    actorBlockFeedState.lastPongAt = Date.now();
+  });
+}
+
+function startActorBlockFeed(actorRunner) {
+  actorBlockFeedState.stopping = false;
+  connectActorBlockFeed(actorRunner);
+  const healthTimer = setInterval(() => {
+    const ws = actorBlockFeedState.ws;
+    if (ws?.readyState === WebSocket.OPEN) {
+      try { ws.ping(); } catch {}
+    }
+    if (actorBlockFeedState.connected && actorBlockFeedState.lastHeadAt && Date.now() - actorBlockFeedState.lastHeadAt > 180_000) {
+      actorBlockFeedState.lastError = "180s 内未收到新区块事件";
+      log("[创建者] WebSocket 新区块订阅长时间无事件，切换连接");
+      try { ws?.terminate(); } catch {}
+    }
+  }, 30_000);
+  return { stop: stopActorBlockFeed, healthTimer };
 }
 
 /* ══════════════════════════════════════════
@@ -5241,39 +5400,48 @@ function clearModuleError(name) {
  */
 function createModuleRunner(name, fn, intervalMs) {
   let running = false;
+  let pending = false;
   let backoffSkips = 0;
   const run = async () => {
-    if (running) return;
+    if (running) {
+      pending = true;
+      return;
+    }
     running = true;
     try {
-      await fn();
-      modulePollCounts[name]++;
-      // warn if recovering from backoff skips (only notify if significant)
-      if (backoffSkips > 0) {
-        const skipped = backoffSkips;
-        backoffSkips = 0;
-        log(`[${name}] 退避恢复：此前因风控跳过 ${skipped} 次检测，本轮已完成全量比对`);
-        // 仅连续跳过 3 次以上才推送通知，避免短暂退避（如 5s）产生噪音
-        if (skipped >= 3) {
-          sendFeishu(
-            `模块恢复：${name}`,
-            `**模块** ${name} 退避结束，已恢复检测\n**跳过次数：** ${skipped}\n**注意：** 退避期间的中间状态变更可能未被捕获`,
-            "yellow"
-          ).catch(err => { log(`[飞书] 退避恢复推送失败：${err.message}`); });
+      do {
+        pending = false;
+        try {
+          await fn();
+          modulePollCounts[name]++;
+          // warn if recovering from backoff skips (only notify if significant)
+          if (backoffSkips > 0) {
+            const skipped = backoffSkips;
+            backoffSkips = 0;
+            log(`[${name}] 退避恢复：此前因风控跳过 ${skipped} 次检测，本轮已完成全量比对`);
+            // 仅连续跳过 3 次以上才推送通知，避免短暂退避（如 5s）产生噪音
+            if (skipped >= 3) {
+              sendFeishu(
+                `模块恢复：${name}`,
+                `**模块** ${name} 退避结束，已恢复检测\n**跳过次数：** ${skipped}\n**注意：** 退避期间的中间状态变更可能未被捕获`,
+                "yellow"
+              ).catch(err => { log(`[飞书] 退避恢复推送失败：${err.message}`); });
+            }
+          }
+          clearModuleError(name);
+          try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
+        } catch (err) {
+          if (err.message?.includes("[退避中]")) {
+            backoffSkips++;
+            if (backoffSkips === 1 || backoffSkips % 10 === 0) {
+              log(`[${name}] 退避中，已跳过 ${backoffSkips} 次`);
+            }
+          } else {
+            log(`[${name}] 异常：${err.message}`);
+            recordModuleError(name, err.message);
+          }
         }
-      }
-      clearModuleError(name);
-      try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
-    } catch (err) {
-      if (err.message?.includes("[退避中]")) {
-        backoffSkips++;
-        if (backoffSkips === 1 || backoffSkips % 10 === 0) {
-          log(`[${name}] 退避中，已跳过 ${backoffSkips} 次`);
-        }
-      } else {
-        log(`[${name}] 异常：${err.message}`);
-        recordModuleError(name, err.message);
-      }
+      } while (pending);
     } finally {
       running = false;
     }
@@ -5802,8 +5970,9 @@ const modules = [
   createModuleRunner("github",   runGithubCheck,    CONFIG.intervals.github),
   createModuleRunner("contract", runContractCheck,  CONFIG.intervals.contract),
   createModuleRunner("onchain",  runOnchainCheck,   CONFIG.intervals.onchain),
-  createModuleRunner("actor",    runActorCheck,     CONFIG.intervals.actor),
+  createModuleRunner("actor",    runActorCheck,     CONFIG.actorMonitor.wsEnabled ? CONFIG.actorMonitor.httpFallbackMs : CONFIG.intervals.actor),
 ];
+const actorRunner = modules.find(m => m.name === "actor");
 
 /**
  * 每日报告：汇总过去 24 小时的变更历史
@@ -5926,12 +6095,17 @@ async function startAllModules() {
       `**GitHub:** ${CONFIG.githubOwner} 账号 ${githubRepoCount} 个仓库，主仓库 ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
       `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
-      `**创建者动作:** ${actorCount} 个地址 — 每 ${CONFIG.intervals.actor / 1000}s（只过滤交易发起地址 tx.from，命中后合约复查）`,
+      `**创建者动作:** ${actorCount} 个地址 — WebSocket 新区块驱动 + 每 ${actorRunner?.intervalMs / 1000}s HTTP 兜底（只过滤交易发起地址 tx.from，命中后合约复查）`,
       `**反风控:** UA轮换 + 按域名自适应退避 + 请求抖动`,
       `**心跳:** ${CONFIG.heartbeatEnabled ? `每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送）` : "关闭"} | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
     ].join("\n"),
     "blue"
   );
+
+  // WebSocket 新区块订阅只负责触发创建者动作检测；HTTP 定时器继续作为断线/漏事件兜底。
+  if (actorRunner && CONFIG.actorMonitor.enabled) {
+    global.__actorBlockFeed = startActorBlockFeed(actorRunner);
+  }
 
   // 启动各模块独立定时器（递归 setTimeout 实现 per-tick 抖动）
   const moduleTimers = []; // 存储定时器 ID，供优雅退出时清理
@@ -6117,6 +6291,11 @@ async function gracefulShutdown(signal) {
       clearTimeout(t.timerId);
     }
     log(`已停止 ${global.__moduleTimers.length} 个模块定时器`);
+  }
+  if (global.__actorBlockFeed) {
+    clearInterval(global.__actorBlockFeed.healthTimer);
+    global.__actorBlockFeed.stop();
+    log("已停止创建者 WebSocket 新区块订阅");
   }
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);

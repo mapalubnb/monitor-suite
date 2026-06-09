@@ -9,6 +9,7 @@
     "check:fourmeme": "node --check fourmeme-monitor/monitor.mjs"
   },
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.35.0"
+    "@larksuiteoapi/node-sdk": "^1.35.0",
+    "ws": "^8.21.0"
   }
 }

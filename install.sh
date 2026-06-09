@@ -388,6 +388,8 @@ if [ -f "$SNAP" ]; then
     if(am.creatorApiLookupEnabled) modes.push('Etherscan API备用');
     if(modes.length===0) modes.push('仅缓存/手动配置');
     console.log('  创建者来源: '+modes.join(' + ')+' | 缓存 '+cachedCreators+' 个');
+    const feed=am.blockFeed||{};
+    if(feed.enabled!==undefined) console.log('  新区块触发: '+(feed.mode||'未知')+' | WS连接: '+(feed.connected?'正常':'未连接')+(feed.latestHeadBlock?' | 最新头块: '+feed.latestHeadBlock:''));
     if(am.lastBlock) {
       const lag=am.actorLagBlocks??(am.safeLatestBlock?Math.max(0,am.safeLatestBlock-am.lastBlock):'-');
       const lagSec=am.actorLagSecondsApprox??(typeof lag==='number'?lag*3:'-');
