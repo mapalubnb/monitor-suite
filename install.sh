@@ -60,6 +60,30 @@ sync_env_template_keys() {
   rm -f "$missing_file"
 }
 
+migrate_env_default_value() {
+  local env_file="$1"
+  local key="$2"
+  local old_value="$3"
+  local new_value="$4"
+
+  if [ ! -f "$env_file" ]; then
+    return
+  fi
+
+  if grep -qE "^${key}=${old_value}$" "$env_file"; then
+    sed -i "s|^${key}=.*|${key}=${new_value}|" "$env_file"
+    echo "  .env 已迁移旧默认值: ${key}=${old_value} → ${new_value}"
+  fi
+}
+
+migrate_fourmeme_actor_env_defaults() {
+  local env_file="$1"
+  migrate_env_default_value "$env_file" "FOURMEME_CREATOR_PAGE_MAX_PER_RUN" "8" "2"
+  migrate_env_default_value "$env_file" "FOURMEME_ACTOR_CONFIRMATIONS" "2" "1"
+  migrate_env_default_value "$env_file" "FOURMEME_ACTOR_BOOTSTRAP_BLOCKS" "6" "20"
+  migrate_env_default_value "$env_file" "FOURMEME_ACTOR_MAX_BLOCKS" "8" "80"
+}
+
 echo "========================================="
 echo "  Monitor Suite 安装脚本"
 echo "  - fourmeme-monitor (four.meme)"
@@ -115,6 +139,7 @@ echo "  安装共享依赖..."
 cd "$SUITE_DIR" && npm install --omit=dev && cd - >/dev/null
 # .env：不存在则生成，已存在则补齐 .env.example 中新增的配置项
 sync_env_template_keys "$SUITE_DIR/.env" "$SUITE_DIR/.env.example"
+migrate_fourmeme_actor_env_defaults "$SUITE_DIR/.env"
 
 # ── 4. 部署 fourmeme-monitor ──
 echo "[4/6] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
@@ -363,7 +388,12 @@ if [ -f "$SNAP" ]; then
     if(am.creatorApiLookupEnabled) modes.push('Etherscan API备用');
     if(modes.length===0) modes.push('仅缓存/手动配置');
     console.log('  创建者来源: '+modes.join(' + ')+' | 缓存 '+cachedCreators+' 个');
-    if(am.lastBlock) console.log('  已扫描至确认块: '+am.lastBlock);
+    if(am.lastBlock) {
+      const lag=am.actorLagBlocks??(am.safeLatestBlock?Math.max(0,am.safeLatestBlock-am.lastBlock):'-');
+      const lagSec=am.actorLagSecondsApprox??(typeof lag==='number'?lag*3:'-');
+      console.log('  已扫描至确认块: '+am.lastBlock+' / 最新确认块: '+(am.safeLatestBlock||'未知')+' / 链最新块: '+(am.latestBlock||'未知'));
+      console.log('  扫链延迟: '+lag+' 块（约 '+lagSec+' 秒） | 上轮: '+(am.lastRunScannedBlocks||0)+' 块 / '+(am.lastRunBatches||0)+' 批');
+    }
     for(const a of actors){
       const item=allActors[a]||{};
       console.log('  '+a+'  '+((item.roles||[]).join(',')||'创建者'));

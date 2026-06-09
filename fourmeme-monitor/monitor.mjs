@@ -232,15 +232,18 @@ const CONFIG = {
   eip1967AdminSlot: "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103",
   actorMonitor: {
     enabled: process.env.FOURMEME_ACTOR_MONITOR !== "false",
-    confirmations: readPositiveIntEnv("FOURMEME_ACTOR_CONFIRMATIONS", 2),
-    maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 8),
-    bootstrapLookbackBlocks: readPositiveIntEnv("FOURMEME_ACTOR_BOOTSTRAP_BLOCKS", 6),
+    confirmations: readPositiveIntEnv("FOURMEME_ACTOR_CONFIRMATIONS", 1),
+    maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 80),
+    catchupMaxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_CATCHUP_MAX_BLOCKS", 800),
+    maxRunMs: readPositiveIntEnv("FOURMEME_ACTOR_MAX_RUN_MS", 45_000),
+    lagWarnBlocks: readPositiveIntEnv("FOURMEME_ACTOR_LAG_WARN_BLOCKS", 120),
+    bootstrapLookbackBlocks: readPositiveIntEnv("FOURMEME_ACTOR_BOOTSTRAP_BLOCKS", 20),
     extraActors: parseEnvAddressList(`${process.env.FOURMEME_WATCH_ACTORS || ""},${process.env.FOURMEME_WATCH_CREATORS || ""}`),
     creatorChainLookupEnabled: readBoolEnv("FOURMEME_CREATOR_CHAIN_LOOKUP", true),
     creatorChainLookbackBlocks: readPositiveIntEnv("FOURMEME_CREATOR_CHAIN_LOOKBACK_BLOCKS", 30000),
     creatorChainMaxBlocksPerRun: readPositiveIntEnv("FOURMEME_CREATOR_CHAIN_MAX_BLOCKS_PER_RUN", 120),
     creatorPageLookupEnabled: readBoolEnv("FOURMEME_CREATOR_PAGE_LOOKUP", true),
-    creatorPageMaxPerRun: readPositiveIntEnv("FOURMEME_CREATOR_PAGE_MAX_PER_RUN", 8),
+    creatorPageMaxPerRun: readPositiveIntEnv("FOURMEME_CREATOR_PAGE_MAX_PER_RUN", 2),
     creatorLookupCooldownMs: readPositiveIntEnv("FOURMEME_CREATOR_LOOKUP_COOLDOWN_MINUTES", 30) * 60_000,
     creatorLookupEnabled: process.env.FOURMEME_CREATOR_LOOKUP === "true",
     explorerApiKey: process.env.ETHERSCAN_V2_API_KEY || process.env.ETHERSCAN_API_KEY || process.env.BSCSCAN_API_KEY || "",
@@ -4776,8 +4779,9 @@ async function fetchCreatorsViaExplorerApi(missing, state, lookupState, now) {
   }
 }
 
-async function fetchContractCreatorActors(contractEntries, state) {
+async function fetchContractCreatorActors(contractEntries, state, options = {}) {
   if (contractEntries.length === 0) return cachedCreatorMap(state);
+  if (options.refresh === false) return cachedCreatorMap(state);
 
   const lookupState = state.creatorLookup || (state.creatorLookup = {});
   let missing = missingCreatorAddresses(contractEntries, state);
@@ -4792,13 +4796,13 @@ async function fetchContractCreatorActors(contractEntries, state) {
   return cachedCreatorMap(state);
 }
 
-async function fetchActorContext(contractEntries, state) {
+async function fetchActorContext(contractEntries, state, options = {}) {
   const actorMap = new Map();
   const contractMap = new Map();
   for (const c of contractEntries) addContractEntry(contractMap, c.labels?.[0] || "", c.address, c.sources?.[0] || "");
   for (const addr of CONFIG.actorMonitor.extraActors) addActorRole(actorMap, addr, "manual", "FOURMEME_WATCH_ACTORS", "env");
 
-  const creatorMap = await fetchContractCreatorActors(contractEntries, state);
+  const creatorMap = await fetchContractCreatorActors(contractEntries, state, options);
   for (const c of contractEntries) {
     const creator = creatorMap[normalizeAddress(c.address)];
     if (creator?.creator) addActorRole(actorMap, creator.creator, "creator", c.labels.join("/"), "explorer");
@@ -4971,16 +4975,6 @@ async function runActorCheck() {
     return;
   }
 
-  const context = await fetchActorContext(contractEntries, state);
-  const actorList = formatActorWatchList(context);
-  state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
-  state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
-  state.contractCount = contractEntries.length;
-  state.creatorChainLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled;
-  state.creatorPageLookupEnabled = CONFIG.actorMonitor.creatorPageLookupEnabled;
-  state.creatorApiLookupEnabled = CONFIG.actorMonitor.creatorLookupEnabled;
-  state.creatorLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled || CONFIG.actorMonitor.creatorPageLookupEnabled || CONFIG.actorMonitor.creatorLookupEnabled;
-
   const latestHex = await bscRpcCall("eth_blockNumber", []);
   const latest = hexToNumber(latestHex);
   const safeLatest = Math.max(0, latest - CONFIG.actorMonitor.confirmations);
@@ -4989,33 +4983,113 @@ async function runActorCheck() {
     log(`[创建者] 初始化区块游标：${state.lastBlock}（最新块=${latest}，确认块=${safeLatest}）`);
   }
 
-  if (state.lastBlock >= safeLatest) {
-    if (stateBefore !== JSON.stringify(state)) await saveSnapshot(snapshot);
-    return;
+  state.latestBlock = latest;
+  state.safeLatestBlock = safeLatest;
+  state.actorLagBlocks = Math.max(0, safeLatest - state.lastBlock);
+  state.actorLagSecondsApprox = state.actorLagBlocks * 3;
+  state.contractCount = contractEntries.length;
+  state.creatorChainLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled;
+  state.creatorPageLookupEnabled = CONFIG.actorMonitor.creatorPageLookupEnabled;
+  state.creatorApiLookupEnabled = CONFIG.actorMonitor.creatorLookupEnabled;
+  state.creatorLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled || CONFIG.actorMonitor.creatorPageLookupEnabled || CONFIG.actorMonitor.creatorLookupEnabled;
+
+  const cachedCreatorCount = Object.keys(cachedCreatorMap(state)).length;
+  const bootstrapCreatorRefresh = cachedCreatorCount === 0 && CONFIG.actorMonitor.extraActors.length === 0;
+  if (bootstrapCreatorRefresh) {
+    log("[创建者] 尚无创建者缓存，先执行一次创建者补全以建立监听地址");
   }
 
-  const fromBlock = state.lastBlock + 1;
-  const toBlock = Math.min(safeLatest, fromBlock + CONFIG.actorMonitor.maxBlocksPerRun - 1);
-  const actions = await fetchActorBlockActions(fromBlock, toBlock, context, state);
-  state.lastBlock = toBlock;
-  state.lastBlockAt = ts();
-  rememberActorTxs(state, actions);
-  await saveSnapshot(snapshot);
+  let context = await fetchActorContext(contractEntries, state, { refresh: bootstrapCreatorRefresh });
+  let actorList = formatActorWatchList(context);
+  state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
+  state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
 
-  if (actions.length === 0) return;
+  const lagBefore = Math.max(0, safeLatest - state.lastBlock);
+  if (lagBefore >= CONFIG.actorMonitor.lagWarnBlocks) {
+    log(`[创建者] 当前扫描延迟 ${lagBefore} 块（约 ${lagBefore * 3}s），启动追块模式`);
+  }
 
-  const highCount = actions.filter(a => a.risk === "high").length;
-  log(`[创建者] 捕获 ${actions.length} 条创建者动作（高风险 ${highCount} 条），区块 ${fromBlock}-${toBlock}`);
-  const content = formatActorActions(actions);
-  appendHistory("actor", `链上创建者动作（${actions.length}项）`, content.slice(0, 300), content);
-  const color = highCount > 0 ? "red" : "yellow";
-  await sendThenEnrichWithAi(`链上创建者动作（${actions.length}项）`, content, color, "Four.meme 合约创建者动作", undefined, undefined, undefined, `https://bscscan.com/block/${toBlock}`);
+  const runStart = Date.now();
+  const maxBlocksThisRun = lagBefore > CONFIG.actorMonitor.maxBlocksPerRun
+    ? CONFIG.actorMonitor.catchupMaxBlocksPerRun
+    : CONFIG.actorMonitor.maxBlocksPerRun;
+  let remainingBlocks = maxBlocksThisRun;
+  let scannedBlocks = 0;
+  let scannedBatches = 0;
+  let anyActions = false;
 
-  try {
-    log("[创建者] 创建者动作已触发，立即复查合约状态");
-    await runContractCheck();
-  } catch (err) {
-    log(`[创建者] 触发合约复查失败：${err.message}`);
+  while (state.lastBlock < safeLatest && remainingBlocks > 0) {
+    const fromBlock = state.lastBlock + 1;
+    const batchSize = Math.min(
+      CONFIG.actorMonitor.maxBlocksPerRun,
+      remainingBlocks,
+      safeLatest - state.lastBlock
+    );
+    const toBlock = fromBlock + batchSize - 1;
+    const actions = await fetchActorBlockActions(fromBlock, toBlock, context, state);
+
+    state.lastBlock = toBlock;
+    state.lastBlockAt = ts();
+    state.actorLagBlocks = Math.max(0, safeLatest - state.lastBlock);
+    state.actorLagSecondsApprox = state.actorLagBlocks * 3;
+    state.lastRunScannedBlocks = scannedBlocks + batchSize;
+    state.lastRunBatches = scannedBatches + 1;
+    state.lastRunAt = ts();
+    rememberActorTxs(state, actions);
+    await saveSnapshot(snapshot);
+
+    scannedBlocks += batchSize;
+    scannedBatches++;
+    remainingBlocks -= batchSize;
+
+    if (actions.length > 0) {
+      anyActions = true;
+      const highCount = actions.filter(a => a.risk === "high").length;
+      log(`[创建者] 捕获 ${actions.length} 条创建者动作（高风险 ${highCount} 条），区块 ${fromBlock}-${toBlock}`);
+      const content = formatActorActions(actions);
+      appendHistory("actor", `链上创建者动作（${actions.length}项）`, content.slice(0, 300), content);
+      const color = highCount > 0 ? "red" : "yellow";
+      await sendThenEnrichWithAi(`链上创建者动作（${actions.length}项）`, content, color, "Four.meme 合约创建者动作", undefined, undefined, undefined, `https://bscscan.com/block/${toBlock}`);
+    }
+
+    if (Date.now() - runStart >= CONFIG.actorMonitor.maxRunMs && state.lastBlock < safeLatest) {
+      log(`[创建者] 本轮已扫描 ${scannedBlocks} 块，用时接近上限，剩余延迟 ${safeLatest - state.lastBlock} 块留待下一轮继续追赶`);
+      break;
+    }
+  }
+
+  state.actorLagBlocks = Math.max(0, safeLatest - state.lastBlock);
+  state.actorLagSecondsApprox = state.actorLagBlocks * 3;
+  state.lastRunScannedBlocks = scannedBlocks;
+  state.lastRunBatches = scannedBatches;
+  state.lastRunAt = ts();
+
+  if (scannedBlocks > 0 && lagBefore >= CONFIG.actorMonitor.lagWarnBlocks) {
+    log(`[创建者] 追块进度：本轮 ${scannedBatches} 批 / ${scannedBlocks} 块，剩余 ${state.actorLagBlocks} 块`);
+  }
+
+  if (state.actorLagBlocks <= CONFIG.actorMonitor.maxBlocksPerRun) {
+    const beforeCreators = JSON.stringify(state.creators || {});
+    await fetchContractCreatorActors(contractEntries, state, { refresh: true });
+    if (beforeCreators !== JSON.stringify(state.creators || {})) {
+      context = await fetchActorContext(contractEntries, state, { refresh: false });
+      actorList = formatActorWatchList(context);
+      state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
+      state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
+    }
+  } else {
+    log(`[创建者] 仍落后 ${state.actorLagBlocks} 块，本轮跳过创建者补全，优先保持扫链追赶`);
+  }
+
+  if (stateBefore !== JSON.stringify(state)) await saveSnapshot(snapshot);
+
+  if (anyActions) {
+    try {
+      log("[创建者] 创建者动作已触发，立即复查合约状态");
+      await runContractCheck();
+    } catch (err) {
+      log(`[创建者] 触发合约复查失败：${err.message}`);
+    }
   }
 }
 
