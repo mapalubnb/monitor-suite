@@ -244,6 +244,8 @@ const CONFIG = {
     catchupMaxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_CATCHUP_MAX_BLOCKS", 800),
     maxRunMs: readPositiveIntEnv("FOURMEME_ACTOR_MAX_RUN_MS", 45_000),
     lagWarnBlocks: readPositiveIntEnv("FOURMEME_ACTOR_LAG_WARN_BLOCKS", 120),
+    catchupLogIntervalMs: readPositiveIntEnv("FOURMEME_ACTOR_CATCHUP_LOG_MINUTES", 5) * 60_000,
+    catchupLogMinDeltaBlocks: readPositiveIntEnv("FOURMEME_ACTOR_CATCHUP_LOG_DELTA_BLOCKS", 5_000),
     bootstrapLookbackBlocks: readPositiveIntEnv("FOURMEME_ACTOR_BOOTSTRAP_BLOCKS", 20),
     extraActors: parseEnvAddressList(`${process.env.FOURMEME_WATCH_ACTORS || ""},${process.env.FOURMEME_WATCH_CREATORS || ""}`),
     creatorChainLookupEnabled: readBoolEnv("FOURMEME_CREATOR_CHAIN_LOOKUP", true),
@@ -5012,6 +5014,30 @@ async function fetchLatestBlockForActorCheck() {
   return hexToNumber(latestHex);
 }
 
+function shouldLogActorCatchup(state, lagBefore, lagAfter) {
+  if (lagBefore < CONFIG.actorMonitor.lagWarnBlocks && lagAfter < CONFIG.actorMonitor.lagWarnBlocks) {
+    if (state.catchupLog?.active) {
+      state.catchupLog = { active: false, lastLogAt: Date.now(), lastLagBlocks: lagAfter };
+      return { ok: true, reason: "done" };
+    }
+    return { ok: false, reason: "" };
+  }
+
+  const now = Date.now();
+  const prev = state.catchupLog || {};
+  const first = !prev.active;
+  const elapsed = now - (prev.lastLogAt || 0);
+  const delta = Math.max(0, (prev.lastLagBlocks ?? lagBefore) - lagAfter);
+  const ok = first
+    || elapsed >= CONFIG.actorMonitor.catchupLogIntervalMs
+    || delta >= CONFIG.actorMonitor.catchupLogMinDeltaBlocks
+    || lagAfter <= CONFIG.actorMonitor.maxBlocksPerRun;
+  if (ok) {
+    state.catchupLog = { active: true, lastLogAt: now, lastLagBlocks: lagAfter };
+  }
+  return { ok, reason: first ? "start" : "progress" };
+}
+
 async function runActorCheck() {
   if (!CONFIG.actorMonitor.enabled) return;
   const state = ensureActorMonitorState();
@@ -5052,9 +5078,6 @@ async function runActorCheck() {
   state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
 
   const lagBefore = Math.max(0, safeLatest - state.lastBlock);
-  if (lagBefore >= CONFIG.actorMonitor.lagWarnBlocks) {
-    log(`[创建者] 当前扫描延迟 ${lagBefore} 块（约 ${lagBefore * 3}s），启动追块模式`);
-  }
 
   const runStart = Date.now();
   const maxBlocksThisRun = lagBefore > CONFIG.actorMonitor.maxBlocksPerRun
@@ -5111,8 +5134,13 @@ async function runActorCheck() {
   state.lastRunBatches = scannedBatches;
   state.lastRunAt = ts();
 
-  if (scannedBlocks > 0 && lagBefore >= CONFIG.actorMonitor.lagWarnBlocks) {
-    log(`[创建者] 追块进度：本轮 ${scannedBatches} 批 / ${scannedBlocks} 块，剩余 ${state.actorLagBlocks} 块`);
+  const catchupLog = shouldLogActorCatchup(state, lagBefore, state.actorLagBlocks);
+  if (catchupLog.ok) {
+    if (catchupLog.reason === "done") {
+      log(`[创建者] 追块完成：当前延迟 ${state.actorLagBlocks} 块，恢复创建者补全`);
+    } else {
+      log(`[创建者] 追块${catchupLog.reason === "start" ? "启动" : "进度"}：延迟 ${lagBefore} → ${state.actorLagBlocks} 块，本轮 ${scannedBatches} 批 / ${scannedBlocks} 块，模式 ${state.blockFeed?.mode || "unknown"}`);
+    }
   }
 
   if (state.actorLagBlocks <= CONFIG.actorMonitor.maxBlocksPerRun) {
@@ -5125,7 +5153,7 @@ async function runActorCheck() {
       state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
     }
   } else {
-    log(`[创建者] 仍落后 ${state.actorLagBlocks} 块，本轮跳过创建者补全，优先保持扫链追赶`);
+    // 追块期间创建者补全会拖慢实时扫链；进度日志由 shouldLogActorCatchup 节流输出。
   }
 
   if (stateBefore !== JSON.stringify(state)) await saveSnapshot(snapshot);
