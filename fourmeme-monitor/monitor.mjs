@@ -3530,7 +3530,9 @@ function diffGithubRepos(oldRepos = {}, newRepos = {}) {
       continue;
     }
     const fields = [];
-    for (const key of ["pushed_at", "updated_at", "default_branch", "description", "archived", "disabled"]) {
+    // updated_at 会被 star/watch/fork 等非代码事件刷新，容易造成“仓库更新但无 diff”的误报。
+    // 这里仅通知会影响代码/项目形态的字段；代码提交以 pushed_at 和主仓库 commit diff 为准。
+    for (const key of ["pushed_at", "default_branch", "description", "archived", "disabled"]) {
       if ((old[key] ?? "") !== (repo[key] ?? "")) {
         fields.push({ key, old: old[key] ?? "", new: repo[key] ?? "" });
       }
