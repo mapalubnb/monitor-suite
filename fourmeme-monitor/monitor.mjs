@@ -5,13 +5,13 @@
  *   1. 各模块独立定时器，互不阻塞
  *   2. BSC RPC batch 请求（模块 6/7 提速 ~10x）
  *   3. 前端/API 并行抓取（模块 2/3/5 提速 ~3-4x）
- *   4. 全面反风控：UA 轮换、按域名自适应退避、请求抖动、GitHub 条件请求
+ *   4. 全面反风控：UA 轮换、按域名自适应退避、请求抖动、GitHub 认证限速
  *
  * 模块与频率：
  *   模块1: 底池配置   — 每 3s（纯 API，轻量，退避保护）
  *   模块2: 前端代码   — 每 15s（基础页面 + 自动发现页面，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
  *   模块3/5: API 结构  — 每 30s（多端点并行，含结构+值 diff）
- *   模块4: GitHub     — 每 5min（条件请求，自带 ETag 缓存）
+ *   模块4: GitHub     — 有 token 每 30s / 无 token 每 90s（账号仓库列表每 5min）
  *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 3s（RPC batch，单次请求）
  *   模块8: 创建者动作 — WebSocket 新区块驱动 + HTTP 兜底（只监听创建者/手动配置地址发起的交易）
@@ -56,11 +56,20 @@ function readPositiveIntEnv(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function readClampedSecondsEnv(name, fallbackSeconds, minSeconds) {
+  const n = readPositiveIntEnv(name, fallbackSeconds);
+  return Math.max(n, minSeconds) * 1000;
+}
+
 function readBoolEnv(name, fallback) {
   const raw = process.env[name];
   if (raw == null || raw === "") return fallback;
   return !["0", "false", "no", "off"].includes(String(raw).trim().toLowerCase());
 }
+
+const HAS_GITHUB_TOKEN = Boolean((process.env.GITHUB_TOKEN || "").trim());
+const GITHUB_INTERVAL_FALLBACK_SECONDS = HAS_GITHUB_TOKEN ? 30 : 90;
+const GITHUB_INTERVAL_MIN_SECONDS = HAS_GITHUB_TOKEN ? 30 : 90;
 
 const CONFIG = {
   // Four.meme
@@ -97,11 +106,12 @@ const CONFIG = {
     pool:     3_000,   // 模块1: 底池配置（3s，退避机制自动保护源站）
     frontend: 15_000,  // 模块2: 前端代码（15s，assetHash 缓存避免无变化时重复下载）
     api:      30_000,  // 模块3/5: API 结构（30s，降低同域并发压力）
-    github:   300_000, // 模块4: GitHub（5min，未认证限额 60/h）
+    github:   readClampedSecondsEnv("GITHUB_INTERVAL_SECONDS", GITHUB_INTERVAL_FALLBACK_SECONDS, GITHUB_INTERVAL_MIN_SECONDS),
     contract: 3_000,   // 模块6: 智能合约
     onchain:  3_000,   // 模块7: 链上参数
     actor:    3_000,   // 模块8: 合约创建者动作
   },
+  githubRepoListIntervalMs: readClampedSecondsEnv("GITHUB_REPO_LIST_INTERVAL_SECONDS", 300, 300),
 
   // 心跳推送开关；默认关闭，只影响周期性状态心跳，不影响变更/异常告警
   heartbeatEnabled: process.env.HEARTBEAT_ENABLED === "true",
@@ -5940,23 +5950,33 @@ async function runGithubCheck() {
   if (!githubETag && snapshot.githubETag) githubETag = snapshot.githubETag;
   if (!githubReposETag && snapshot.githubReposETag) githubReposETag = snapshot.githubReposETag;
 
-  const { repoMap, changes: repoChanges } = await checkGithubRepos(
-    snapshot.githubRepos || null,
-    Boolean(snapshot.githubSha)
-  );
-  if (githubReposETag && snapshot.githubReposETag !== githubReposETag) {
-    snapshot.githubReposETag = githubReposETag;
-  }
-  if (repoMap && !jsonEqual(snapshot.githubRepos, repoMap)) {
-    snapshot.githubRepos = repoMap;
-  }
-  if (repoChanges) {
-    const count = (repoChanges.added?.length || 0) + (repoChanges.removed?.length || 0) + (repoChanges.changed?.length || 0);
-    log(`[GitHub] 检测到 ${count} 项账号仓库/项目变更！`);
-    const content = formatGithubRepoChanges(repoChanges);
-    await saveSnapshot(snapshot);
-    appendHistory("github", `GitHub 项目变更（${count}项）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`GitHub 项目变更（${count}项）`, content, "turquoise", "Four.meme GitHub 项目变更", undefined, undefined, undefined, `https://github.com/${CONFIG.githubOwner}`);
+  const now = Date.now();
+  const lastRepoPoll = Date.parse(snapshot.githubReposLastPollAt || "") || 0;
+  const shouldCheckRepos = !snapshot.githubRepos || now - lastRepoPoll >= CONFIG.githubRepoListIntervalMs;
+  if (shouldCheckRepos) {
+    try {
+      const { repoMap, changes: repoChanges } = await checkGithubRepos(
+        snapshot.githubRepos || null,
+        Boolean(snapshot.githubSha)
+      );
+      snapshot.githubReposLastPollAt = new Date(now).toISOString();
+      if (githubReposETag && snapshot.githubReposETag !== githubReposETag) {
+        snapshot.githubReposETag = githubReposETag;
+      }
+      if (repoMap && !jsonEqual(snapshot.githubRepos, repoMap)) {
+        snapshot.githubRepos = repoMap;
+      }
+      if (repoChanges) {
+        const count = (repoChanges.added?.length || 0) + (repoChanges.removed?.length || 0) + (repoChanges.changed?.length || 0);
+        log(`[GitHub] 检测到 ${count} 项账号仓库/项目变更！`);
+        const content = formatGithubRepoChanges(repoChanges);
+        await saveSnapshot(snapshot);
+        appendHistory("github", `GitHub 项目变更（${count}项）`, content.slice(0, 300), content);
+        await sendThenEnrichWithAi(`GitHub 项目变更（${count}项）`, content, "turquoise", "Four.meme GitHub 项目变更", undefined, undefined, undefined, `https://github.com/${CONFIG.githubOwner}`);
+      }
+    } catch (err) {
+      log(`[GitHub] 账号仓库列表检查失败，继续检查主仓库提交：${err.message}`);
+    }
   }
 
   const { newSha, newCommits } = await checkGithub(snapshot.githubSha || "");
@@ -5983,6 +6003,7 @@ async function runGithubCheck() {
     appendHistory("github", title, content.slice(0, 300), content);
     await sendThenEnrichWithAi(title, content, "turquoise", "Four.meme GitHub 仓库新提交", fullDiff, undefined, diffFilePath, `https://github.com/${CONFIG.githubRepo}`);
   } else {
+    snapshot.githubLastPollAt = new Date().toISOString();
     // ETag 变了也保存（即使无新提交）
     await saveSnapshot(snapshot);
   }
