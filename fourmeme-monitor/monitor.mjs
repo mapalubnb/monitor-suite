@@ -3440,6 +3440,7 @@ const GITHUB_API = "https://api.github.com";
 // githubETag 从 snapshot 恢复，避免重启后浪费 rate limit
 let githubETag = "";
 let githubReposETag = "";
+const GITHUB_COMMIT_DETAIL_LIMIT = 30;
 
 function githubHeaders() {
   const h = {
@@ -3453,17 +3454,13 @@ function githubHeaders() {
 async function fetchLatestCommits(perPage = 30) {
   const url = `${GITHUB_API}/repos/${CONFIG.githubRepo}/commits?sha=${CONFIG.githubApiBranch}&per_page=${perPage}`;
   const headers = githubHeaders();
-  if (githubETag) headers["If-None-Match"] = githubETag;
 
   const res = await fetchSafe(url, { headers }, 10_000);
 
-  // 304 Not Modified — 无新提交，节省 rate limit
-  // 注意：fetchSafe 已消费 304 的响应体，可直接返回
-  if (res.status === 304) return null;
-
   if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
 
-  // 记录 ETag 供下次条件请求
+  // 提交监控每轮都按 SHA 主动确认，避免条件缓存 304 导致真实提交延迟到缓存失效后才推送。
+  // 这里仍记录 ETag 仅用于诊断/快照兼容，不再用于 commits 条件请求。
   const etag = res.headers.get("etag");
   if (etag) githubETag = etag;
 
@@ -3630,7 +3627,7 @@ function formatGithubChanges(newCommits) {
       if (patchFiles.length > 0) {
         lines.push("");
         lines.push("**代码变更摘要：**");
-        let patchBudget = 2000; // 总 patch 字符预算，避免超出 AI token 限制
+        let patchBudget = 6000; // 卡片内展示摘要；完整 patch 另存为 diff 文件
         for (const f of patchFiles.slice(0, 5)) {
           if (patchBudget <= 0) break;
           const patch = f.patch.length > patchBudget
@@ -3644,16 +3641,67 @@ function formatGithubChanges(newCommits) {
         }
         if (patchFiles.length > 5) lines.push(`... 还有 ${patchFiles.length - 5} 个文件有代码变更`);
       }
+    } else {
+      lines.push("  文件详情：未获取到 commit detail，已在日志记录失败原因。");
     }
     lines.push("---");
   }
   return lines.join("\n");
 }
 
+function buildGithubFullDiff(newCommits) {
+  const lines = [];
+  lines.push(`GitHub 提交完整 diff`);
+  lines.push(`仓库: https://github.com/${CONFIG.githubRepo}`);
+  lines.push(`分支: ${CONFIG.githubApiBranch}`);
+  lines.push(`生成时间: ${ts()}`);
+  lines.push(`提交数: ${newCommits.length}`);
+  lines.push("");
+
+  for (const c of newCommits) {
+    const sha = c.sha || "";
+    const commitUrl = `https://github.com/${CONFIG.githubRepo}/commit/${sha}`;
+    const msg = c.commit?.message?.trim() || "";
+    const author = c.commit?.author?.name || "未知";
+    const date = c.commit?.author?.date || "";
+    lines.push("=".repeat(80));
+    lines.push(`commit ${sha}`);
+    lines.push(`url: ${commitUrl}`);
+    lines.push(`author: ${author}`);
+    lines.push(`date: ${date}`);
+    lines.push("");
+    lines.push(msg);
+    lines.push("");
+
+    if (!c.files || c.files.length === 0) {
+      lines.push("(未获取到文件级 diff，可能是 GitHub 未返回 patch 或详情请求失败)");
+      lines.push("");
+      continue;
+    }
+
+    const totalAdditions = c.files.reduce((sum, f) => sum + (f.additions || 0), 0);
+    const totalDeletions = c.files.reduce((sum, f) => sum + (f.deletions || 0), 0);
+    lines.push(`files: ${c.files.length}, +${totalAdditions} -${totalDeletions}`);
+    for (const f of c.files) {
+      lines.push("");
+      lines.push(`--- ${f.status || "changed"} ${f.filename} (+${f.additions || 0} -${f.deletions || 0})`);
+      if (f.previous_filename) lines.push(`previous: ${f.previous_filename}`);
+      if (f.patch) {
+        lines.push("```diff");
+        lines.push(f.patch);
+        lines.push("```");
+      } else {
+        lines.push("(GitHub 未返回该文件 patch，通常是二进制文件、文件过大或 diff 被折叠)");
+      }
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
+}
+
 async function checkGithub(lastSha) {
   const commits = await fetchLatestCommits(30);
-  // null = 304 Not Modified
-  if (commits === null) return { newSha: lastSha, newCommits: [] };
   if (!commits || commits.length === 0) return { newSha: lastSha, newCommits: [] };
   const latestSha = commits[0].sha;
   if (latestSha === lastSha) return { newSha: lastSha, newCommits: [] };
@@ -3664,12 +3712,18 @@ async function checkGithub(lastSha) {
     newCommits.push(c);
   }
 
-  // 并行获取详情（最多 5 个，错开请求避免 rate limit）
+  // 获取尽量完整的提交详情，确保通知和 diff 文件包含 files/patch。
+  // GitHub commit list 本身不带 patch，必须逐个请求 commit detail。
   const detailed = [];
-  const detailTasks = newCommits.slice(0, 5).map((c, i) => {
-    return sleep(i * 500).then(async () => {
-      try { return await fetchCommitDetail(c.sha); }
-      catch { return c; }
+  const detailLimit = Math.min(newCommits.length, GITHUB_COMMIT_DETAIL_LIMIT);
+  const detailTasks = newCommits.slice(0, detailLimit).map((c, i) => {
+    return sleep(i * 250).then(async () => {
+      try {
+        return await fetchCommitDetail(c.sha);
+      } catch (err) {
+        log(`[GitHub] 获取提交详情失败 ${c.sha.slice(0, 8)}：${err.message}`);
+        return c;
+      }
     });
   });
   const detailResults = await Promise.allSettled(detailTasks);
@@ -5919,10 +5973,15 @@ async function runGithubCheck() {
   if (newCommits.length > 0) {
     log(`[GitHub] 检测到 ${newCommits.length} 个新提交！`);
     const content = formatGithubChanges(newCommits);
+    const title = `GitHub 新提交（${newCommits.length}个）`;
+    const fullDiff = buildGithubFullDiff(newCommits);
+    const diffFilePath = saveDiffLocally(title, fullDiff);
     snapshot.githubSha = newSha;
+    snapshot.githubLastPollAt = new Date().toISOString();
+    snapshot.githubLastCommitCount = newCommits.length;
     await saveSnapshot(snapshot);
-    appendHistory("github", `GitHub 新提交（${newCommits.length}个）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`GitHub 新提交（${newCommits.length}个）`, content, "turquoise", "Four.meme GitHub 仓库新提交", undefined, undefined, undefined, `https://github.com/${CONFIG.githubRepo}`);
+    appendHistory("github", title, content.slice(0, 300), content);
+    await sendThenEnrichWithAi(title, content, "turquoise", "Four.meme GitHub 仓库新提交", fullDiff, undefined, diffFilePath, `https://github.com/${CONFIG.githubRepo}`);
   } else {
     // ETag 变了也保存（即使无新提交）
     await saveSnapshot(snapshot);
