@@ -34,8 +34,8 @@
 | 模块 | 监控内容 | 频率 |
 |------|---------|------|
 | 模块 1 | 底池配置（Pool Config） | 3s |
-| 模块 2 | 前端代码（统一页面池，含文案 diff、`__NEXT_DATA__`、i18n、路由/端点发现，同轮相同前端变更合并推送） | 15s |
-| 模块 3 | API 结构（多端点并行，结构 + 值 diff，覆盖 public/blog/mapi 端点发现） | 30s |
+| 模块 2 | 前端代码（统一页面池，含文案 diff、`__NEXT_DATA__`、i18n、路由/端点发现，同轮相同前端变更合并推送） | 10s |
+| 模块 3 | API 结构（多端点并行，结构 + 值 diff，覆盖 public/blog/mapi 端点发现） | 15s |
 | 模块 4 | OpenFour 业务模板（新模板上线、模板状态变化，如 `PUBLISHED`） | 3s |
 | 模块 4b | OpenFour Registry 新模块发现（链上 logs 触发，发现新的 module/token implementation 地址） | 实时触发 |
 | 模块 5 | GitHub 仓库/项目变更（主仓库提交高频轮询，账号仓库列表降频检查） | 有 token 30s / 无 token 90s |
@@ -160,6 +160,13 @@ rm -f /usr/local/bin/fm-* /usr/local/bin/fl-* /usr/local/bin/bot-* /usr/local/bi
 | `FEISHU_BOT_EXEC_MAX_BUFFER` | 否 | 飞书 Bot 执行命令输出缓冲，默认 16777216（16MB） |
 | `DOUBAO_API_KEY` | 否 | 豆包 API Key |
 | `DEEPSEEK_API_KEY` | 否 | DeepSeek API Key |
+| `FOURMEME_FRONTEND_INTERVAL_SECONDS` | 否 | Four.meme 前端页面池监控间隔，默认/最低 10 秒 |
+| `FOURMEME_API_INTERVAL_SECONDS` | 否 | Four.meme API 结构和值监控间隔，默认/最低 15 秒 |
+| `FOURMEME_FRONTEND_HTML_CONCURRENCY` | 否 | 前端 HTML 页面并发，默认 6；被风控时可降到 4 |
+| `FOURMEME_FRONTEND_ASSET_CONCURRENCY` | 否 | 前端资源并发，默认 6；被风控时可降到 4 |
+| `FOURMEME_MODULE_JITTER_MS` | 否 | 模块调度抖动，默认 200ms；设 0 关闭 |
+| `FOURMEME_API_PROBE_STAGGER_MS` | 否 | API 探针内部错峰，默认 200ms |
+| `FOURMEME_FRONTEND_WARMUP_STABLE_RUNS` | 否 | 新发现前端页面 warm-up 轮数，默认 1；设 2 可降低抖动误报 |
 | `OPENFOUR_TEMPLATE_INTERVAL_SECONDS` | 否 | OpenFour 业务模板监控间隔，默认/最低 3 秒 |
 | `OPENFOUR_REGISTRY_LOG_MONITOR` | 否 | 是否启用 OpenFourRegistry 链上日志监听，默认 `true` |
 | `OPENFOUR_REGISTRY_DISCOVERY_DEBOUNCE_MS` | 否 | Registry logs 触发新模块发现的合并延迟，默认 3000ms |

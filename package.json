@@ -6,10 +6,13 @@
   "private": true,
   "scripts": {
     "check": "node --check fourmeme-monitor/monitor.mjs && node --check fourmeme-monitor/feishu-bot.mjs && node --check flap-monitor/monitor.mjs",
-    "check:fourmeme": "node --check fourmeme-monitor/monitor.mjs"
+    "check:fourmeme": "node --check fourmeme-monitor/monitor.mjs",
+    "test:fourmeme": "node --test fourmeme-monitor/monitor.test.mjs"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.35.0",
+    "linkedom": "^0.18.12",
+    "undici": "^8.4.1",
     "ws": "^8.21.0"
   }
 }

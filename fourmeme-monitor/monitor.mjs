@@ -26,10 +26,13 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mk
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { Agent, setGlobalDispatcher } from "undici";
+import { parseHTML } from "linkedom";
 
 import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const IS_TEST_MODE = process.env.FOURMEME_MONITOR_TEST === "1";
 
 // 加载共享 .env + 本地 .env（兼容统一部署和独立部署）
 for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) {
@@ -57,6 +60,11 @@ function readPositiveIntEnv(name, fallback) {
   return Number.isFinite(n) && n > 0 ? n : fallback;
 }
 
+function readNonNegativeIntEnv(name, fallback) {
+  const n = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(n) && n >= 0 ? n : fallback;
+}
+
 function readClampedSecondsEnv(name, fallbackSeconds, minSeconds) {
   const n = readPositiveIntEnv(name, fallbackSeconds);
   return Math.max(n, minSeconds) * 1000;
@@ -67,6 +75,12 @@ function readBoolEnv(name, fallback) {
   if (raw == null || raw === "") return fallback;
   return !["0", "false", "no", "off"].includes(String(raw).trim().toLowerCase());
 }
+
+setGlobalDispatcher(new Agent({
+  connections: readPositiveIntEnv("HTTP_KEEPALIVE_CONNECTIONS", 16),
+  keepAliveTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_TIMEOUT_MS", 30_000),
+  keepAliveMaxTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_MAX_TIMEOUT_MS", 120_000),
+}));
 
 const HAS_GITHUB_TOKEN = Boolean((process.env.GITHUB_TOKEN || "").trim());
 const GITHUB_INTERVAL_FALLBACK_SECONDS = HAS_GITHUB_TOKEN ? 30 : 90;
@@ -108,8 +122,8 @@ const CONFIG = {
   // ── 各模块独立间隔（毫秒）──
   intervals: {
     pool:     3_000,   // 模块1: 底池配置（3s，退避机制自动保护源站）
-    frontend: 15_000,  // 模块2: 前端代码（15s，assetHash 缓存避免无变化时重复下载）
-    api:      30_000,  // 模块3: API 结构（30s，降低同域并发压力）
+    frontend: readClampedSecondsEnv("FOURMEME_FRONTEND_INTERVAL_SECONDS", 10, 10), // 模块2: 前端代码（默认/最低 10s）
+    api:      readClampedSecondsEnv("FOURMEME_API_INTERVAL_SECONDS", 15, 15),      // 模块3: API 结构（默认/最低 15s）
     openfourTemplates: readClampedSecondsEnv("OPENFOUR_TEMPLATE_INTERVAL_SECONDS", 3, 3),
     github:   readClampedSecondsEnv("GITHUB_INTERVAL_SECONDS", GITHUB_INTERVAL_FALLBACK_SECONDS, GITHUB_INTERVAL_MIN_SECONDS),
     contract: 3_000,   // 模块6: 智能合约
@@ -136,7 +150,7 @@ const CONFIG = {
 
   // ── 反风控 ──
   // 每次请求随机抖动范围（毫秒），叠加到间隔上
-  jitterMs: 1_000,
+  jitterMs: readNonNegativeIntEnv("FOURMEME_MODULE_JITTER_MS", 200),
   // 默认 HTTP 超时
   defaultTimeoutMs: 10_000,
   // 退避：初始、最大、衰减因子
@@ -160,7 +174,7 @@ const CONFIG = {
       /^\/v\d+\/resolve-ens$/i,
     ],
   },
-  apiProbeStaggerMs: 350,
+  apiProbeStaggerMs: readNonNegativeIntEnv("FOURMEME_API_PROBE_STAGGER_MS", 200),
 
   // ── BSC RPC ──
   bscRpcUrls: [
@@ -357,6 +371,15 @@ function recordSuccess(domain) {
   }
 }
 
+function classifyFetchFailure(err) {
+  const msg = err?.message || String(err || "");
+  if (msg.includes("[退避中]")) return "backoff";
+  if (/HTTP\s+(?:403|429)|风控|captcha|Cloudflare|verify you are human|access denied/i.test(msg)) return "rate_limited";
+  if (/地区限制|restricted/i.test(msg)) return "restricted";
+  if (/超时|timeout/i.test(msg)) return "timeout";
+  return "error";
+}
+
 function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
@@ -476,6 +499,9 @@ function migrateSnapshot(data) {
     if (!Array.isArray(data.chainActorMonitor.seenTxs)) data.chainActorMonitor.seenTxs = [];
     log("[快照迁移] v5 → v6：补充合约创建者动作监听字段");
   }
+  if (!data._frontendDiscoveredHistory) data._frontendDiscoveredHistory = {};
+  if (!data._frontendNotifyDedupe) data._frontendNotifyDedupe = {};
+  if (!data._frontendWarmup) data._frontendWarmup = {};
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
 }
@@ -562,7 +588,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
 
   // 2. 异步调用 AI → 编辑原消息补充摘要（不阻塞调用方）
   if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
-    aiSummarize(aiInput || content, moduleContext).then(async (summary) => {
+    summarizeWithRetry(aiInput || content, moduleContext).then(async (summary) => {
       if (!summary) return;
       const enriched = enrichFn
         ? enrichFn(summary)
@@ -572,14 +598,47 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
           await patchCardViaApi(messageId, title, urlLine + enriched, template, diffFilePath);
           log(`[AI→更新] ${title} 已补充 AI 摘要`);
         } catch (err) {
-          log(`[AI→更新] 编辑失败(${err.message})，追加发送`);
-          await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
+          log(`[AI→更新] 编辑失败(${err.message})，进入重试队列`);
+          scheduleAiPatchRetry({ messageId, title, content: urlLine + enriched, template, diffFilePath, summary });
         }
       } else {
         await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
       }
     }).catch(err => log(`[AI] 异步摘要异常：${err.message}`));
   }
+}
+
+async function summarizeWithRetry(input, moduleContext) {
+  const maxAttempts = readPositiveIntEnv("AI_SUMMARY_RETRY_ATTEMPTS", 2);
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const summary = await aiSummarize(input, moduleContext, 1);
+      if (summary) return summary;
+    } catch (err) {
+      if (attempt >= maxAttempts) throw err;
+    }
+    if (attempt < maxAttempts) await sleep(1_500 * attempt);
+  }
+  return "";
+}
+
+function scheduleAiPatchRetry({ messageId, title, content, template, diffFilePath, summary, attempt = 1 }) {
+  const maxAttempts = readPositiveIntEnv("AI_PATCH_RETRY_ATTEMPTS", 2);
+  const delayMs = Math.min(30_000, 2_000 * attempt);
+  setTimeout(async () => {
+    try {
+      await patchCardViaApi(messageId, title, content, template, diffFilePath);
+      log(`[AI→更新] ${title} 重试补充 AI 摘要成功`);
+    } catch (err) {
+      if (attempt < maxAttempts) {
+        log(`[AI→更新] 重试 ${attempt}/${maxAttempts} 失败(${err.message})，继续排队`);
+        scheduleAiPatchRetry({ messageId, title, content, template, diffFilePath, summary, attempt: attempt + 1 });
+      } else {
+        log(`[AI→更新] 重试失败，追加发送 AI 摘要：${err.message}`);
+        await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
+      }
+    }
+  }, delayMs);
 }
 
 /**
@@ -1105,20 +1164,50 @@ function urlLabel(url) {
 function canonicalFrontendUrl(url) {
   try {
     const u = new URL(url, CONFIG.siteUrl);
+    if (!["http:", "https:"].includes(u.protocol)) return "";
+    if (u.protocol === "http:" && u.port === "80") u.port = "";
+    if (u.protocol === "https:" && u.port === "443") u.port = "";
     u.hash = "";
     if (u.pathname !== "/" && u.pathname.endsWith("/")) u.pathname = u.pathname.replace(/\/+$/, "");
-    return u.origin + (u.pathname === "/" ? "" : u.pathname) + u.search;
+    const params = [...u.searchParams.entries()]
+      .filter(([key]) => !/^utm_/i.test(key) && !["fbclid", "gclid", "_t", "_ts", "timestamp", "cacheBust"].includes(key))
+      .sort(([ak, av], [bk, bv]) => ak === bk ? av.localeCompare(bv) : ak.localeCompare(bk));
+    const search = params.length
+      ? "?" + params.map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`).join("&")
+      : "";
+    return u.origin + (u.pathname === "/" ? "" : u.pathname) + search;
   } catch {
     return url;
   }
 }
 
 function getFrontendMonitorUrls() {
-  const urls = [
-    ...CONFIG.monitorUrls,
-    ...Object.values(snapshot?.frontendPages || {}).map(page => page?.originalUrl).filter(Boolean),
-  ];
-  return [...new Set(urls.map(canonicalFrontendUrl).filter(url => isDiscoverableFrontendUrl(url)))];
+  const configured = CONFIG.monitorUrls
+    .map(canonicalFrontendUrl)
+    .filter(isConfiguredFrontendUrl);
+  const configuredSet = new Set(configured);
+  const discovered = Object.values(snapshot?.frontendPages || {})
+    .map(page => page?.originalUrl)
+    .filter(Boolean)
+    .map(canonicalFrontendUrl)
+    .filter(url => !configuredSet.has(url))
+    .filter(isDiscoverableFrontendUrl);
+  return [...new Set([...configured, ...discovered])];
+}
+
+function isConfiguredFrontendUrl(url) {
+  const canonical = canonicalFrontendUrl(url);
+  if (!canonical || REMOVED_FRONTEND_URLS.has(canonical)) return false;
+  try {
+    const u = new URL(canonical);
+    if (u.origin !== CONFIG.siteUrl) return false;
+    const route = normalizeRouteString(canonical).split("?")[0].replace(/\/+$/, "") || "/";
+    if (isApiOrEndpointRoute(route)) return false;
+    if (route.startsWith("/_next/") || route.startsWith("/static/")) return false;
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isDiscoverableFrontendUrl(url) {
@@ -1212,13 +1301,90 @@ function discoverFrontendUrlsFromPages(pages, knownUrls = []) {
 }
 
 function extractTextContent(html) {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, "")
-    .replace(/<style[\s\S]*?<\/style>/gi, "")
-    .replace(/<[^>]+>/g, " ")
+  const raw = String(html || "");
+  const fallback = () => stripHtmlTagsPreservingQuotedGt(raw
+    .replace(/<!--[\s\S]*?-->/g, " ")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style\b[^>]*>[\s\S]*?<\/style>/gi, " ")
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, " "))
     .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
     .replace(/&quot;/g, '"').replace(/&#x27;/g, "'").replace(/&#39;/g, "'")
     .replace(/&nbsp;/g, " ").replace(/\s+/g, " ").trim();
+  try {
+    const { document } = parseHTML(raw);
+    for (const node of document.querySelectorAll("script,style,noscript,template,svg,canvas")) {
+      node.remove();
+    }
+    const root = document.body || document.documentElement || document;
+    const texts = [];
+    const visit = (node) => {
+      if (!node) return;
+      if (node.nodeType === 3) {
+        const text = String(node.nodeValue || "").replace(/\s+/g, " ").trim();
+        if (text) texts.push(text);
+        return;
+      }
+      for (const child of node.childNodes || []) visit(child);
+    };
+    visit(root);
+    const parsed = texts.join(" ").replace(/\s+/g, " ").trim();
+    return parsed || fallback();
+  } catch {
+    return fallback();
+  }
+}
+
+function stripHtmlTagsPreservingQuotedGt(input) {
+  const text = String(input || "");
+  let out = "";
+  let inTag = false;
+  let quote = "";
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inTag) {
+      if (quote) {
+        if (ch === quote) quote = "";
+        continue;
+      }
+      if (ch === '"' || ch === "'") {
+        quote = ch;
+        continue;
+      }
+      if (ch === ">") {
+        inTag = false;
+        out += " ";
+      }
+      continue;
+    }
+    if (ch === "<") {
+      inTag = true;
+      quote = "";
+      out += " ";
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+function extractHrefRoutesFromHtml(html) {
+  const routes = [];
+  const raw = String(html || "");
+  const maxLinks = readPositiveIntEnv("FOURMEME_FRONTEND_MAX_HREFS", 500);
+  try {
+    const { document } = parseHTML(raw);
+    for (const a of document.querySelectorAll("a[href],link[href]")) {
+      if (routes.length >= maxLinks) break;
+      const href = a.getAttribute("href");
+      if (href) routes.push(href);
+    }
+    return routes;
+  } catch {
+    const hrefRe = /\bhref=["']([^"']+)["']/g;
+    let m;
+    while ((m = hrefRe.exec(raw)) !== null && routes.length < maxLinks) routes.push(m[1]);
+    return routes;
+  }
 }
 
 /* ── 构建噪音过滤（移植自 flap-monitor） ── */
@@ -1440,45 +1606,58 @@ function extractStrings(content, ext) {
  */
 async function downloadAssetContents(assetUrls, sharedCache = null) {
   const results = {};
-  const BATCH = 3;        // 每批并发数；降低前端资源解析的 CPU/内存峰值，不改变监控频率
+  const BATCH = readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6);
   const STAGGER = 80;     // 批内请求间隔 ms
   const entries = [...assetUrls.entries()]; // [[filename, url], ...]
 
-  async function fetchAsset(filename, url) {
+  async function fetchAsset(assetKey, asset) {
+    const url = typeof asset === "string" ? asset : asset.url;
+    const previous = typeof asset === "object" ? asset.previous : null;
     if (sharedCache?.has(url)) {
-      const cached = await sharedCache.get(url);
-      return cached ? { ...cached, filename } : null;
+      const cached = await sharedCache.get(url).catch(() => null);
+      return cached ? { ...cached, filename: assetKey } : null;
     }
 
     const promise = (async () => {
       try {
+        const headers = { ...browserHeaders(), "Accept": "*/*" };
+        if (previous?.etag) headers["If-None-Match"] = previous.etag;
+        if (previous?.lastModified) headers["If-Modified-Since"] = previous.lastModified;
         const res = await fetchSafe(url, {
-          headers: { ...browserHeaders(), "Accept": "*/*" },
+          headers,
         }, 8_000);
+        if (res.status === 304 && previous) {
+          return {
+            ...previous,
+            fromCache: true,
+          };
+        }
         if (!res.ok) return null;
         const content = await res.text();
-        const ext = filename.endsWith(".css") ? "css" : "js";
+        const ext = assetKey.endsWith(".css") ? "css" : "js";
         const strings = prioritizeFrontendStrings(extractStrings(content, ext));
         return {
           contentHash: md5(content),
           size: content.length,
           strings,
           ext,
+          etag: res.headers.get("etag") || "",
+          lastModified: res.headers.get("last-modified") || "",
         };
       } catch {
         return null;
       }
-    })();
+    })().catch(() => null);
 
     if (sharedCache) sharedCache.set(url, promise);
     const data = await promise;
-    return data ? { ...data, filename } : null;
+    return data ? { ...data, filename: assetKey } : null;
   }
 
   for (let i = 0; i < entries.length; i += BATCH) {
     const batch = entries.slice(i, i + BATCH);
-    const tasks = batch.map(([filename, url], idx) =>
-      sleep(idx * STAGGER).then(() => fetchAsset(filename, url))
+    const tasks = batch.map(([assetKey, asset], idx) =>
+      sleep(idx * STAGGER).then(() => fetchAsset(assetKey, asset))
     );
     const batchResults = await Promise.allSettled(tasks);
     for (const r of batchResults) {
@@ -1690,7 +1869,7 @@ function extractNextData(html) {
   if (!match) return null;
   try {
     const data = JSON.parse(match[1]);
-    return {
+    return stableNextData({
       props: data.props || {},
       page: data.page || "",
       query: data.query || {},
@@ -1698,8 +1877,40 @@ function extractNextData(html) {
       runtimeConfig: data.runtimeConfig || data.publicRuntimeConfig || null,
       locale: data.locale || null,
       locales: data.locales || null,
-    };
+    });
   } catch { return null; }
+}
+
+const NEXT_DATA_REDACT_KEY_RE = /(?:nonce|timestamp|requestId|traceId|buildTimestamp|serverTime|currentTime|random|sessionId)$/i;
+
+function stableObject(value, depth = 0) {
+  if (depth > 12) return "[depth]";
+  if (value === null || value === undefined) return value ?? null;
+  if (Array.isArray(value)) return value.map(item => stableObject(item, depth + 1));
+  if (typeof value !== "object") return value;
+  const out = {};
+  for (const key of Object.keys(value).sort()) {
+    if (NEXT_DATA_REDACT_KEY_RE.test(key)) continue;
+    out[key] = stableObject(value[key], depth + 1);
+  }
+  return out;
+}
+
+function stableJsonHash(value) {
+  return md5(JSON.stringify(stableObject(value)));
+}
+
+function stableNextData(data) {
+  if (!data || typeof data !== "object") return data;
+  return {
+    props: stableObject(data.props || {}),
+    page: data.page || "",
+    query: stableObject(data.query || {}),
+    buildId: data.buildId || "",
+    runtimeConfig: stableObject(data.runtimeConfig || null),
+    locale: stableObject(data.locale || null),
+    locales: stableObject(data.locales || null),
+  };
 }
 
 function flattenObject(obj, prefix = "", depth = 0) {
@@ -1904,25 +2115,24 @@ function _parseRawI18nString(raw) {
  * 返回 { i18nStrings: {flatKey: value}, i18nHash: string } 或 null
  */
 function extractI18nFromStreamingHtml(html) {
-  // 策略：在所有 self.__next_f.push 数据中搜索 "resources" 对象
-  // 数据格式：self.__next_f.push([1,"...\"resources\":{\"common\":{...}}..."])
-  const pushPattern = /self\.__next_f\.push\(\[1,"((?:[^"\\]|\\.)*)"\]\)/g;
-  let combinedData = "";
+  const pushPattern = /self\.__next_f\.push\((\[[\s\S]*?\])\)/g;
+  const chunks = [];
   let m;
   while ((m = pushPattern.exec(html)) !== null) {
-    const chunk = m[1];
-    // 只处理包含 resources 的 chunk
-    if (chunk.includes('\\"resources\\"') || chunk.includes('"resources"')) {
-      combinedData += chunk;
+    try {
+      const parsed = JSON.parse(m[1]);
+      for (const item of parsed) {
+        if (typeof item === "string" && item.includes("resources")) chunks.push(item);
+      }
+    } catch {
+      const raw = m[1];
+      if (raw.includes('\\"resources\\"') || raw.includes('"resources"')) chunks.push(raw);
     }
   }
+  let combinedData = chunks.join("");
   if (!combinedData) return null;
 
-  // 解转义（注意：\\\\ 必须最先处理，否则 \\" 会被错误匹配）
-  // 不转换 \n \t 为实际控制字符，JSON.parse 原生支持这些转义序列
-  let unescaped = combinedData
-    .replace(/\\\\/g, "\\")
-    .replace(/\\"/g, '"');
+  const unescaped = decodeJsStringFragment(combinedData);
 
   // 提取 "resources":{...} 对象
   const resIdx = unescaped.indexOf('"resources":{');
@@ -1930,24 +2140,8 @@ function extractI18nFromStreamingHtml(html) {
 
   // 从 "resources":{ 开始找到匹配的 } 闭合
   const objStart = resIdx + '"resources":'.length;
-  let depth = 0;
-  let objEnd = objStart;
-  for (let i = objStart; i < unescaped.length; i++) {
-    if (unescaped[i] === "{") depth++;
-    if (unescaped[i] === "}") {
-      depth--;
-      if (depth === 0) { objEnd = i + 1; break; }
-    }
-    // 跳过字符串内容
-    if (unescaped[i] === '"') {
-      i++;
-      while (i < unescaped.length && unescaped[i] !== '"') {
-        if (unescaped[i] === "\\") i++;
-        i++;
-      }
-    }
-  }
-  if (depth !== 0) return null;
+  const objEnd = findJsonObjectEnd(unescaped, objStart);
+  if (objEnd <= objStart) return null;
 
   const resourcesJson = unescaped.slice(objStart, objEnd);
   try {
@@ -1967,17 +2161,75 @@ function extractI18nFromStreamingHtml(html) {
       }
     }
     if (Object.keys(allStrings).length < 20) return null;
-    // 日志移至调用方，仅在 hash 变化时输出，避免每轮重复刷屏
-    // 排序 keys 后再生成 hash，避免 namespace 遍历顺序变化导致假阳性
-    // 使用归一化值计算 hash，过滤 RSC 指针编号抖动
-    const sortedKeys = Object.keys(allStrings).sort();
-    const sortedObj = {};
-    for (const k of sortedKeys) sortedObj[k] = normalizeI18nValue(allStrings[k]);
-    return { i18nStrings: allStrings, i18nHash: md5(JSON.stringify(sortedObj)) };
+    return { i18nStrings: allStrings, i18nHash: stableI18nHash(allStrings) };
   } catch (err) {
     log(`  [i18n] streaming 解析失败：${err.message}`);
     return null;
   }
+}
+
+function decodeJsStringFragment(raw) {
+  const wrapped = `"${String(raw || "").replace(/"/g, '\\"')}"`;
+  try {
+    return JSON.parse(wrapped);
+  } catch {
+    return String(raw || "")
+      .replace(/\\\\/g, "\\")
+      .replace(/\\"/g, '"')
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+      .replace(/\\n/g, "\n")
+      .replace(/\\r/g, "\r")
+      .replace(/\\t/g, "\t");
+  }
+}
+
+function findJsonObjectEnd(text, start) {
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+function stableI18nHash(strings) {
+  const sortedKeys = Object.keys(strings || {}).sort();
+  const sortedObj = {};
+  for (const k of sortedKeys) sortedObj[k] = normalizeI18nValue(strings[k]);
+  return md5(JSON.stringify(sortedObj));
+}
+
+function applyI18nResult(features, i18nResult, oldFeatures = null) {
+  if (i18nResult) {
+    features.i18nStrings = i18nResult.i18nStrings;
+    features.i18nHash = i18nResult.i18nHash;
+    features.i18nMissCount = 0;
+    return true;
+  }
+  const missCount = (oldFeatures?.i18nMissCount || 0) + 1;
+  features.i18nMissCount = missCount;
+  if (oldFeatures?.i18nHash && missCount < readPositiveIntEnv("FOURMEME_I18N_REUSE_MAX_MISSES", 3)) {
+    features.i18nStrings = oldFeatures.i18nStrings;
+    features.i18nHash = oldFeatures.i18nHash;
+    return false;
+  }
+  return false;
 }
 
 function flattenI18n(obj, prefix) {
@@ -2014,11 +2266,7 @@ async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
       if (!data || typeof data !== "object") return null;
       const strings = flattenI18n(data, "");
       if (Object.keys(strings).length < 20) return null;
-      // 排序 keys 确保 hash 确定性，归一化值过滤 RSC 指针抖动
-      const sortedKeys = Object.keys(strings).sort();
-      const sortedObj = {};
-      for (const k of sortedKeys) sortedObj[k] = normalizeI18nValue(strings[k]);
-      return { i18nStrings: strings, i18nHash: md5(JSON.stringify(sortedObj)), i18nChunk: url };
+      return { i18nStrings: strings, i18nHash: stableI18nHash(strings), i18nChunk: url };
     } catch { return null; }
   });
 
@@ -2122,30 +2370,29 @@ function formatI18nChanges(changes) {
 
 /* ── 路由/端点发现 ── */
 
-function extractRoutes(html, assetContents, nextData) {
-  const routes = new Set();
+function extractRouteSignals(html, assetContents, nextData) {
+  const pageRoutes = new Set();
+  const apiEndpoints = new Set();
 
   // 1. 从已解析的 __NEXT_DATA__ 中提取页面路由和 manifest
   if (nextData) {
     if (nextData.page) {
       const pageRoute = normalizeRouteString(nextData.page).split("?")[0];
-      if (isTrackableRouteString(pageRoute)) routes.add(pageRoute);
+      if (isTrackableRouteString(pageRoute)) pageRoutes.add(pageRoute);
     }
     if (nextData.props?.pageProps?.pages) {
       for (const p of nextData.props.pageProps.pages) {
         const pageRoute = normalizeRouteString(p).split("?")[0];
-        if (isTrackableRouteString(pageRoute)) routes.add(pageRoute);
+        if (isTrackableRouteString(pageRoute)) pageRoutes.add(pageRoute);
       }
     }
   }
 
   // 2. 从 HTML 中提取内部链接（排除静态资源路径）
-  const hrefRe = /\bhref=["']([^"']+)["']/g;
-  let m;
-  while ((m = hrefRe.exec(html)) !== null) {
-    const path = normalizeRouteString(m[1]).split("?")[0];
+  for (const href of extractHrefRoutesFromHtml(html)) {
+    const path = normalizeRouteString(href).split("?")[0];
     if (isTrackableRouteString(path)) {
-      routes.add(path);
+      pageRoutes.add(path);
     }
   }
 
@@ -2156,19 +2403,30 @@ function extractRoutes(html, assetContents, nextData) {
       for (const s of data.strings) {
         const normalized = normalizeRouteString(s);
         if (!normalized) continue;
-        // Next.js 页面路由: /xxx or /xxx/[param]
-        if (/^\/[a-zA-Z][\w-]*(\/[\w[\]-]*)*$/.test(normalized) && normalized.length < 100 && isTrackableRouteString(normalized)) {
-          routes.add(normalized);
-        }
         // API 端点: /api/xxx, /meme-api/xxx, /mapi/xxx, /v1/xxx, /blog/v1/xxx
         if (isApiOrEndpointRoute(normalized) && normalized.length < 220) {
-          routes.add(normalized);
+          apiEndpoints.add(normalized);
+          continue;
+        }
+        // Next.js 页面路由: /xxx or /xxx/[param]
+        if (/^\/[a-zA-Z][\w-]*(\/[\w[\]-]*)*$/.test(normalized) && normalized.length < 100 && isTrackableRouteString(normalized)) {
+          pageRoutes.add(normalized);
         }
       }
     }
   }
 
-  return [...routes].sort();
+  const routes = [...pageRoutes].sort();
+  const endpoints = [...apiEndpoints].sort();
+  return {
+    routes,
+    endpoints,
+    combined: [...new Set([...routes, ...endpoints])].sort(),
+  };
+}
+
+function extractRoutes(html, assetContents, nextData) {
+  return extractRouteSignals(html, assetContents, nextData).combined;
 }
 
 function diffRoutes(oldRoutes, newRoutes) {
@@ -2233,7 +2491,7 @@ function extractPageFeatures(html, url) {
 
   // __NEXT_DATA__
   features.nextData = extractNextData(html);
-  if (features.nextData) features.nextDataHash = md5(JSON.stringify(features.nextData));
+  if (features.nextData) features.nextDataHash = stableJsonHash(features.nextData);
 
   // 资源文件列表（从 HTML 标签提取，支持 _next/static 和 CDN 路径）
   const assetMatches = html.matchAll(/(?:src|href)=["']((?:https?:\/\/[^"']*?)?\/\_next\/static\/[^"']+\.(?:js|css)(?:\?[^"']*)?)["']/g);
@@ -2242,10 +2500,10 @@ function extractPageFeatures(html, url) {
     const raw = m[1];
     const fullUrl = raw.startsWith("http") ? raw : baseUrl + raw;
     const cleanUrl = fullUrl.split("?")[0];
-    const path = cleanUrl.replace(baseUrl, "");
+    const parsed = new URL(cleanUrl);
+    const path = parsed.pathname;
     pathSet.add(path);
-    const filename = cleanUrl.split("/").pop();
-    features.assetUrlMap.set(filename, cleanUrl);
+    features.assetUrlMap.set(path, cleanUrl);
   }
   features.assetFiles = [...pathSet].sort();
   features.assetHash = md5(features.assetFiles.join("\n"));
@@ -2291,24 +2549,83 @@ function isAssetDownloadComplete(assetUrlMap, assetContents, oldFeatures = null)
   return ratio >= 0.7 && downloaded >= 5;
 }
 
+function attachPreviousAssets(assetUrlMap, oldFeatures = null) {
+  const map = new Map();
+  for (const [assetKey, url] of assetUrlMap || []) {
+    map.set(assetKey, { url, previous: oldFeatures?.assetContents?.[assetKey] || null });
+  }
+  return map;
+}
+
+async function runLimited(taskFactories, limit) {
+  const results = new Array(taskFactories.length);
+  let next = 0;
+  async function worker() {
+    while (next < taskFactories.length) {
+      const idx = next++;
+      try {
+        results[idx] = { status: "fulfilled", value: await taskFactories[idx]() };
+      } catch (reason) {
+        results[idx] = { status: "rejected", reason };
+      }
+    }
+  }
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, taskFactories.length)) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
+function frontendPageQuality(page) {
+  if (!page) return -1;
+  return (page.assetFiles?.length || 0)
+    + Object.keys(page.assetContents || {}).length
+    + (page.i18nStrings ? Math.min(20, Object.keys(page.i18nStrings).length / 20) : 0)
+    + (page.routes?.length || 0) / 10
+    + ((page.textContent || "").length > 100 ? 5 : 0);
+}
+
+function chooseBetterFrontendPage(existing, candidate) {
+  if (!existing) return candidate;
+  if (!candidate) return existing;
+  if (frontendPageQuality(candidate) > frontendPageQuality(existing)) return candidate;
+  log(`[前端] 同一 canonical key 重复抓取，保留质量更高的结果：${urlLabel(existing.originalUrl || candidate.originalUrl)}`);
+  return existing;
+}
+
 /**
  * 抓取单个页面：HTML 解析 + 按需下载资源。
  * oldFeatures: 上一轮的快照数据（用于 assetHash 比对决定是否跳过下载）
  */
 async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   let features = null;
+  const startedAt = Date.now();
   try {
-    const res = await fetchSafe(url, { headers: browserHeaders() });
+    const headers = browserHeaders();
+    if (oldFeatures?.htmlEtag) headers["If-None-Match"] = oldFeatures.htmlEtag;
+    if (oldFeatures?.htmlLastModified) headers["If-Modified-Since"] = oldFeatures.htmlLastModified;
+    const res = await fetchSafe(url, { headers });
+    if (res.status === 304 && oldFeatures) {
+      return {
+        data: {
+          ...oldFeatures,
+          fetchMeta: { status: 304, durationMs: Date.now() - startedAt, reused: true },
+        },
+        error: null,
+      };
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
     const html = await res.text();
     if (html.length < 1000) throw new Error(`响应过短（${html.length} 字节），可能被拦截`);
 
     // 第一层：纯解析
     features = extractPageFeatures(html, url);
+    features.htmlEtag = res.headers.get("etag") || "";
+    features.htmlLastModified = res.headers.get("last-modified") || "";
+    features.fetchMeta = { status: res.status, durationMs: Date.now() - startedAt };
     validateFrontendPageFeatures(url, html, features);
   } catch (err) {
     log(`  [${urlLabel(url)}] HTML 抓取失败：${err.message}`);
-    return null; // 明确返回 null 表示抓取失败
+    return { data: null, error: { url, reason: classifyFetchFailure(err), message: err.message || String(err), durationMs: Date.now() - startedAt } };
   }
 
   // 第二层：按需下载资源（仅当 assetHash 变化时）
@@ -2320,28 +2637,23 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
     // i18n: 每次都从 streaming HTML 重新提取，因为 i18n 可能随 SSR 内容变化而非静态资源变化
     try {
       let i18nResult = extractI18nFromStreamingHtml(features.html);
-      if (!i18nResult) {
-        // 仅当 streaming HTML 未提取到时才 fallback 到旧缓存或重新从 chunk 获取
-        if (oldFeatures.i18nHash) {
-          features.i18nStrings = oldFeatures.i18nStrings;
-          features.i18nHash = oldFeatures.i18nHash;
-        } else {
-          i18nResult = await fetchI18nStrings(features.assetUrlMap, baseUrl);
-        }
+      if (!i18nResult && (!oldFeatures.i18nHash || (oldFeatures.i18nMissCount || 0) + 1 >= readPositiveIntEnv("FOURMEME_I18N_REUSE_MAX_MISSES", 3))) {
+        i18nResult = await fetchI18nStrings(features.assetUrlMap, baseUrl);
       }
-      if (i18nResult) {
-        features.i18nStrings = i18nResult.i18nStrings;
-        features.i18nHash = i18nResult.i18nHash;
+      const freshI18n = applyI18nResult(features, i18nResult, oldFeatures);
+      if (freshI18n) {
         // 仅在 hash 变化或首次提取时输出日志
         if (!oldFeatures.i18nHash || oldFeatures.i18nHash !== i18nResult.i18nHash) {
           log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（${!oldFeatures.i18nHash ? '首次' : 'hash 变化'}）`);
         }
+      } else if (features.i18nMissCount >= readPositiveIntEnv("FOURMEME_I18N_REUSE_MAX_MISSES", 3)) {
+        log(`  [i18n] 连续 ${features.i18nMissCount} 次未提取到 i18n，不再无限复用旧缓存`);
       }
     } catch (err) { log(`  [i18n] 提取异常（非致命）：${err.message}`); }
   } else {
     // assetHash 变了（或首次）→ 下载资源
     try {
-      features.assetContents = await downloadAssetContents(features.assetUrlMap, assetCache);
+      features.assetContents = await downloadAssetContents(attachPreviousAssets(features.assetUrlMap, oldFeatures), assetCache);
       if (!isAssetDownloadComplete(features.assetUrlMap, features.assetContents, oldFeatures)) {
         const expected = features.assetUrlMap?.size || 0;
         const downloaded = Object.keys(features.assetContents || {}).length;
@@ -2358,7 +2670,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
     } catch (err) {
       features.assetContents = null;
       log(`  [${urlLabel(url)}] 资源下载异常：${err.message}`);
-      return null;
+      return { data: null, error: { url, reason: classifyFetchFailure(err), message: err.message || String(err), durationMs: Date.now() - startedAt } };
     }
     // 提取 i18n（优先从 streaming HTML 中直接获取中文翻译）
     try {
@@ -2367,16 +2679,17 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
         // fallback: 尝试从 JS chunk 中提取
         i18nResult = await fetchI18nStrings(features.assetUrlMap, baseUrl);
       }
-      if (i18nResult) {
-        features.i18nStrings = i18nResult.i18nStrings;
-        features.i18nHash = i18nResult.i18nHash;
+      if (applyI18nResult(features, i18nResult, oldFeatures)) {
         log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（资源更新/首次）`);
       }
     } catch (err) { log(`  [i18n] 提取异常（非致命）：${err.message}`); }
   }
 
   // 提取路由/端点（利用 HTML + nextData，assetContents 为可选增强）
-  features.routes = extractRoutes(features.html, features.assetContents, features.nextData);
+  const routeSignals = extractRouteSignals(features.html, features.assetContents, features.nextData);
+  features.pageRoutes = routeSignals.routes;
+  features.apiEndpoints = routeSignals.endpoints;
+  features.routes = routeSignals.combined;
   features.assetContentHash = frontendAssetContentsHash(features.assetContents);
   const createTokenSignals = extractCreateTokenSignals(features, url);
   if (createTokenSignals) {
@@ -2388,7 +2701,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   delete features.html;
   delete features.assetUrlMap; // Map 不可序列化
 
-  return features;
+  return { data: features, error: null };
 }
 
 /**
@@ -2398,22 +2711,27 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
 async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls(), assetCache = null) {
   const pages = {};
   const failedUrls = [];
-  const tasks = urls.map((url, i) => {
-    return sleep(i * 300).then(async () => {  // 每个页面错开 300ms
+  const failedDetails = [];
+  const limit = readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6);
+  const tasks = urls.map((url, i) => async () => {
+    await sleep((i % limit) * 300);
       const key = urlToKey(url);
       const oldFeatures = oldPages[key] || null;
-      const data = await fetchFrontendData(url, oldFeatures, assetCache);
-      if (!data) { failedUrls.push(url); return { key, data: null }; } // HTML 抓取失败
+      const { data, error } = await fetchFrontendData(url, oldFeatures, assetCache);
+      if (!data) {
+        failedUrls.push(url);
+        failedDetails.push(error || { url, reason: "error", message: "unknown" });
+        return { key, data: null };
+      }
       return { key, data: { ...data, originalUrl: url } };
-    });
   });
-  const results = await Promise.allSettled(tasks);
+  const results = await runLimited(tasks, limit);
   for (const r of results) {
     if (r.status === "fulfilled" && r.value.data) {
-      pages[r.value.key] = r.value.data;
+      pages[r.value.key] = chooseBetterFrontendPage(pages[r.value.key], r.value.data);
     }
   }
-  return { pages, failedUrls };
+  return { pages, failedUrls, failedDetails };
 }
 
 async function fetchFrontendDataWithDiscovery(oldPages = {}) {
@@ -2432,10 +2750,13 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
     log(`[前端] 从路由发现 ${discoveredUrls.length} 个新页面，立即纳入同一监控池：${discoveredUrls.map(urlLabel).join(", ")}`);
     for (const url of discoveredUrls) knownUrls.add(canonicalFrontendUrl(url));
     const extra = await fetchAllFrontendData(oldPages, discoveredUrls, assetCache);
-    Object.assign(result.pages, extra.pages);
+    for (const [key, page] of Object.entries(extra.pages)) {
+      result.pages[key] = chooseBetterFrontendPage(result.pages[key], page);
+    }
     if (extra.failedUrls.length > 0) {
       log(`[前端] 路由发现候选页抓取失败，未纳入监控：${extra.failedUrls.map(urlLabel).join(", ")}`);
     }
+    result.failedDetails = [...(result.failedDetails || []), ...(extra.failedDetails || [])];
     allDiscoveredUrls.push(...discoveredUrls.filter(url => extra.pages[urlToKey(url)]));
   }
 
@@ -2448,6 +2769,7 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
  */
 function jaccard(a, b) {
   if (!a.length && !b.length) return 1;
+  if (Math.abs(a.length - b.length) > Math.max(a.length, b.length) * 0.8) return 0;
   const setA = new Set(a);
   const setB = new Set(b);
   let inter = 0;
@@ -2570,6 +2892,9 @@ function diffFrontendAssets(oldAssets, newAssets) {
         const newExt = newFile.endsWith(".css") ? "css" : "js";
         const oldExt = oldFile.endsWith(".css") ? "css" : "js";
         if (newExt !== oldExt) continue;
+        const oldSize = Number(oldData.size || 0);
+        const newSize = Number(newData.size || 0);
+        if (oldSize && newSize && Math.abs(oldSize - newSize) / Math.max(oldSize, newSize) > 0.7) continue;
         const sim = jaccard(oldData.strings || [], newData.strings || []);
         if (sim > 0.4) pairs.push({ oldFile, newFile, sim });
       }
@@ -2611,6 +2936,15 @@ function diffTextContent(oldText, newText) {
   };
   const oldParts = split(oldText);
   const newParts = split(newText);
+  const maxParts = readPositiveIntEnv("FOURMEME_TEXT_DIFF_MAX_PARTS", 100);
+  if (oldParts.length > maxParts || newParts.length > maxParts) {
+    return {
+      changes: [
+        { type: "modified", oldText: `文案段落 ${oldParts.length} 段`, newText: `文案段落 ${newParts.length} 段，已超过详细 diff 上限` },
+      ],
+      reordered: false,
+    };
+  }
   const oldSet = new Set(oldParts);
   const newSet = new Set(newParts);
   const rawAdded = newParts.filter(s => !oldSet.has(s));
@@ -2834,7 +3168,7 @@ async function maybeSuppressTransientAssetJitter(label, oldData, newData, assetD
   log(`[前端] ${label} 疑似资源列表抖动（${fileSummary}），${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 后快速复抓确认`);
 
   await sleep(CONFIG.frontendAssetJitter.quickConfirmDelayMs);
-  const fresh = await fetchFrontendData(newData.originalUrl, oldData);
+  const { data: fresh } = await fetchFrontendData(newData.originalUrl, oldData);
   if (!fresh) {
     log(`[前端] ${label} 快速复抓失败，为避免漏报仍推送本轮资源变更`);
     return { suppress: false };
@@ -3119,6 +3453,35 @@ function mergeFrontendNotifications(notifications) {
   return merged.map(item => item.type === "asset"
     ? buildMergedFrontendAssetNotification(item.group)
     : item.notification);
+}
+
+function frontendNotificationDedupeKey(n) {
+  return md5(JSON.stringify({
+    title: n.title || "",
+    url: canonicalFrontendUrl(n.url || ""),
+    content: n.fullDiff ? md5(n.fullDiff) : md5(n.content || ""),
+  }));
+}
+
+function filterFrontendDedupe(notifications, state, windowMs = readPositiveIntEnv("FOURMEME_FRONTEND_DEDUPE_MINUTES", 30) * 60_000) {
+  const now = Date.now();
+  const dedupe = state._frontendNotifyDedupe || {};
+  for (const [key, tsVal] of Object.entries(dedupe)) {
+    if (now - Number(tsVal || 0) > windowMs * 4) delete dedupe[key];
+  }
+  const out = [];
+  for (const n of notifications || []) {
+    const key = frontendNotificationDedupeKey(n);
+    if (dedupe[key] && now - dedupe[key] < windowMs) {
+      frontendMetrics.suppressed++;
+      log(`[前端] 去重窗口内抑制重复通知：${n.title}`);
+      continue;
+    }
+    dedupe[key] = now;
+    out.push(n);
+  }
+  state._frontendNotifyDedupe = dedupe;
+  return out;
 }
 
 /**
@@ -6287,6 +6650,14 @@ let snapshot = loadSnapshot();
 let startTime = Date.now();
 let modulePollCounts = { pool: 0, frontend: 0, api: 0, openfourTemplates: 0, github: 0, contract: 0, onchain: 0, actor: 0 };
 const apiEmptyArrayLogState = new Map();
+const frontendMetrics = {
+  lastRunAt: 0,
+  success: 0,
+  failed: 0,
+  suppressed: 0,
+  notifications: 0,
+  pages: {},
+};
 
 /* ── 已移除底池缓存（防止 API 短暂返回不完整数据导致误报）── */
 const removedPoolsCache = new Map(); // poolKey -> { data, expireAt }
@@ -6377,7 +6748,9 @@ async function flushExpiredPoolRemovals() {
 }
 
 // 定期刷新过期移除缓存
-setInterval(() => { flushExpiredPoolRemovals().catch(e => log(`[底池] 移除缓存刷新异常：${e.message}`)); }, 120_000);
+if (!IS_TEST_MODE) {
+  setInterval(() => { flushExpiredPoolRemovals().catch(e => log(`[底池] 移除缓存刷新异常：${e.message}`)); }, 120_000);
+}
 
 /* ── [已移除] 资源/路由抖动缓存和去重缓存 ──
    重构后采用 Flap 架构：assetHash 轻量检测 + fallback 文件列表 diff，
@@ -6516,28 +6889,60 @@ async function runPoolCheck() {
 
 async function runFrontendCheck() {
   if (!snapshot) snapshot = {};
+  if (!snapshot._frontendFailCounts) snapshot._frontendFailCounts = {};
+  if (!snapshot._frontendDiscoveredHistory) snapshot._frontendDiscoveredHistory = {};
+  if (!snapshot._frontendNotifyDedupe) snapshot._frontendNotifyDedupe = {};
+  if (!snapshot._frontendWarmup) snapshot._frontendWarmup = {};
+  frontendMetrics.lastRunAt = Date.now();
   const prunedBeforeRun = pruneFrontendSnapshot(snapshot);
   const oldPages = snapshot.frontendPages || {};
-  const { pages: newPages, failedUrls } = await fetchFrontendDataWithDiscovery(oldPages);
+  const { pages: newPages, failedUrls, failedDetails = [] } = await fetchFrontendDataWithDiscovery(oldPages);
+  frontendMetrics.success = Object.keys(newPages).length;
+  frontendMetrics.failed = failedUrls.length;
 
   // 页面抓取失败告警：连续失败计数
-  if (!snapshot._frontendFailCounts) snapshot._frontendFailCounts = {};
   let failCountChanged = false;
+  const failedByUrl = new Map(failedDetails.map(item => [item.url, item]));
   for (const url of failedUrls) {
+    const detail = failedByUrl.get(url) || { reason: "error", message: "" };
     const key = urlToKey(url);
-    snapshot._frontendFailCounts[key] = (snapshot._frontendFailCounts[key] || 0) + 1;
+    const prev = snapshot._frontendFailCounts[key];
+    const count = typeof prev === "object" ? (prev.count || 0) : (prev || 0);
+    snapshot._frontendFailCounts[key] = {
+      count: count + 1,
+      reason: detail.reason,
+      message: detail.message,
+      lastFailAt: Date.now(),
+    };
     failCountChanged = true;
   }
   // 重置成功页面的失败计数
   for (const key of Object.keys(newPages)) {
     if (snapshot._frontendFailCounts[key]) {
-      snapshot._frontendFailCounts[key] = 0;
+      delete snapshot._frontendFailCounts[key];
       failCountChanged = true;
     }
+    frontendMetrics.pages[key] = {
+      lastSuccessAt: Date.now(),
+      durationMs: newPages[key]?.fetchMeta?.durationMs || 0,
+      status: newPages[key]?.fetchMeta?.status || 200,
+    };
   }
 
   if (!snapshot.frontendPages) {
+    const configuredKeys = new Set(CONFIG.monitorUrls.map(url => urlToKey(canonicalFrontendUrl(url))));
+    const configuredSuccess = Object.keys(newPages).filter(key => configuredKeys.has(key)).length;
+    const minSuccessRatio = Number(process.env.FOURMEME_FRONTEND_BASELINE_MIN_SUCCESS_RATIO || "0.8");
+    const successRatio = CONFIG.monitorUrls.length ? configuredSuccess / CONFIG.monitorUrls.length : 1;
+    if (successRatio < minSuccessRatio) {
+      log(`[前端] 首次基线成功率不足：固定入口 ${configuredSuccess}/${CONFIG.monitorUrls.length}，暂不保存基线`);
+      await saveSnapshot(snapshot);
+      return;
+    }
     snapshot.frontendPages = newPages;
+    for (const page of Object.values(newPages)) {
+      snapshot._frontendDiscoveredHistory[canonicalFrontendUrl(page.originalUrl)] = { firstSeenAt: Date.now(), baselineOnly: true };
+    }
     await saveSnapshot(snapshot);
     const pageDetails = Object.values(newPages).map(p => {
       const label = urlLabel(p.originalUrl);
@@ -6560,11 +6965,15 @@ async function runFrontendCheck() {
   const FAIL_THRESHOLD = 3;
   for (const url of failedUrls) {
     const key = urlToKey(url);
-    const count = snapshot._frontendFailCounts[key] || 0;
-    if (count > 0 && count % FAIL_THRESHOLD === 0) {
+    const failState = snapshot._frontendFailCounts[key] || {};
+    const count = typeof failState === "object" ? (failState.count || 0) : failState;
+    const reason = typeof failState === "object" ? failState.reason : "error";
+    const isBackoffLike = ["backoff", "rate_limited", "restricted"].includes(reason);
+    const threshold = isBackoffLike ? FAIL_THRESHOLD * 2 : FAIL_THRESHOLD;
+    if (count > 0 && count % threshold === 0) {
       notifications.push({
-        title: `⚠️ 前端页面不可达：${urlLabel(url)}`,
-        content: `页面 ${url} 已连续 ${count} 次抓取失败，可能宕机或被封禁。`,
+        title: isBackoffLike ? `⚠️ 前端抓取受限：${urlLabel(url)}` : `⚠️ 前端页面不可达：${urlLabel(url)}`,
+        content: `页面 ${url} 已连续 ${count} 次抓取失败。\n原因: ${reason}\n最近错误: ${failState.message || ""}`,
         template: "red",
         url
       });
@@ -6578,35 +6987,31 @@ async function runFrontendCheck() {
       const label = urlLabel(newData.originalUrl);
       const fileCount = (newData.assetFiles || []).length;
       const routeCount = (newData.routes || []).length;
-      log(`[前端] 新增监控页面已建立基线：${label}（资源 ${fileCount} 个，路由/端点 ${routeCount} 个）`);
-      const lines = [
-        `**🆕 新增监控页面：${label}**`,
-        `URL: ${newData.originalUrl}`,
-        `资源文件: ${fileCount} 个`,
-        `路由/端点: ${routeCount} 个`,
-      ];
-      const signalLines = isCreateTokenFrontendUrl(newData.originalUrl)
-        ? (newData.createTokenSignals || []).slice(0, 12)
-        : [];
-      if (signalLines.length > 0) {
-        lines.push("");
-        lines.push("**当前创建页重点文案/功能信号：**");
-        lines.push("```");
-        for (const s of signalLines) lines.push(s.length > 160 ? s.slice(0, 160) + "..." : s);
-        if ((newData.createTokenSignals || []).length > signalLines.length) {
-          lines.push(`... 还有 ${(newData.createTokenSignals || []).length - signalLines.length} 项`);
-        }
-        lines.push("```");
-      }
-      notifications.push({
-        title: `前端新增页面：${label}`,
-        content: lines.join("\n"),
-        template: "orange",
-        url: newData.originalUrl,
-      });
+      log(`[前端] 新增监控页面 warm-up 基线：${label}（资源 ${fileCount} 个，路由/端点 ${routeCount} 个）`);
+      snapshot._frontendDiscoveredHistory[canonicalFrontendUrl(newData.originalUrl)] = {
+        firstSeenAt: Date.now(),
+        lastSeenAt: Date.now(),
+        baselineOnly: true,
+      };
+      snapshot._frontendWarmup[key] = { stableRuns: 1, firstSeenAt: Date.now() };
       snapshot.frontendPages[key] = newData;
       snapshotDirty = true;
       continue;
+    }
+    const canonicalPageUrl = canonicalFrontendUrl(newData.originalUrl);
+    if (snapshot._frontendDiscoveredHistory[canonicalPageUrl]) {
+      snapshot._frontendDiscoveredHistory[canonicalPageUrl].lastSeenAt = Date.now();
+    }
+    if (snapshot._frontendWarmup[key]) {
+      const stableRuns = (snapshot._frontendWarmup[key].stableRuns || 0) + 1;
+      if (stableRuns < readPositiveIntEnv("FOURMEME_FRONTEND_WARMUP_STABLE_RUNS", 1)) {
+        snapshot._frontendWarmup[key] = { ...snapshot._frontendWarmup[key], stableRuns };
+        snapshot.frontendPages[key] = newData;
+        snapshotDirty = true;
+        continue;
+      }
+      delete snapshot._frontendWarmup[key];
+      log(`[前端] ${urlLabel(newData.originalUrl)} warm-up 完成，后续变更将正常告警`);
     }
 
     const contentParts = [];
@@ -6814,7 +7219,8 @@ async function runFrontendCheck() {
   }
 
   if (notifications.length > 0) {
-    const dedupedNotifications = mergeFrontendNotifications(notifications);
+    const dedupedNotifications = filterFrontendDedupe(mergeFrontendNotifications(notifications), snapshot);
+    frontendMetrics.notifications += dedupedNotifications.length;
 
     await saveSnapshot(snapshot);
     for (const n of dedupedNotifications) {
@@ -7165,7 +7571,7 @@ async function startAllModules() {
       `**底池监控:** BSC ${poolCount} 个 — 每 ${CONFIG.intervals.pool / 1000}s`,
       `**前端监控:** ${pageCount} 个页面（固定入口 ${entryPageCount}，路由发现页面纳入同一监控池）— 每 ${CONFIG.intervals.frontend / 1000}s`,
       `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面同层纳入`,
-      `  资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
+      `  HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)} / 资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)} / 资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
       `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
@@ -7192,19 +7598,24 @@ async function startAllModules() {
   const moduleTimers = []; // 存储定时器 ID，供优雅退出时清理
   for (const m of modules) {
     const initialDelay = Math.random() * Math.min(m.intervalMs, 2_000);
-    function scheduleModule() {
-      const timerId = setTimeout(async () => {
-        await m.run();
-        scheduleModule();
-      }, m.intervalMs + Math.random() * CONFIG.jitterMs);
-      // 替换为最新的 timerId
+    let nextDueAt = Date.now() + m.intervalMs + initialDelay;
+    function upsertModuleTimer(timerId) {
       const idx = moduleTimers.findIndex(t => t.name === m.name);
       if (idx >= 0) moduleTimers[idx].timerId = timerId;
       else moduleTimers.push({ name: m.name, timerId });
     }
+    function scheduleModule(delayMs = 0) {
+      const timerId = setTimeout(async () => {
+        await m.run();
+        nextDueAt += m.intervalMs;
+        if (nextDueAt <= Date.now()) nextDueAt = Date.now();
+        const jitter = CONFIG.jitterMs > 0 ? Math.random() * CONFIG.jitterMs : 0;
+        scheduleModule(Math.max(0, nextDueAt - Date.now()) + jitter);
+      }, delayMs);
+      upsertModuleTimer(timerId);
+    }
     // 初始延迟的 timer 也要跟踪，防止退出时遗漏
-    const initTimerId = setTimeout(scheduleModule, initialDelay);
-    moduleTimers.push({ name: m.name, timerId: initTimerId });
+    scheduleModule(m.intervalMs + initialDelay);
   }
 
   // 暴露给 gracefulShutdown 使用
@@ -7227,6 +7638,7 @@ async function startAllModules() {
         `运行 **${h}h${m}m**，总检测 **${total}** 次`,
         Object.entries(modulePollCounts).map(([k, v]) => `  ${k}: ${v}`).join("\n"),
         `当前底池：**${poolCount}** 个`,
+        `前端页面池：**${Object.keys(snapshot?.frontendPages || {}).length}** 个，最近一轮成功 ${frontendMetrics.success} / 失败 ${frontendMetrics.failed}，累计推送 ${frontendMetrics.notifications}，抑制 ${frontendMetrics.suppressed}`,
       ];
 
       // 汇总近 2 小时内的模块错误
@@ -7337,29 +7749,30 @@ async function startAllModules() {
 
 }
 
-// SIGUSR1 信号：立即触发所有模块执行一次
-process.on("SIGUSR1", () => {
-  log("收到 SIGUSR1，触发全量检测...");
-  (async () => {
-    for (const m of modules) {
-      try { await m.run(); } catch (err) { log(`[SIGUSR1] ${m.name} 异常：${err.message}`); }
-    }
-    // 检查是否有模块因防重入被跳过（run 内部 running=true 时直接 return）
-    // 等待 2s 后重试一次被跳过的模块
-    await new Promise(r => setTimeout(r, 2000));
-    for (const m of modules) {
-      try { await m.run(); } catch (err) { /* 第二次仍失败则放弃 */ }
-    }
-    log("SIGUSR1 全量检测完成");
-  })();
-});
+if (!IS_TEST_MODE) {
+  // SIGUSR1 信号：立即触发所有模块执行一次
+  process.on("SIGUSR1", () => {
+    log("收到 SIGUSR1，触发全量检测...");
+    (async () => {
+      for (const m of modules) {
+        try { await m.run(); } catch (err) { log(`[SIGUSR1] ${m.name} 异常：${err.message}`); }
+      }
+      // 检查是否有模块因防重入被跳过（run 内部 running=true 时直接 return）
+      // 等待 2s 后重试一次被跳过的模块
+      await new Promise(r => setTimeout(r, 2000));
+      for (const m of modules) {
+        try { await m.run(); } catch (err) { /* 第二次仍失败则放弃 */ }
+      }
+      log("SIGUSR1 全量检测完成");
+    })();
+  });
 
-// 启动
-startAllModules().catch(err => {
-  log(`启动异常：${err.message}`);
-  log(`[启动异常详情]\n${err?.stack || err}`);
-  process.exit(1);
-});
+  startAllModules().catch(err => {
+    log(`启动异常：${err.message}`);
+    log(`[启动异常详情]\n${err?.stack || err}`);
+    process.exit(1);
+  });
+}
 
 let isShuttingDown = false;
 async function gracefulShutdown(signal) {
@@ -7389,9 +7802,30 @@ async function gracefulShutdown(signal) {
   try { await saveSnapshot(snapshot); } catch {}
   process.exit(0);
 }
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+if (!IS_TEST_MODE) {
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+}
 
-process.on("unhandledRejection", (err) => {
-  log(`[未捕获异常] ${err?.message || err}`);
-});
+export const __testables = {
+  CONFIG,
+  canonicalFrontendUrl,
+  isConfiguredFrontendUrl,
+  isDiscoverableFrontendUrl,
+  extractTextContent,
+  extractHrefRoutesFromHtml,
+  extractNextData,
+  stableJsonHash,
+  extractI18nFromStreamingHtml,
+  extractRouteSignals,
+  diffI18nStrings,
+  diffRoutes,
+  frontendAssetChangeSignature,
+  classifyFetchFailure,
+};
+
+if (!IS_TEST_MODE) {
+  process.on("unhandledRejection", (err) => {
+    log(`[未捕获异常] ${err?.message || err}`);
+  });
+}
