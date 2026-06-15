@@ -485,11 +485,12 @@ function migrateSnapshot(data) {
 }
 
 function saveSnapshot(data) {
-  data._schemaVersion = CURRENT_SCHEMA_VERSION;
-  data.lastCheck = ts();
-  const serialized = JSON.stringify(data, null, 2);
   snapshotWriteQueue = snapshotWriteQueue.then(() => {
     try {
+      data._schemaVersion = CURRENT_SCHEMA_VERSION;
+      data.lastCheck = ts();
+      // 紧凑且延后序列化，避免写队列堆积多份大快照字符串。
+      const serialized = JSON.stringify(data);
       const tmpFile = CONFIG.snapshotFile + ".tmp";
       writeFileSync(tmpFile, serialized, "utf-8");
       renameSync(tmpFile, CONFIG.snapshotFile);
@@ -1363,7 +1364,7 @@ function extractStrings(content, ext) {
  */
 async function downloadAssetContents(assetUrls, sharedCache = null) {
   const results = {};
-  const BATCH = 6;        // 每批并发数
+  const BATCH = 3;        // 每批并发数；降低前端资源解析的 CPU/内存峰值，不改变监控频率
   const STAGGER = 80;     // 批内请求间隔 ms
   const entries = [...assetUrls.entries()]; // [[filename, url], ...]
 
@@ -3788,6 +3789,10 @@ async function runOpenFourModuleDiscoveryCheck(context = {}) {
   if (!snapshot) snapshot = {};
   const oldState = snapshot.openFourModules || null;
   const newModules = oldState ? diffOpenFourModules(oldState, discovered) : [];
+  const moduleSnapshotChanged = !oldState || !jsonEqual(
+    { registry: oldState.registry, presetIds: oldState.presetIds, byAddress: oldState.byAddress },
+    { registry: discovered.registry, presetIds: discovered.presetIds, byAddress: discovered.byAddress }
+  );
   snapshot.openFourModules = {
     registry: discovered.registry,
     presetIds: discovered.presetIds,
@@ -3808,7 +3813,7 @@ async function runOpenFourModuleDiscoveryCheck(context = {}) {
     await saveSnapshot(snapshot);
     appendHistory("openfour", title, content.slice(0, 300), content);
     await sendThenEnrichWithAi(title, content, "orange", "Four.meme OpenFour Registry 新模块发现", undefined, undefined, undefined, `https://bscscan.com/address/${CONFIG.contracts.openFourRegistry}`);
-  } else {
+  } else if (moduleSnapshotChanged) {
     await saveSnapshot(snapshot);
   }
 }
@@ -5618,6 +5623,7 @@ async function runActorCheck() {
   if (!CONFIG.actorMonitor.enabled) return;
   const state = ensureActorMonitorState();
   const stateBefore = JSON.stringify(state);
+  let persistedActorStateSignature = stateBefore;
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
     log("[创建者] 尚无合约指纹，等待合约模块建立基线");
@@ -5663,6 +5669,7 @@ async function runActorCheck() {
   let scannedBlocks = 0;
   let scannedBatches = 0;
   let anyActions = false;
+  let lastActorProgressSaveAt = Date.now();
 
   while (state.lastBlock < safeLatest && remainingBlocks > 0) {
     const fromBlock = state.lastBlock + 1;
@@ -5682,11 +5689,17 @@ async function runActorCheck() {
     state.lastRunBatches = scannedBatches + 1;
     state.lastRunAt = ts();
     rememberActorTxs(state, actions);
-    await saveSnapshot(snapshot);
 
     scannedBlocks += batchSize;
     scannedBatches++;
     remainingBlocks -= batchSize;
+    const shouldPersistProgress = actions.length > 0
+      || Date.now() - lastActorProgressSaveAt >= 10_000;
+    if (shouldPersistProgress) {
+      await saveSnapshot(snapshot);
+      persistedActorStateSignature = JSON.stringify(state);
+      lastActorProgressSaveAt = Date.now();
+    }
 
     if (actions.length > 0) {
       anyActions = true;
@@ -5732,7 +5745,8 @@ async function runActorCheck() {
     // 追块期间创建者补全会拖慢实时扫链；进度日志由 shouldLogActorCatchup 节流输出。
   }
 
-  if (stateBefore !== JSON.stringify(state)) await saveSnapshot(snapshot);
+  const finalActorStateSignature = JSON.stringify(state);
+  if (persistedActorStateSignature !== finalActorStateSignature) await saveSnapshot(snapshot);
 
   if (anyActions) {
     try {
@@ -6433,18 +6447,20 @@ async function runApiCheck() {
   // 仅保存稳定结构/稳定值，避免动态字段和高频列表导致快照每轮漂移。
   if (!snapshot.apiStructure) snapshot.apiStructure = {};
   if (!snapshot.apiValues) snapshot.apiValues = {};
-  const apiStructureBefore = JSON.stringify(snapshot.apiStructure);
-  const apiValuesBefore = JSON.stringify(snapshot.apiValues);
+  let apiSnapshotChanged = prunedApiKeys.length > 0;
   for (const [key, val] of Object.entries(newStruct)) {
-    snapshot.apiStructure[key] = val;
+    if (!jsonEqual(snapshot.apiStructure[key], val)) {
+      snapshot.apiStructure[key] = val;
+      apiSnapshotChanged = true;
+    }
   }
   for (const [key, val] of Object.entries(newValues)) {
     const stableValues = stableApiValuesForSnapshot(key, val);
-    if (stableValues !== null) snapshot.apiValues[key] = stableValues;
+    if (stableValues !== null && !jsonEqual(snapshot.apiValues[key], stableValues)) {
+      snapshot.apiValues[key] = stableValues;
+      apiSnapshotChanged = true;
+    }
   }
-  const apiSnapshotChanged = prunedApiKeys.length > 0
-    || apiStructureBefore !== JSON.stringify(snapshot.apiStructure)
-    || apiValuesBefore !== JSON.stringify(snapshot.apiValues);
 
   if (notifications.length > 0) {
     const content = notifications.join("\n\n");
@@ -6461,6 +6477,7 @@ async function runGithubCheck() {
   // 从快照恢复 ETag（避免重启后浪费 rate limit）
   if (!githubETag && snapshot.githubETag) githubETag = snapshot.githubETag;
   if (!githubReposETag && snapshot.githubReposETag) githubReposETag = snapshot.githubReposETag;
+  let githubSnapshotDirty = false;
 
   const now = Date.now();
   const lastRepoPoll = Date.parse(snapshot.githubReposLastPollAt || "") || 0;
@@ -6474,15 +6491,18 @@ async function runGithubCheck() {
       snapshot.githubReposLastPollAt = new Date(now).toISOString();
       if (githubReposETag && snapshot.githubReposETag !== githubReposETag) {
         snapshot.githubReposETag = githubReposETag;
+        githubSnapshotDirty = true;
       }
       if (repoMap && !jsonEqual(snapshot.githubRepos, repoMap)) {
         snapshot.githubRepos = repoMap;
+        githubSnapshotDirty = true;
       }
       if (repoChanges) {
         const count = (repoChanges.added?.length || 0) + (repoChanges.removed?.length || 0) + (repoChanges.changed?.length || 0);
         log(`[GitHub] 检测到 ${count} 项账号仓库/项目变更！`);
         const content = formatGithubRepoChanges(repoChanges);
         await saveSnapshot(snapshot);
+        githubSnapshotDirty = false;
         appendHistory("github", `GitHub 项目变更（${count}项）`, content.slice(0, 300), content);
         await sendThenEnrichWithAi(`GitHub 项目变更（${count}项）`, content, "turquoise", "Four.meme GitHub 项目变更", undefined, undefined, undefined, `https://github.com/${CONFIG.githubOwner}`);
       }
@@ -6495,6 +6515,7 @@ async function runGithubCheck() {
   // 持久化 ETag
   if (githubETag && snapshot.githubETag !== githubETag) {
     snapshot.githubETag = githubETag;
+    githubSnapshotDirty = true;
   }
   if (!snapshot.githubSha) {
     snapshot.githubSha = newSha;
@@ -6516,8 +6537,7 @@ async function runGithubCheck() {
     await sendThenEnrichWithAi(title, content, "turquoise", "Four.meme GitHub 仓库新提交", fullDiff, undefined, diffFilePath, `https://github.com/${CONFIG.githubRepo}`);
   } else {
     snapshot.githubLastPollAt = new Date().toISOString();
-    // ETag 变了也保存（即使无新提交）
-    await saveSnapshot(snapshot);
+    if (githubSnapshotDirty) await saveSnapshot(snapshot);
   }
 }
 
