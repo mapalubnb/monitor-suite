@@ -1658,9 +1658,6 @@ function extractCreateTokenSignals(features, url) {
   for (const [key, value] of Object.entries(features.i18nStrings || {})) {
     collectCriticalFrontendSignals(`${key}: ${value}`, "i18n", signals);
   }
-  for (const [file, data] of Object.entries(features.assetContents || {})) {
-    for (const s of data?.strings || []) collectCriticalFrontendSignals(s, file, signals);
-  }
   return [...signals].sort();
 }
 
@@ -2656,38 +2653,6 @@ function diffTextContent(oldText, newText) {
   return { changes, reordered: false };
 }
 
-// ── 业务关键词检测器（用于字符串和文件分类） ──
-const BUSINESS_MATCHERS = [
-  { pattern: /Vault/i,            label: "Vault" },
-  { pattern: /Dividend/i,         label: "Dividend" },
-  { pattern: /DividendBps/i,      label: "DividendBps" },
-  { pattern: /constraints/i,      label: "Constraints" },
-  { pattern: /enabled\s*[:=]/i,   label: "Enabled" },
-  { pattern: /\bEnable\s+Tax\b/i, label: "Enable Tax" },
-  { pattern: /\btax(?:Fee|FeeSell|Enabled)?\b|\bTax\b/i, label: "Tax(税收)" },
-  { pattern: /showInCAStore/i,    label: "CAStore展示" },
-  { pattern: /quickAmounts/i,     label: "QuickAmounts" },
-  { pattern: /usePermit/i,        label: "UsePermit" },
-  { pattern: /fee[sS]?[\s:=]/i,  label: "Fee(费率)" },
-  { pattern: /Staking/i,          label: "Staking" },
-  { pattern: /Lista/i,            label: "Lista" },
-  { pattern: /SwapRouter/i,       label: "SwapRouter" },
-  { pattern: /TokenManager/i,     label: "TokenManager" },
-  { pattern: /create-token/i,     label: "创建代币" },
-  { pattern: /agentic/i,          label: "Agentic" },
-  { pattern: /announcement/i,     label: "公告" },
-  { pattern: /\/v1\//i,           label: "API端点" },
-  { pattern: /\/docs\//i,         label: "文档路由" },
-];
-
-function matchBusinessKeywords(text) {
-  const hits = new Set();
-  for (const m of BUSINESS_MATCHERS) {
-    if (m.pattern.test(text)) hits.add(m.label);
-  }
-  return [...hits];
-}
-
 function frontendRoutePath(url) {
   try {
     return new URL(url, CONFIG.siteUrl).pathname.replace(/\/+$/, "") || "/";
@@ -2727,11 +2692,7 @@ function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}, pag
   const summary = {
     stats: frontendAssetStats(assetDiff),
     configDiffs: [],
-    readableAdded: [],
-    readableRemoved: [],
-    keywordHits: new Set(),
     noisyStringChanges: 0,
-    readableStringChanges: 0,
     fileOnlyChanges: (assetDiff?.added?.length || 0) + (assetDiff?.removed?.length || 0),
   };
   const suppressTaxScopedAssetStrings = pageUrl && !isTaxOrCreateScopedRoute(pageUrl);
@@ -2746,31 +2707,20 @@ function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}, pag
         continue;
       }
       summary.configDiffs.push({ ...cd, file: m.newFile || m.oldFile });
-      summary.keywordHits.add(cd.field);
     }
     for (const s of added) {
       if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) {
         summary.noisyStringChanges++;
         continue;
       }
-      if (isReadableFrontendSignalString(s)) {
-        summary.readableAdded.push({ text: s, file: m.newFile || m.oldFile, keywords: matchBusinessKeywords(s) });
-        for (const k of matchBusinessKeywords(s)) summary.keywordHits.add(k);
-      } else {
-        summary.noisyStringChanges++;
-      }
+      summary.noisyStringChanges++;
     }
     for (const s of removed) {
       if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) {
         summary.noisyStringChanges++;
         continue;
       }
-      if (isReadableFrontendSignalString(s)) {
-        summary.readableRemoved.push({ text: s, file: m.oldFile || m.newFile, keywords: matchBusinessKeywords(s) });
-        for (const k of matchBusinessKeywords(s)) summary.keywordHits.add(k);
-      } else {
-        summary.noisyStringChanges++;
-      }
+      summary.noisyStringChanges++;
     }
   }
 
@@ -2781,42 +2731,25 @@ function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}, pag
     for (const data of Object.values(newAssets || {})) for (const s of data?.strings || []) newGlobalStrings.add(s);
     for (const s of [...newGlobalStrings].filter(v => !oldGlobalStrings.has(v))) {
       if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) continue;
-      if (isReadableFrontendSignalString(s)) summary.readableAdded.push({ text: s, file: "global", keywords: matchBusinessKeywords(s) });
+      summary.noisyStringChanges++;
     }
     for (const s of [...oldGlobalStrings].filter(v => !newGlobalStrings.has(v))) {
       if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) continue;
-      if (isReadableFrontendSignalString(s)) summary.readableRemoved.push({ text: s, file: "global", keywords: matchBusinessKeywords(s) });
+      summary.noisyStringChanges++;
     }
   }
 
-  const dedupe = (items) => {
-    const seen = new Set();
-    const out = [];
-    for (const item of items) {
-      const key = item.text;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(item);
-    }
-    return out;
-  };
-  summary.readableAdded = dedupe(summary.readableAdded);
-  summary.readableRemoved = dedupe(summary.readableRemoved);
-  summary.readableStringChanges = summary.readableAdded.length + summary.readableRemoved.length;
   return summary;
 }
 
 function hasMeaningfulFrontendAssetChange(assetSummary) {
   if (!assetSummary) return false;
-  return assetSummary.configDiffs.length > 0
-    || assetSummary.readableStringChanges > 0;
+  return assetSummary.configDiffs.length > 0;
 }
 
 function formatFrontendAssetBrief(assetSummary) {
   if (!assetSummary) return "";
   const lines = [`**资源变化：** ${assetSummary.stats}`];
-  const hits = [...assetSummary.keywordHits].filter(Boolean);
-  if (hits.length > 0) lines.push(`**命中重点：** ${hits.slice(0, 8).join("、")}`);
 
   if (assetSummary.configDiffs.length > 0) {
     lines.push("");
@@ -2825,20 +2758,6 @@ function formatFrontendAssetBrief(assetSummary) {
       lines.push(`- ${cd.field}: ${frontendDisplaySnippet(cd.oldVal, 60)} -> ${frontendDisplaySnippet(cd.newVal, 60)}`);
     }
     if (assetSummary.configDiffs.length > 12) lines.push(`- 还有 ${assetSummary.configDiffs.length - 12} 项配置变化，见 diff 附件`);
-  }
-
-  const readable = [
-    ...assetSummary.readableRemoved.slice(0, 8).map(item => ({ sign: "-", ...item })),
-    ...assetSummary.readableAdded.slice(0, 8).map(item => ({ sign: "+", ...item })),
-  ];
-  if (readable.length > 0) {
-    lines.push("");
-    lines.push("**可读文案/功能信号：**");
-    lines.push("```");
-    for (const item of readable.slice(0, 16)) {
-      lines.push(`${item.sign} ${frontendDisplaySnippet(item.text, 140)}`);
-    }
-    lines.push("```");
   }
 
   if (assetSummary.noisyStringChanges > 0 || assetSummary.fileOnlyChanges > 0) {
@@ -2950,8 +2869,6 @@ function formatFrontendChanges(assetDiff, textDiff, pageLabel, oldAssets, newAss
     if (assetDiff.removed.length) parts.push(`移除 ${assetDiff.removed.length}`);
     lines.push(`**📦 资源文件变更：** ${parts.join(" | ")}`);
 
-    // ── 噪音过滤 + 实质/噪音分离（移植自 flap-monitor） ──
-    const substantiveFiles = [];
     const noiseOnlyFiles = [];
     const allConfigDiffs = [];
 
@@ -2969,10 +2886,11 @@ function formatFrontendChanges(assetDiff, textDiff, pageLabel, oldAssets, newAss
         }
       }
 
-      if (totalReal === 0 && totalNoise > 0) {
-        noiseOnlyFiles.push({ label: m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`, noise: totalNoise });
-      } else if (totalReal > 0) {
-        substantiveFiles.push({ ...m, realAdded, realRemoved, totalNoise, configDiffs });
+      if (totalReal > 0 || totalNoise > 0) {
+        noiseOnlyFiles.push({
+          label: m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`,
+          noise: totalReal + totalNoise,
+        });
       }
     }
 
@@ -2985,43 +2903,14 @@ function formatFrontendChanges(assetDiff, textDiff, pageLabel, oldAssets, newAss
       }
     }
 
-    // ── 实质文件变更（过滤噪音后） ──
-    let shownCount = 0;
-    for (const m of substantiveFiles) {
-      const totalReal = m.realAdded.length + m.realRemoved.length;
-      if (totalReal === 0) continue;
-      if (shownCount >= 8) continue;
-      shownCount++;
-
-      const label = m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`;
-      const changeText = [...m.realAdded, ...m.realRemoved].join(" ");
-      const kws = matchBusinessKeywords(changeText);
-      const kwTag = kws.length > 0 ? `含: ${kws.join("、")}` : "";
-      const noiseNote = m.totalNoise > 0 ? ` + ${m.totalNoise} 噪音已过滤` : "";
-      lines.push("");
-      lines.push(`**📝 ${label}** (${totalReal} 处实质变更${noiseNote}${kwTag ? "，" + kwTag : ""})`);
-      lines.push("```");
-      for (const s of m.realRemoved.slice(0, 8)) {
-        lines.push(`- ${s.length > 120 ? s.slice(0, 120) + "..." : s}`);
-      }
-      if (m.realRemoved.length > 8) lines.push(`  ... 还有 ${m.realRemoved.length - 8} 处移除`);
-      for (const s of m.realAdded.slice(0, 8)) {
-        lines.push(`+ ${s.length > 120 ? s.slice(0, 120) + "..." : s}`);
-      }
-      if (m.realAdded.length > 8) lines.push(`  ... 还有 ${m.realAdded.length - 8} 处新增`);
-      lines.push("```");
-    }
-
-    // ── 噪音汇总（一行带过） ──
+    // ── 构建产物汇总（一行带过） ──
     if (noiseOnlyFiles.length > 0) {
       const totalNoise = noiseOnlyFiles.reduce((s, f) => s + f.noise, 0);
-      lines.push(`\n🔇 构建噪音：${noiseOnlyFiles.length} 文件 ${totalNoise} 处变更（已过滤）`);
+      lines.push(`\n🔇 构建产物变化：${noiseOnlyFiles.length} 文件 ${totalNoise} 处字符串差异（已收敛，不作为业务文案变更推送）`);
     }
 
     // ── 新增/移除文件：全局字符串池对比 ──
-    // 避免 chunk 重组误报：只有全局维度真正新增/消失的业务字符串才算变更
     if (assetDiff.added.length > 0 || assetDiff.removed.length > 0) {
-      // 收集所有旧 chunk 和新 chunk 的全局字符串池
       const oldGlobalStrings = new Set();
       const newGlobalStrings = new Set();
       for (const data of Object.values(oldAssets || {})) {
@@ -3030,48 +2919,18 @@ function formatFrontendChanges(assetDiff, textDiff, pageLabel, oldAssets, newAss
       for (const data of Object.values(newAssets || {})) {
         for (const s of (data.strings || [])) newGlobalStrings.add(s);
       }
-      // 真正新增/消失的字符串（全局维度）
       const globallyAdded = [...newGlobalStrings].filter(s => !oldGlobalStrings.has(s) && !isNoiseString(s));
       const globallyRemoved = [...oldGlobalStrings].filter(s => !newGlobalStrings.has(s) && !isNoiseString(s));
 
-      // 分类业务 vs 非业务
-      const bizAdded = globallyAdded.filter(s => matchBusinessKeywords(s).length > 0);
-      const bizRemoved = globallyRemoved.filter(s => matchBusinessKeywords(s).length > 0);
-      const nonBizAdded = globallyAdded.length - bizAdded.length;
-      const nonBizRemoved = globallyRemoved.length - bizRemoved.length;
-
-      if (bizAdded.length > 0 || bizRemoved.length > 0) {
-        lines.push("");
-        lines.push("**🔍 全局业务字符串变更：**");
-        lines.push("```");
-        for (const s of bizRemoved.slice(0, 15)) {
-          const kws = matchBusinessKeywords(s);
-          lines.push(`- ${s.length > 100 ? s.slice(0, 100) + "..." : s}  (${kws.join("、")})`);
-        }
-        if (bizRemoved.length > 15) lines.push(`  ... 还有 ${bizRemoved.length - 15} 处移除`);
-        for (const s of bizAdded.slice(0, 15)) {
-          const kws = matchBusinessKeywords(s);
-          lines.push(`+ ${s.length > 100 ? s.slice(0, 100) + "..." : s}  (${kws.join("、")})`);
-        }
-        if (bizAdded.length > 15) lines.push(`  ... 还有 ${bizAdded.length - 15} 处新增`);
-        lines.push("```");
+      if (globallyAdded.length > 0 || globallyRemoved.length > 0) {
+        lines.push(`📊 全局资源字符串池：新增 ${globallyAdded.length} | 移除 ${globallyRemoved.length}（构建产物变化，已收敛）`);
       }
 
-      if (nonBizAdded > 0 || nonBizRemoved > 0) {
-        lines.push(`📊 非业务字符串：新增 ${nonBizAdded} | 移除 ${nonBizRemoved}（构建产物变更）`);
-      }
-
-      // 文件数量概览（不再逐个列出 chunk 名）
       if (assetDiff.added.length > 0 || assetDiff.removed.length > 0) {
         const fileParts = [];
         if (assetDiff.added.length > 0) fileParts.push(`新增 ${assetDiff.added.length} 文件`);
         if (assetDiff.removed.length > 0) fileParts.push(`移除 ${assetDiff.removed.length} 文件`);
-        // 只有全局无业务变更时才标注为 chunk 重组
-        if (bizAdded.length === 0 && bizRemoved.length === 0) {
-          lines.push(`📦 ${fileParts.join("、")}（chunk 重组，无业务影响，详见 diff 附件）`);
-        } else {
-          lines.push(`📦 ${fileParts.join("、")}（详见 diff 附件）`);
-        }
+        lines.push(`📦 ${fileParts.join("、")}（chunk 重组/构建产物变化，已收敛）`);
       }
     }
   }
@@ -3127,8 +2986,6 @@ function frontendSemanticChangeSignature({ assetSummary = null, businessSignalDi
   if (assetSummary && hasMeaningfulFrontendAssetChange(assetSummary)) {
     payload.asset = {
       configDiffs: assetSummary.configDiffs.map(({ field, oldVal, newVal }) => ({ field, oldVal, newVal })).sort((a, b) => a.field.localeCompare(b.field)),
-      added: assetSummary.readableAdded.map(x => x.text).sort(),
-      removed: assetSummary.readableRemoved.map(x => x.text).sort(),
     };
   }
   if (businessSignalDiff && ((businessSignalDiff.added || []).length || (businessSignalDiff.removed || []).length)) {
@@ -3265,14 +3122,9 @@ function mergeFrontendNotifications(notifications) {
 }
 
 /**
- * 构建完整 diff 详情文本（用于文件附件，不做任何省略）
- * 包含所有文件名、所有字符串变更、业务分类标注
+ * 构建完整 diff 详情文本（用于文件附件）
+ * 资产内容只展示结构化配置和汇总，页面文案/i18n/路由仍完整展示。
  */
-function filterAssetStringsForPage(strings, pageUrl) {
-  if (!pageUrl || isTaxOrCreateScopedRoute(pageUrl)) return strings || [];
-  return (strings || []).filter(s => !isTaxOrCreateScopedAssetString(s));
-}
-
 function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignalDiff, recoveredAssets, oldAssets, newAssets, pageUrl = "") {
   const lines = [];
   lines.push("=".repeat(60));
@@ -3292,54 +3144,44 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignal
     if (assetDiff.removed?.length) stats.push(`移除 ${assetDiff.removed.length}`);
     lines.push(`  统计: ${stats.join(" | ")}`);
 
-    // 修改文件：完整字符串 diff
+    // 修改文件：只输出结构化配置，压缩代码字符串统一收敛为统计。
     if (assetDiff.matched?.length > 0) {
       lines.push("");
       lines.push("--- 修改文件详情 ---");
       for (const m of assetDiff.matched) {
-        const removedStrings = filterAssetStringsForPage(m.removedStrings, pageUrl);
-        const addedStrings = filterAssetStringsForPage(m.addedStrings, pageUrl);
-        const totalChanges = addedStrings.length + removedStrings.length;
-        const suppressedChanges = (m.addedStrings.length + m.removedStrings.length) - totalChanges;
+        const totalChanges = (m.addedStrings?.length || 0) + (m.removedStrings?.length || 0);
         if (totalChanges === 0) continue;
         const fname = m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`;
-        const suffix = suppressedChanges > 0 ? `，已收敛 ${suppressedChanges} 处跨页面 tax/create 共享 chunk 噪声` : "";
+        const configDiffs = extractConfigDiffs(m.removedStrings || [], m.addedStrings || [])
+          .filter(cd => !(pageUrl && !isTaxOrCreateScopedRoute(pageUrl) && isTaxOrCreateScopedConfigField(cd.field)));
         lines.push("");
-        lines.push(`  [${fname}] (${totalChanges} 处字符串变更${suffix})`);
-        for (const s of removedStrings) {
-          lines.push(`    - ${s}`);
+        lines.push(`  [${fname}] (${totalChanges} 处资源字符串差异，已收敛为构建产物变化)`);
+        for (const cd of configDiffs.slice(0, 20)) {
+          lines.push(`    * ${cd.field}: ${frontendDisplaySnippet(cd.oldVal, 80)} -> ${frontendDisplaySnippet(cd.newVal, 80)}`);
         }
-        for (const s of addedStrings) {
-          lines.push(`    + ${s}`);
-        }
+        if (configDiffs.length > 20) lines.push(`    ... 还有 ${configDiffs.length - 20} 项结构化配置变化`);
       }
     }
 
-    // 新增文件：列出所有文件名 + strings 摘要
+    // 新增文件：只列文件名和字符串数量，不展开压缩内容。
     if (assetDiff.added?.length > 0) {
       lines.push("");
       lines.push("--- 新增文件 ---");
       for (const f of assetDiff.added) {
         const assetData = newAssets?.[f];
-        const strings = filterAssetStringsForPage(assetData?.strings || [], pageUrl);
-        const strCount = strings.length;
-        const sampleStrs = strings.slice(0, 5).join(" | ");
+        const strCount = (assetData?.strings || []).length;
         lines.push(`  + ${f}  (${strCount} 个字符串)`);
-        if (sampleStrs) lines.push(`    摘要: ${sampleStrs}`);
       }
     }
 
-    // 移除文件：列出所有文件名 + strings 摘要
+    // 移除文件：只列文件名和字符串数量，不展开压缩内容。
     if (assetDiff.removed?.length > 0) {
       lines.push("");
       lines.push("--- 移除文件 ---");
       for (const f of assetDiff.removed) {
         const assetData = oldAssets?.[f];
-        const strings = filterAssetStringsForPage(assetData?.strings || [], pageUrl);
-        const strCount = strings.length;
-        const sampleStrs = strings.slice(0, 5).join(" | ");
+        const strCount = (assetData?.strings || []).length;
         lines.push(`  - ${f}  (${strCount} 个字符串)`);
-        if (sampleStrs) lines.push(`    摘要: ${sampleStrs}`);
       }
     }
   }
@@ -6813,7 +6655,8 @@ async function runFrontendCheck() {
     }
 
     // ── 1.5 创建页关键业务指纹 diff（税收按钮/费率开关/创建表单配置）──
-    if (newData.createTokenSignals || oldData.createTokenSignals) {
+    const isCreateTokenPage = isCreateTokenFrontendUrl(newData.originalUrl);
+    if (isCreateTokenPage && (newData.createTokenSignals || oldData.createTokenSignals)) {
       businessSignalDiff = diffFrontendSignals(oldData.createTokenSignals, newData.createTokenSignals);
       const signalContent = formatFrontendSignalChanges(businessSignalDiff, "创建页重点文案/功能信号");
       if (signalContent) {
@@ -6821,11 +6664,15 @@ async function runFrontendCheck() {
         pageContentParts.push(signalContent);
         hasNonAssetChange = true;
       }
-    } else if (isCreateTokenFrontendUrl(newData.originalUrl) && newData.createTokenSignalHash) {
+    } else if (isCreateTokenPage && newData.createTokenSignalHash) {
       const signalContent = `**🔎 创建页重点文案/功能信号首次建立：** ${(newData.createTokenSignals || []).length} 项`;
       contentParts.push(signalContent);
       pageContentParts.push(signalContent);
       hasNonAssetChange = true;
+    } else if (!isCreateTokenPage && oldData.createTokenSignals) {
+      delete newData.createTokenSignals;
+      delete newData.createTokenSignalHash;
+      log(`[前端] ${urlLabel(newData.originalUrl)} 清理历史创建页业务指纹快照，不推送`);
     }
 
     // ── 2. i18n diff（优先展示，中文内容最具可读性）──
