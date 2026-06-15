@@ -12,6 +12,15 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
   assert.equal(__testables.CONFIG.apiProbeStaggerMs, 200);
 });
 
+test("startup card copy reflects active frontend and api cadences", () => {
+  const progress = __testables.buildStartupProgressContent();
+  const ready = __testables.buildStartupReadyContent();
+  assert.match(progress, /前端监控:[\s\S]*每 10s/);
+  assert.match(progress, /API监控:[\s\S]*每 15s/);
+  assert.match(ready, /前端监控:[\s\S]*每 10s/);
+  assert.match(ready, /API监控:[\s\S]*每 15s/);
+});
+
 test("canonicalFrontendUrl normalizes tracking params, hash, query order, and trailing slash", () => {
   assert.equal(
     __testables.canonicalFrontendUrl("https://four.meme/zh-TW/create-token/?b=2&utm_source=x&a=1#top"),

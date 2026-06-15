@@ -531,7 +531,8 @@ function saveSnapshot(data) {
 async function sendFeishu(title, content, template = "red", _retries = 2) {
   for (let attempt = 0; attempt <= _retries; attempt++) {
     try {
-      await sendCardQueued(title, content, template);
+      const messageId = await sendCardQueued(title, content, template);
+      if (!messageId) throw new Error("飞书队列发送返回空 message_id");
       return;
     } catch (err) {
       log(`飞书推送异常（第${attempt + 1}次）：${err.message}`);
@@ -563,6 +564,26 @@ async function sendCardViaApi(title, content, template = "red", diffFilePath, re
     }
   }
   return null;
+}
+
+async function sendStartupCard(title, content, template = "blue") {
+  let messageId = await sendCardViaApi(title, content, template, undefined, 2);
+  if (messageId) return messageId;
+  log(`[启动通知] 即时通道失败，切换队列兜底：${title}`);
+  messageId = await sendCardQueued(title, content, template);
+  if (!messageId) log(`[启动通知] 发送失败：${title}`);
+  return messageId;
+}
+
+async function patchStartupCard(messageId, title, content, template = "blue") {
+  if (!messageId) return false;
+  try {
+    await patchCardViaApi(messageId, title, content, template);
+    return true;
+  } catch (err) {
+    log(`[启动通知] 更新启动卡片失败：${err.message}`);
+    return false;
+  }
 }
 
 /**
@@ -7528,6 +7549,46 @@ async function sendDailyReport() {
   }
 }
 
+function buildStartupProgressContent() {
+  const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
+  return [
+    `**状态:** 进程已启动，正在建立/刷新首轮基线`,
+    `**前端监控:** 当前快照 ${pageCount} 个页面 — 每 ${CONFIG.intervals.frontend / 1000}s`,
+    `**API监控:** 每 ${CONFIG.intervals.api / 1000}s`,
+    `**提示:** 首轮检查完成后会更新本卡片为已启动状态`,
+  ].join("\n");
+}
+
+function buildStartupReadyContent() {
+  const poolCount = buildPoolMap(snapshot?.poolConfig).size;
+  const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
+  const entryPageCount = CONFIG.monitorUrls.length;
+  const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
+  const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
+  const openFourTemplateCount = Object.keys(snapshot?.openFourTemplates || {}).length;
+  const openFourModuleCount = Object.keys(snapshot?.openFourModules?.byAddress || {}).length;
+  const actorCount = snapshot?.chainActorMonitor?.actionActorCount
+    ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
+  return [
+    `**状态:** 首轮基线检查完成，定时器已启动`,
+    `**架构:** 独立定时器 + RPC Batch + 并行抓取`,
+    `**底池监控:** BSC ${poolCount} 个 — 每 ${CONFIG.intervals.pool / 1000}s`,
+    `**前端监控:** ${pageCount} 个页面（固定入口 ${entryPageCount}，路由发现页面纳入同一监控池）— 每 ${CONFIG.intervals.frontend / 1000}s`,
+    `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面同层纳入`,
+    `  HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)} / 资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)} / 资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
+    `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
+    `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
+    `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
+    `**OpenFour模块:** ${openFourModuleCount} 个实现地址 — Registry logs ${CONFIG.openFourRegistryLogMonitor.enabled ? "实时触发" : "关闭"}`,
+    `**GitHub:** ${CONFIG.githubOwner} 账号 ${githubRepoCount} 个仓库，主仓库 ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
+    `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
+    `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
+    `**创建者动作:** ${actorCount} 个地址 — WebSocket 新区块驱动 + 每 ${actorRunner?.intervalMs / 1000}s HTTP 兜底（只过滤交易发起地址 tx.from，命中后合约复查）`,
+    `**反风控:** UA轮换 + 按域名自适应退避 + 请求抖动`,
+    `**心跳:** ${CONFIG.heartbeatEnabled ? `每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送）` : "关闭"} | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
+  ].join("\n");
+}
+
 async function startAllModules() {
   log("Four.meme 全面监控 v2 启动中...");
   log("模块频率：");
@@ -7542,6 +7603,12 @@ async function startAllModules() {
     printPoolList(snapshot.poolConfig);
   }
 
+  const startupMessageId = await sendStartupCard(
+    "Four.meme 全面监控 v2 启动中",
+    buildStartupProgressContent(),
+    "blue"
+  );
+
   // 首次启动：所有模块依次执行一次（建立基线）
   for (const m of modules) {
     await m.run();
@@ -7555,36 +7622,16 @@ async function startAllModules() {
     }
   }
 
-  // 发送启动通知
-  const poolCount = buildPoolMap(snapshot?.poolConfig).size;
-  const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
-  const entryPageCount = CONFIG.monitorUrls.length;
-  const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
-  const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
-  const openFourTemplateCount = Object.keys(snapshot?.openFourTemplates || {}).length;
-  const openFourModuleCount = Object.keys(snapshot?.openFourModules?.byAddress || {}).length;
-  const actorCount = snapshot?.chainActorMonitor?.actionActorCount
-    ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
-  await sendFeishu("Four.meme 全面监控 v2 已启动",
-    [
-      `**架构:** 独立定时器 + RPC Batch + 并行抓取`,
-      `**底池监控:** BSC ${poolCount} 个 — 每 ${CONFIG.intervals.pool / 1000}s`,
-      `**前端监控:** ${pageCount} 个页面（固定入口 ${entryPageCount}，路由发现页面纳入同一监控池）— 每 ${CONFIG.intervals.frontend / 1000}s`,
-      `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面同层纳入`,
-      `  HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)} / 资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)} / 资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
-      `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
-      `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
-      `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
-      `**OpenFour模块:** ${openFourModuleCount} 个实现地址 — Registry logs ${CONFIG.openFourRegistryLogMonitor.enabled ? "实时触发" : "关闭"}`,
-      `**GitHub:** ${CONFIG.githubOwner} 账号 ${githubRepoCount} 个仓库，主仓库 ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
-      `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
-      `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
-      `**创建者动作:** ${actorCount} 个地址 — WebSocket 新区块驱动 + 每 ${actorRunner?.intervalMs / 1000}s HTTP 兜底（只过滤交易发起地址 tx.from，命中后合约复查）`,
-      `**反风控:** UA轮换 + 按域名自适应退避 + 请求抖动`,
-      `**心跳:** ${CONFIG.heartbeatEnabled ? `每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送）` : "关闭"} | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
-    ].join("\n"),
-    "blue"
+  const startupReadyContent = buildStartupReadyContent();
+  const startupPatched = await patchStartupCard(
+    startupMessageId,
+    "Four.meme 全面监控 v2 已启动",
+    startupReadyContent,
+    "green"
   );
+  if (!startupPatched) {
+    await sendStartupCard("Four.meme 全面监控 v2 已启动", startupReadyContent, "green");
+  }
 
   // WebSocket 新区块订阅只负责触发创建者动作检测；HTTP 定时器继续作为断线/漏事件兜底。
   if (actorRunner && CONFIG.actorMonitor.enabled) {
@@ -7822,6 +7869,8 @@ export const __testables = {
   diffRoutes,
   frontendAssetChangeSignature,
   classifyFetchFailure,
+  buildStartupProgressContent,
+  buildStartupReadyContent,
 };
 
 if (!IS_TEST_MODE) {
