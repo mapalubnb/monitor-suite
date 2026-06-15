@@ -280,26 +280,18 @@ if [ -f "$SNAP" ]; then
 
     // 模块 2：前端
     const canonicalFrontendUrl=(url)=>{try{const u=new URL(url,'https://four.meme');u.hash='';if(u.pathname!=='/'&&u.pathname.endsWith('/'))u.pathname=u.pathname.replace(/\/+$/,'');return u.origin+(u.pathname==='/'?'':u.pathname)+u.search}catch{return url}};
-    const baseFrontendUrls=[
-      'https://four.meme',
-      'https://four.meme/zh-TW/create-token',
-      'https://four.meme/zh-TW/agentic',
-      'https://four.meme/zh-TW/announcement'
-    ].map(canonicalFrontendUrl);
     const removedFrontendUrls=new Set([
       'https://four.meme/zh-TW/create-token?entry=X-mode',
       'https://four.meme/zh-TW/ja',
       'https://four.meme/zh-TW/vi'
     ].map(canonicalFrontendUrl));
-    const discovered=(s._frontendDiscoveredUrls||[]).map(canonicalFrontendUrl).filter(u=>!removedFrontendUrls.has(u));
-    const activeFrontendUrls=new Set([...baseFrontendUrls,...discovered]);
     const pageEntries=Object.entries(s.frontendPages||{}).filter(([k,p])=>{
       const url=p&&p.originalUrl?canonicalFrontendUrl(p.originalUrl):'';
-      return url&&!removedFrontendUrls.has(url)&&activeFrontendUrls.has(url);
+      return url&&!removedFrontendUrls.has(url);
     });
     console.log('');
     console.log('[ 模块2: 前端监控 ]');
-    console.log('  页面: '+pageEntries.length+' 个（基础 '+baseFrontendUrls.length+'，自动发现 '+discovered.length+' 个）');
+    console.log('  页面: '+pageEntries.length+' 个（统一监控池）');
     const assetFiles=pageEntries.reduce((sum,[,p])=>sum+(p.assetFiles||[]).length,0);
     const downloaded=pageEntries.reduce((sum,[,p])=>sum+Object.keys(p.assetContents||{}).length,0);
     const i18nTotal=pageEntries.reduce((sum,[,p])=>sum+Object.keys(p.i18nStrings||{}).length,0);
@@ -310,8 +302,7 @@ if [ -f "$SNAP" ]; then
       const dlCount=Object.keys(p.assetContents||{}).length;
       const text=(p.textContent||'').length;
       const i18n=p.i18nStrings?Object.keys(p.i18nStrings).length:0;
-      const mark=discovered.includes(canonicalFrontendUrl(url))?'自动发现':'基础';
-      console.log('  '+mdLink(url,url)+'  '+mark+' | JS/CSS '+files+'/'+dlCount+' | 文案 '+text+' | i18n '+i18n);
+      console.log('  '+mdLink(url,url)+' | JS/CSS '+files+'/'+dlCount+' | 文案 '+text+' | i18n '+i18n);
     }
 
     // 模块 3：API

@@ -76,13 +76,6 @@ const API_ENDPOINT_LINKS = {
   token_search_cap: { label: "/v1/public/token/search CAP", url: "https://four.meme/meme-api/v1/public/token/search" },
 };
 
-const BASE_FRONTEND_URLS = [
-  "https://four.meme",
-  "https://four.meme/zh-TW/create-token",
-  "https://four.meme/zh-TW/agentic",
-  "https://four.meme/zh-TW/announcement",
-];
-
 const REMOVED_FRONTEND_URLS = new Set([
   "https://four.meme/zh-TW/create-token?entry=X-mode",
   "https://four.meme/zh-TW/ja",
@@ -107,16 +100,11 @@ function canonicalFrontendUrl(url) {
 }
 
 function activeFrontendPageEntries(snap) {
-  const baseUrls = BASE_FRONTEND_URLS.map(canonicalFrontendUrl);
-  const discovered = (snap._frontendDiscoveredUrls || [])
-    .map(canonicalFrontendUrl)
-    .filter(url => !REMOVED_FRONTEND_URLS.has(url));
-  const activeUrls = new Set([...baseUrls, ...discovered]);
   const entries = Object.entries(snap.frontendPages || {}).filter(([, page]) => {
     const url = page?.originalUrl ? canonicalFrontendUrl(page.originalUrl) : "";
-    return url && !REMOVED_FRONTEND_URLS.has(url) && activeUrls.has(url);
+    return url && !REMOVED_FRONTEND_URLS.has(url);
   });
-  return { entries, discovered, baseCount: baseUrls.length };
+  return { entries };
 }
 
 const rateLimiter = { counts: new Map(), windowMs: 60_000, maxPerWindow: 20 };
@@ -330,9 +318,12 @@ function buildMonitorContext() {
       }
 
       // 前端
-      const { entries: pages, discovered, baseCount } = activeFrontendPageEntries(snap);
-      parts.push(`\n前端页面: ${pages.length} 个（基础 ${baseCount}，自动发现 ${discovered.length} 个）`);
-      for (const url of discovered) parts.push(`  自动发现: ${url}`);
+      const { entries: pages } = activeFrontendPageEntries(snap);
+      parts.push(`\n前端页面: ${pages.length} 个（统一监控池）`);
+      for (const [, page] of pages) {
+        const url = page?.originalUrl ? canonicalFrontendUrl(page.originalUrl) : "";
+        if (url) parts.push(`  ${url}`);
+      }
 
       // API
       const apis = Object.keys(snap.apiStructure || {});

@@ -34,7 +34,7 @@
 | 模块 | 监控内容 | 频率 |
 |------|---------|------|
 | 模块 1 | 底池配置（Pool Config） | 3s |
-| 模块 2 | 前端代码（基础页面 + 自动发现页面，含文案 diff、`__NEXT_DATA__`、i18n、路由/端点发现，同轮相同 JS/CSS 资源变更合并推送） | 15s |
+| 模块 2 | 前端代码（统一页面池，含文案 diff、`__NEXT_DATA__`、i18n、路由/端点发现，同轮相同前端变更合并推送） | 15s |
 | 模块 3 | API 结构（多端点并行，结构 + 值 diff，覆盖 public/blog/mapi 端点发现） | 30s |
 | 模块 4 | OpenFour 业务模板（新模板上线、模板状态变化，如 `PUBLISHED`） | 3s |
 | 模块 4b | OpenFour Registry 新模块发现（链上 logs 触发，发现新的 module/token implementation 地址） | 实时触发 |
@@ -51,8 +51,8 @@
 
 ### Four.meme 前端/API 覆盖策略
 
-- 基础监控页面：`/zh-TW/create-token`、`/zh-TW/agentic`、`/zh-TW/announcement`、`/zh-TW/contract*`、`/en/contract*`
-- 自动从 HTML、`__NEXT_DATA__`、JS 资源字符串中发现新页面，并在同一轮纳入监控
+- 固定入口页面与路由发现页面都进入同一个前端监控池，不再区分基础/自动发现层级
+- 自动从 HTML、`__NEXT_DATA__`、JS 资源字符串中发现新页面，并在同一轮同层纳入监控
 - 首页、语言根路径、ranking 页面和动态项目页（如 `/`、`/en`、`/zh-TW`、`/en/ranking`、`/zh-TW/ranking`、`/token/0x...`、`/presale/数字`、`/competition/项目ID`）不纳入页面发现，避免新增代币/预售/竞赛项目刷屏
 - 路由/端点发现覆盖 `/api/`、`/meme-api/`、`/mapi/`、`/v1/`、`/blog/v1/` 和站内完整 URL
 - 纯资源列表小抖动会在同一轮 2.5 秒后快速复抓确认；真实变化立即推送，短暂恢复则静默忽略

@@ -3122,6 +3122,46 @@ function frontendAssetChangeSignature(assetDiff, oldAssets, newAssets) {
   }));
 }
 
+function frontendSemanticChangeSignature({ assetSummary = null, businessSignalDiff = null, i18nChanges = null, textDiff = null, routeDiff = null } = {}) {
+  const payload = {};
+  if (assetSummary && hasMeaningfulFrontendAssetChange(assetSummary)) {
+    payload.asset = {
+      configDiffs: assetSummary.configDiffs.map(({ field, oldVal, newVal }) => ({ field, oldVal, newVal })).sort((a, b) => a.field.localeCompare(b.field)),
+      added: assetSummary.readableAdded.map(x => x.text).sort(),
+      removed: assetSummary.readableRemoved.map(x => x.text).sort(),
+    };
+  }
+  if (businessSignalDiff && ((businessSignalDiff.added || []).length || (businessSignalDiff.removed || []).length)) {
+    payload.signals = {
+      added: [...(businessSignalDiff.added || [])].sort(),
+      removed: [...(businessSignalDiff.removed || [])].sort(),
+    };
+  }
+  if (i18nChanges?.length) {
+    payload.i18n = i18nChanges.map(c => ({
+      type: c.type,
+      key: c.key,
+      oldValue: c.oldValue ?? c.value ?? "",
+      newValue: c.newValue ?? c.value ?? "",
+    })).sort((a, b) => `${a.type}:${a.key}`.localeCompare(`${b.type}:${b.key}`));
+  }
+  if (textDiff && !textDiff.reordered && textDiff.changes?.length) {
+    payload.text = textDiff.changes.map(c => ({
+      type: c.type,
+      text: c.text || "",
+      oldText: c.oldText || "",
+      newText: c.newText || "",
+    }));
+  }
+  if (routeDiff && ((routeDiff.added || []).length || (routeDiff.removed || []).length)) {
+    payload.routes = {
+      added: [...(routeDiff.added || [])].sort(),
+      removed: [...(routeDiff.removed || [])].sort(),
+    };
+  }
+  return Object.keys(payload).length ? md5(JSON.stringify(payload)) : "";
+}
+
 function compactFrontendUrlList(pages) {
   const seen = new Set();
   const result = [];
@@ -3140,7 +3180,7 @@ function buildMergedFrontendAssetNotification(group) {
   const pages = compactFrontendUrlList(group.pages);
   const pageCount = pages.length;
   const title = pageCount > 1
-    ? `前端资源变更（影响 ${pageCount} 页）`
+    ? `前端变更（影响 ${pageCount} 页）`
     : `前端变更：${pages[0]?.label || "未知页面"}`;
   const lines = [];
   if (pageCount > 1) {
@@ -6733,6 +6773,7 @@ async function runFrontendCheck() {
     let hasNonAssetChange = false;
     let cachedAssetDiff = null; // 缓存资源 diff 结果，避免重复计算
     let businessSignalDiff = null;
+    let i18nChanges = null;
     let i18nChanged = false;
     let routeChanged = false;
 
@@ -6761,21 +6802,13 @@ async function runFrontendCheck() {
           }
         }
       } else {
-        // 降级 fallback：仅基于文件列表 diff（类似 Flap 的 fallback）
+        // 内容不完整时不推送文件列表 diff，避免 CDN/风控/短暂下载失败造成 chunk 噪声反复报警。
         const oldSet = new Set(oldData.assetFiles || []);
         const newSet = new Set(newData.assetFiles || []);
         const added = [...newSet].filter(f => !oldSet.has(f));
         const removed = [...oldSet].filter(f => !newSet.has(f));
         cachedAssetDiff = { matched: [], added, removed, unchanged: 0, renamed: 0 };
-        const lines = ["**📦 前端代码（JS/CSS 资源）更新**"];
-        if (added.length > 0) lines.push(`  🟢 新增：${added.slice(0, 10).map(f => f.split("/").pop()).join(", ")}${added.length > 10 ? ` ... 等 ${added.length} 个` : ""}`);
-        if (removed.length > 0) lines.push(`  🔴 移除：${removed.slice(0, 10).map(f => f.split("/").pop()).join(", ")}${removed.length > 10 ? ` ... 等 ${removed.length} 个` : ""}`);
-        if (!hasOldContents || !hasNewContents) {
-          lines.push(`  ⚠️ 资源内容下载不完整，仅展示文件列表变更`);
-        }
-        const assetContent = lines.join("\n");
-        contentParts.push(assetContent);
-        assetContentParts.push(assetContent);
+        log(`[前端] ${urlLabel(newData.originalUrl)} 资源内容下载不完整，已跳过文件列表变更推送（新增 ${added.length}，移除 ${removed.length}）`);
       }
     }
 
@@ -6797,7 +6830,7 @@ async function runFrontendCheck() {
 
     // ── 2. i18n diff（优先展示，中文内容最具可读性）──
     if (oldData.i18nHash && newData.i18nHash && oldData.i18nHash !== newData.i18nHash) {
-      const i18nChanges = diffI18nStrings(oldData.i18nStrings, newData.i18nStrings);
+      i18nChanges = diffI18nStrings(oldData.i18nStrings, newData.i18nStrings);
       const i18nFormatted = formatI18nChanges(i18nChanges);
       if (i18nFormatted) {
         contentParts.push(i18nFormatted);
@@ -6907,12 +6940,7 @@ async function runFrontendCheck() {
       // 构建详细 diff 文件（复用已计算的 assetDiff）
       const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, businessSignalDiff, [], oldData.assetContents, newData.assetContents, newData.originalUrl);
       const assetSummary = cachedAssetDiff ? analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents, newData.originalUrl) : null;
-      const summarySignature = assetSummary ? md5(JSON.stringify({
-        configDiffs: assetSummary.configDiffs,
-        added: assetSummary.readableAdded.map(x => x.text).sort(),
-        removed: assetSummary.readableRemoved.map(x => x.text).sort(),
-        files: assetSummary.fileOnlyChanges,
-      })) : "";
+      const semanticSignature = frontendSemanticChangeSignature({ assetSummary, businessSignalDiff, i18nChanges, textDiff, routeDiff });
       const contentV2 = [
         `**页面：${label}**`,
         `URL: ${newData.originalUrl}`,
@@ -6927,7 +6955,7 @@ async function runFrontendCheck() {
         fullDiff,
         url: newData.originalUrl,
         pageLabel: label,
-        assetSignature: summarySignature || frontendAssetChangeSignature(cachedAssetDiff, oldData.assetContents, newData.assetContents),
+        assetSignature: semanticSignature || frontendAssetChangeSignature(cachedAssetDiff, oldData.assetContents, newData.assetContents),
         assetContent: assetContentParts.join("\n\n"),
         pageContent: pageContentParts.join("\n\n"),
       });
