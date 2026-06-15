@@ -59,6 +59,28 @@ test("extractI18nFromStreamingHtml parses resources with braces inside strings",
   assert.equal(result.i18nStrings["common.key0"], "值 0 {keep}");
 });
 
+test("extractI18nFromStreamingHtml does not truncate push payloads containing closing brackets in strings", () => {
+  const resources = {
+    common: Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`key${i}`, `value ${i} ] keep`]))
+  };
+  const payload = [1, `x\\"resources\\":${JSON.stringify(resources)} y`];
+  const html = `<script>self.__next_f.push(${JSON.stringify(payload)})</script>`;
+  const result = __testables.extractI18nFromStreamingHtml(html);
+  assert.ok(result);
+  assert.equal(result.i18nStrings["common.key0"], "value 0 ] keep");
+});
+
+test("failed discovered frontend URLs are suppressed during cooldown", () => {
+  const route = `/codex-suppressed-${Date.now()}`;
+  const url = `https://four.meme/zh-TW${route}`;
+  assert.equal(__testables.recordFailedDiscoveredFrontendUrls([url], [{ url, reason: "http_404", message: "HTTP 404 Not Found", status: 404 }]), true);
+  assert.equal(__testables.isSuppressedDiscoveredFrontendUrl(url), true);
+  const discovered = __testables.discoverFrontendUrlsFromPages({
+    page: { routes: [route] }
+  }, []);
+  assert.deepEqual(discovered, []);
+});
+
 test("diffRoutes suppresses small remove-only SSR jitter", () => {
   const diff = __testables.diffRoutes(["/zh-TW/create-token", "/zh-TW/advanced"], ["/zh-TW/create-token"]);
   assert.deepEqual(diff, { added: [], removed: [] });

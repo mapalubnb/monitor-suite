@@ -1320,6 +1320,43 @@ function routeToFrontendUrl(route) {
   return isDiscoverableFrontendUrl(candidate) ? candidate : null;
 }
 
+function isSuppressedDiscoveredFrontendUrl(url) {
+  const canonical = canonicalFrontendUrl(url);
+  const state = snapshot?._frontendDiscoveredHistory?.[canonical];
+  if (!state?.failedDiscoveryAt) return false;
+  const cooldownMs = readPositiveIntEnv("FOURMEME_FRONTEND_DISCOVERY_FAIL_COOLDOWN_MINUTES", 360) * 60_000;
+  return Date.now() - state.failedDiscoveryAt < cooldownMs;
+}
+
+function recordFailedDiscoveredFrontendUrls(failedUrls = [], failedDetails = []) {
+  if (!failedUrls.length) return false;
+  if (!snapshot) snapshot = {};
+  if (!snapshot._frontendDiscoveredHistory) snapshot._frontendDiscoveredHistory = {};
+  const detailByUrl = new Map(
+    (failedDetails || [])
+      .filter(item => item?.url)
+      .map(item => [canonicalFrontendUrl(item.url), item])
+  );
+  const now = Date.now();
+  let changed = false;
+  for (const url of failedUrls) {
+    const canonical = canonicalFrontendUrl(url);
+    if (!canonical) continue;
+    const prev = snapshot._frontendDiscoveredHistory[canonical] || {};
+    const detail = detailByUrl.get(canonical) || {};
+    snapshot._frontendDiscoveredHistory[canonical] = {
+      ...prev,
+      failedDiscoveryAt: now,
+      failedDiscoveryCount: (prev.failedDiscoveryCount || 0) + 1,
+      lastFailureReason: detail.reason || prev.lastFailureReason || "error",
+      lastFailureMessage: detail.message || prev.lastFailureMessage || "",
+      lastFailureStatus: detail.status || detail.statusCode || prev.lastFailureStatus || "",
+    };
+    changed = true;
+  }
+  return changed;
+}
+
 function discoverFrontendUrlsFromPages(pages, knownUrls = []) {
   const known = new Set(knownUrls.map(canonicalFrontendUrl));
   const discovered = [];
@@ -1327,6 +1364,10 @@ function discoverFrontendUrlsFromPages(pages, knownUrls = []) {
     for (const route of page.routes || []) {
       const url = routeToFrontendUrl(route);
       if (!url || known.has(url)) continue;
+      if (isSuppressedDiscoveredFrontendUrl(url)) {
+        known.add(url);
+        continue;
+      }
       known.add(url);
       discovered.push(url);
       if (discovered.length >= CONFIG.frontendDiscovery.maxDiscoveredPages) return discovered;
@@ -2144,63 +2185,122 @@ function _parseRawI18nString(raw) {
   }
 }
 
+const i18nParseLogState = new Map();
+
 /**
  * 从 Next.js streaming HTML 中提取 i18n 翻译（适配 four.meme App Router 架构）
  * 匹配 self.__next_f.push 中的 "resources":{"common":{...},...} 结构
  * 返回 { i18nStrings: {flatKey: value}, i18nHash: string } 或 null
  */
 function extractI18nFromStreamingHtml(html) {
-  const pushPattern = /self\.__next_f\.push\((\[[\s\S]*?\])\)/g;
-  const chunks = [];
-  let m;
-  while ((m = pushPattern.exec(html)) !== null) {
+  const chunks = extractNextFlightPushPayloads(html);
+  const candidates = [];
+  for (const payload of chunks) {
     try {
-      const parsed = JSON.parse(m[1]);
+      const parsed = JSON.parse(payload);
       for (const item of parsed) {
-        if (typeof item === "string" && item.includes("resources")) chunks.push(item);
+        if (typeof item === "string" && item.includes("resources")) candidates.push(item);
       }
     } catch {
-      const raw = m[1];
-      if (raw.includes('\\"resources\\"') || raw.includes('"resources"')) chunks.push(raw);
+      if (payload.includes('\\"resources\\"') || payload.includes('"resources"')) candidates.push(payload);
     }
   }
-  let combinedData = chunks.join("");
-  if (!combinedData) return null;
+  if (candidates.length === 0) return null;
 
-  const unescaped = decodeJsStringFragment(combinedData);
+  for (const rawCandidate of candidates) {
+    const result = parseI18nResourcesCandidate(rawCandidate);
+    if (result) return result;
+  }
 
-  // 提取 "resources":{...} 对象
-  const resIdx = unescaped.indexOf('"resources":{');
-  if (resIdx === -1) return null;
+  // Last-resort fallback: combine chunks, but do not let one truncated chunk spam logs.
+  return parseI18nResourcesCandidate(candidates.join(""), { logFailure: true });
+}
 
-  // 从 "resources":{ 开始找到匹配的 } 闭合
-  const objStart = resIdx + '"resources":'.length;
-  const objEnd = findJsonObjectEnd(unescaped, objStart);
-  if (objEnd <= objStart) return null;
+function extractNextFlightPushPayloads(html) {
+  const text = String(html || "");
+  const marker = "self.__next_f.push(";
+  const payloads = [];
+  let searchFrom = 0;
+  while (true) {
+    const markerIdx = text.indexOf(marker, searchFrom);
+    if (markerIdx === -1) break;
+    const start = markerIdx + marker.length;
+    const end = findBalancedExpressionEnd(text, start, "(", ")");
+    if (end > start) payloads.push(text.slice(start, end));
+    searchFrom = (end > start ? end : start) + 1;
+  }
+  return payloads;
+}
 
-  const resourcesJson = unescaped.slice(objStart, objEnd);
-  try {
-    // 防御：将可能残留的控制字符重新转义为 JSON 合法形式
-    const sanitized = resourcesJson.replace(/[\x00-\x1f]/g, (ch) => {
-      const map = {'\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f'};
-      return map[ch] || `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
-    });
-    const resources = JSON.parse(sanitized);
-    // resources 结构：{ common: {...}, detail: {...}, create: {...}, ... }
-    // 展平所有 namespace
-    const allStrings = {};
-    for (const [namespace, content] of Object.entries(resources)) {
-      if (typeof content === "object" && content !== null) {
-        const flat = flattenI18n(content, namespace);
-        Object.assign(allStrings, flat);
+function findBalancedExpressionEnd(text, start, open = "(", close = ")") {
+  let depth = 1;
+  let quote = "";
+  let escaped = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = "";
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === open) depth++;
+    else if (ch === close) {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+function parseI18nResourcesCandidate(rawCandidate, { logFailure = false } = {}) {
+  const unescaped = decodeJsStringFragment(rawCandidate);
+  let searchFrom = 0;
+  while (true) {
+    const resIdx = unescaped.indexOf('"resources":{', searchFrom);
+    if (resIdx === -1) return null;
+    const objStart = resIdx + '"resources":'.length;
+    const objEnd = findJsonObjectEnd(unescaped, objStart);
+    if (objEnd <= objStart) {
+      searchFrom = objStart + 1;
+      continue;
+    }
+    const resourcesJson = unescaped.slice(objStart, objEnd);
+    try {
+      const sanitized = resourcesJson.replace(/[\x00-\x1f]/g, (ch) => {
+        const map = {'\n': '\\n', '\r': '\\r', '\t': '\\t', '\b': '\\b', '\f': '\\f'};
+        return map[ch] || `\\u${ch.charCodeAt(0).toString(16).padStart(4, '0')}`;
+      });
+      const resources = JSON.parse(sanitized);
+      const allStrings = {};
+      for (const [namespace, content] of Object.entries(resources)) {
+        if (typeof content === "object" && content !== null) {
+          Object.assign(allStrings, flattenI18n(content, namespace));
+        }
       }
+      if (Object.keys(allStrings).length < 20) return null;
+      return { i18nStrings: allStrings, i18nHash: stableI18nHash(allStrings) };
+    } catch (err) {
+      if (logFailure) logI18nParseFailure(err, resourcesJson);
+      searchFrom = objEnd;
     }
-    if (Object.keys(allStrings).length < 20) return null;
-    return { i18nStrings: allStrings, i18nHash: stableI18nHash(allStrings) };
-  } catch (err) {
-    log(`  [i18n] streaming 解析失败：${err.message}`);
-    return null;
   }
+}
+
+function logI18nParseFailure(err, sample) {
+  const key = md5(`${err.message}:${String(sample || "").slice(0, 256)}`);
+  const state = i18nParseLogState.get(key) || { count: 0, lastLogAt: 0 };
+  state.count++;
+  const now = Date.now();
+  if (state.count === 1 || now - state.lastLogAt > 300_000) {
+    log(`  [i18n] streaming 解析失败（同类第 ${state.count} 次）：${err.message}`);
+    state.lastLogAt = now;
+  }
+  i18nParseLogState.set(key, state);
 }
 
 function decodeJsStringFragment(raw) {
@@ -2790,6 +2890,9 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
     }
     if (extra.failedUrls.length > 0) {
       log(`[前端] 路由发现候选页抓取失败，未纳入监控：${extra.failedUrls.map(urlLabel).join(", ")}`);
+      if (recordFailedDiscoveredFrontendUrls(extra.failedUrls, extra.failedDetails || [])) {
+        result.discoveryHistoryChanged = true;
+      }
     }
     result.failedDetails = [...(result.failedDetails || []), ...(extra.failedDetails || [])];
     allDiscoveredUrls.push(...discoveredUrls.filter(url => extra.pages[urlToKey(url)]));
@@ -6931,7 +7034,7 @@ async function runFrontendCheck() {
   frontendMetrics.lastRunAt = Date.now();
   const prunedBeforeRun = pruneFrontendSnapshot(snapshot);
   const oldPages = snapshot.frontendPages || {};
-  const { pages: newPages, failedUrls, failedDetails = [] } = await fetchFrontendDataWithDiscovery(oldPages);
+  const { pages: newPages, failedUrls, failedDetails = [], discoveryHistoryChanged = false } = await fetchFrontendDataWithDiscovery(oldPages);
   frontendMetrics.success = Object.keys(newPages).length;
   frontendMetrics.failed = failedUrls.length;
 
@@ -6994,7 +7097,7 @@ async function runFrontendCheck() {
   }
 
   const notifications = [];
-  let snapshotDirty = prunedBeforeRun;
+  let snapshotDirty = prunedBeforeRun || discoveryHistoryChanged;
 
   // 连续 3 次抓取失败的页面发送告警（每 3 的倍数重复提醒）
   const FAIL_THRESHOLD = 3;
@@ -7873,6 +7976,9 @@ export const __testables = {
   canonicalFrontendUrl,
   isConfiguredFrontendUrl,
   isDiscoverableFrontendUrl,
+  isSuppressedDiscoveredFrontendUrl,
+  recordFailedDiscoveredFrontendUrls,
+  discoverFrontendUrlsFromPages,
   extractTextContent,
   extractHrefRoutesFromHtml,
   extractNextData,
