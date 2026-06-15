@@ -11,7 +11,7 @@
  *   模块1: 底池配置   — 每 3s（纯 API，轻量，退避保护）
  *   模块2: 前端代码   — 每 15s（基础页面 + 自动发现页面，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
  *   模块3: API 结构    — 每 30s（多端点并行，含结构+值 diff）
- *   模块4: OpenFour模板 — 每 30s（新增模板 / 状态变化）
+ *   模块4: OpenFour模板 — 每 3s（新增模板 / 状态变化）
  *   模块5: GitHub     — 有 token 每 30s / 无 token 每 90s（账号仓库列表每 5min）
  *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 3s（RPC batch，单次请求）
@@ -106,8 +106,8 @@ const CONFIG = {
   intervals: {
     pool:     3_000,   // 模块1: 底池配置（3s，退避机制自动保护源站）
     frontend: 15_000,  // 模块2: 前端代码（15s，assetHash 缓存避免无变化时重复下载）
-    api:      30_000,  // 模块3/5: API 结构（30s，降低同域并发压力）
-    openfourTemplates: readClampedSecondsEnv("OPENFOUR_TEMPLATE_INTERVAL_SECONDS", 30, 30),
+    api:      30_000,  // 模块3: API 结构（30s，降低同域并发压力）
+    openfourTemplates: readClampedSecondsEnv("OPENFOUR_TEMPLATE_INTERVAL_SECONDS", 3, 3),
     github:   readClampedSecondsEnv("GITHUB_INTERVAL_SECONDS", GITHUB_INTERVAL_FALLBACK_SECONDS, GITHUB_INTERVAL_MIN_SECONDS),
     contract: 3_000,   // 模块6: 智能合约
     onchain:  3_000,   // 模块7: 链上参数
@@ -270,6 +270,10 @@ const CONFIG = {
     explorerApiKey: process.env.ETHERSCAN_V2_API_KEY || process.env.ETHERSCAN_API_KEY || process.env.BSCSCAN_API_KEY || "",
     explorerApiBase: process.env.ETHERSCAN_API_BASE || "https://api.etherscan.io/v2/api",
     explorerPageBase: (process.env.BSCSCAN_WEB_BASE || "https://bscscan.com").replace(/\/+$/, ""),
+  },
+  openFourRegistryLogMonitor: {
+    enabled: readBoolEnv("OPENFOUR_REGISTRY_LOG_MONITOR", true),
+    discoveryDebounceMs: readPositiveIntEnv("OPENFOUR_REGISTRY_DISCOVERY_DEBOUNCE_MS", 3_000),
   },
 };
 
@@ -901,6 +905,22 @@ function decodeUint256(hex, offset = 0) {
 function decodeAddress(hex, offset = 0) {
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
   return "0x" + clean.slice(offset * 64 + 24, offset * 64 + 64);
+}
+function decodeUintArray(hex) {
+  if (!hex || hex === "0x") return [];
+  const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
+  if (clean.length < 128) return [];
+  const offset = Number(BigInt("0x" + clean.slice(0, 64)));
+  const lengthStart = offset * 2;
+  if (clean.length < lengthStart + 64) return [];
+  const length = Number(BigInt("0x" + clean.slice(lengthStart, lengthStart + 64)));
+  const values = [];
+  for (let i = 0; i < length; i++) {
+    const start = lengthStart + 64 + i * 64;
+    const chunk = clean.slice(start, start + 64);
+    if (chunk.length === 64) values.push(BigInt("0x" + chunk).toString());
+  }
+  return values;
 }
 
 const SEL = {
@@ -3605,6 +3625,194 @@ async function runOpenFourTemplateCheck() {
   }
 }
 
+/* ── OpenFour Registry 日志触发的新模块发现 ── */
+
+const OPEN_FOUR_REGISTRY_SELECTORS = {
+  getPresetIdsCount: "0x40f985a9",
+  getPresetIdsByBatch: "0x35a9d950",
+  resolvePresetImplementations: "0x6c512d72",
+  getPresetTokenImpl: "0x07632308",
+};
+
+const OPEN_FOUR_MODULE_ROLES = [
+  "tokenModule",
+  "vaultModule",
+  "curveModule",
+  "tradeModule",
+  "migrateModule",
+  "customDataModule",
+];
+
+function openFourRegistryCallData(selector, ...uintArgs) {
+  return selector + uintArgs.map(arg => encodeUint256(arg)).join("");
+}
+
+function nonZeroAddress(addr) {
+  const normalized = normalizeAddress(addr);
+  return normalized && normalized !== ZERO_ADDRESS ? normalized : "";
+}
+
+async function fetchOpenFourPresetIds() {
+  const registry = normalizeAddress(CONFIG.contracts.openFourRegistry);
+  if (!registry) return [];
+  const [countHex] = await bscRpcBatch([{
+    method: "eth_call",
+    params: [{ to: registry, data: OPEN_FOUR_REGISTRY_SELECTORS.getPresetIdsCount }, "latest"],
+  }]);
+  const count = Number(decodeUint256(countHex || "0x0"));
+  if (!Number.isFinite(count) || count <= 0) return [];
+
+  const calls = [];
+  const batchSize = 50;
+  for (let index = 0; index < count; index += batchSize) {
+    calls.push({
+      method: "eth_call",
+      params: [{
+        to: registry,
+        data: openFourRegistryCallData(
+          OPEN_FOUR_REGISTRY_SELECTORS.getPresetIdsByBatch,
+          index,
+          Math.min(batchSize, count - index)
+        ),
+      }, "latest"],
+    });
+  }
+  const results = await bscRpcBatch(calls);
+  return [...new Set(results.flatMap(r => decodeUintArray(r || "0x")))].sort((a, b) => {
+    const ai = BigInt(a), bi = BigInt(b);
+    return ai < bi ? -1 : ai > bi ? 1 : 0;
+  });
+}
+
+function addOpenFourModuleEntry(map, address, role, presetId) {
+  const addr = nonZeroAddress(address);
+  if (!addr) return;
+  if (!map[addr]) map[addr] = { address: addr, roles: [], presetIds: [] };
+  if (!map[addr].roles.includes(role)) map[addr].roles.push(role);
+  const preset = String(presetId);
+  if (!map[addr].presetIds.includes(preset)) map[addr].presetIds.push(preset);
+}
+
+function decodeOpenFourResolvedModules(hex) {
+  if (!hex || hex === "0x") return {};
+  const out = {};
+  for (let i = 0; i < OPEN_FOUR_MODULE_ROLES.length; i++) {
+    const addr = nonZeroAddress(decodeAddress(hex, i + 1));
+    if (addr) out[OPEN_FOUR_MODULE_ROLES[i]] = addr;
+  }
+  return out;
+}
+
+async function fetchOpenFourDiscoveredModules() {
+  const registry = normalizeAddress(CONFIG.contracts.openFourRegistry);
+  const presetIds = await fetchOpenFourPresetIds();
+  const byAddress = {};
+  if (!registry || presetIds.length === 0) {
+    return { registry, presetIds, byAddress };
+  }
+
+  const calls = [];
+  const callMeta = [];
+  for (const presetId of presetIds) {
+    calls.push({
+      method: "eth_call",
+      params: [{ to: registry, data: openFourRegistryCallData(OPEN_FOUR_REGISTRY_SELECTORS.resolvePresetImplementations, presetId) }, "latest"],
+    });
+    callMeta.push({ presetId, type: "modules" });
+    calls.push({
+      method: "eth_call",
+      params: [{ to: registry, data: openFourRegistryCallData(OPEN_FOUR_REGISTRY_SELECTORS.getPresetTokenImpl, presetId) }, "latest"],
+    });
+    callMeta.push({ presetId, type: "tokenImpl" });
+  }
+
+  const results = await bscRpcBatch(calls);
+  for (let i = 0; i < results.length; i++) {
+    const hex = results[i];
+    if (!hex) continue;
+    const meta = callMeta[i];
+    if (meta.type === "tokenImpl") {
+      addOpenFourModuleEntry(byAddress, decodeAddress(hex, 0), "tokenImpl", meta.presetId);
+      continue;
+    }
+    const modules = decodeOpenFourResolvedModules(hex);
+    for (const [role, address] of Object.entries(modules)) {
+      addOpenFourModuleEntry(byAddress, address, role, meta.presetId);
+    }
+  }
+
+  for (const item of Object.values(byAddress)) {
+    item.roles.sort();
+    item.presetIds.sort((a, b) => {
+      const ai = BigInt(a), bi = BigInt(b);
+      return ai < bi ? -1 : ai > bi ? 1 : 0;
+    });
+  }
+
+  return { registry, presetIds, byAddress };
+}
+
+function diffOpenFourModules(oldState, newState) {
+  const oldMap = oldState?.byAddress || {};
+  const newModules = [];
+  for (const [address, item] of Object.entries(newState.byAddress || {})) {
+    if (!oldMap[address]) newModules.push(item);
+  }
+  return newModules.sort((a, b) => a.address.localeCompare(b.address));
+}
+
+function formatOpenFourNewModules(newModules, context = {}) {
+  const lines = [];
+  lines.push(`**Registry：** [${CONFIG.contracts.openFourRegistry}](https://bscscan.com/address/${CONFIG.contracts.openFourRegistry})`);
+  lines.push(`**新增模块实现：** ${newModules.length} 个`);
+  if (context.reason) lines.push(`**触发：** ${context.reason}`);
+  if (context.blockNumber) lines.push(`**区块：** [${context.blockNumber}](https://bscscan.com/block/${context.blockNumber})`);
+  if (context.txHash) lines.push(`**交易：** [${context.txHash.slice(0, 10)}...](https://bscscan.com/tx/${context.txHash})`);
+  lines.push("---");
+
+  for (const item of newModules) {
+    lines.push(`**${item.address}**`);
+    lines.push("```");
+    lines.push(`roles: ${item.roles.join(", ") || "unknown"}`);
+    lines.push(`presetIds: ${item.presetIds.join(", ") || "unknown"}`);
+    lines.push("```");
+    lines.push(`[BscScan](https://bscscan.com/address/${item.address})`);
+    lines.push("---");
+  }
+
+  return lines.join("\n");
+}
+
+async function runOpenFourModuleDiscoveryCheck(context = {}) {
+  const discovered = await fetchOpenFourDiscoveredModules();
+  if (!snapshot) snapshot = {};
+  const oldState = snapshot.openFourModules || null;
+  const newModules = oldState ? diffOpenFourModules(oldState, discovered) : [];
+  snapshot.openFourModules = {
+    registry: discovered.registry,
+    presetIds: discovered.presetIds,
+    byAddress: discovered.byAddress,
+    lastPollAt: new Date().toISOString(),
+  };
+
+  if (!oldState) {
+    await saveSnapshot(snapshot);
+    log(`[OpenFour模块] 首次记录：${Object.keys(discovered.byAddress).length} 个模块实现，${discovered.presetIds.length} 个 preset`);
+    return;
+  }
+
+  if (newModules.length > 0) {
+    log(`[OpenFour模块] 发现 ${newModules.length} 个新模块实现`);
+    const title = `OpenFour 新模块发现（${newModules.length}个）`;
+    const content = formatOpenFourNewModules(newModules, context);
+    await saveSnapshot(snapshot);
+    appendHistory("openfour", title, content.slice(0, 300), content);
+    await sendThenEnrichWithAi(title, content, "orange", "Four.meme OpenFour Registry 新模块发现", undefined, undefined, undefined, `https://bscscan.com/address/${CONFIG.contracts.openFourRegistry}`);
+  } else {
+    await saveSnapshot(snapshot);
+  }
+}
+
 const GITHUB_API = "https://api.github.com";
 // githubETag 从 snapshot 恢复，避免重启后浪费 rate limit
 let githubETag = "";
@@ -5199,6 +5407,149 @@ function formatActorActions(actions) {
   return lines.join("\n");
 }
 
+const openFourRegistryLogState = {
+  enabled: CONFIG.openFourRegistryLogMonitor.enabled,
+  connected: false,
+  urlIndex: 0,
+  reconnectAttempts: 0,
+  lastLogAt: 0,
+  lastLogBlock: 0,
+  lastTxHash: "",
+  lastError: "",
+  subscriptionId: "",
+  ws: null,
+  reconnectTimer: null,
+  discoveryTimer: null,
+  discoveryRunning: false,
+  pendingContext: null,
+  stopping: false,
+};
+
+function scheduleOpenFourRegistryReconnect(reason) {
+  if (openFourRegistryLogState.stopping || !openFourRegistryLogState.enabled) return;
+  if (openFourRegistryLogState.reconnectTimer) return;
+  const delay = Math.min(60_000, 2_000 * Math.max(1, ++openFourRegistryLogState.reconnectAttempts));
+  openFourRegistryLogState.lastError = reason || "";
+  log(`[OpenFourRegistry] WebSocket 将在 ${delay / 1000}s 后重连：${reason || "unknown"}`);
+  openFourRegistryLogState.reconnectTimer = setTimeout(() => {
+    openFourRegistryLogState.reconnectTimer = null;
+    connectOpenFourRegistryLogFeed();
+  }, delay);
+}
+
+function stopOpenFourRegistryLogFeed() {
+  openFourRegistryLogState.stopping = true;
+  if (openFourRegistryLogState.reconnectTimer) clearTimeout(openFourRegistryLogState.reconnectTimer);
+  if (openFourRegistryLogState.discoveryTimer) clearTimeout(openFourRegistryLogState.discoveryTimer);
+  openFourRegistryLogState.reconnectTimer = null;
+  openFourRegistryLogState.discoveryTimer = null;
+  try { openFourRegistryLogState.ws?.close(); } catch {}
+  openFourRegistryLogState.ws = null;
+}
+
+function scheduleOpenFourModuleDiscovery(context) {
+  openFourRegistryLogState.pendingContext = context;
+  if (openFourRegistryLogState.discoveryTimer || openFourRegistryLogState.discoveryRunning) return;
+  openFourRegistryLogState.discoveryTimer = setTimeout(async () => {
+    openFourRegistryLogState.discoveryTimer = null;
+    openFourRegistryLogState.discoveryRunning = true;
+    const pending = openFourRegistryLogState.pendingContext || { reason: "OpenFourRegistry log" };
+    openFourRegistryLogState.pendingContext = null;
+    try {
+      await runOpenFourModuleDiscoveryCheck(pending);
+    } catch (err) {
+      openFourRegistryLogState.lastError = err.message || String(err);
+      log(`[OpenFourRegistry] 新模块发现检查失败：${openFourRegistryLogState.lastError}`);
+    } finally {
+      openFourRegistryLogState.discoveryRunning = false;
+      if (openFourRegistryLogState.pendingContext) scheduleOpenFourModuleDiscovery(openFourRegistryLogState.pendingContext);
+    }
+  }, CONFIG.openFourRegistryLogMonitor.discoveryDebounceMs);
+}
+
+function handleOpenFourRegistryLogMessage(raw) {
+  let msg;
+  try { msg = JSON.parse(String(raw)); } catch { return; }
+  if (msg.id === 1 && msg.result) {
+    openFourRegistryLogState.subscriptionId = msg.result;
+    openFourRegistryLogState.connected = true;
+    openFourRegistryLogState.reconnectAttempts = 0;
+    log(`[OpenFourRegistry] 已订阅 Registry logs：${msg.result}`);
+    return;
+  }
+  const event = msg.params?.result;
+  if (!event) return;
+  const blockNumber = hexToNumber(event.blockNumber || "0x0");
+  openFourRegistryLogState.lastLogAt = Date.now();
+  openFourRegistryLogState.lastLogBlock = blockNumber;
+  openFourRegistryLogState.lastTxHash = event.transactionHash || "";
+  log(`[OpenFourRegistry] 捕获 Registry 日志，触发新模块发现检查：block=${blockNumber}`);
+  scheduleOpenFourModuleDiscovery({
+    reason: "OpenFourRegistry 链上日志",
+    blockNumber,
+    txHash: event.transactionHash || "",
+  });
+}
+
+function connectOpenFourRegistryLogFeed() {
+  if (!openFourRegistryLogState.enabled || openFourRegistryLogState.stopping) return;
+  const registry = normalizeAddress(CONFIG.contracts.openFourRegistry);
+  if (!registry) {
+    log("[OpenFourRegistry] 未配置 Registry 地址，跳过链上日志监听");
+    return;
+  }
+  const urls = CONFIG.bscWsUrls || [];
+  if (urls.length === 0) {
+    log("[OpenFourRegistry] 未配置 BSC WebSocket URL，跳过 Registry 日志监听");
+    return;
+  }
+
+  const url = urls[openFourRegistryLogState.urlIndex % urls.length];
+  openFourRegistryLogState.urlIndex++;
+  openFourRegistryLogState.lastError = "";
+  log(`[OpenFourRegistry] 正在连接 WebSocket 日志订阅：${url.replace(/\/\/[^/@]+@/, "//***@")}`);
+
+  const ws = new WebSocket(url, { handshakeTimeout: 10_000 });
+  openFourRegistryLogState.ws = ws;
+
+  ws.on("open", () => {
+    openFourRegistryLogState.connected = true;
+    openFourRegistryLogState.lastError = "";
+    ws.send(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_subscribe",
+      params: ["logs", { address: registry }],
+    }));
+  });
+
+  ws.on("message", handleOpenFourRegistryLogMessage);
+
+  ws.on("close", (code, reason) => {
+    if (openFourRegistryLogState.ws === ws) openFourRegistryLogState.ws = null;
+    openFourRegistryLogState.connected = false;
+    openFourRegistryLogState.subscriptionId = "";
+    scheduleOpenFourRegistryReconnect(`close ${code}${reason ? ` ${reason}` : ""}`);
+  });
+
+  ws.on("error", (err) => {
+    openFourRegistryLogState.lastError = err.message || String(err);
+    log(`[OpenFourRegistry] WebSocket 日志订阅异常：${openFourRegistryLogState.lastError}`);
+  });
+}
+
+function startOpenFourRegistryLogFeed() {
+  openFourRegistryLogState.stopping = false;
+  connectOpenFourRegistryLogFeed();
+  const healthTimer = setInterval(() => {
+    const ws = openFourRegistryLogState.ws;
+    if (ws?.readyState === WebSocket.OPEN) {
+      try { ws.ping(); } catch {}
+    }
+  }, 30_000);
+  return { stop: stopOpenFourRegistryLogFeed, healthTimer };
+}
+
 const actorBlockFeedState = {
   enabled: CONFIG.actorMonitor.wsEnabled,
   connected: false,
@@ -6344,6 +6695,13 @@ async function startAllModules() {
     await m.run();
     await sleep(500); // 各模块间隔 500ms，避免同时大量请求
   }
+  if (CONFIG.openFourRegistryLogMonitor.enabled) {
+    try {
+      await runOpenFourModuleDiscoveryCheck({ reason: "startup" });
+    } catch (err) {
+      log(`[OpenFour模块] 启动基线建立失败：${err.message}`);
+    }
+  }
 
   // 发送启动通知
   const poolCount = buildPoolMap(snapshot?.poolConfig).size;
@@ -6352,6 +6710,7 @@ async function startAllModules() {
   const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
   const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
   const openFourTemplateCount = Object.keys(snapshot?.openFourTemplates || {}).length;
+  const openFourModuleCount = Object.keys(snapshot?.openFourModules?.byAddress || {}).length;
   const actorCount = snapshot?.chainActorMonitor?.actionActorCount
     ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
   await sendFeishu("Four.meme 全面监控 v2 已启动",
@@ -6364,6 +6723,7 @@ async function startAllModules() {
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
       `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
+      `**OpenFour模块:** ${openFourModuleCount} 个实现地址 — Registry logs ${CONFIG.openFourRegistryLogMonitor.enabled ? "实时触发" : "关闭"}`,
       `**GitHub:** ${CONFIG.githubOwner} 账号 ${githubRepoCount} 个仓库，主仓库 ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
       `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
@@ -6377,6 +6737,9 @@ async function startAllModules() {
   // WebSocket 新区块订阅只负责触发创建者动作检测；HTTP 定时器继续作为断线/漏事件兜底。
   if (actorRunner && CONFIG.actorMonitor.enabled) {
     global.__actorBlockFeed = startActorBlockFeed(actorRunner);
+  }
+  if (CONFIG.openFourRegistryLogMonitor.enabled) {
+    global.__openFourRegistryLogFeed = startOpenFourRegistryLogFeed();
   }
 
   // 启动各模块独立定时器（递归 setTimeout 实现 per-tick 抖动）
@@ -6568,6 +6931,11 @@ async function gracefulShutdown(signal) {
     clearInterval(global.__actorBlockFeed.healthTimer);
     global.__actorBlockFeed.stop();
     log("已停止创建者 WebSocket 新区块订阅");
+  }
+  if (global.__openFourRegistryLogFeed) {
+    clearInterval(global.__openFourRegistryLogFeed.healthTimer);
+    global.__openFourRegistryLogFeed.stop();
+    log("已停止 OpenFourRegistry WebSocket 日志订阅");
   }
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
