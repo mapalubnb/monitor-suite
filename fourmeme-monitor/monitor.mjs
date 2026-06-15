@@ -1260,6 +1260,62 @@ function isNoiseString(s) {
   return NOISE_PATTERNS.some(p => p.test(s));
 }
 
+function isMinifierValue(val) {
+  const s = String(val || "").trim();
+  if (!s) return true;
+  if (/^[a-zA-Z_$]$/.test(s)) return true;
+  if (/^[a-zA-Z_$]{2}$/.test(s)) return true;
+  if (/^[a-zA-Z_$]\.[\w$]{1,16}$/.test(s)) return true;
+  if (/^[a-zA-Z_$][\w$]?\?\.[\w$]+$/.test(s)) return true;
+  if (/^(void\s+0|null|undefined)$/.test(s)) return true;
+  return false;
+}
+
+function isConcreteConfigValue(val) {
+  const s = String(val || "").trim();
+  if (!s || isMinifierValue(s)) return false;
+  if (/[{}]/.test(s)) {
+    const hasConcreteObjectValue = /:\s*(?:["']|0x[a-fA-F0-9]{40}\b|-?\d+(?:\.\d+)?\b|true\b|false\b|![01]\b)/.test(s);
+    if (!hasConcreteObjectValue) return false;
+    return /(fee|tax|burn|liquidity|recipient|holder|founder|vault|dividend|staking|router|manager|address|rate|amount)/i.test(s)
+      && !/[`$]/.test(s);
+  }
+  return /^["'][^"']{2,}["']$/.test(s)
+    || /^0x[a-fA-F0-9]{40}$/.test(s)
+    || /^-?\d+(?:\.\d+)?$/.test(s)
+    || /^(true|false|![01]|[01])$/.test(s)
+    || /^[A-Z_]{3,32}$/.test(s);
+}
+
+function isReadableFrontendSignalString(value) {
+  const s = String(value || "").replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16))).trim();
+  if (s.length > 240) return false;
+  if (/[\u4e00-\u9fff]/.test(s) && s.length <= 2) return true;
+  if (/^(AI|OK|ON|OFF|APY|APR|TVL|KYC)$/i.test(s)) return true;
+  if (/^(Tax|Fee|Buy|Sell|Swap|Burn|Claim|Create|Launch|Token|Agent|Vault|Pool|User|Team|Status)$/i.test(s)) return true;
+  if (s.length < 3) return false;
+  if (isNoiseString(s)) return false;
+  if (/^static\/chunks\//i.test(s) || /\/_next\/static\//i.test(s) || /\.(?:js|css|map|png|svg|webp|woff2?)$/i.test(s)) return false;
+  if (/webpack|turbopack|__next_f|loadableGenerated|prototype|constructor|children:|className:|onClick|function|=>/.test(s)) return false;
+  if (/^[\w$.[\]{}(),:;'"`+\-*/%!<>=?\\|&\s]+$/.test(s) && !/[A-Za-z]{3,}\s+[A-Za-z]{2,}/.test(s) && !/[\u4e00-\u9fff]/.test(s)) return false;
+  const punct = (s.match(/[{}()[\];,:`=<>|\\]/g) || []).length;
+  if (punct / Math.max(s.length, 1) > 0.22 && !/[\u4e00-\u9fff]/.test(s)) return false;
+  return /[\u4e00-\u9fff]/.test(s) || /[A-Za-z][A-Za-z\s'’&/.-]{2,}/.test(s);
+}
+
+function isBusinessConfigDiff(cd) {
+  if (!cd || !CONFIG_BUSINESS_KEYS.has(cd.field)) return false;
+  if (!isConcreteConfigValue(cd.oldVal) && cd.oldVal !== "(无)" && cd.oldVal !== "(新增)") return false;
+  if (!isConcreteConfigValue(cd.newVal)) return false;
+  if (String(cd.oldVal).includes("`") || String(cd.newVal).includes("`")) return false;
+  return true;
+}
+
+function frontendDisplaySnippet(value, max = 120) {
+  const s = String(value || "").replace(/\s+/g, " ").trim();
+  return s.length > max ? s.slice(0, max) + "..." : s;
+}
+
 /* ── 配置参数结构化提取（移植自 flap-monitor，按 four.meme 业务调整） ── */
 const CONFIG_BUSINESS_KEYS = new Set([
   // 费率 / 底池
@@ -1312,12 +1368,14 @@ function extractConfigDiffs(removedStrings, addedStrings) {
         const oldVal = oldTokens.get(key);
         const newVal = newTokens.get(key);
         if (oldVal !== newVal) {
-          configDiffs.push({ field: key, oldVal, newVal });
+          const item = { field: key, oldVal, newVal };
+          if (isBusinessConfigDiff(item)) configDiffs.push(item);
         }
       }
       for (const [key, val] of newTokens) {
         if (!oldTokens.has(key) && CONFIG_BUSINESS_KEYS.has(key)) {
-          configDiffs.push({ field: key, oldVal: "(无)", newVal: val });
+          const item = { field: key, oldVal: "(新增)", newVal: val };
+          if (isBusinessConfigDiff(item)) configDiffs.push(item);
         }
       }
       if (configDiffs.length > 0) break;
@@ -1358,7 +1416,7 @@ function extractStrings(content, ext) {
   const strings = new Set();
   if (ext === "js") {
     // 提取双引号和单引号字符串 >= 6 字符
-    const re = /(?:"((?:[^"\\]|\\.){6,})")|(?:'((?:[^'\\]|\\.){6,})')/g;
+    const re = /(?:"((?:[^"\\]|\\.){2,})")|(?:'((?:[^'\\]|\\.){2,})')/g;
     let m;
     while ((m = re.exec(content)) !== null) {
       const s = (m[1] || m[2] || "").trim();
@@ -1369,6 +1427,7 @@ function extractStrings(content, ext) {
       if (/^data:/.test(s)) continue;
       if (/\.map$/.test(s)) continue;
       if (/^webpack/.test(s)) continue;
+      if (s.length < 6 && !isReadableFrontendSignalString(s) && !isCriticalFrontendString(s)) continue;
       strings.add(s.length > 200 ? s.slice(0, 200) : s);
     }
     const criticalKeyRe = /\b(?:enableTax|taxEnabled|taxFee|taxFeeSell|feeBurn|buyFee|sellFee|feeRate|feeBps|tradeFee|commission|create-token)\b/g;
@@ -2094,6 +2153,40 @@ function extractPageFeatures(html, url) {
   return features;
 }
 
+function validateFrontendPageFeatures(url, html, features) {
+  const text = features?.textContent || "";
+  if (/Due to your current location,\s*access to our services is restricted/i.test(text)) {
+    const err = new Error("页面返回地区限制提示，拒绝更新前端快照");
+    err.transient = true;
+    throw err;
+  }
+  if (/(access denied|forbidden|cf-ray|captcha|verify you are human)/i.test(text) && (features?.assetFiles || []).length === 0) {
+    const err = new Error("页面疑似风控/拦截页，拒绝更新前端快照");
+    err.transient = true;
+    throw err;
+  }
+  if ((features?.assetFiles || []).length < 5) {
+    const err = new Error(`页面资源数量异常(${(features?.assetFiles || []).length})，可能不是正常 Next.js 页面`);
+    err.transient = true;
+    throw err;
+  }
+  if (html.length < 1000) {
+    const err = new Error(`响应过短(${html.length} 字节)，拒绝更新前端快照`);
+    err.transient = true;
+    throw err;
+  }
+}
+
+function isAssetDownloadComplete(assetUrlMap, assetContents, oldFeatures = null) {
+  const expected = assetUrlMap?.size || 0;
+  const downloaded = Object.keys(assetContents || {}).length;
+  if (expected === 0) return false;
+  const ratio = downloaded / expected;
+  const hadGoodBaseline = oldFeatures?.assetContents && Object.keys(oldFeatures.assetContents).length >= Math.max(5, Math.floor(expected * 0.5));
+  if (hadGoodBaseline) return ratio >= 0.85;
+  return ratio >= 0.7 && downloaded >= 5;
+}
+
 /**
  * 抓取单个页面：HTML 解析 + 按需下载资源。
  * oldFeatures: 上一轮的快照数据（用于 assetHash 比对决定是否跳过下载）
@@ -2108,6 +2201,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
 
     // 第一层：纯解析
     features = extractPageFeatures(html, url);
+    validateFrontendPageFeatures(url, html, features);
   } catch (err) {
     log(`  [${urlLabel(url)}] HTML 抓取失败：${err.message}`);
     return null; // 明确返回 null 表示抓取失败
@@ -2144,9 +2238,23 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
     // assetHash 变了（或首次）→ 下载资源
     try {
       features.assetContents = await downloadAssetContents(features.assetUrlMap, assetCache);
+      if (!isAssetDownloadComplete(features.assetUrlMap, features.assetContents, oldFeatures)) {
+        const expected = features.assetUrlMap?.size || 0;
+        const downloaded = Object.keys(features.assetContents || {}).length;
+        if (oldFeatures?.assetContents && Object.keys(oldFeatures.assetContents).length > 0) {
+          log(`  [${urlLabel(url)}] 资源下载不完整 ${downloaded}/${expected}，沿用上一轮资源内容，避免半包误报`);
+          features.assetContents = oldFeatures.assetContents;
+          features.assetContentHash = oldFeatures.assetContentHash || frontendAssetContentsHash(oldFeatures.assetContents);
+          features.assetHash = oldFeatures.assetHash || features.assetHash;
+          features.assetFiles = oldFeatures.assetFiles || features.assetFiles;
+        } else {
+          throw new Error(`资源下载不完整 ${downloaded}/${expected}`);
+        }
+      }
     } catch (err) {
       features.assetContents = null;
       log(`  [${urlLabel(url)}] 资源下载异常：${err.message}`);
+      return null;
     }
     // 提取 i18n（优先从 streaming HTML 中直接获取中文翻译）
     try {
@@ -2471,6 +2579,142 @@ function matchBusinessKeywords(text) {
     if (m.pattern.test(text)) hits.add(m.label);
   }
   return [...hits];
+}
+
+function frontendAssetStats(assetDiff) {
+  const parts = [];
+  if (assetDiff?.unchanged) parts.push(`不变 ${assetDiff.unchanged}`);
+  if (assetDiff?.renamed) parts.push(`重命名 ${assetDiff.renamed}`);
+  if (assetDiff?.matched?.length) parts.push(`内容变化 ${assetDiff.matched.length}`);
+  if (assetDiff?.added?.length) parts.push(`新增 ${assetDiff.added.length}`);
+  if (assetDiff?.removed?.length) parts.push(`移除 ${assetDiff.removed.length}`);
+  return parts.join(" | ") || "无资源变化";
+}
+
+function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}) {
+  const summary = {
+    stats: frontendAssetStats(assetDiff),
+    configDiffs: [],
+    readableAdded: [],
+    readableRemoved: [],
+    keywordHits: new Set(),
+    noisyStringChanges: 0,
+    readableStringChanges: 0,
+    fileOnlyChanges: (assetDiff?.added?.length || 0) + (assetDiff?.removed?.length || 0),
+  };
+
+  for (const m of assetDiff?.matched || []) {
+    const added = m.addedStrings || [];
+    const removed = m.removedStrings || [];
+    const configDiffs = extractConfigDiffs(removed, added).filter(isBusinessConfigDiff);
+    for (const cd of configDiffs) {
+      summary.configDiffs.push({ ...cd, file: m.newFile || m.oldFile });
+      summary.keywordHits.add(cd.field);
+    }
+    for (const s of added) {
+      if (isReadableFrontendSignalString(s)) {
+        summary.readableAdded.push({ text: s, file: m.newFile || m.oldFile, keywords: matchBusinessKeywords(s) });
+        for (const k of matchBusinessKeywords(s)) summary.keywordHits.add(k);
+      } else {
+        summary.noisyStringChanges++;
+      }
+    }
+    for (const s of removed) {
+      if (isReadableFrontendSignalString(s)) {
+        summary.readableRemoved.push({ text: s, file: m.oldFile || m.newFile, keywords: matchBusinessKeywords(s) });
+        for (const k of matchBusinessKeywords(s)) summary.keywordHits.add(k);
+      } else {
+        summary.noisyStringChanges++;
+      }
+    }
+  }
+
+  if (assetDiff?.added?.length || assetDiff?.removed?.length) {
+    const oldGlobalStrings = new Set();
+    const newGlobalStrings = new Set();
+    for (const data of Object.values(oldAssets || {})) for (const s of data?.strings || []) oldGlobalStrings.add(s);
+    for (const data of Object.values(newAssets || {})) for (const s of data?.strings || []) newGlobalStrings.add(s);
+    for (const s of [...newGlobalStrings].filter(v => !oldGlobalStrings.has(v))) {
+      if (isReadableFrontendSignalString(s)) summary.readableAdded.push({ text: s, file: "global", keywords: matchBusinessKeywords(s) });
+    }
+    for (const s of [...oldGlobalStrings].filter(v => !newGlobalStrings.has(v))) {
+      if (isReadableFrontendSignalString(s)) summary.readableRemoved.push({ text: s, file: "global", keywords: matchBusinessKeywords(s) });
+    }
+  }
+
+  const dedupe = (items) => {
+    const seen = new Set();
+    const out = [];
+    for (const item of items) {
+      const key = item.text;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(item);
+    }
+    return out;
+  };
+  summary.readableAdded = dedupe(summary.readableAdded);
+  summary.readableRemoved = dedupe(summary.readableRemoved);
+  summary.readableStringChanges = summary.readableAdded.length + summary.readableRemoved.length;
+  return summary;
+}
+
+function hasMeaningfulFrontendAssetChange(assetSummary) {
+  if (!assetSummary) return false;
+  return assetSummary.configDiffs.length > 0
+    || assetSummary.readableStringChanges > 0;
+}
+
+function formatFrontendAssetBrief(assetSummary) {
+  if (!assetSummary) return "";
+  const lines = [`**资源变化：** ${assetSummary.stats}`];
+  const hits = [...assetSummary.keywordHits].filter(Boolean);
+  if (hits.length > 0) lines.push(`**命中重点：** ${hits.slice(0, 8).join("、")}`);
+
+  if (assetSummary.configDiffs.length > 0) {
+    lines.push("");
+    lines.push("**功能/配置变化：**");
+    for (const cd of assetSummary.configDiffs.slice(0, 12)) {
+      lines.push(`- ${cd.field}: ${frontendDisplaySnippet(cd.oldVal, 60)} -> ${frontendDisplaySnippet(cd.newVal, 60)}`);
+    }
+    if (assetSummary.configDiffs.length > 12) lines.push(`- 还有 ${assetSummary.configDiffs.length - 12} 项配置变化，见 diff 附件`);
+  }
+
+  const readable = [
+    ...assetSummary.readableRemoved.slice(0, 8).map(item => ({ sign: "-", ...item })),
+    ...assetSummary.readableAdded.slice(0, 8).map(item => ({ sign: "+", ...item })),
+  ];
+  if (readable.length > 0) {
+    lines.push("");
+    lines.push("**可读文案/功能信号：**");
+    lines.push("```");
+    for (const item of readable.slice(0, 16)) {
+      lines.push(`${item.sign} ${frontendDisplaySnippet(item.text, 140)}`);
+    }
+    lines.push("```");
+  }
+
+  if (assetSummary.noisyStringChanges > 0 || assetSummary.fileOnlyChanges > 0) {
+    lines.push("");
+    lines.push(`构建产物变化已收敛：压缩/框架噪音 ${assetSummary.noisyStringChanges} 处，文件增删 ${assetSummary.fileOnlyChanges} 个。`);
+  }
+  return lines.join("\n");
+}
+
+function normalizeFrontendNotificationTitle(title, fallbackUrl = "") {
+  const raw = String(title || "");
+  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw)) return raw;
+  const m = raw.match(/\/(?:en|zh-TW)\/[A-Za-z0-9/_-]+/);
+  const label = m?.[0] || (fallbackUrl ? urlLabel(fallbackUrl) : "未知页面");
+  return `前端变更：${label}`;
+}
+
+function frontendNotificationTitle(label, { textDiff = null, i18nChanged = false, routeChanged = false } = {}) {
+  if (i18nChanged || (textDiff && !textDiff.reordered && textDiff.changes?.length > 0)) {
+    return `前端文案变更：${label}`;
+  }
+  if (routeChanged) return `前端路由/端点变更：${label}`;
+  return `前端变更：${label}`;
 }
 
 function assetDiffSignature(assetDiff) {
@@ -6376,6 +6620,8 @@ async function runFrontendCheck() {
     let hasNonAssetChange = false;
     let cachedAssetDiff = null; // 缓存资源 diff 结果，避免重复计算
     let businessSignalDiff = null;
+    let i18nChanged = false;
+    let routeChanged = false;
 
     // ── 1. 资源文件 diff（独立于下载成功与否）──
     // assetHash 监控文件列表；assetContentHash 补充监控创建页资源原地替换。
@@ -6392,9 +6638,14 @@ async function runFrontendCheck() {
         cachedAssetDiff = diffFrontendAssets(oldData.assetContents, newData.assetContents);
         const hasAssetChange = cachedAssetDiff.matched.length > 0 || cachedAssetDiff.added.length > 0 || cachedAssetDiff.removed.length > 0;
         if (hasAssetChange) {
-          const assetContent = formatFrontendChanges(cachedAssetDiff, null, null, oldData.assetContents, newData.assetContents);
-          contentParts.push(assetContent);
-          assetContentParts.push(assetContent);
+          const assetSummary = analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents);
+          const assetContent = formatFrontendAssetBrief(assetSummary);
+          if (hasMeaningfulFrontendAssetChange(assetSummary) && assetContent) {
+            contentParts.push(assetContent);
+            assetContentParts.push(assetContent);
+          } else {
+            log(`[前端] ${urlLabel(newData.originalUrl)} 仅检测到构建产物/压缩变量噪音，更新快照但不推送`);
+          }
         }
       } else {
         // 降级 fallback：仅基于文件列表 diff（类似 Flap 的 fallback）
@@ -6439,6 +6690,7 @@ async function runFrontendCheck() {
         contentParts.push(i18nFormatted);
         pageContentParts.push(i18nFormatted);
         hasNonAssetChange = true;
+        i18nChanged = true;
       }
     } else if (!oldData.i18nHash && newData.i18nHash && newData.i18nStrings) {
       // 首次出现 i18n 数据
@@ -6447,11 +6699,13 @@ async function runFrontendCheck() {
       contentParts.push(pageContent);
       pageContentParts.push(pageContent);
       hasNonAssetChange = true;
+      i18nChanged = true;
     } else if (oldData.i18nHash && !newData.i18nHash) {
       const pageContent = "**📝 i18n 国际化字符串被移除**";
       contentParts.push(pageContent);
       pageContentParts.push(pageContent);
       hasNonAssetChange = true;
+      i18nChanged = true;
     }
 
     // ── 3. 页面文案 diff（独立，不依赖资源下载）──
@@ -6510,6 +6764,7 @@ async function runFrontendCheck() {
         contentParts.push(routeFormatted);
         pageContentParts.push(routeFormatted);
         hasNonAssetChange = true;
+        routeChanged = true;
       }
     }
     // 路由抖动保护：如果 diffRoutes 内部抑制了移除（removed 被清空），
@@ -6535,19 +6790,31 @@ async function runFrontendCheck() {
 
     if (contentParts.length > 0) {
       log(`[前端] ${label} 变化！`);
-      const content = `**📄 ${label}**\n${contentParts.join("\n\n")}`;
 
       // 构建详细 diff 文件（复用已计算的 assetDiff）
       const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, businessSignalDiff, [], oldData.assetContents, newData.assetContents);
+      const assetSummary = cachedAssetDiff ? analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents) : null;
+      const summarySignature = assetSummary ? md5(JSON.stringify({
+        configDiffs: assetSummary.configDiffs,
+        added: assetSummary.readableAdded.map(x => x.text).sort(),
+        removed: assetSummary.readableRemoved.map(x => x.text).sort(),
+        files: assetSummary.fileOnlyChanges,
+      })) : "";
+      const contentV2 = [
+        `**页面：${label}**`,
+        `URL: ${newData.originalUrl}`,
+        "",
+        contentParts.join("\n\n"),
+      ].join("\n");
 
       notifications.push({
-        title: `前端变更：${label}`,
-        content,
+        title: frontendNotificationTitle(label, { textDiff, i18nChanged, routeChanged }),
+        content: contentV2,
         template: "orange",
         fullDiff,
         url: newData.originalUrl,
         pageLabel: label,
-        assetSignature: frontendAssetChangeSignature(cachedAssetDiff, oldData.assetContents, newData.assetContents),
+        assetSignature: summarySignature || frontendAssetChangeSignature(cachedAssetDiff, oldData.assetContents, newData.assetContents),
         assetContent: assetContentParts.join("\n\n"),
         pageContent: pageContentParts.join("\n\n"),
       });
@@ -6563,6 +6830,7 @@ async function runFrontendCheck() {
 
     await saveSnapshot(snapshot);
     for (const n of dedupedNotifications) {
+      n.title = normalizeFrontendNotificationTitle(n.title, n.url);
       appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
       const diffFilePath = n.fullDiff ? saveDiffLocally(n.title, n.fullDiff) : null;
       await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, undefined, undefined, diffFilePath, n.url);
