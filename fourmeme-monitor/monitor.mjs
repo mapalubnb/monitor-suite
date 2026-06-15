@@ -4,7 +4,7 @@
  * 优化要点：
  *   1. 各模块独立定时器，互不阻塞
  *   2. BSC RPC batch 请求（模块 6/7 提速 ~10x）
- *   3. 前端/API 并行抓取（模块 2/3/5 提速 ~3-4x）
+ *   3. 前端/API 并行抓取（模块 2/3 提速 ~3-4x）
  *   4. 全面反风控：UA 轮换、按域名自适应退避、请求抖动、GitHub 认证限速
  *
  * 模块与频率：
@@ -2828,7 +2828,7 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, recoveredAsset
 }
 
 /* ══════════════════════════════════════════
-   模块 3/5：多端点 API 结构监控（并行探测）
+   模块 3：多端点 API 结构监控（并行探测）
    ══════════════════════════════════════════ */
 
 function extractStructure(obj, prefix = "", endpoint = "") {
