@@ -35,8 +35,9 @@
 |------|---------|------|
 | 模块 1 | 底池配置（Pool Config） | 3s |
 | 模块 2 | 前端代码（基础页面 + 自动发现页面，含文案 diff、`__NEXT_DATA__`、i18n、路由/端点发现，同轮相同 JS/CSS 资源变更合并推送） | 15s |
-| 模块 3/5 | API 结构（多端点并行，结构 + 值 diff，覆盖 public/blog/mapi 端点发现） | 30s |
-| 模块 4 | GitHub 仓库/项目变更（主仓库提交高频轮询，账号仓库列表降频检查） | 有 token 30s / 无 token 90s |
+| 模块 3 | API 结构（多端点并行，结构 + 值 diff，覆盖 public/blog/mapi 端点发现） | 30s |
+| 模块 4 | OpenFour 业务模板（新模板上线、模板状态变化，如 `PUBLISHED`） | 30s |
+| 模块 5 | GitHub 仓库/项目变更（主仓库提交高频轮询，账号仓库列表降频检查） | 有 token 30s / 无 token 90s |
 | 模块 6 | BSC 智能合约（静态核心合约 + OpenFour 链上发现，`/v1/public/address` 作为种子/兜底，RPC batch） | 3s |
 | 模块 7 | 链上参数（RPC batch） | 3s |
 | 模块 8 | 合约创建者动作（合约地址页读取 + RPC 近期反查兜底，自动缓存 deployer，只监听 deployer/手动配置地址作为 `tx.from` 发起的交易，命中后立即复查合约） | 3s |
@@ -158,6 +159,7 @@ rm -f /usr/local/bin/fm-* /usr/local/bin/fl-* /usr/local/bin/bot-* /usr/local/bi
 | `FEISHU_BOT_EXEC_MAX_BUFFER` | 否 | 飞书 Bot 执行命令输出缓冲，默认 16777216（16MB） |
 | `DOUBAO_API_KEY` | 否 | 豆包 API Key |
 | `DEEPSEEK_API_KEY` | 否 | DeepSeek API Key |
+| `OPENFOUR_TEMPLATE_INTERVAL_SECONDS` | 否 | OpenFour 业务模板监控间隔，默认/最低 30 秒 |
 | `GITHUB_TOKEN` | 否 | GitHub Token（提升 rate limit）|
 | `GITHUB_INTERVAL_SECONDS` | 否 | GitHub 主仓库提交监控间隔；默认有 token 30 秒、无 token 90 秒，低于安全下限会自动抬高 |
 | `GITHUB_REPO_LIST_INTERVAL_SECONDS` | 否 | GitHub 账号仓库列表监控间隔，默认/最低 300 秒 |

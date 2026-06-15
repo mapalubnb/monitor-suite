@@ -10,8 +10,9 @@
  * 模块与频率：
  *   模块1: 底池配置   — 每 3s（纯 API，轻量，退避保护）
  *   模块2: 前端代码   — 每 15s（基础页面 + 自动发现页面，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
- *   模块3/5: API 结构  — 每 30s（多端点并行，含结构+值 diff）
- *   模块4: GitHub     — 有 token 每 30s / 无 token 每 90s（账号仓库列表每 5min）
+ *   模块3: API 结构    — 每 30s（多端点并行，含结构+值 diff）
+ *   模块4: OpenFour模板 — 每 30s（新增模板 / 状态变化）
+ *   模块5: GitHub     — 有 token 每 30s / 无 token 每 90s（账号仓库列表每 5min）
  *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 3s（RPC batch，单次请求）
  *   模块8: 创建者动作 — WebSocket 新区块驱动 + HTTP 兜底（只监听创建者/手动配置地址发起的交易）
@@ -106,6 +107,7 @@ const CONFIG = {
     pool:     3_000,   // 模块1: 底池配置（3s，退避机制自动保护源站）
     frontend: 15_000,  // 模块2: 前端代码（15s，assetHash 缓存避免无变化时重复下载）
     api:      30_000,  // 模块3/5: API 结构（30s，降低同域并发压力）
+    openfourTemplates: readClampedSecondsEnv("OPENFOUR_TEMPLATE_INTERVAL_SECONDS", 30, 30),
     github:   readClampedSecondsEnv("GITHUB_INTERVAL_SECONDS", GITHUB_INTERVAL_FALLBACK_SECONDS, GITHUB_INTERVAL_MIN_SECONDS),
     contract: 3_000,   // 模块6: 智能合约
     onchain:  3_000,   // 模块7: 链上参数
@@ -3446,6 +3448,163 @@ function formatApiValueChanges(changes) {
   return lines.join("\n");
 }
 
+/* ── OpenFour 业务模板监控（新模板 / 状态变化）── */
+
+const OPENFOUR_TEMPLATE_STABLE_FIELDS = [
+  "id",
+  "name",
+  "tag",
+  "userAddress",
+  "userImg",
+  "codeType",
+  "amount",
+  "descr",
+  "status",
+  "time",
+  "imgUrl",
+];
+
+function normalizeOpenFourTemplate(item) {
+  const id = item?.id == null ? "" : String(item.id);
+  if (!id) return null;
+  const out = { id };
+  for (const key of OPENFOUR_TEMPLATE_STABLE_FIELDS) {
+    if (key === "id") continue;
+    const value = item?.[key];
+    out[key] = value == null ? "" : String(value);
+  }
+  return out;
+}
+
+function normalizeOpenFourTemplates(items) {
+  const map = {};
+  const normalizedItems = (items || [])
+    .map(item => normalizeOpenFourTemplate(item))
+    .filter(Boolean)
+    .sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  for (const item of normalizedItems) {
+    map[item.id] = item;
+  }
+  return map;
+}
+
+async function fetchOpenFourTemplates() {
+  const url = `${CONFIG.apiBase}/v1/public/token_template/search`;
+  const res = await fetchProbe(url, {
+    method: "POST",
+    headers: {
+      "Accept": "application/json, text/plain, */*",
+      "Content-Type": "application/json",
+      "Origin": CONFIG.siteUrl,
+      "Referer": `${CONFIG.siteUrl}/`,
+      "User-Agent": nextUA(),
+    },
+    body: JSON.stringify({ sort: "LAST" }),
+  }, 10_000);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const json = await res.json();
+  if (json?.code !== 0 && json?.code !== "0") {
+    throw new Error(`API code=${json?.code}: ${json?.message || json?.msg || ""}`);
+  }
+  if (!Array.isArray(json.data)) throw new Error("template search data is not an array");
+  return normalizeOpenFourTemplates(json.data);
+}
+
+function diffOpenFourTemplates(oldMap = {}, newMap = {}) {
+  const added = [];
+  const statusChanged = [];
+  for (const [id, item] of Object.entries(newMap)) {
+    const old = oldMap[id];
+    if (!old) {
+      added.push(item);
+      continue;
+    }
+    const oldStatus = String(old.status || "");
+    const newStatus = String(item.status || "");
+    if (oldStatus !== newStatus) statusChanged.push({ old, item, oldStatus, newStatus });
+  }
+  return { added, statusChanged };
+}
+
+function formatOpenFourTemplate(item) {
+  const lines = [];
+  lines.push(`id: ${item.id}`);
+  lines.push(`name: ${item.name || "未知"}`);
+  lines.push(`status: ${item.status || "未知"}`);
+  if (item.tag) lines.push(`tag: ${item.tag}`);
+  if (item.codeType) lines.push(`codeType: ${item.codeType}`);
+  if (item.amount) lines.push(`amount: ${item.amount}`);
+  if (item.userAddress) lines.push(`author: ${item.userAddress}`);
+  if (item.time) lines.push(`time: ${item.time}`);
+  if (item.imgUrl) lines.push(`imgUrl: ${item.imgUrl}`);
+  if (item.descr) {
+    const descr = item.descr.length > 300 ? item.descr.slice(0, 300) + "..." : item.descr;
+    lines.push(`descr: ${descr}`);
+  }
+  return lines.join("\n");
+}
+
+function formatOpenFourTemplateChanges(changes) {
+  const lines = [];
+  lines.push(`**接口：** \`POST /v1/public/token_template/search\``);
+  lines.push(`**新增模板：** ${changes.added.length} 个`);
+  lines.push(`**状态变化：** ${changes.statusChanged.length} 个`);
+  lines.push("---");
+
+  for (const item of changes.added) {
+    const marker = String(item.status).toUpperCase() === "PUBLISHED" ? "🆕 新模板上线" : "🆕 新模板";
+    lines.push(`**${marker}：${item.name || item.id}**`);
+    lines.push("```");
+    lines.push(formatOpenFourTemplate(item));
+    lines.push("```");
+    lines.push("---");
+  }
+
+  for (const c of changes.statusChanged) {
+    const marker = String(c.newStatus).toUpperCase() === "PUBLISHED" ? "🚀 模板已发布" : "🔄 模板状态变化";
+    lines.push(`**${marker}：${c.item.name || c.item.id}**`);
+    lines.push("```");
+    lines.push(`id: ${c.item.id}`);
+    lines.push(`status: ${c.oldStatus || "空"} -> ${c.newStatus || "空"}`);
+    if (c.item.tag) lines.push(`tag: ${c.item.tag}`);
+    if (c.item.userAddress) lines.push(`author: ${c.item.userAddress}`);
+    lines.push("```");
+    lines.push("---");
+  }
+
+  return lines.join("\n");
+}
+
+async function runOpenFourTemplateCheck() {
+  const templates = await fetchOpenFourTemplates();
+  if (!snapshot) snapshot = {};
+  if (!snapshot.openFourTemplates) {
+    snapshot.openFourTemplates = templates;
+    snapshot.openFourTemplatesLastPollAt = new Date().toISOString();
+    await saveSnapshot(snapshot);
+    log(`[OpenFour模板] 首次记录：${Object.keys(templates).length} 个模板`);
+    return;
+  }
+
+  const changes = diffOpenFourTemplates(snapshot.openFourTemplates, templates);
+  const hasChanges = changes.added.length > 0 || changes.statusChanged.length > 0;
+  const snapshotChanged = !jsonEqual(snapshot.openFourTemplates, templates);
+  snapshot.openFourTemplates = templates;
+  snapshot.openFourTemplatesLastPollAt = new Date().toISOString();
+
+  if (hasChanges) {
+    const count = changes.added.length + changes.statusChanged.length;
+    log(`[OpenFour模板] 检测到 ${count} 项变化（新增 ${changes.added.length}，状态 ${changes.statusChanged.length}）`);
+    const title = `OpenFour 模板变更（${count}项）`;
+    const content = formatOpenFourTemplateChanges(changes);
+    await saveSnapshot(snapshot);
+    appendHistory("openfour", title, content.slice(0, 300), content);
+    await sendThenEnrichWithAi(title, content, "orange", "Four.meme OpenFour 业务模板变更", undefined, undefined, undefined, `${CONFIG.siteUrl}/zh-TW/contract/create`);
+  } else if (snapshotChanged) {
+    await saveSnapshot(snapshot);
+  }
+}
+
 const GITHUB_API = "https://api.github.com";
 // githubETag 从 snapshot 恢复，避免重启后浪费 rate limit
 let githubETag = "";
@@ -5353,7 +5512,7 @@ function startActorBlockFeed(actorRunner) {
 /* ── 全局状态 ── */
 let snapshot = loadSnapshot();
 let startTime = Date.now();
-let modulePollCounts = { pool: 0, frontend: 0, api: 0, github: 0, contract: 0, onchain: 0, actor: 0 };
+let modulePollCounts = { pool: 0, frontend: 0, api: 0, openfourTemplates: 0, github: 0, contract: 0, onchain: 0, actor: 0 };
 const apiEmptyArrayLogState = new Map();
 
 /* ── 已移除底池缓存（防止 API 短暂返回不完整数据导致误报）── */
@@ -6077,6 +6236,7 @@ const modules = [
   createModuleRunner("pool",     runPoolCheck,     CONFIG.intervals.pool),
   createModuleRunner("frontend", runFrontendCheck,  CONFIG.intervals.frontend),
   createModuleRunner("api",      runApiCheck,       CONFIG.intervals.api),
+  createModuleRunner("openfourTemplates", runOpenFourTemplateCheck, CONFIG.intervals.openfourTemplates),
   createModuleRunner("github",   runGithubCheck,    CONFIG.intervals.github),
   createModuleRunner("contract", runContractCheck,  CONFIG.intervals.contract),
   createModuleRunner("onchain",  runOnchainCheck,   CONFIG.intervals.onchain),
@@ -6191,6 +6351,7 @@ async function startAllModules() {
   const discoveredCount = (snapshot?._frontendDiscoveredUrls || []).length;
   const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
   const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
+  const openFourTemplateCount = Object.keys(snapshot?.openFourTemplates || {}).length;
   const actorCount = snapshot?.chainActorMonitor?.actionActorCount
     ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
   await sendFeishu("Four.meme 全面监控 v2 已启动",
@@ -6202,6 +6363,7 @@ async function startAllModules() {
       `  资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
+      `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
       `**GitHub:** ${CONFIG.githubOwner} 账号 ${githubRepoCount} 个仓库，主仓库 ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
       `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
       `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
