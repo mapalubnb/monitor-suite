@@ -26,7 +26,6 @@ import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mk
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
-import { Agent, setGlobalDispatcher } from "undici";
 import { parseHTML } from "linkedom";
 
 import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
@@ -76,11 +75,26 @@ function readBoolEnv(name, fallback) {
   return !["0", "false", "no", "off"].includes(String(raw).trim().toLowerCase());
 }
 
-setGlobalDispatcher(new Agent({
-  connections: readPositiveIntEnv("HTTP_KEEPALIVE_CONNECTIONS", 16),
-  keepAliveTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_TIMEOUT_MS", 30_000),
-  keepAliveMaxTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_MAX_TIMEOUT_MS", 120_000),
-}));
+function earlyLog(msg) {
+  const stamp = new Date().toLocaleString("zh-CN", { hour12: false });
+  console.log(`[${stamp}] ${msg}`);
+}
+
+async function setupHttpKeepAlive() {
+  try {
+    const { Agent, setGlobalDispatcher } = await import("undici");
+    setGlobalDispatcher(new Agent({
+      connections: readPositiveIntEnv("HTTP_KEEPALIVE_CONNECTIONS", 16),
+      keepAliveTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_TIMEOUT_MS", 30_000),
+      keepAliveMaxTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_MAX_TIMEOUT_MS", 120_000),
+    }));
+    earlyLog("[HTTP] undici keep-alive dispatcher 已启用");
+  } catch (err) {
+    earlyLog(`[HTTP] undici keep-alive 不可用，降级为 Node 内置 fetch：${err.message}`);
+  }
+}
+
+await setupHttpKeepAlive();
 
 const HAS_GITHUB_TOKEN = Boolean((process.env.GITHUB_TOKEN || "").trim());
 const GITHUB_INTERVAL_FALLBACK_SECONDS = HAS_GITHUB_TOKEN ? 30 : 90;
