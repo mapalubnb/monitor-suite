@@ -70,6 +70,22 @@ test("extractI18nFromStreamingHtml does not truncate push payloads containing cl
   assert.equal(result.i18nStrings["common.key0"], "value 0 ] keep");
 });
 
+test("extractI18nFromStreamingHtml preserves escaped quotes inside parsed flight resources", () => {
+  const resources = {
+    common: Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`key${i}`, `value ${i}`])),
+    contract: {
+      editModal: {
+        warning: `The audit status will reset to "Pending".`
+      }
+    }
+  };
+  const payload = [1, `x"resources":${JSON.stringify(resources)},"children":"$L20" y`];
+  const html = `<script>self.__next_f.push(${JSON.stringify(payload)})</script>`;
+  const result = __testables.extractI18nFromStreamingHtml(html);
+  assert.ok(result);
+  assert.equal(result.i18nStrings["contract.editModal.warning"], `The audit status will reset to "Pending".`);
+});
+
 test("failed discovered frontend URLs are suppressed during cooldown", () => {
   const route = `/codex-suppressed-${Date.now()}`;
   const url = `https://four.meme/zh-TW${route}`;

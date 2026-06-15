@@ -2199,21 +2199,21 @@ function extractI18nFromStreamingHtml(html) {
     try {
       const parsed = JSON.parse(payload);
       for (const item of parsed) {
-        if (typeof item === "string" && item.includes("resources")) candidates.push(item);
+        if (typeof item === "string" && item.includes("resources")) candidates.push({ text: item, decode: false });
       }
     } catch {
-      if (payload.includes('\\"resources\\"') || payload.includes('"resources"')) candidates.push(payload);
+      if (payload.includes('\\"resources\\"') || payload.includes('"resources"')) candidates.push({ text: payload, decode: true });
     }
   }
   if (candidates.length === 0) return null;
 
-  for (const rawCandidate of candidates) {
-    const result = parseI18nResourcesCandidate(rawCandidate);
+  for (const candidate of candidates) {
+    const result = parseI18nResourcesCandidate(candidate.text, { decode: candidate.decode });
     if (result) return result;
   }
 
   // Last-resort fallback: combine chunks, but do not let one truncated chunk spam logs.
-  return parseI18nResourcesCandidate(candidates.join(""), { logFailure: true });
+  return parseI18nResourcesCandidate(candidates.map(item => item.text).join(""), { logFailure: true, decode: true });
 }
 
 function extractNextFlightPushPayloads(html) {
@@ -2257,12 +2257,18 @@ function findBalancedExpressionEnd(text, start, open = "(", close = ")") {
   return -1;
 }
 
-function parseI18nResourcesCandidate(rawCandidate, { logFailure = false } = {}) {
-  const unescaped = decodeJsStringFragment(rawCandidate);
+function parseI18nResourcesCandidate(rawCandidate, { logFailure = false, decode = false } = {}) {
+  const original = String(rawCandidate || "");
+  const variants = [decode ? decodeJsStringFragment(original) : original];
+  if (!decode && !original.includes('"resources":{') && original.includes('\\"resources\\"')) {
+    variants.push(decodeJsStringFragment(original));
+  }
+
+  for (const unescaped of variants) {
   let searchFrom = 0;
   while (true) {
     const resIdx = unescaped.indexOf('"resources":{', searchFrom);
-    if (resIdx === -1) return null;
+    if (resIdx === -1) break;
     const objStart = resIdx + '"resources":'.length;
     const objEnd = findJsonObjectEnd(unescaped, objStart);
     if (objEnd <= objStart) {
@@ -2289,6 +2295,8 @@ function parseI18nResourcesCandidate(rawCandidate, { logFailure = false } = {}) 
       searchFrom = objEnd;
     }
   }
+  }
+  return null;
 }
 
 function logI18nParseFailure(err, sample) {
