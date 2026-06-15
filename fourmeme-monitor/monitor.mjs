@@ -9,7 +9,7 @@
  *
  * 模块与频率：
  *   模块1: 底池配置   — 每 3s（纯 API，轻量，退避保护）
- *   模块2: 前端代码   — 每 15s（基础页面 + 自动发现页面，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
+ *   模块2: 前端代码   — 每 15s（统一页面池，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
  *   模块3: API 结构    — 每 30s（多端点并行，含结构+值 diff）
  *   模块4: OpenFour模板 — 每 3s（新增模板 / 状态变化）
  *   模块5: GitHub     — 有 token 每 30s / 无 token 每 90s（账号仓库列表每 5min）
@@ -424,20 +424,14 @@ function pruneFrontendSnapshot(data) {
   if (!data || !data.frontendPages) return false;
 
   let changed = false;
-  const monitorUrls = new Set(CONFIG.monitorUrls.map(canonicalFrontendUrl));
-  const discoveredUrls = (Array.isArray(data._frontendDiscoveredUrls) ? data._frontendDiscoveredUrls : [])
-    .map(canonicalFrontendUrl)
-    .filter(url => isDiscoverableFrontendUrl(url));
-  const allowedUrls = new Set([...monitorUrls, ...discoveredUrls]);
-
-  if (discoveredUrls.length !== (data._frontendDiscoveredUrls || []).length) {
-    data._frontendDiscoveredUrls = discoveredUrls;
+  if (data._frontendDiscoveredUrls) {
+    delete data._frontendDiscoveredUrls;
     changed = true;
   }
 
   for (const [key, page] of Object.entries(data.frontendPages)) {
     const canonical = page?.originalUrl ? canonicalFrontendUrl(page.originalUrl) : "";
-    if (!canonical || REMOVED_FRONTEND_URLS.has(canonical) || isDynamicFrontendRoute(canonical) || !allowedUrls.has(canonical)) {
+    if (!canonical || REMOVED_FRONTEND_URLS.has(canonical) || !isDiscoverableFrontendUrl(canonical)) {
       delete data.frontendPages[key];
       if (data._frontendFailCounts) delete data._frontendFailCounts[key];
       changed = true;
@@ -466,9 +460,8 @@ function migrateSnapshot(data) {
     log("[快照迁移] v2 → v3：补充 githubETag/apiValues 字段");
   }
   if (ver < 4) {
-    if (!Array.isArray(data._frontendDiscoveredUrls)) data._frontendDiscoveredUrls = [];
     if (data._frontendAssetPending) delete data._frontendAssetPending;
-    log("[快照迁移] v3 → v4：补充前端自动发现页面字段，清理旧资源待确认缓存");
+    log("[快照迁移] v3 → v4：清理旧资源待确认缓存");
   }
   if (ver < 5) {
     if (pruneFrontendSnapshot(data)) {
@@ -1123,19 +1116,14 @@ function canonicalFrontendUrl(url) {
 function getFrontendMonitorUrls() {
   const urls = [
     ...CONFIG.monitorUrls,
-    ...(snapshot?._frontendDiscoveredUrls || []).filter(url => isDiscoverableFrontendUrl(url)),
+    ...Object.values(snapshot?.frontendPages || {}).map(page => page?.originalUrl).filter(Boolean),
   ];
-  return [...new Set(urls.map(canonicalFrontendUrl))];
-}
-
-function isConfiguredFrontendUrl(url) {
-  const canonical = canonicalFrontendUrl(url);
-  return CONFIG.monitorUrls.map(canonicalFrontendUrl).includes(canonical);
+  return [...new Set(urls.map(canonicalFrontendUrl).filter(url => isDiscoverableFrontendUrl(url)))];
 }
 
 function isDiscoverableFrontendUrl(url) {
   const canonical = canonicalFrontendUrl(url);
-  if (!canonical || isConfiguredFrontendUrl(canonical) || REMOVED_FRONTEND_URLS.has(canonical)) return false;
+  if (!canonical || REMOVED_FRONTEND_URLS.has(canonical)) return false;
   const route = normalizeRouteString(canonical).split("?")[0].replace(/\/+$/, "") || "/";
   if (!isTrackableRouteString(route)) return false;
   if (isApiOrEndpointRoute(route)) return false;
@@ -2444,12 +2432,12 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
   for (let depth = 0; depth < 2; depth++) {
     const discoveredUrls = discoverFrontendUrlsFromPages(result.pages, [...knownUrls]);
     if (discoveredUrls.length === 0) break;
-    log(`[前端] 自动发现 ${discoveredUrls.length} 个新页面，立即纳入本轮抓取：${discoveredUrls.map(urlLabel).join(", ")}`);
+    log(`[前端] 从路由发现 ${discoveredUrls.length} 个新页面，立即纳入同一监控池：${discoveredUrls.map(urlLabel).join(", ")}`);
     for (const url of discoveredUrls) knownUrls.add(canonicalFrontendUrl(url));
     const extra = await fetchAllFrontendData(oldPages, discoveredUrls, assetCache);
     Object.assign(result.pages, extra.pages);
     if (extra.failedUrls.length > 0) {
-      log(`[前端] 自动发现候选页抓取失败，未纳入监控：${extra.failedUrls.map(urlLabel).join(", ")}`);
+      log(`[前端] 路由发现候选页抓取失败，未纳入监控：${extra.failedUrls.map(urlLabel).join(", ")}`);
     }
     allDiscoveredUrls.push(...discoveredUrls.filter(url => extra.pages[urlToKey(url)]));
   }
@@ -6648,7 +6636,7 @@ async function runFrontendCheck() {
   if (!snapshot) snapshot = {};
   const prunedBeforeRun = pruneFrontendSnapshot(snapshot);
   const oldPages = snapshot.frontendPages || {};
-  const { pages: newPages, failedUrls, discoveredUrls } = await fetchFrontendDataWithDiscovery(oldPages);
+  const { pages: newPages, failedUrls } = await fetchFrontendDataWithDiscovery(oldPages);
 
   // 页面抓取失败告警：连续失败计数
   if (!snapshot._frontendFailCounts) snapshot._frontendFailCounts = {};
@@ -6667,15 +6655,6 @@ async function runFrontendCheck() {
   }
 
   if (!snapshot.frontendPages) {
-    const successfulDiscoveredUrls = (discoveredUrls || []).filter(url => newPages[urlToKey(url)]);
-    if (CONFIG.frontendDiscovery.enabled) {
-      snapshot._frontendDiscoveredUrls = [...new Set([
-        ...(snapshot._frontendDiscoveredUrls || []),
-        ...successfulDiscoveredUrls.map(canonicalFrontendUrl),
-      ])]
-        .filter(url => isDiscoverableFrontendUrl(url))
-        .slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
-    }
     snapshot.frontendPages = newPages;
     await saveSnapshot(snapshot);
     const pageDetails = Object.values(newPages).map(p => {
@@ -6694,26 +6673,6 @@ async function runFrontendCheck() {
 
   const notifications = [];
   let snapshotDirty = prunedBeforeRun;
-
-  if (CONFIG.frontendDiscovery.enabled) {
-    const oldDiscovered = new Set(snapshot._frontendDiscoveredUrls || []);
-    const mergedDiscovered = [...oldDiscovered];
-    const successfulDiscoveredUrls = (discoveredUrls || []).filter(url => newPages[urlToKey(url)]);
-    for (const url of successfulDiscoveredUrls) {
-      const canonical = canonicalFrontendUrl(url);
-      if (!oldDiscovered.has(canonical) && isDiscoverableFrontendUrl(canonical)) {
-        mergedDiscovered.push(canonical);
-        oldDiscovered.add(canonical);
-      }
-    }
-    const cleanedDiscovered = mergedDiscovered
-      .filter(url => isDiscoverableFrontendUrl(url))
-      .slice(0, CONFIG.frontendDiscovery.maxDiscoveredPages);
-    if (JSON.stringify(cleanedDiscovered) !== JSON.stringify(snapshot._frontendDiscoveredUrls || [])) {
-      snapshot._frontendDiscoveredUrls = cleanedDiscovered;
-      snapshotDirty = true;
-    }
-  }
 
   // 连续 3 次抓取失败的页面发送告警（每 3 的倍数重复提醒）
   const FAIL_THRESHOLD = 3;
@@ -6737,45 +6696,29 @@ async function runFrontendCheck() {
       const label = urlLabel(newData.originalUrl);
       const fileCount = (newData.assetFiles || []).length;
       const routeCount = (newData.routes || []).length;
-      if (isConfiguredFrontendUrl(newData.originalUrl)) {
-        log(`[前端] 默认监控页面已建立基线：${label}（资源 ${fileCount} 个，路由/端点 ${routeCount} 个）`);
-        if (isCreateTokenFrontendUrl(newData.originalUrl)) {
-          const lines = [
-            `**🆕 新增重点基础监控页面：${label}**`,
-            `URL: ${newData.originalUrl}`,
-            `资源文件: ${fileCount} 个`,
-            `路由/端点: ${routeCount} 个`,
-          ];
-          const signalLines = (newData.createTokenSignals || []).slice(0, 12);
-          if (signalLines.length > 0) {
-            lines.push("");
-            lines.push("**当前创建页重点文案/功能信号：**");
-            lines.push("```");
-            for (const s of signalLines) lines.push(s.length > 160 ? s.slice(0, 160) + "..." : s);
-            if ((newData.createTokenSignals || []).length > signalLines.length) {
-              lines.push(`... 还有 ${(newData.createTokenSignals || []).length - signalLines.length} 项`);
-            }
-            lines.push("```");
-          }
-          notifications.push({
-            title: `前端新增重点页面：${label}`,
-            content: lines.join("\n"),
-            template: "orange",
-            url: newData.originalUrl,
-          });
+      log(`[前端] 新增监控页面已建立基线：${label}（资源 ${fileCount} 个，路由/端点 ${routeCount} 个）`);
+      const lines = [
+        `**🆕 新增监控页面：${label}**`,
+        `URL: ${newData.originalUrl}`,
+        `资源文件: ${fileCount} 个`,
+        `路由/端点: ${routeCount} 个`,
+      ];
+      const signalLines = isCreateTokenFrontendUrl(newData.originalUrl)
+        ? (newData.createTokenSignals || []).slice(0, 12)
+        : [];
+      if (signalLines.length > 0) {
+        lines.push("");
+        lines.push("**当前创建页重点文案/功能信号：**");
+        lines.push("```");
+        for (const s of signalLines) lines.push(s.length > 160 ? s.slice(0, 160) + "..." : s);
+        if ((newData.createTokenSignals || []).length > signalLines.length) {
+          lines.push(`... 还有 ${(newData.createTokenSignals || []).length - signalLines.length} 项`);
         }
-        snapshot.frontendPages[key] = newData;
-        snapshotDirty = true;
-        continue;
+        lines.push("```");
       }
       notifications.push({
         title: `前端新增页面：${label}`,
-        content: [
-          `**🆕 新增监控页面：${label}**`,
-          `URL: ${newData.originalUrl}`,
-          `资源文件: ${fileCount} 个`,
-          `路由/端点: ${routeCount} 个`,
-        ].join("\n"),
+        content: lines.join("\n"),
         template: "orange",
         url: newData.originalUrl,
       });
@@ -7334,7 +7277,7 @@ async function startAllModules() {
   // 发送启动通知
   const poolCount = buildPoolMap(snapshot?.poolConfig).size;
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
-  const discoveredCount = (snapshot?._frontendDiscoveredUrls || []).length;
+  const entryPageCount = CONFIG.monitorUrls.length;
   const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
   const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
   const openFourTemplateCount = Object.keys(snapshot?.openFourTemplates || {}).length;
@@ -7345,8 +7288,8 @@ async function startAllModules() {
     [
       `**架构:** 独立定时器 + RPC Batch + 并行抓取`,
       `**底池监控:** BSC ${poolCount} 个 — 每 ${CONFIG.intervals.pool / 1000}s`,
-      `**前端监控:** ${pageCount} 个页面（基础 ${CONFIG.monitorUrls.length} + 自动发现 ${discoveredCount}）— 每 ${CONFIG.intervals.frontend / 1000}s`,
-      `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面自动纳入`,
+      `**前端监控:** ${pageCount} 个页面（固定入口 ${entryPageCount}，路由发现页面纳入同一监控池）— 每 ${CONFIG.intervals.frontend / 1000}s`,
+      `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面同层纳入`,
       `  资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
       `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
       `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
