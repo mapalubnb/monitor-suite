@@ -78,7 +78,9 @@ const CONFIG = {
   siteUrl: "https://four.meme",
   monitorUrls: [
     "https://four.meme/en/create-token",
+    "https://four.meme/en/advanced",
     "https://four.meme/zh-TW/create-token",
+    "https://four.meme/zh-TW/advanced",
     "https://four.meme/zh-TW/agentic",
     "https://four.meme/zh-TW/contract",
     "https://four.meme/zh-TW/contract/collection",
@@ -1510,7 +1512,7 @@ function frontendAssetContentsHash(assetContents) {
 function isCreateTokenFrontendUrl(url) {
   try {
     const path = new URL(url, CONFIG.siteUrl).pathname.replace(/\/+$/, "");
-    return /^\/(?:en|zh-TW)\/create-token$/i.test(path);
+    return /^\/(?:en|zh-TW)\/(?:create-token|advanced)$/i.test(path);
   } catch {
     return false;
   }
@@ -2698,6 +2700,31 @@ function matchBusinessKeywords(text) {
   return [...hits];
 }
 
+function frontendRoutePath(url) {
+  try {
+    return new URL(url, CONFIG.siteUrl).pathname.replace(/\/+$/, "") || "/";
+  } catch {
+    return "";
+  }
+}
+
+function isTaxOrCreateScopedAssetString(value) {
+  const s = String(value || "").trim();
+  return /^tax\.[A-Za-z][A-Za-z0-9 &'()\/.+-]{0,90}$/.test(s)
+    || /^(?:Enable Tax|Token Tax(?:es)?|Tax Rate|Tax Token Info|Tax Allocation & Basic Info)$/i.test(s)
+    || /^(?:enableTax|taxEnabled|taxFee|taxFeeSell|feeBurn|buyFee|sellFee|feeRateSell|feeRate|feeBps|tradeFee|commission)$/.test(s)
+    || /\bcreate-token\b/i.test(s);
+}
+
+function isTaxOrCreateScopedConfigField(field) {
+  return /^(?:fee|feeRate|feeBps|buyFee|sellFee|tradeFee|commission|tax|enableTax|taxEnabled|taxFee|taxFeeSell|feeBurn|buyTax|sellTax)$/i.test(String(field || ""));
+}
+
+function isTaxOrCreateScopedRoute(url) {
+  const path = frontendRoutePath(url);
+  return /^\/(?:en|zh-TW)\/(?:create-token|advanced)$/i.test(path);
+}
+
 function frontendAssetStats(assetDiff) {
   const parts = [];
   if (assetDiff?.unchanged) parts.push(`不变 ${assetDiff.unchanged}`);
@@ -2708,7 +2735,7 @@ function frontendAssetStats(assetDiff) {
   return parts.join(" | ") || "无资源变化";
 }
 
-function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}) {
+function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}, pageUrl = "") {
   const summary = {
     stats: frontendAssetStats(assetDiff),
     configDiffs: [],
@@ -2719,16 +2746,25 @@ function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}) {
     readableStringChanges: 0,
     fileOnlyChanges: (assetDiff?.added?.length || 0) + (assetDiff?.removed?.length || 0),
   };
+  const suppressTaxScopedAssetStrings = pageUrl && !isTaxOrCreateScopedRoute(pageUrl);
 
   for (const m of assetDiff?.matched || []) {
     const added = m.addedStrings || [];
     const removed = m.removedStrings || [];
     const configDiffs = extractConfigDiffs(removed, added).filter(isBusinessConfigDiff);
     for (const cd of configDiffs) {
+      if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedConfigField(cd.field)) {
+        summary.noisyStringChanges++;
+        continue;
+      }
       summary.configDiffs.push({ ...cd, file: m.newFile || m.oldFile });
       summary.keywordHits.add(cd.field);
     }
     for (const s of added) {
+      if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) {
+        summary.noisyStringChanges++;
+        continue;
+      }
       if (isReadableFrontendSignalString(s)) {
         summary.readableAdded.push({ text: s, file: m.newFile || m.oldFile, keywords: matchBusinessKeywords(s) });
         for (const k of matchBusinessKeywords(s)) summary.keywordHits.add(k);
@@ -2737,6 +2773,10 @@ function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}) {
       }
     }
     for (const s of removed) {
+      if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) {
+        summary.noisyStringChanges++;
+        continue;
+      }
       if (isReadableFrontendSignalString(s)) {
         summary.readableRemoved.push({ text: s, file: m.oldFile || m.newFile, keywords: matchBusinessKeywords(s) });
         for (const k of matchBusinessKeywords(s)) summary.keywordHits.add(k);
@@ -2752,9 +2792,11 @@ function analyzeFrontendAssetDiff(assetDiff, oldAssets = {}, newAssets = {}) {
     for (const data of Object.values(oldAssets || {})) for (const s of data?.strings || []) oldGlobalStrings.add(s);
     for (const data of Object.values(newAssets || {})) for (const s of data?.strings || []) newGlobalStrings.add(s);
     for (const s of [...newGlobalStrings].filter(v => !oldGlobalStrings.has(v))) {
+      if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) continue;
       if (isReadableFrontendSignalString(s)) summary.readableAdded.push({ text: s, file: "global", keywords: matchBusinessKeywords(s) });
     }
     for (const s of [...oldGlobalStrings].filter(v => !newGlobalStrings.has(v))) {
+      if (suppressTaxScopedAssetStrings && isTaxOrCreateScopedAssetString(s)) continue;
       if (isReadableFrontendSignalString(s)) summary.readableRemoved.push({ text: s, file: "global", keywords: matchBusinessKeywords(s) });
     }
   }
@@ -3198,7 +3240,12 @@ function mergeFrontendNotifications(notifications) {
  * 构建完整 diff 详情文本（用于文件附件，不做任何省略）
  * 包含所有文件名、所有字符串变更、业务分类标注
  */
-function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignalDiff, recoveredAssets, oldAssets, newAssets) {
+function filterAssetStringsForPage(strings, pageUrl) {
+  if (!pageUrl || isTaxOrCreateScopedRoute(pageUrl)) return strings || [];
+  return (strings || []).filter(s => !isTaxOrCreateScopedAssetString(s));
+}
+
+function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignalDiff, recoveredAssets, oldAssets, newAssets, pageUrl = "") {
   const lines = [];
   lines.push("=".repeat(60));
   lines.push(`前端变更详细 Diff — ${label}`);
@@ -3222,15 +3269,19 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignal
       lines.push("");
       lines.push("--- 修改文件详情 ---");
       for (const m of assetDiff.matched) {
-        const totalChanges = m.addedStrings.length + m.removedStrings.length;
+        const removedStrings = filterAssetStringsForPage(m.removedStrings, pageUrl);
+        const addedStrings = filterAssetStringsForPage(m.addedStrings, pageUrl);
+        const totalChanges = addedStrings.length + removedStrings.length;
+        const suppressedChanges = (m.addedStrings.length + m.removedStrings.length) - totalChanges;
         if (totalChanges === 0) continue;
         const fname = m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`;
+        const suffix = suppressedChanges > 0 ? `，已收敛 ${suppressedChanges} 处跨页面 tax/create 共享 chunk 噪声` : "";
         lines.push("");
-        lines.push(`  [${fname}] (${totalChanges} 处字符串变更)`);
-        for (const s of m.removedStrings) {
+        lines.push(`  [${fname}] (${totalChanges} 处字符串变更${suffix})`);
+        for (const s of removedStrings) {
           lines.push(`    - ${s}`);
         }
-        for (const s of m.addedStrings) {
+        for (const s of addedStrings) {
           lines.push(`    + ${s}`);
         }
       }
@@ -3242,8 +3293,9 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignal
       lines.push("--- 新增文件 ---");
       for (const f of assetDiff.added) {
         const assetData = newAssets?.[f];
-        const strCount = assetData?.strings?.length || 0;
-        const sampleStrs = (assetData?.strings || []).slice(0, 5).join(" | ");
+        const strings = filterAssetStringsForPage(assetData?.strings || [], pageUrl);
+        const strCount = strings.length;
+        const sampleStrs = strings.slice(0, 5).join(" | ");
         lines.push(`  + ${f}  (${strCount} 个字符串)`);
         if (sampleStrs) lines.push(`    摘要: ${sampleStrs}`);
       }
@@ -3255,8 +3307,9 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignal
       lines.push("--- 移除文件 ---");
       for (const f of assetDiff.removed) {
         const assetData = oldAssets?.[f];
-        const strCount = assetData?.strings?.length || 0;
-        const sampleStrs = (assetData?.strings || []).slice(0, 5).join(" | ");
+        const strings = filterAssetStringsForPage(assetData?.strings || [], pageUrl);
+        const strCount = strings.length;
+        const sampleStrs = strings.slice(0, 5).join(" | ");
         lines.push(`  - ${f}  (${strCount} 个字符串)`);
         if (sampleStrs) lines.push(`    摘要: ${sampleStrs}`);
       }
@@ -6755,7 +6808,7 @@ async function runFrontendCheck() {
         cachedAssetDiff = diffFrontendAssets(oldData.assetContents, newData.assetContents);
         const hasAssetChange = cachedAssetDiff.matched.length > 0 || cachedAssetDiff.added.length > 0 || cachedAssetDiff.removed.length > 0;
         if (hasAssetChange) {
-          const assetSummary = analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents);
+          const assetSummary = analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents, newData.originalUrl);
           const assetContent = formatFrontendAssetBrief(assetSummary);
           if (hasMeaningfulFrontendAssetChange(assetSummary) && assetContent) {
             contentParts.push(assetContent);
@@ -6909,8 +6962,8 @@ async function runFrontendCheck() {
       log(`[前端] ${label} 变化！`);
 
       // 构建详细 diff 文件（复用已计算的 assetDiff）
-      const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, businessSignalDiff, [], oldData.assetContents, newData.assetContents);
-      const assetSummary = cachedAssetDiff ? analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents) : null;
+      const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, businessSignalDiff, [], oldData.assetContents, newData.assetContents, newData.originalUrl);
+      const assetSummary = cachedAssetDiff ? analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents, newData.originalUrl) : null;
       const summarySignature = assetSummary ? md5(JSON.stringify({
         configDiffs: assetSummary.configDiffs,
         added: assetSummary.readableAdded.map(x => x.text).sort(),
