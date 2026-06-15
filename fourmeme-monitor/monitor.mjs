@@ -1524,6 +1524,123 @@ function normalizeFrontendSignalSnippet(text, index = 0, length = 0) {
   return raw.slice(start, end).trim();
 }
 
+function normalizeFrontendSignalText(value) {
+  return String(value || "")
+    .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/\\"/g, "\"")
+    .replace(/\\'/g, "'")
+    .replace(/\\n|\\r|\\t/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function stripFrontendSignalSourcePrefix(value) {
+  let s = normalizeFrontendSignalText(value);
+  for (let i = 0; i < 2; i++) {
+    const m = s.match(/^((?:page|nextData|i18n|asset)|(?:static\/chunks\/)?[^:\s]{1,120}\.(?:js|css)):\s*(.+)$/i);
+    if (!m) break;
+    s = m[2].trim();
+  }
+  return s;
+}
+
+function isCodeLikeFrontendSignalSnippet(value) {
+  const s = stripFrontendSignalSourcePrefix(value);
+  if (!s) return true;
+  if (/^(?:字段|文案键|文案|路由):\s*/.test(s)) return false;
+  if (/^tax\.[A-Za-z][A-Za-z0-9 &'()\/.+-]{0,90}$/.test(s)) return false;
+  if (/^(?:enableTax|taxEnabled|taxFee|taxFeeSell|feeBurn|buyFee|sellFee|feeRateSell|feeRate|feeBps|tradeFee|commission)$/.test(s)) return false;
+  if (/(?:\?\.|===|!==|=>|\(0,|function\b|useAtom|className|onClick|children:|webpack|turbopack|__next_f)/.test(s)) return true;
+  const punct = (s.match(/[{}()[\];,`=<>|\\]/g) || []).length;
+  if (punct >= 3 && punct / Math.max(s.length, 1) > 0.08) return true;
+  if (s.length > 180 && !isReadableFrontendSignalString(s)) return true;
+  return false;
+}
+
+function addFrontendSignal(out, kind, value) {
+  if (!out || out.size >= 160) return;
+  const clean = normalizeFrontendSignalText(value).replace(/\s+([:,.])/g, "$1").trim();
+  if (!clean) return;
+  out.add(`${kind}: ${frontendDisplaySnippet(clean, 160)}`);
+}
+
+function collectNormalizedFrontendSignalsFromSnippet(snippet, source, out) {
+  const clean = stripFrontendSignalSourcePrefix(snippet);
+  if (!clean || out.size >= 160) return;
+
+  const typed = clean.match(/^(字段|文案键|文案|路由):\s*(.+)$/);
+  if (typed) {
+    addFrontendSignal(out, typed[1] === "文案键" ? "文案" : typed[1], typed[2]);
+    return;
+  }
+
+  const pair = clean.match(/^([A-Za-z][\w.-]{1,80})\s*:\s*(.{1,180})$/);
+  if (pair && (source === "i18n" || isCriticalFrontendString(pair[1]) || isCriticalFrontendString(pair[2]))) {
+    const key = pair[1].trim();
+    const value = normalizeFrontendSignalText(pair[2]);
+    if (value && !isCodeLikeFrontendSignalSnippet(value)) addFrontendSignal(out, "文案", `${key} = ${value}`);
+    else addFrontendSignal(out, "文案键", key);
+  }
+
+  const textKeyRe = /\b(?:tax|fee|token|createToken|launchToken|common)\.[A-Za-z][A-Za-z0-9 &'()\/.+-]{0,90}/g;
+  let m;
+  while ((m = textKeyRe.exec(clean)) !== null && out.size < 160) {
+    const key = m[0].replace(/[.,;:)\]}]+$/g, "").trim();
+    if (key && isCriticalFrontendString(key)) addFrontendSignal(out, "文案", key);
+  }
+
+  if (!/^(?:tax|fee|token|createToken|launchToken|common)\./.test(clean)
+    && !isCodeLikeFrontendSignalSnippet(clean)
+    && isReadableFrontendSignalString(clean)
+    && isCriticalFrontendString(clean)) {
+    addFrontendSignal(out, "文案", clean);
+  }
+
+  const fieldRe = /\b(?:enableTax|taxEnabled|taxFee|taxFeeSell|feeBurn|buyFee|sellFee|feeRateSell|feeRate|feeBps|tradeFee|commission)\b/g;
+  while ((m = fieldRe.exec(clean)) !== null && out.size < 160) addFrontendSignal(out, "字段", m[0]);
+
+  if (/\bcreate-token\b/i.test(clean) && !isCodeLikeFrontendSignalSnippet(clean)) addFrontendSignal(out, "路由", "create-token");
+}
+
+function canonicalFrontendSignal(value) {
+  const s = stripFrontendSignalSourcePrefix(value);
+  const normalized = s.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const typed = normalized.match(/^(字段|文案键|文案|路由):\s*(.+)$/);
+  if (typed) {
+    const kind = typed[1] === "文案键" ? "文案" : typed[1];
+    return `${kind}:${typed[2].trim()}`;
+  }
+
+  const signals = new Set();
+  collectNormalizedFrontendSignalsFromSnippet(normalized, "snapshot", signals);
+  if (signals.size === 1) return canonicalFrontendSignal([...signals][0]);
+  if (signals.size > 1) return "";
+  if (isCodeLikeFrontendSignalSnippet(normalized)) return "";
+  if (!isCriticalFrontendString(normalized)) return "";
+  if (isReadableFrontendSignalString(normalized)) return `文案:${normalized}`;
+  return "";
+}
+
+function normalizeFrontendSignalsForDiff(signals) {
+  const map = new Map();
+  for (const raw of signals || []) {
+    const expanded = new Set();
+    collectNormalizedFrontendSignalsFromSnippet(raw, "snapshot", expanded);
+    if (expanded.size === 0) {
+      const canonical = canonicalFrontendSignal(raw);
+      if (canonical && !map.has(canonical)) map.set(canonical, stripFrontendSignalSourcePrefix(raw));
+      continue;
+    }
+    for (const display of expanded) {
+      const canonical = canonicalFrontendSignal(display);
+      if (canonical && !map.has(canonical)) map.set(canonical, display);
+    }
+  }
+  return map;
+}
+
 function collectCriticalFrontendSignals(text, source, out) {
   const raw = String(text || "");
   if (!raw) return;
@@ -1535,7 +1652,7 @@ function collectCriticalFrontendSignals(text, source, out) {
     let matchedForPattern = 0;
     while ((match = scan.exec(raw)) !== null) {
       const snippet = normalizeFrontendSignalSnippet(raw, match.index, match[0].length);
-      if (snippet) out.add(`${source}: ${snippet}`);
+      collectNormalizedFrontendSignalsFromSnippet(snippet, source, out);
       matchedForPattern++;
       if (matchedForPattern >= 20 || out.size >= 160) break;
       if (match.index === scan.lastIndex) scan.lastIndex++;
@@ -1558,11 +1675,11 @@ function extractCreateTokenSignals(features, url) {
 }
 
 function diffFrontendSignals(oldSignals, newSignals) {
-  const oldSet = new Set(oldSignals || []);
-  const newSet = new Set(newSignals || []);
+  const oldMap = normalizeFrontendSignalsForDiff(oldSignals);
+  const newMap = normalizeFrontendSignalsForDiff(newSignals);
   return {
-    added: [...newSet].filter(s => !oldSet.has(s)).sort(),
-    removed: [...oldSet].filter(s => !newSet.has(s)).sort(),
+    added: [...newMap.entries()].filter(([key]) => !oldMap.has(key)).map(([, value]) => value).sort(),
+    removed: [...oldMap.entries()].filter(([key]) => !newMap.has(key)).map(([, value]) => value).sort(),
   };
 }
 
@@ -6579,7 +6696,7 @@ async function runFrontendCheck() {
           const signalLines = (newData.createTokenSignals || []).slice(0, 12);
           if (signalLines.length > 0) {
             lines.push("");
-            lines.push("**当前创建页关键业务指纹：**");
+            lines.push("**当前创建页重点文案/功能信号：**");
             lines.push("```");
             for (const s of signalLines) lines.push(s.length > 160 ? s.slice(0, 160) + "..." : s);
             if ((newData.createTokenSignals || []).length > signalLines.length) {
@@ -6669,14 +6786,14 @@ async function runFrontendCheck() {
     // ── 1.5 创建页关键业务指纹 diff（税收按钮/费率开关/创建表单配置）──
     if (newData.createTokenSignals || oldData.createTokenSignals) {
       businessSignalDiff = diffFrontendSignals(oldData.createTokenSignals, newData.createTokenSignals);
-      const signalContent = formatFrontendSignalChanges(businessSignalDiff, "创建页关键业务指纹");
+      const signalContent = formatFrontendSignalChanges(businessSignalDiff, "创建页重点文案/功能信号");
       if (signalContent) {
         contentParts.push(signalContent);
         pageContentParts.push(signalContent);
         hasNonAssetChange = true;
       }
     } else if (isCreateTokenFrontendUrl(newData.originalUrl) && newData.createTokenSignalHash) {
-      const signalContent = `**🔎 创建页关键业务指纹首次建立：** ${(newData.createTokenSignals || []).length} 项`;
+      const signalContent = `**🔎 创建页重点文案/功能信号首次建立：** ${(newData.createTokenSignals || []).length} 项`;
       contentParts.push(signalContent);
       pageContentParts.push(signalContent);
       hasNonAssetChange = true;
