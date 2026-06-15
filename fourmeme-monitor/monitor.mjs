@@ -2194,6 +2194,31 @@ function _parseRawI18nString(raw) {
 }
 
 const i18nParseLogState = new Map();
+const frontendInfoLogState = new Map();
+
+function shouldLogI18nExtraction(oldFeatures, i18nResult) {
+  if (!i18nResult?.i18nHash) return false;
+  return !oldFeatures?.i18nHash || oldFeatures.i18nHash !== i18nResult.i18nHash;
+}
+
+function i18nExtractionReason(oldFeatures) {
+  return oldFeatures?.i18nHash ? "hash 变化" : "首次";
+}
+
+function logFrontendInfoRateLimited(key, message, cooldownSeconds = readPositiveIntEnv("FOURMEME_FRONTEND_INFO_LOG_COOLDOWN_SECONDS", 300)) {
+  const now = Date.now();
+  const cooldownMs = Math.max(1, cooldownSeconds) * 1000;
+  const state = frontendInfoLogState.get(key) || { lastLogAt: 0, suppressed: 0 };
+  if (!state.lastLogAt || now - state.lastLogAt >= cooldownMs) {
+    const suffix = state.suppressed > 0 ? `（已抑制 ${state.suppressed} 条同类日志）` : "";
+    log(message + suffix);
+    state.lastLogAt = now;
+    state.suppressed = 0;
+  } else {
+    state.suppressed++;
+  }
+  frontendInfoLogState.set(key, state);
+}
 
 /**
  * 从 Next.js streaming HTML 中提取 i18n 翻译（适配 four.meme App Router 架构）
@@ -2793,9 +2818,8 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
       }
       const freshI18n = applyI18nResult(features, i18nResult, oldFeatures);
       if (freshI18n) {
-        // 仅在 hash 变化或首次提取时输出日志
-        if (!oldFeatures.i18nHash || oldFeatures.i18nHash !== i18nResult.i18nHash) {
-          log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（${!oldFeatures.i18nHash ? '首次' : 'hash 变化'}）`);
+        if (shouldLogI18nExtraction(oldFeatures, i18nResult)) {
+          log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（${i18nExtractionReason(oldFeatures)}）`);
         }
       } else if (features.i18nMissCount >= readPositiveIntEnv("FOURMEME_I18N_REUSE_MAX_MISSES", 3)) {
         log(`  [i18n] 连续 ${features.i18nMissCount} 次未提取到 i18n，不再无限复用旧缓存`);
@@ -2831,7 +2855,9 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
         i18nResult = await fetchI18nStrings(features.assetUrlMap, baseUrl);
       }
       if (applyI18nResult(features, i18nResult, oldFeatures)) {
-        log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（资源更新/首次）`);
+        if (shouldLogI18nExtraction(oldFeatures, i18nResult)) {
+          log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（${i18nExtractionReason(oldFeatures)}）`);
+        }
       }
     } catch (err) { log(`  [i18n] 提取异常（非致命）：${err.message}`); }
   }
@@ -7199,7 +7225,10 @@ async function runFrontendCheck() {
             contentParts.push(assetContent);
             assetContentParts.push(assetContent);
           } else {
-            log(`[前端] ${urlLabel(newData.originalUrl)} 仅检测到构建产物/压缩变量噪音，更新快照但不推送`);
+            logFrontendInfoRateLimited(
+              `asset-noise:${canonicalFrontendUrl(newData.originalUrl)}`,
+              `[前端] ${urlLabel(newData.originalUrl)} 仅检测到构建产物/压缩变量噪音，更新快照但不推送`
+            );
           }
         }
       } else {
@@ -8000,6 +8029,7 @@ export const __testables = {
   extractNextData,
   stableJsonHash,
   extractI18nFromStreamingHtml,
+  shouldLogI18nExtraction,
   extractRouteSignals,
   diffI18nStrings,
   diffRoutes,

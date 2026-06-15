@@ -86,6 +86,13 @@ test("extractI18nFromStreamingHtml preserves escaped quotes inside parsed flight
   assert.equal(result.i18nStrings["contract.editModal.warning"], `The audit status will reset to "Pending".`);
 });
 
+test("unchanged i18n extraction stays quiet after baseline", () => {
+  const i18nResult = { i18nHash: "same-hash", i18nStrings: { a: "b" } };
+  assert.equal(__testables.shouldLogI18nExtraction(null, i18nResult), true);
+  assert.equal(__testables.shouldLogI18nExtraction({ i18nHash: "old-hash" }, i18nResult), true);
+  assert.equal(__testables.shouldLogI18nExtraction({ i18nHash: "same-hash" }, i18nResult), false);
+});
+
 test("failed discovered frontend URLs are suppressed during cooldown", () => {
   const route = `/codex-suppressed-${Date.now()}`;
   const url = `https://four.meme/zh-TW${route}`;
