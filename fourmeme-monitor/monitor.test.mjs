@@ -112,6 +112,19 @@ test("extractRouteSignals separates frontend pages from API endpoints", () => {
   assert.deepEqual(signals.endpoints, ["/meme-api/v1/public/config"]);
 });
 
+test("extractRouteSignals filters resource links and placeholder dynamic routes", () => {
+  const signals = __testables.extractRouteSignals(
+    `<link rel="preload" href="/_next/static/chunks/app.js">
+     <a href="/zh-TW/null">bad null</a>
+     <a href="/zh-TW/token/undefined">bad token</a>
+     <a href="/zh-TW/contract/1778027615723">dynamic contract</a>
+     <a href="/zh-TW/contract/create">create contract</a>`,
+    null,
+    null,
+  );
+  assert.deepEqual(signals.routes, ["/zh-TW/contract/create"]);
+});
+
 test("classifyFetchFailure distinguishes backoff and rate limits", () => {
   assert.equal(__testables.classifyFetchFailure(new Error("[退避中] four.meme")), "backoff");
   assert.equal(__testables.classifyFetchFailure(new Error("HTTP 429 (风控)")), "rate_limited");

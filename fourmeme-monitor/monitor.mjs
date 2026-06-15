@@ -1276,6 +1276,7 @@ function isTrackableRouteString(route) {
   if (!route || route[0] !== "/") return false;
   if (route === "/") return false;
   if (route.startsWith("//")) return false;
+  if (isPlaceholderFrontendRoute(route)) return false;
   if (route.startsWith("/_next/") || route.startsWith("/static/")) return false;
   if (/\.(js|css|png|svg|ico|jpg|jpeg|gif|webp|woff2?|ttf|eot|map)$/i.test(route.split("?")[0])) return false;
   if (isLocaleRootRoute(route)) return false;
@@ -1292,6 +1293,11 @@ function isLocaleRootRoute(route) {
   return /^\/[a-z]{2}(?:-[a-z]{2})?$/i.test((route || "").split("?")[0].replace(/\/+$/, ""));
 }
 
+function isPlaceholderFrontendRoute(route) {
+  const path = normalizeRouteString(route).split("?")[0].replace(/\/+$/, "");
+  return /\/(?:null|undefined)(?:\/|$)/i.test(path);
+}
+
 function isUnsupportedLocalePrefixedRoute(route) {
   const path = (route || "").split("?")[0];
   return /^\/[a-z]{2}(?:-[a-z]{2})?(?:\/|$)/i.test(path) && !/^\/(?:en|zh-TW)(?:\/|$)/i.test(path);
@@ -1300,6 +1306,8 @@ function isUnsupportedLocalePrefixedRoute(route) {
 function isDynamicFrontendRoute(route) {
   const path = normalizeRouteString(route).split("?")[0].replace(/\/+$/, "");
   return /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/0x[a-f0-9]{40}$/i.test(path)
+    || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/undefined$/i.test(path)
+    || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?contract\/\d+$/i.test(path)
     || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?presale\/\d+$/i.test(path)
     || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?competition\/[^/?#]+$/i.test(path);
 }
@@ -1449,14 +1457,14 @@ function extractHrefRoutesFromHtml(html) {
   const maxLinks = readPositiveIntEnv("FOURMEME_FRONTEND_MAX_HREFS", 500);
   try {
     const { document } = parseHTML(raw);
-    for (const a of document.querySelectorAll("a[href],link[href]")) {
+    for (const a of document.querySelectorAll("a[href]")) {
       if (routes.length >= maxLinks) break;
       const href = a.getAttribute("href");
       if (href) routes.push(href);
     }
     return routes;
   } catch {
-    const hrefRe = /\bhref=["']([^"']+)["']/g;
+    const hrefRe = /<a\b[^>]*\bhref=["']([^"']+)["']/gi;
     let m;
     while ((m = hrefRe.exec(raw)) !== null && routes.length < maxLinks) routes.push(m[1]);
     return routes;
