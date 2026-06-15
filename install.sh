@@ -309,7 +309,7 @@ if [ -f "$SNAP" ]; then
       console.log('    i18n: '+i18n+' 键  |  __NEXT_DATA__: '+nextData);
     }
 
-    // 模块 3/5：API
+    // 模块 3：API
     const api=s.apiStructure||{};
     const apiKeys=Object.keys(api);
     const apiLinks={
@@ -324,7 +324,7 @@ if [ -f "$SNAP" ]; then
       token_search_cap:['/v1/public/token/search CAP','https://four.meme/meme-api/v1/public/token/search']
     };
     console.log('');
-    console.log('[ 模块3/5: API结构 ]');
+    console.log('[ 模块3: API结构 ]');
     console.log('  端点: '+apiKeys.length+' 个');
     for(const k of apiKeys){
       const a=api[k];
@@ -333,11 +333,33 @@ if [ -f "$SNAP" ]; then
       console.log('  '+link+' ('+fields+' 个顶层字段)');
     }
 
-    // 模块 4：GitHub
+    // 模块 4：OpenFour
+    const templates=s.openFourTemplates||{};
+    const templateKeys=Object.keys(templates);
+    console.log('');
+    console.log('[ 模块4: OpenFour ]');
+    console.log('  业务模板: '+templateKeys.length+' 个');
+    if(s.openFourTemplatesLastPollAt) console.log('  模板最后检查: '+s.openFourTemplatesLastPollAt);
+    for(const id of templateKeys.slice(0,10)){
+      const t=templates[id]||{};
+      console.log('  '+id+'  ['+(t.status||'?')+'] '+(t.name||'未知')+(t.tag?' / '+t.tag:''));
+    }
+    if(templateKeys.length>10) console.log('  ... 还有 '+(templateKeys.length-10)+' 个模板');
+    const ofm=s.openFourModules||{};
+    const moduleItems=Object.values(ofm.byAddress||{});
+    console.log('  Registry: '+(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
+    console.log('  Preset: '+((ofm.presetIds||[]).length)+' 个 | 模块实现: '+moduleItems.length+' 个');
+    if(ofm.lastPollAt) console.log('  模块最后发现检查: '+ofm.lastPollAt);
+    for(const m of moduleItems.slice(0,12)){
+      console.log('  '+m.address+'  roles='+(m.roles||[]).join(',')+'  presets='+(m.presetIds||[]).join(','));
+    }
+    if(moduleItems.length>12) console.log('  ... 还有 '+(moduleItems.length-12)+' 个模块实现');
+
+    // 模块 5：GitHub
     const sha=(s.githubSha||'')||'未知';
     const repos=Object.keys(s.githubRepos||{}).length;
     console.log('');
-    console.log('[ 模块4: GitHub ]');
+    console.log('[ 模块5: GitHub ]');
     console.log('  账号: four-meme-community（仓库 '+repos+' 个）');
     console.log('  主仓库: four-meme-community/four-meme-ai');
     console.log('  最新 SHA: '+sha);
@@ -804,7 +826,7 @@ pm2 jlist 2>/dev/null | node -e "
         waiting:'等待中',
       }[status]||'未知');
       const services=[
-        {name:'fourmeme-monitor', label:'Four.meme 监控', desc:'7模块全面监控'},
+        {name:'fourmeme-monitor', label:'Four.meme 监控', desc:'OpenFour + 多模块全面监控'},
         {name:'flap-monitor',     label:'Flap.sh 监控',   desc:'页面/资源/文案监控'},
         {name:'feishu-bot',       label:'飞书交互机器人',   desc:'WebSocket 长连接'},
       ];
@@ -1073,7 +1095,7 @@ cat << 'INNER'
   mon-help            显示此帮助
 
 ── fourmeme (fm-*) ──────────────────────────────────
-  fm-status           进程 + 7 模块数据摘要
+  fm-status           进程 + OpenFour/底池/前端/API/GitHub/合约/链上/创建者数据摘要
   fm-log [N]          日志（默认 80 行, 倒序）
   fm-restart          重启
   fm-stop             停止

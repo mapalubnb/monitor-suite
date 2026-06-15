@@ -7,7 +7,7 @@
 ```
 ~/monitor-suite/              # 源码 + 部署目录（/root/monitor-suite/）
 ├── fourmeme-monitor/         # Four.meme 全面监控
-│   ├── monitor.mjs           #   7 大监控模块（底池/前端/API/GitHub/合约/链上参数）
+│   ├── monitor.mjs           #   Four.meme 多模块监控（OpenFour/底池/前端/API/GitHub/合约/链上参数）
 │   ├── feishu-bot.mjs        #   飞书 Bot（群聊指令交互 + 卡片回调）
 │   └── package.json
 ├── flap-monitor/             # Flap.sh 页面监控
@@ -208,7 +208,7 @@ sudo bash install.sh
 | `mon-stop` | 停止全部进程 |
 | `mon-ai` | 查看/切换 AI 模型 |
 | `mon-help` | 显示所有快捷命令 |
-| `fm-status` | Four.meme 进程 + 7 模块数据摘要 |
+| `fm-status` | Four.meme 进程 + OpenFour/底池/前端/API/GitHub/合约/链上/创建者数据摘要 |
 | `fm-log [N]` | 日志（默认 80 行，倒序） |
 | `fm-restart` | 重启 |
 | `fm-check` | SIGUSR1 触发全量检测 |
