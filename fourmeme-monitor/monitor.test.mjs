@@ -22,6 +22,26 @@ test("frontend fetch defaults to Scrapling stealthy mode", () => {
   assert.equal(__testables.frontendFetchModeLabel(), "scrapling_stealthy");
 });
 
+test("Four.meme API fallback is limited to meme-api URLs and uses Scrapling by default", () => {
+  assert.equal(__testables.CONFIG.fourMemeApiFetch.scraplingFallbackEnabled, true);
+  assert.equal(__testables.CONFIG.fourMemeApiFetch.directRetryMs, 300_000);
+  assert.equal(__testables.fourMemeApiScraplingFallbackConfigured(), true);
+  assert.equal(__testables.isFourMemeApiUrl("https://four.meme/meme-api/v1/public/config"), true);
+  assert.equal(__testables.isFourMemeApiUrl("https://four.meme/en"), false);
+  assert.equal(__testables.isFourMemeApiUrl("https://api.github.com/repos/x/y"), false);
+});
+
+test("Scrapling text response wrapper behaves like the fetch Response subset used by monitors", async () => {
+  const res = __testables.makeTextResponse({
+    status: 200,
+    text: "{\"code\":0,\"data\":[1]}",
+    headers: { "Content-Type": "application/json" },
+  });
+  assert.equal(res.ok, true);
+  assert.equal(res.headers.get("content-type"), "application/json");
+  assert.deepEqual(await res.json(), { code: 0, data: [1] });
+});
+
 test("startup card copy reflects active frontend and api cadences", () => {
   const progress = __testables.buildStartupProgressContent();
   const ready = __testables.buildStartupReadyContent();

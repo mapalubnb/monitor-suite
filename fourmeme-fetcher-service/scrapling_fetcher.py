@@ -86,6 +86,7 @@ FETCH_WITH_ASSETS_TOTAL_TIMEOUT_MS = read_int("FOURMEME_SCRAPLING_FETCH_WITH_ASS
 MAX_ASSETS = read_int("FOURMEME_SCRAPLING_MAX_ASSETS", 20)
 MAX_ASSET_BYTES = read_int("FOURMEME_SCRAPLING_MAX_ASSET_BYTES", 1_000_000)
 MAX_ASSET_TOTAL_BYTES = read_int("FOURMEME_SCRAPLING_MAX_ASSET_TOTAL_BYTES", 6_000_000)
+MAX_TEXT_BYTES = read_int("FOURMEME_SCRAPLING_MAX_TEXT_BYTES", 4_000_000)
 ASSET_TIMEOUT_MS = read_int("FOURMEME_SCRAPLING_ASSET_TIMEOUT_MS", 8_000)
 ASSET_TOTAL_TIMEOUT_MS = read_int("FOURMEME_SCRAPLING_ASSET_TOTAL_TIMEOUT_MS", 15_000)
 ASSET_CONCURRENCY = read_int("FOURMEME_SCRAPLING_ASSET_CONCURRENCY", 4)
@@ -102,6 +103,26 @@ ALLOWED_HOSTS = tuple(
     for h in os.getenv("FOURMEME_SCRAPLING_ALLOWED_HOSTS", "four.meme,*.four.meme").split(",")
     if h.strip()
 )
+
+RAW_RESPONSE_TYPES = {"text", "raw", "api", "json"}
+ALLOWED_METHODS = {"GET", "POST"}
+FORBIDDEN_BROWSER_HEADERS = {
+    "accept-encoding",
+    "connection",
+    "content-length",
+    "cookie",
+    "host",
+    "origin",
+    "referer",
+    "sec-fetch-dest",
+    "sec-fetch-mode",
+    "sec-fetch-site",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "user-agent",
+}
 
 
 def is_loopback_bind(host: str) -> bool:
@@ -140,6 +161,71 @@ def validate_fetch_url(url: str) -> str:
     if not host_allowed(parsed.hostname):
         raise PermissionError(f"Host is not allowed: {parsed.hostname}")
     return url
+
+
+def response_type(payload: dict[str, Any]) -> str:
+    value = str(payload.get("responseType") or payload.get("mode") or "html").strip().lower()
+    return value if value in RAW_RESPONSE_TYPES else "html"
+
+
+def request_timeout_ms(payload: dict[str, Any], fallback: int) -> int:
+    try:
+        value = int(payload.get("timeoutMs") or fallback)
+    except (TypeError, ValueError):
+        value = fallback
+    return max(1_000, min(value, PAGE_TIMEOUT_MS))
+
+
+def sanitize_method(method: Any) -> str:
+    value = str(method or "GET").strip().upper()
+    if value not in ALLOWED_METHODS:
+        raise ValueError(f"Unsupported method: {value}")
+    return value
+
+
+def sanitize_headers(raw_headers: Any) -> dict[str, str]:
+    if not isinstance(raw_headers, dict):
+        return {}
+    headers: dict[str, str] = {}
+    for raw_key, raw_value in raw_headers.items():
+        key = str(raw_key or "").strip()
+        if not key or len(key) > 80 or "\n" in key or "\r" in key:
+            continue
+        lower = key.lower()
+        if lower in FORBIDDEN_BROWSER_HEADERS or lower.startswith("proxy-"):
+            continue
+        value = str(raw_value if raw_value is not None else "")
+        if len(value) > 4_096 or "\n" in value or "\r" in value:
+            continue
+        headers[key] = value
+        if len(headers) >= 24:
+            break
+    return headers
+
+
+def sanitize_body(body: Any) -> str | None:
+    if body is None:
+        return None
+    value = body if isinstance(body, str) else json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    if len(value.encode("utf-8", errors="ignore")) > 512_000:
+        raise ValueError("Request body is too large")
+    return value
+
+
+def same_origin(a: str, b: str) -> bool:
+    pa = urlparse(a)
+    pb = urlparse(b)
+    return pa.scheme == pb.scheme and pa.hostname == pb.hostname and (pa.port or default_port(pa.scheme)) == (pb.port or default_port(pb.scheme))
+
+
+def default_port(scheme: str) -> int:
+    return 443 if scheme == "https" else 80
+
+
+def enforce_text_limit(text: str) -> str:
+    if len(text.encode("utf-8", errors="ignore")) > MAX_TEXT_BYTES:
+        raise ValueError(f"Response text is too large ({MAX_TEXT_BYTES} bytes limit)")
+    return text
 
 
 def response_text(response: Any) -> str:
@@ -243,9 +329,15 @@ class FetcherRuntime:
 
     def run_fetch(self, payload: dict[str, Any]) -> dict[str, Any]:
         include_assets = bool(payload.get("includeAssets"))
-        total_timeout_ms = FETCH_WITH_ASSETS_TOTAL_TIMEOUT_MS if include_assets else FETCH_TOTAL_TIMEOUT_MS
+        per_request_timeout_ms = request_timeout_ms(payload, PAGE_TIMEOUT_MS)
+        if include_assets:
+            total_timeout_ms = FETCH_WITH_ASSETS_TOTAL_TIMEOUT_MS
+        elif response_type(payload) in RAW_RESPONSE_TYPES:
+            total_timeout_ms = min(FETCH_TOTAL_TIMEOUT_MS, per_request_timeout_ms + 5_000)
+        else:
+            total_timeout_ms = FETCH_TOTAL_TIMEOUT_MS
         fut = asyncio.run_coroutine_threadsafe(
-            asyncio.wait_for(self.fetch(payload), timeout=total_timeout_ms / 1000),
+            asyncio.wait_for(self.fetch(payload, timeout_ms=per_request_timeout_ms), timeout=total_timeout_ms / 1000),
             self.loop,
         )
         try:
@@ -261,6 +353,8 @@ class FetcherRuntime:
 
         url = validate_fetch_url(str(payload.get("url") or ""))
         include_assets = bool(payload.get("includeAssets"))
+        if response_type(payload) in RAW_RESPONSE_TYPES:
+            return await self._fetch_text(payload, timeout_ms)
 
         started = time.time()
         async with self.sem:
@@ -279,6 +373,95 @@ class FetcherRuntime:
                 result["assets"] = await self._fetch_assets(url, html)
                 result["assetCount"] = len(result["assets"])
             return result
+
+    async def _fetch_text(self, payload: dict[str, Any], timeout_ms: int) -> dict[str, Any]:
+        url = validate_fetch_url(str(payload.get("url") or ""))
+        method = sanitize_method(payload.get("method"))
+        headers = sanitize_headers(payload.get("headers"))
+        body = sanitize_body(payload.get("body"))
+        started = time.time()
+        async with self.sem:
+            if method == "GET":
+                page = await self.session.fetch(
+                    url,
+                    timeout=timeout_ms,
+                    extra_headers=headers or None,
+                    solve_cloudflare=SOLVE_CLOUDFLARE,
+                    load_dom=False,
+                    network_idle=False,
+                    disable_resources=True,
+                )
+                text = enforce_text_limit(response_text(page))
+                status = int(getattr(page, "status", 200) or 200)
+                return {
+                    "text": text,
+                    "headers": {},
+                    "status": status,
+                    "source": "scrapling_stealthy_api",
+                    "durationMs": int((time.time() - started) * 1000),
+                    "challenge": is_challenge(text),
+                }
+
+            bridge_url = str(payload.get("bridgeUrl") or WARMUP_URL or "https://four.meme/en")
+            bridge_url = validate_fetch_url(bridge_url)
+            if not same_origin(url, bridge_url):
+                raise ValueError("bridgeUrl must use the same origin as url")
+
+            result_box: dict[str, Any] = {}
+
+            async def page_action(page: Any) -> None:
+                result_box["result"] = await page.evaluate(
+                    """async (req) => {
+                        const controller = new AbortController();
+                        const timer = setTimeout(() => controller.abort(), req.timeoutMs);
+                        try {
+                            const init = {
+                                method: req.method,
+                                headers: req.headers,
+                                credentials: "include",
+                                signal: controller.signal
+                            };
+                            if (req.body !== null && req.body !== undefined) init.body = req.body;
+                            const res = await fetch(req.url, init);
+                            const text = await res.text();
+                            const headers = {};
+                            for (const [key, value] of res.headers.entries()) headers[key] = value;
+                            return { status: res.status, ok: res.ok, url: res.url, text, headers };
+                        } finally {
+                            clearTimeout(timer);
+                        }
+                    }""",
+                    {
+                        "url": url,
+                        "method": method,
+                        "headers": headers,
+                        "body": body,
+                        "timeoutMs": timeout_ms,
+                    },
+                )
+
+            bridge_page = await self.session.fetch(
+                bridge_url,
+                timeout=timeout_ms,
+                solve_cloudflare=SOLVE_CLOUDFLARE,
+                load_dom=True,
+                network_idle=False,
+                disable_resources=True,
+                page_action=page_action,
+            )
+            bridge_html = response_text(bridge_page)
+            result = result_box.get("result")
+            if not isinstance(result, dict):
+                raise RuntimeError("Browser API fetch did not return a result")
+            text = enforce_text_limit(str(result.get("text") or ""))
+            return {
+                "text": text,
+                "headers": result.get("headers") if isinstance(result.get("headers"), dict) else {},
+                "status": int(result.get("status") or 0),
+                "source": "scrapling_stealthy_api",
+                "durationMs": int((time.time() - started) * 1000),
+                "challenge": is_challenge(text) or is_challenge(bridge_html),
+            }
 
     async def _fetch_assets(self, base_url: str, html: str) -> dict[str, dict[str, Any]]:
         from html.parser import HTMLParser
@@ -401,6 +584,7 @@ class Handler(BaseHTTPRequestHandler):
             "assetConcurrency": ASSET_CONCURRENCY,
             "assetTotalTimeoutMs": ASSET_TOTAL_TIMEOUT_MS,
             "assetMaxTotalBytes": MAX_ASSET_TOTAL_BYTES,
+            "textMaxBytes": MAX_TEXT_BYTES,
             "warmupUrl": WARMUP_URL,
             "warmupOk": runtime.warmup_ok,
             "warmupRunning": runtime.warmup_started_at > 0 and runtime.warmup_finished_at == 0,

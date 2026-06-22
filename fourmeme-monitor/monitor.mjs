@@ -209,6 +209,12 @@ const CONFIG = {
     minIntervalMs: readPositiveIntEnv("FOURMEME_SCRAPLING_MIN_INTERVAL_MS", 250),
     maxHtmlBytes: readPositiveIntEnv("FOURMEME_SCRAPLING_MAX_HTML_BYTES", 8_000_000),
   },
+  fourMemeApiFetch: {
+    scraplingFallbackEnabled: readBoolEnv("FOURMEME_API_SCRAPLING_FALLBACK_ENABLED", true),
+    scraplingTimeoutMs: readPositiveIntEnv("FOURMEME_API_SCRAPLING_TIMEOUT_MS", 30_000),
+    maxTextBytes: readPositiveIntEnv("FOURMEME_API_SCRAPLING_MAX_TEXT_BYTES", 4_000_000),
+    directRetryMs: readPositiveIntEnv("FOURMEME_API_DIRECT_RETRY_SECONDS", 300) * 1000,
+  },
   frontendDiscovery: {
     enabled: true,
     locale: "zh-TW",
@@ -443,6 +449,10 @@ function recordSuccess(domain) {
   } else {
     domainBackoff.set(domain, b);
   }
+}
+
+function clearDomainBackoff(domain) {
+  if (domain) domainBackoff.delete(domain);
 }
 
 function classifyFetchFailure(err) {
@@ -1135,6 +1145,233 @@ async function readLimitedTextResponse(res, maxBytes) {
   return Buffer.concat(chunks.map(chunk => Buffer.from(chunk))).toString("utf8");
 }
 
+function isFourMemeApiUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === "four.meme" && /^\/meme-api\//i.test(parsed.pathname);
+  } catch {
+    return false;
+  }
+}
+
+function fourMemeApiScraplingFallbackConfigured() {
+  return CONFIG.fourMemeApiFetch.scraplingFallbackEnabled && frontendScraplingFetchConfigured();
+}
+
+function headersToPlainObject(headers = {}) {
+  const out = {};
+  if (!headers) return out;
+  if (typeof Headers !== "undefined" && headers instanceof Headers) {
+    for (const [key, value] of headers.entries()) out[key] = value;
+    return out;
+  }
+  if (Array.isArray(headers)) {
+    for (const [key, value] of headers) out[String(key)] = String(value);
+    return out;
+  }
+  if (typeof headers.entries === "function") {
+    for (const [key, value] of headers.entries()) out[key] = value;
+    return out;
+  }
+  for (const [key, value] of Object.entries(headers)) out[key] = String(value);
+  return out;
+}
+
+function bodyToScraplingPayload(body) {
+  if (body == null) return undefined;
+  if (typeof body === "string") return body;
+  if (body instanceof URLSearchParams) return body.toString();
+  if (Buffer.isBuffer(body)) return body.toString("utf8");
+  return String(body);
+}
+
+function makeTextResponse({ status = 200, text = "", headers = {}, source = "scrapling_stealthy_api" } = {}) {
+  const headerMap = new Map();
+  for (const [key, value] of Object.entries(headers || {})) {
+    headerMap.set(String(key).toLowerCase(), String(value));
+  }
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: "",
+    source,
+    headers: {
+      get(name) {
+        return headerMap.get(String(name || "").toLowerCase()) || null;
+      },
+    },
+    async text() {
+      return text;
+    },
+    async json() {
+      return JSON.parse(text);
+    },
+  };
+}
+
+async function fetchDirectNoBackoff(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    if (res.status === 429 || res.status === 403) {
+      let body = "";
+      try { body = await res.text(); } catch {}
+      const reason = isCloudflareChallengeText(body) || res.headers.get("cf-ray") ? "cloudflare_challenge" : "rate_limited";
+      throw buildFetchError(`HTTP ${res.status} (${reason === "cloudflare_challenge" ? "Cloudflare challenge" : "风控"})`, {
+        statusCode: res.status,
+        reason,
+        responseText: body.slice(0, 4000),
+      });
+    }
+    return res;
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw buildFetchError(`请求超时 ${timeoutMs}ms: ${url}`, { reason: "timeout" });
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const fourMemeApiFallbackLogAt = new Map();
+const fourMemeApiDirectBlock = { until: 0, reason: "" };
+
+function logFourMemeApiFallback(url, reason) {
+  const key = `${getDomain(url)}:${reason}`;
+  const now = Date.now();
+  const lastAt = fourMemeApiFallbackLogAt.get(key) || 0;
+  if (now - lastAt < 60_000) return;
+  fourMemeApiFallbackLogAt.set(key, now);
+  log(`[API] ${getDomain(url)} 普通 HTTP 触发 ${reason}，改用 Scrapling 浏览器上下文抓取`);
+}
+
+function markFourMemeApiDirectBlocked(reason) {
+  fourMemeApiDirectBlock.until = Date.now() + CONFIG.fourMemeApiFetch.directRetryMs;
+  fourMemeApiDirectBlock.reason = reason || "blocked";
+}
+
+function fourMemeApiDirectBlocked() {
+  return fourMemeApiDirectBlock.until > Date.now();
+}
+
+async function fetchFourMemeApiViaScrapling(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
+  if (!fourMemeApiScraplingFallbackConfigured()) {
+    throw buildFetchError("Four.meme API Scrapling fallback is not configured", { reason: "scrapling_unavailable" });
+  }
+  await waitForFrontendScraplingFetchSlot();
+  const startedAt = Date.now();
+  const apiTimeoutMs = Math.max(timeoutMs, CONFIG.fourMemeApiFetch.scraplingTimeoutMs);
+  const maxTextBytes = CONFIG.fourMemeApiFetch.maxTextBytes;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), apiTimeoutMs + 2_000);
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (CONFIG.frontendScraplingFetch.token) {
+      headers["X-Fourmeme-Fetcher-Token"] = CONFIG.frontendScraplingFetch.token;
+    }
+    const payload = {
+      url,
+      responseType: "text",
+      method: String(opts.method || "GET").toUpperCase(),
+      headers: headersToPlainObject(opts.headers || {}),
+      timeoutMs: apiTimeoutMs,
+    };
+    const body = bodyToScraplingPayload(opts.body);
+    if (body !== undefined) payload.body = body;
+
+    const res = await fetch(CONFIG.frontendScraplingFetch.url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: ctrl.signal,
+    });
+    const raw = await readLimitedTextResponse(res, maxTextBytes * 2 + 4096);
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch {
+      throw buildFetchError(`Scrapling API returned non-JSON response: ${raw.slice(0, 200)}`, { reason: "scrapling_error" });
+    }
+    if (!res.ok || data?.ok === false) {
+      throw buildFetchError(`Scrapling API fetch failed: ${data?.message || data?.error || res.status}`, {
+        statusCode: res.status,
+        reason: "scrapling_error",
+        responseText: raw.slice(0, 4000),
+      });
+    }
+    const text = String(data?.text || "");
+    if (Buffer.byteLength(text, "utf8") > maxTextBytes) {
+      throw buildFetchError(`Scrapling API response too large (${Buffer.byteLength(text, "utf8")} bytes)`, {
+        statusCode: data?.status || 0,
+        reason: "scrapling_error",
+      });
+    }
+    if (data?.challenge || isCloudflareChallengeText(text)) {
+      throw buildFetchError("Scrapling API session is still on Cloudflare challenge", {
+        statusCode: data?.status || 403,
+        reason: "cloudflare_challenge",
+        responseText: text.slice(0, 4000),
+      });
+    }
+    clearDomainBackoff(getDomain(url));
+    const response = makeTextResponse({
+      status: Number(data?.status || 200),
+      text,
+      headers: data?.headers || {},
+      source: data?.source || "scrapling_stealthy_api",
+    });
+    response.durationMs = Date.now() - startedAt;
+    return response;
+  } catch (err) {
+    if (err?.reason) throw err;
+    const isTimeout = err?.name === "AbortError" || /timed out|timeout/i.test(err?.message || "");
+    throw buildFetchError(
+      isTimeout ? `Scrapling API fetch timeout ${apiTimeoutMs}ms` : `Scrapling API fetch error: ${err.message || err}`,
+      { reason: isTimeout ? "timeout" : "scrapling_error" },
+    );
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchFourMemeApi(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
+  if (!isFourMemeApiUrl(url)) {
+    return await fetchSafe(url, opts, timeoutMs);
+  }
+
+  const domain = getDomain(url);
+  const backoffState = currentBackoffState(domain);
+  if (backoffState && fourMemeApiScraplingFallbackConfigured()) {
+    logFourMemeApiFallback(url, backoffState.lastReason || "backoff");
+    return await fetchFourMemeApiViaScrapling(url, opts, timeoutMs);
+  }
+  if (fourMemeApiDirectBlocked() && fourMemeApiScraplingFallbackConfigured()) {
+    logFourMemeApiFallback(url, fourMemeApiDirectBlock.reason || "blocked");
+    return await fetchFourMemeApiViaScrapling(url, opts, timeoutMs);
+  }
+
+  try {
+    const res = await fetchDirectNoBackoff(url, opts, timeoutMs);
+    fourMemeApiDirectBlock.until = 0;
+    fourMemeApiDirectBlock.reason = "";
+    if (res.ok || res.status < 500) recordSuccess(domain);
+    return res;
+  } catch (err) {
+    const reason = classifyFetchFailure(err);
+    if (["cloudflare_challenge", "rate_limited", "backoff"].includes(reason) && fourMemeApiScraplingFallbackConfigured()) {
+      markFourMemeApiDirectBlocked(reason);
+      logFourMemeApiFallback(url, reason);
+      return await fetchFourMemeApiViaScrapling(url, opts, timeoutMs);
+    }
+    if (["cloudflare_challenge", "rate_limited"].includes(reason)) {
+      recordFail(domain, err.statusCode || 403, reason);
+    }
+    throw err;
+  }
+}
+
 async function fetchFrontendHtmlViaScrapling(url, { includeAssets = false } = {}) {
   if (!frontendScraplingFetchConfigured()) {
     throw buildFetchError("Scrapling frontend fetch service is not configured", { reason: "scrapling_unavailable" });
@@ -1327,41 +1564,6 @@ async function fetchFrontendHtml(url, oldFeatures = null, { allowBrowserFallback
   }
 }
 
-/**
- * API 探测专用 fetch — 不触发域级退避
- * 用于用非法参数探测 API 结构的场景，4xx/5xx 是预期行为，
- * 不应影响同域其他模块（前端、底池）的正常请求。
- * 仅对 429/403（真正的风控）触发退避。
- */
-async function fetchProbe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
-  const domain = getDomain(url);
-  const backoffState = currentBackoffState(domain);
-  if (backoffState) {
-    const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
-    throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
-  }
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { ...opts, signal: ctrl.signal });
-    if (res.status === 429 || res.status === 403) {
-      try { await res.text(); } catch {}
-      recordFail(domain, res.status);
-      throw new Error(`HTTP ${res.status} (风控)`);
-    }
-    // 对非风控错误码：直接返回响应，不触发退避，让调用方决定如何处理
-    if (res.ok || res.status < 500) recordSuccess(domain);
-    return res;
-  } catch (err) {
-    if (err.name === "AbortError") {
-      throw new Error(`请求超时 ${timeoutMs}ms: ${url}`);
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
 /* ══════════════════════════════════════════
    BSC JSON-RPC 工具（含 Batch）
    ══════════════════════════════════════════ */
@@ -1525,7 +1727,7 @@ const SEL = {
    ══════════════════════════════════════════ */
 
 async function fetchPoolConfig() {
-  const res = await fetchSafe(`${CONFIG.apiBase}/v1/public/config`, {
+  const res = await fetchFourMemeApi(`${CONFIG.apiBase}/v1/public/config`, {
     headers: { "User-Agent": nextUA(), "Accept": "application/json" },
   }, 15_000);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -4995,7 +5197,7 @@ async function fetchApiData() {
           },
         };
         if (ep.method === "POST" && ep.body) opts.body = JSON.stringify(ep.body);
-        res = await fetchProbe(ep.url, opts, 15_000);
+        res = await fetchFourMemeApi(ep.url, opts, 15_000);
         const text = await res.text();
         const json = tryParseJson(text);
         payload = json === null ? buildNonJsonApiPayload(res, text) : normalizeApiPayload(json, 0, ep.sampleArrayItems || 0);
@@ -5507,7 +5709,7 @@ function normalizeOpenFourTemplates(items) {
 
 async function fetchOpenFourTemplates() {
   const url = `${CONFIG.apiBase}/v1/public/token_template/search`;
-  const res = await fetchProbe(url, {
+  const res = await fetchFourMemeApi(url, {
     method: "POST",
     headers: {
       "Accept": "application/json, text/plain, */*",
@@ -6248,7 +6450,7 @@ function staticContractTargets() {
 }
 
 async function fetchPublicAddressContractTargets() {
-  const res = await fetchSafe(`${CONFIG.apiBase}/v1/public/address`, {
+  const res = await fetchFourMemeApi(`${CONFIG.apiBase}/v1/public/address`, {
     headers: { "User-Agent": nextUA(), "Accept": "application/json" },
   }, 3_000);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -9198,6 +9400,9 @@ export const __testables = {
   frontendManagedBrowserFetchForced,
   frontendFetchModeLabel,
   frontendCloudflareFailureHint,
+  fourMemeApiScraplingFallbackConfigured,
+  isFourMemeApiUrl,
+  makeTextResponse,
   fetchFrontendHtmlViaScrapling,
   normalizeBrowserFetchedAssets,
   stripRawAssetContents,
