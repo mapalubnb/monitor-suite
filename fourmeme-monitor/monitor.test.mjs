@@ -89,6 +89,33 @@ test("approved frontend routes are included in monitor URL pool", () => {
   assert.ok(__testables.getFrontendMonitorUrls().includes(url));
 });
 
+test("frontend fetch failures are grouped by domain and skip AI", () => {
+  const snap = {
+    _frontendFailCounts: {
+      [__testables.urlToKey("https://four.meme/en/announcement")]: {
+        count: 18,
+        reason: "backoff",
+        message: "[退避中] four.meme，剩余 80s，上次状态: 403",
+      },
+      [__testables.urlToKey("https://four.meme/en/campaign")]: {
+        count: 18,
+        reason: "backoff",
+        message: "[退避中] four.meme，剩余 80s，上次状态: 403",
+      },
+    },
+  };
+  const notifications = __testables.buildFrontendFailureNotifications([
+    "https://four.meme/en/announcement",
+    "https://four.meme/en/campaign",
+  ], snap);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, "⚠️ 前端抓取受限：four.meme");
+  assert.equal(notifications[0].skipAi, true);
+  assert.match(notifications[0].content, /影响 2 个页面/);
+  assert.match(notifications[0].content, /\/en\/announcement/);
+  assert.match(notifications[0].content, /\/en\/campaign/);
+});
+
 test("extractTextContent ignores script content and handles greater-than in attributes", () => {
   const html = `<main data-x="a > b"><h1>Create Token</h1><script>throw new Error("<bad>")</script><p>Tax Fee</p></main>`;
   assert.equal(__testables.extractTextContent(html), "Create Token Tax Fee");

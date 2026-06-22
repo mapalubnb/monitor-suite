@@ -364,6 +364,13 @@ function shouldBackoff(domain) {
   return Date.now() - b.lastFail < b.delayMs;
 }
 
+function currentBackoffState(domain) {
+  const b = domainBackoff.get(domain);
+  if (!b) return null;
+  const remainingMs = Math.max(0, b.delayMs - (Date.now() - b.lastFail));
+  return remainingMs > 0 ? { ...b, remainingMs } : null;
+}
+
 function recordFail(domain, statusCode) {
   const b = domainBackoff.get(domain) || { delayMs: 0, lastFail: 0 };
   if (statusCode === 429 || statusCode === 403) {
@@ -375,6 +382,8 @@ function recordFail(domain, statusCode) {
     b.delayMs = Math.min(b.delayMs + 5_000, CONFIG.backoff.maxMs);
   }
   b.lastFail = Date.now();
+  b.lastStatusCode = statusCode || 0;
+  b.failCount = (b.failCount || 0) + 1;
   domainBackoff.set(domain, b);
   log(`[退避] ${domain} → ${(b.delayMs / 1000).toFixed(0)}s`);
 }
@@ -851,8 +860,10 @@ function appendHistory(module, title, summary, diffSnippet = "") {
 /* ── HTTP 请求工具（含反风控 + 5xx 静默重试）── */
 async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
   const domain = getDomain(url);
-  if (shouldBackoff(domain)) {
-    throw new Error(`[退避中] ${domain}`);
+  const backoffState = currentBackoffState(domain);
+  if (backoffState) {
+    const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
+    throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
   }
   const maxRetries = 2; // 5xx 最多重试 2 次（共 3 次尝试）
   let lastStatus = 0;
@@ -906,8 +917,10 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
  */
 async function fetchProbe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
   const domain = getDomain(url);
-  if (shouldBackoff(domain)) {
-    throw new Error(`[退避中] ${domain}`);
+  const backoffState = currentBackoffState(domain);
+  if (backoffState) {
+    const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
+    throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
   }
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -3703,7 +3716,7 @@ function formatFrontendAssetBrief(assetSummary) {
 
 function normalizeFrontendNotificationTitle(title, fallbackUrl = "") {
   const raw = String(title || "");
-  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw) || /^前端 i18n 资源变更/.test(raw) || /^前端新路由发现：/.test(raw)) return raw;
+  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw) || /^前端 i18n 资源变更/.test(raw) || /^前端新路由发现：/.test(raw) || /^⚠️ 前端(?:抓取受限|页面不可达)：/.test(raw)) return raw;
   const m = raw.match(/\/(?:en|zh-TW)\/[A-Za-z0-9/_-]+/);
   const label = m?.[0] || (fallbackUrl ? urlLabel(fallbackUrl) : "未知页面");
   return `前端变更：${label}`;
@@ -4086,6 +4099,66 @@ function filterFrontendDedupe(notifications, state, windowMs = readPositiveIntEn
   }
   state._frontendNotifyDedupe = dedupe;
   return out;
+}
+
+function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
+  const groups = new Map();
+  const FAIL_THRESHOLD = 3;
+  for (const url of failedUrls) {
+    const key = urlToKey(url);
+    const failState = state?._frontendFailCounts?.[key] || {};
+    const count = typeof failState === "object" ? (failState.count || 0) : failState;
+    const reason = typeof failState === "object" ? failState.reason : "error";
+    const isBackoffLike = ["backoff", "rate_limited", "restricted"].includes(reason);
+    const threshold = isBackoffLike ? FAIL_THRESHOLD * 2 : FAIL_THRESHOLD;
+    if (!(count > 0 && count % threshold === 0)) continue;
+
+    const domain = getDomain(url);
+    const groupKey = isBackoffLike ? `${domain}:${reason}` : `${domain}:${reason}:${count}`;
+    if (!groups.has(groupKey)) {
+      groups.set(groupKey, {
+        domain,
+        reason,
+        isBackoffLike,
+        count,
+        messages: new Set(),
+        urls: [],
+      });
+    }
+    const group = groups.get(groupKey);
+    group.count = Math.max(group.count, count);
+    if (failState.message) group.messages.add(failState.message);
+    group.urls.push(url);
+  }
+
+  return [...groups.values()].map(group => {
+    const backoffState = currentBackoffState(group.domain);
+    const lines = [
+      `站点 ${group.domain} 前端抓取已连续失败 ${group.count} 轮，影响 ${group.urls.length} 个页面。`,
+      `原因: ${group.reason}`,
+    ];
+    if (backoffState) {
+      lines.push(`当前退避: 剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${backoffState.lastStatusCode ? `，上次状态 ${backoffState.lastStatusCode}` : ""}`);
+    }
+    const latestMessages = [...group.messages].slice(0, 3);
+    if (latestMessages.length) {
+      lines.push(`最近错误: ${latestMessages.join(" | ")}`);
+    }
+    lines.push("");
+    lines.push("影响页面:");
+    for (const url of group.urls.slice(0, 12)) {
+      lines.push(`- ${urlLabel(url)} (${url})`);
+    }
+    if (group.urls.length > 12) lines.push(`- ... 还有 ${group.urls.length - 12} 个页面`);
+    return {
+      title: group.isBackoffLike ? `⚠️ 前端抓取受限：${group.domain}` : `⚠️ 前端页面不可达：${group.domain}`,
+      content: lines.join("\n"),
+      template: "red",
+      url: CONFIG.siteUrl,
+      skipAi: true,
+      dedupeKey: `frontend:failure:${group.domain}:${group.reason}:${group.count}`,
+    };
+  });
 }
 
 /**
@@ -7632,24 +7705,10 @@ async function runFrontendCheck() {
     }
   }
 
-  // 连续 3 次抓取失败的页面发送告警（每 3 的倍数重复提醒）
-  const FAIL_THRESHOLD = 3;
-  for (const url of failedUrls) {
-    const key = urlToKey(url);
-    const failState = snapshot._frontendFailCounts[key] || {};
-    const count = typeof failState === "object" ? (failState.count || 0) : failState;
-    const reason = typeof failState === "object" ? failState.reason : "error";
-    const isBackoffLike = ["backoff", "rate_limited", "restricted"].includes(reason);
-    const threshold = isBackoffLike ? FAIL_THRESHOLD * 2 : FAIL_THRESHOLD;
-    if (count > 0 && count % threshold === 0) {
-      notifications.push({
-        title: isBackoffLike ? `⚠️ 前端抓取受限：${urlLabel(url)}` : `⚠️ 前端页面不可达：${urlLabel(url)}`,
-        content: `页面 ${url} 已连续 ${count} 次抓取失败。\n原因: ${reason}\n最近错误: ${failState.message || ""}`,
-        template: "red",
-        url
-      });
-      snapshotDirty = true;
-    }
+  const failureNotifications = buildFrontendFailureNotifications(failedUrls, snapshot);
+  if (failureNotifications.length > 0) {
+    notifications.push(...failureNotifications);
+    snapshotDirty = true;
   }
 
   for (const [key, newData] of Object.entries(newPages)) {
@@ -7932,7 +7991,16 @@ async function runFrontendCheck() {
       n.title = normalizeFrontendNotificationTitle(n.title, n.url);
       appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
       const diffFilePath = n.fullDiff ? saveDiffLocally(n.title, n.fullDiff) : null;
-      await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, n.aiInput, undefined, diffFilePath, n.url, n.cardOpts || {});
+      if (n.skipAi) {
+        const urlLine = n.url ? `🔗 [${n.url}](${n.url})\n\n` : "";
+        let messageId = await sendCardViaApi(n.title, urlLine + n.content, n.template, diffFilePath, 2, n.cardOpts || {});
+        if (!messageId) {
+          log(`[推送] 前端失败告警即时通道失败，切换队列兜底：${n.title}`);
+          await sendCardQueued(n.title, urlLine + n.content, n.template, { ...(n.cardOpts || {}), diffFilePath });
+        }
+      } else {
+        await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, n.aiInput, undefined, diffFilePath, n.url, n.cardOpts || {});
+      }
     }
   } else if (snapshotDirty || failCountChanged) {
     await saveSnapshot(snapshot);
@@ -8546,6 +8614,7 @@ function setSnapshotForTests(value) {
 
 export const __testables = {
   CONFIG,
+  urlToKey,
   canonicalFrontendUrl,
   getFrontendMonitorUrls,
   isConfiguredFrontendUrl,
@@ -8568,6 +8637,7 @@ export const __testables = {
   i18nChangeTypeCounts,
   shouldConfirmI18nRemoval,
   frontendNotificationDedupeKey,
+  buildFrontendFailureNotifications,
   buildFrontendNewPageNotification,
   buildFrontendRouteActionButtons,
   buildFrontendNewPageAiInput,
