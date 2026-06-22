@@ -2206,6 +2206,16 @@ function i18nExtractionReason(oldFeatures) {
   return oldFeatures?.i18nHash ? "hash 变化" : "首次";
 }
 
+function logI18nExtractionResult(oldFeatures, i18nResult, source = "streaming HTML") {
+  if (!shouldLogI18nExtraction(oldFeatures, i18nResult)) return;
+  const count = Object.keys(i18nResult.i18nStrings || {}).length;
+  const key = `i18n-extract:${oldFeatures?.i18nHash || "none"}:${i18nResult.i18nHash}:${count}`;
+  logFrontendInfoRateLimited(
+    key,
+    `  [i18n] 从 ${source} 提取到 ${count} 个翻译字符串（${i18nExtractionReason(oldFeatures)}）`
+  );
+}
+
 function logFrontendInfoRateLimited(key, message, cooldownSeconds = readPositiveIntEnv("FOURMEME_FRONTEND_INFO_LOG_COOLDOWN_SECONDS", 300)) {
   const now = Date.now();
   const cooldownMs = Math.max(1, cooldownSeconds) * 1000;
@@ -2241,10 +2251,14 @@ function extractI18nFromStreamingHtml(html) {
   }
   if (candidates.length === 0) return null;
 
+  let best = null;
   for (const candidate of candidates) {
     const result = parseI18nResourcesCandidate(candidate.text, { decode: candidate.decode });
-    if (result) return result;
+    if (result && (!best || Object.keys(result.i18nStrings).length > Object.keys(best.i18nStrings).length)) {
+      best = result;
+    }
   }
+  if (best) return best;
 
   // Last-resort fallback: combine chunks, but do not let one truncated chunk spam logs.
   return parseI18nResourcesCandidate(candidates.map(item => item.text).join(""), { logFailure: true, decode: true });
@@ -2595,6 +2609,50 @@ function i18nChangeSignature(changes) {
   return md5(JSON.stringify(payload));
 }
 
+function i18nChangeTypeCounts(changes) {
+  return {
+    added: (changes || []).filter(c => c.type === "added").length,
+    modified: (changes || []).filter(c => c.type === "modified").length,
+    removed: (changes || []).filter(c => c.type === "removed").length,
+  };
+}
+
+function isLikelyTransientI18nRemoval(changes, oldStrings, newStrings) {
+  const counts = i18nChangeTypeCounts(changes);
+  if (counts.removed === 0 || counts.added > 0 || counts.modified > 0) return false;
+  const oldCount = Object.keys(oldStrings || {}).length;
+  const newCount = Object.keys(newStrings || {}).length;
+  if (!oldCount || newCount >= oldCount) return false;
+  const maxRemoved = readPositiveIntEnv("FOURMEME_I18N_REMOVAL_JITTER_MAX_KEYS", 5);
+  const maxRatio = Number(process.env.FOURMEME_I18N_REMOVAL_JITTER_MAX_RATIO || "0.02");
+  const ratio = counts.removed / oldCount;
+  return counts.removed <= maxRemoved || ratio <= maxRatio;
+}
+
+function shouldConfirmI18nRemoval(snapshotState, pageKey, changes, oldStrings, newStrings) {
+  if (!isLikelyTransientI18nRemoval(changes, oldStrings, newStrings)) {
+    if (snapshotState?._frontendI18nPendingRemovals) delete snapshotState._frontendI18nPendingRemovals[pageKey];
+    return true;
+  }
+  if (!snapshotState._frontendI18nPendingRemovals) snapshotState._frontendI18nPendingRemovals = {};
+  const signature = i18nChangeSignature(changes);
+  const prev = snapshotState._frontendI18nPendingRemovals[pageKey] || {};
+  const count = prev.signature === signature ? (prev.count || 0) + 1 : 1;
+  snapshotState._frontendI18nPendingRemovals[pageKey] = {
+    signature,
+    count,
+    firstSeenAt: prev.signature === signature ? (prev.firstSeenAt || Date.now()) : Date.now(),
+    lastSeenAt: Date.now(),
+  };
+  return count >= readPositiveIntEnv("FOURMEME_I18N_REMOVAL_CONFIRM_RUNS", 3);
+}
+
+function preserveOldI18nSnapshot(newData, oldData) {
+  newData.i18nStrings = oldData.i18nStrings;
+  newData.i18nHash = oldData.i18nHash;
+  newData.i18nMissCount = oldData.i18nMissCount || 0;
+}
+
 function addGlobalI18nResourceChange(groups, page, changes) {
   if (!changes?.length) return;
   const signature = i18nChangeSignature(changes);
@@ -2687,6 +2745,7 @@ function buildGlobalI18nResourceNotification(group) {
     fullDiff,
     url: CONFIG.siteUrl,
     pageLabel: "全局 i18n 资源",
+    dedupeKey: `frontend:i18n-resource:${group.signature}`,
   };
 }
 
@@ -2964,9 +3023,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
       }
       const freshI18n = applyI18nResult(features, i18nResult, oldFeatures);
       if (freshI18n) {
-        if (shouldLogI18nExtraction(oldFeatures, i18nResult)) {
-          log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（${i18nExtractionReason(oldFeatures)}）`);
-        }
+        logI18nExtractionResult(oldFeatures, i18nResult);
       } else if (features.i18nMissCount >= readPositiveIntEnv("FOURMEME_I18N_REUSE_MAX_MISSES", 3)) {
         log(`  [i18n] 连续 ${features.i18nMissCount} 次未提取到 i18n，不再无限复用旧缓存`);
       }
@@ -3001,9 +3058,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
         i18nResult = await fetchI18nStrings(features.assetUrlMap, baseUrl);
       }
       if (applyI18nResult(features, i18nResult, oldFeatures)) {
-        if (shouldLogI18nExtraction(oldFeatures, i18nResult)) {
-          log(`  [i18n] 从 streaming HTML 提取到 ${Object.keys(i18nResult.i18nStrings).length} 个翻译字符串（${i18nExtractionReason(oldFeatures)}）`);
-        }
+        logI18nExtractionResult(oldFeatures, i18nResult);
       }
     } catch (err) { log(`  [i18n] 提取异常（非致命）：${err.message}`); }
   }
@@ -3729,6 +3784,7 @@ function buildMergedFrontendAssetNotification(group) {
     template: group.template || "orange",
     fullDiff: group.fullDiffs.filter(Boolean).join("\n\n"),
     url: pages[0]?.url || CONFIG.siteUrl,
+    dedupeKey: group.signature ? `frontend:asset:${group.signature}` : undefined,
   };
 }
 
@@ -3742,6 +3798,7 @@ function mergeFrontendNotifications(notifications) {
       let group = assetGroups.get(n.assetSignature);
       if (!group) {
         group = {
+          signature: n.assetSignature,
           assetContent: n.assetContent || "",
           template: n.template,
           pages: [],
@@ -3782,10 +3839,12 @@ function mergeFrontendNotifications(notifications) {
 }
 
 function frontendNotificationDedupeKey(n) {
+  if (n.dedupeKey) return n.dedupeKey;
+  if (n.assetSignature) return `frontend:asset:${n.assetSignature}`;
   return md5(JSON.stringify({
     title: n.title || "",
     url: canonicalFrontendUrl(n.url || ""),
-    content: n.fullDiff ? md5(n.fullDiff) : md5(n.content || ""),
+    content: md5(n.content || ""),
   }));
 }
 
@@ -7437,6 +7496,20 @@ async function runFrontendCheck() {
     // ── 2. i18n diff（优先展示，中文内容最具可读性）──
     if (oldData.i18nHash && newData.i18nHash && oldData.i18nHash !== newData.i18nHash) {
       i18nChanges = diffI18nStrings(oldData.i18nStrings, newData.i18nStrings);
+      if (!shouldConfirmI18nRemoval(snapshot, key, i18nChanges, oldData.i18nStrings, newData.i18nStrings)) {
+        const counts = i18nChangeTypeCounts(i18nChanges);
+        logFrontendInfoRateLimited(
+          `i18n-removal-jitter:${key}:${i18nChangeSignature(i18nChanges)}`,
+          `[前端] ${urlLabel(newData.originalUrl)} 检测到疑似 i18n 资源集短暂缺 key（删除 ${counts.removed}），等待连续确认，暂不推送`
+        );
+        preserveOldI18nSnapshot(newData, oldData);
+        i18nChanges = null;
+      } else if (snapshot._frontendI18nPendingRemovals) {
+        delete snapshot._frontendI18nPendingRemovals[key];
+      }
+    }
+
+    if (i18nChanges?.length) {
       const { visible, resourceOnly } = partitionI18nChangesByPageVisibility(
         i18nChanges,
         oldData.textContent || "",
@@ -8220,6 +8293,10 @@ export const __testables = {
   extractRouteSignals,
   diffI18nStrings,
   partitionI18nChangesByPageVisibility,
+  i18nChangeSignature,
+  i18nChangeTypeCounts,
+  shouldConfirmI18nRemoval,
+  frontendNotificationDedupeKey,
   formatI18nChangesForFullDiff,
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,

@@ -86,6 +86,26 @@ test("extractI18nFromStreamingHtml preserves escaped quotes inside parsed flight
   assert.equal(result.i18nStrings["contract.editModal.warning"], `The audit status will reset to "Pending".`);
 });
 
+test("extractI18nFromStreamingHtml chooses the largest streaming resources block", () => {
+  const small = {
+    common: Object.fromEntries(Array.from({ length: 25 }, (_, i) => [`key${i}`, `small ${i}`])),
+  };
+  const large = {
+    common: Object.fromEntries(Array.from({ length: 35 }, (_, i) => [`key${i}`, `large ${i}`])),
+    presale: { "Token contract": "代幣合約" },
+  };
+  const smallPayload = [1, `x"resources":${JSON.stringify(small)} y`];
+  const largePayload = [1, `x"resources":${JSON.stringify(large)} y`];
+  const html = [
+    `<script>self.__next_f.push(${JSON.stringify(smallPayload)})</script>`,
+    `<script>self.__next_f.push(${JSON.stringify(largePayload)})</script>`,
+  ].join("");
+  const result = __testables.extractI18nFromStreamingHtml(html);
+  assert.ok(result);
+  assert.equal(Object.keys(result.i18nStrings).length, 36);
+  assert.equal(result.i18nStrings["presale.Token contract"], "代幣合約");
+});
+
 test("unchanged i18n extraction stays quiet after baseline", () => {
   const i18nResult = { i18nHash: "same-hash", i18nStrings: { a: "b" } };
   assert.equal(__testables.shouldLogI18nExtraction(null, i18nResult), true);
@@ -137,6 +157,35 @@ test("header-only frontend diff is not considered meaningful", () => {
     "============================================================",
   ].join("\n");
   assert.equal(__testables.hasMeaningfulFrontendDiffBody(diffText), false);
+});
+
+test("frontend notification dedupe key ignores full diff timestamps", () => {
+  const base = {
+    title: "前端 i18n 资源变更（影响 2 页）",
+    url: "https://four.meme",
+    content: "**类型：全局 i18n 资源变更**\n+ common.presale.Token contract: 代幣合約",
+  };
+  const first = __testables.frontendNotificationDedupeKey({
+    ...base,
+    fullDiff: "时间: 2026/6/22 13:00:07\n+ common.presale.Token contract: 代幣合約",
+  });
+  const second = __testables.frontendNotificationDedupeKey({
+    ...base,
+    fullDiff: "时间: 2026/6/22 13:00:28\n+ common.presale.Token contract: 代幣合約",
+  });
+  assert.equal(first, second);
+});
+
+test("small i18n remove-only changes require consecutive confirmation", () => {
+  const oldStrings = Object.fromEntries(Array.from({ length: 1102 }, (_, i) => [`k${i}`, `v${i}`]));
+  const newStrings = { ...oldStrings };
+  delete newStrings.k1;
+  const changes = __testables.diffI18nStrings(oldStrings, newStrings);
+  const state = {};
+  assert.deepEqual(__testables.i18nChangeTypeCounts(changes), { added: 0, modified: 0, removed: 1 });
+  assert.equal(__testables.shouldConfirmI18nRemoval(state, "page", changes, oldStrings, newStrings), false);
+  assert.equal(__testables.shouldConfirmI18nRemoval(state, "page", changes, oldStrings, newStrings), false);
+  assert.equal(__testables.shouldConfirmI18nRemoval(state, "page", changes, oldStrings, newStrings), true);
 });
 
 test("failed discovered frontend URLs are suppressed during cooldown", () => {
