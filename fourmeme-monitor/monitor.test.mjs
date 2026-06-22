@@ -19,6 +19,7 @@ test("frontend fetch defaults to Scrapling stealthy mode", () => {
   assert.equal(__testables.frontendBrowserFetchConfigured(), false);
   assert.equal(__testables.frontendBrowserFetchForced(), false);
   assert.equal(__testables.frontendManagedBrowserFetchForced(), true);
+  assert.equal(__testables.frontendSyncAssetFetchEnabled(), false);
   assert.equal(__testables.configuredFrontendHtmlConcurrency(), 4);
   assert.equal(__testables.effectiveFrontendHtmlConcurrency(), 4);
   assert.equal(__testables.frontendFetchModeLabel(), "scrapling_stealthy");

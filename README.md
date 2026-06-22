@@ -91,6 +91,7 @@ FOURMEME_FRONTEND_FETCH_PROVIDER=scrapling
 FOURMEME_SCRAPLING_FETCH_ENABLED=true
 FOURMEME_SCRAPLING_FETCH_URL=http://127.0.0.1:8787/fetch
 FOURMEME_SCRAPLING_TIMEOUT_MS=80000
+FOURMEME_SCRAPLING_SYNC_ASSET_FETCH_ENABLED=false
 FOURMEME_API_SCRAPLING_FALLBACK_ENABLED=true
 FOURMEME_API_SCRAPLING_TIMEOUT_MS=30000
 FOURMEME_API_SCRAPLING_MAX_TEXT_BYTES=4000000
@@ -114,7 +115,7 @@ FOURMEME_SCRAPLING_ASSET_TOTAL_TIMEOUT_MS=15000
 FOURMEME_SCRAPLING_PROXY=
 ```
 
-资源占用策略：`FOURMEME_SCRAPLING_MAX_PAGES=4` 控制浏览器并发页面数，避免每个 URL 拉起新浏览器；Node 侧 HTML 并发会自动不超过该页面池，避免请求在 sidecar 内排队到 65s 超时。HTML 抓取默认 `FOURMEME_SCRAPLING_HTML_LOAD_DOM=false`、`FOURMEME_SCRAPLING_HTML_DISABLE_RESOURCES=true`，只拿可解析的 Next HTML，不等待完整前端水合和重资源。资源补抓默认最多 20 个文件、15s 总预算、6MB 总内容，防止资源 diff 拖垮 10s HTML 轮询。CPU/内存紧张时先把 `MAX_PAGES` 降到 2；如果 22 个页面无法在 10s 内完成，再把它升到 6。若服务器出口 IP 被 Cloudflare 高强度拦截，优先配置 `FOURMEME_SCRAPLING_PROXY` 为住宅/ISP 出口。
+资源占用策略：`FOURMEME_SCRAPLING_MAX_PAGES=4` 控制浏览器并发页面数，避免每个 URL 拉起新浏览器；Node 侧 HTML 并发会自动不超过该页面池，避免请求在 sidecar 内排队到 65s 超时。HTML 抓取默认 `FOURMEME_SCRAPLING_HTML_LOAD_DOM=false`、`FOURMEME_SCRAPLING_HTML_DISABLE_RESOURCES=true`，只拿可解析的 Next HTML，不等待完整前端水合和重资源。10s 主链路默认 `FOURMEME_SCRAPLING_SYNC_ASSET_FETCH_ENABLED=false`，不再同步执行 JS/CSS 内容补抓；资源文件列表、文案、i18n streaming、路由/端点仍会更新。需要完整 JS/CSS 内容 diff 时再临时打开该开关。CPU/内存紧张时先把 `MAX_PAGES` 降到 2；如果 22 个页面无法在 10s 内完成，再把它升到 6。若服务器出口 IP 被 Cloudflare 高强度拦截，优先配置 `FOURMEME_SCRAPLING_PROXY` 为住宅/ISP 出口。
 
 安全边界：sidecar 默认只绑定 `127.0.0.1`，且只允许抓取 `four.meme` / `*.four.meme`。如果要把 `FOURMEME_SCRAPLING_HOST` 改成非 localhost，必须同时设置 `FOURMEME_SCRAPLING_TOKEN`，主监控会用同名变量发送鉴权头。
 

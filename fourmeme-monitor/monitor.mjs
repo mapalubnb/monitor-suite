@@ -208,6 +208,7 @@ const CONFIG = {
     timeoutMs: readPositiveIntEnv("FOURMEME_SCRAPLING_TIMEOUT_MS", 80_000),
     minIntervalMs: readPositiveIntEnv("FOURMEME_SCRAPLING_MIN_INTERVAL_MS", 250),
     maxHtmlBytes: readPositiveIntEnv("FOURMEME_SCRAPLING_MAX_HTML_BYTES", 8_000_000),
+    syncAssetFetchEnabled: readBoolEnv("FOURMEME_SCRAPLING_SYNC_ASSET_FETCH_ENABLED", false),
   },
   fourMemeApiFetch: {
     scraplingFallbackEnabled: readBoolEnv("FOURMEME_API_SCRAPLING_FALLBACK_ENABLED", true),
@@ -1072,6 +1073,13 @@ function frontendBrowserFetchForced() {
 
 function frontendManagedBrowserFetchForced() {
   return (frontendFetchProvider() === "scrapling" && frontendScraplingFetchConfigured()) || frontendBrowserFetchForced();
+}
+
+function frontendSyncAssetFetchEnabled() {
+  if (frontendFetchProvider() === "scrapling" && frontendScraplingFetchConfigured()) {
+    return CONFIG.frontendScraplingFetch.syncAssetFetchEnabled;
+  }
+  return true;
 }
 
 function configuredFrontendHtmlConcurrency() {
@@ -3858,7 +3866,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   const baseUrl = new URL(url).origin;
   const refreshAssetContents = isCreateTokenFrontendUrl(url);
   const needsAssetRefresh = !oldFeatures || oldFeatures.assetHash !== features.assetHash || refreshAssetContents;
-  if (needsAssetRefresh && (htmlResult?.source === "browser_session" || htmlResult?.source === "scrapling_stealthy") && Object.keys(htmlResult.assetContents || {}).length === 0) {
+  if (frontendSyncAssetFetchEnabled() && needsAssetRefresh && (htmlResult?.source === "browser_session" || htmlResult?.source === "scrapling_stealthy") && Object.keys(htmlResult.assetContents || {}).length === 0) {
     try {
       const assetHtmlResult = htmlResult?.source === "scrapling_stealthy"
         ? await fetchFrontendHtmlViaScrapling(url, { includeAssets: true })
@@ -3899,7 +3907,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   } else if (frontendManagedBrowserFetchForced()) {
     features.assetContents = {};
     features.assetContentHash = null;
-    features.assetDownloadIncomplete = true;
+    features.assetContentMode = frontendSyncAssetFetchEnabled() ? "html_only_incomplete" : "html_only_fast";
     try {
       const i18nResult = extractI18nFromStreamingHtml(features.html);
       applyI18nResult(features, i18nResult, oldFeatures);
@@ -9410,6 +9418,7 @@ export const __testables = {
   frontendBrowserFetchConfigured,
   frontendBrowserFetchForced,
   frontendManagedBrowserFetchForced,
+  frontendSyncAssetFetchEnabled,
   configuredFrontendHtmlConcurrency,
   effectiveFrontendHtmlConcurrency,
   frontendFetchModeLabel,
