@@ -120,6 +120,10 @@ const CONFIG = {
     "https://four.meme/en/contract/create",
     "https://four.meme/en/contract/profile",
   ],
+  frontendDiscoverySeedUrls: [
+    "https://four.meme/en",
+    "https://four.meme/zh-TW",
+  ],
   networkCode: "BSC",
 
   // GitHub 仓库监控
@@ -1309,7 +1313,6 @@ function isDynamicFrontendRoute(route) {
   return /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/0x[a-f0-9]{40}$/i.test(path)
     || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?token\/undefined$/i.test(path)
     || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?contract\/\d+$/i.test(path)
-    || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?presale\/\d+$/i.test(path)
     || /^\/(?:[a-z]{2}(?:-[a-z]{2})?\/)?competition\/[^/?#]+$/i.test(path);
 }
 
@@ -2749,6 +2752,40 @@ function buildGlobalI18nResourceNotification(group) {
   };
 }
 
+function buildFrontendNewPageNotification(page) {
+  const label = urlLabel(page.originalUrl);
+  const fileCount = (page.assetFiles || []).length;
+  const textLen = (page.textContent || "").length;
+  const i18nCount = page.i18nStrings ? Object.keys(page.i18nStrings).length : 0;
+  const routeCount = (page.routes || []).length;
+  const lines = [
+    `**页面：${label}**`,
+    `URL: ${page.originalUrl}`,
+    "",
+    "**类型：前端新页面发现**",
+    `已成功抓取并纳入同一前端监控池，后续按每 ${CONFIG.intervals.frontend / 1000}s 检查页面变化。`,
+    "",
+    `资源文件：${fileCount} 个`,
+    `页面文案：${textLen} 字`,
+    `i18n：${i18nCount} 条`,
+    `路由/端点：${routeCount} 个`,
+  ];
+  const preview = frontendDisplaySnippet(page.textContent || "", 240);
+  if (preview) {
+    lines.push("");
+    lines.push("**页面文案预览：**");
+    lines.push(preview);
+  }
+  return {
+    title: `前端新页面发现：${label}`,
+    content: lines.join("\n"),
+    template: "orange",
+    url: page.originalUrl,
+    pageLabel: label,
+    dedupeKey: `frontend:new-page:${canonicalFrontendUrl(page.originalUrl)}`,
+  };
+}
+
 /* ── 路由/端点发现 ── */
 
 function extractRouteSignals(html, assetContents, nextData) {
@@ -3112,24 +3149,73 @@ async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls
   return { pages, failedUrls, failedDetails };
 }
 
+async function fetchFrontendDiscoverySeedPages(urls = []) {
+  const pages = {};
+  if (!urls.length) return pages;
+  const limit = readPositiveIntEnv("FOURMEME_FRONTEND_DISCOVERY_SEED_CONCURRENCY", 2);
+  const tasks = urls.map((url, i) => async () => {
+    await sleep((i % limit) * 250);
+    const startedAt = Date.now();
+    try {
+      const res = await fetchSafe(url, { headers: browserHeaders() });
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      const html = await res.text();
+      if (html.length < 1000) throw new Error(`响应过短（${html.length} 字节），可能被拦截`);
+      const features = extractPageFeatures(html, url);
+      validateFrontendPageFeatures(url, html, features);
+      const routeSignals = extractRouteSignals(features.html, null, features.nextData);
+      features.pageRoutes = routeSignals.routes;
+      features.apiEndpoints = routeSignals.endpoints;
+      features.routes = routeSignals.combined;
+      features.fetchMeta = { status: res.status, durationMs: Date.now() - startedAt, discoverySeed: true };
+      delete features.html;
+      delete features.assetUrlMap;
+      return { key: urlToKey(url), data: { ...features, originalUrl: url } };
+    } catch (err) {
+      logFrontendInfoRateLimited(
+        `discovery-seed-fail:${canonicalFrontendUrl(url)}`,
+        `[前端] 发现入口抓取失败：${urlLabel(url)} ${err.message}`
+      );
+      return { key: urlToKey(url), data: null };
+    }
+  });
+  const results = await runLimited(tasks, limit);
+  for (const r of results) {
+    if (r.status === "fulfilled" && r.value.data) {
+      pages[r.value.key] = r.value.data;
+    }
+  }
+  return pages;
+}
+
 async function fetchFrontendDataWithDiscovery(oldPages = {}) {
   const assetCache = new Map();
   const baseUrls = getFrontendMonitorUrls();
+  const baseUrlSet = new Set(baseUrls.map(canonicalFrontendUrl));
+  const seedUrls = (CONFIG.frontendDiscoverySeedUrls || [])
+    .map(canonicalFrontendUrl)
+    .filter(url => url && !baseUrlSet.has(url));
   const result = await fetchAllFrontendData(oldPages, baseUrls, assetCache);
+  const discoveryPages = {
+    ...result.pages,
+    ...(await fetchFrontendDiscoverySeedPages(seedUrls)),
+  };
   const knownUrls = new Set([
     ...baseUrls,
-    ...Object.values(result.pages).map(p => p.originalUrl),
+    ...seedUrls,
+    ...Object.values(discoveryPages).map(p => p.originalUrl),
   ].map(canonicalFrontendUrl));
   const allDiscoveredUrls = [];
 
   for (let depth = 0; depth < 2; depth++) {
-    const discoveredUrls = discoverFrontendUrlsFromPages(result.pages, [...knownUrls]);
+    const discoveredUrls = discoverFrontendUrlsFromPages(discoveryPages, [...knownUrls]);
     if (discoveredUrls.length === 0) break;
     log(`[前端] 从路由发现 ${discoveredUrls.length} 个新页面，立即纳入同一监控池：${discoveredUrls.map(urlLabel).join(", ")}`);
     for (const url of discoveredUrls) knownUrls.add(canonicalFrontendUrl(url));
     const extra = await fetchAllFrontendData(oldPages, discoveredUrls, assetCache);
     for (const [key, page] of Object.entries(extra.pages)) {
       result.pages[key] = chooseBetterFrontendPage(result.pages[key], page);
+      discoveryPages[key] = chooseBetterFrontendPage(discoveryPages[key], page);
     }
     if (extra.failedUrls.length > 0) {
       log(`[前端] 路由发现候选页抓取失败，未纳入监控：${extra.failedUrls.map(urlLabel).join(", ")}`);
@@ -7404,6 +7490,7 @@ async function runFrontendCheck() {
       };
       snapshot._frontendWarmup[key] = { stableRuns: 1, firstSeenAt: Date.now() };
       snapshot.frontendPages[key] = newData;
+      notifications.push(buildFrontendNewPageNotification(newData));
       snapshotDirty = true;
       continue;
     }
@@ -8297,6 +8384,7 @@ export const __testables = {
   i18nChangeTypeCounts,
   shouldConfirmI18nRemoval,
   frontendNotificationDedupeKey,
+  buildFrontendNewPageNotification,
   formatI18nChangesForFullDiff,
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,

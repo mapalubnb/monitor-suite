@@ -34,6 +34,33 @@ test("configured URL validation is looser than discoverable route validation but
   assert.equal(__testables.isConfiguredFrontendUrl("https://four.meme/en"), false);
 });
 
+test("presale detail routes are discoverable from homepage links", () => {
+  assert.equal(__testables.isDiscoverableFrontendUrl("https://four.meme/en/presale/102364633"), true);
+  const signals = __testables.extractRouteSignals(
+    `<a href="https://four.meme/en/presale/102364633"></a>`,
+    null,
+    null,
+  );
+  assert.deepEqual(signals.routes, ["/en/presale/102364633"]);
+  const discovered = __testables.discoverFrontendUrlsFromPages({
+    home: { routes: signals.routes },
+  }, ["https://four.meme/en"]);
+  assert.deepEqual(discovered, ["https://four.meme/en/presale/102364633"]);
+});
+
+test("new frontend page notification records successful monitoring enrollment", () => {
+  const notification = __testables.buildFrontendNewPageNotification({
+    originalUrl: "https://four.meme/en/presale/102364633",
+    assetFiles: ["/_next/static/a.js"],
+    textContent: "Mame Inu Description Rule Details",
+    i18nStrings: { a: "b" },
+    routes: ["/en/presale/102364633"],
+  });
+  assert.equal(notification.title, "前端新页面发现：/en/presale/102364633");
+  assert.match(notification.content, /已成功抓取并纳入同一前端监控池/);
+  assert.equal(notification.dedupeKey, "frontend:new-page:https://four.meme/en/presale/102364633");
+});
+
 test("extractTextContent ignores script content and handles greater-than in attributes", () => {
   const html = `<main data-x="a > b"><h1>Create Token</h1><script>throw new Error("<bad>")</script><p>Tax Fee</p></main>`;
   assert.equal(__testables.extractTextContent(html), "Create Token Tax Fee");
