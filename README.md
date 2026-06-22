@@ -28,6 +28,8 @@ monitor-suite/
 
 前端/API 已做 keep-alive、条件请求、并发抓取、风控退避、去重窗口和新页面 warm-up。稳定状态下会尽量贴近 `10s/15s`；遇到 403/429/Cloudflare 等风控时会自动退避。
 
+Cloudflare challenge 出现时，脚本不会自动解挑战，也不会把拦截页写入快照。默认行为是按站点聚合推送一张“前端 Cloudflare 拦截”告警，并继续按 10s 调度尝试恢复。
+
 ## 快速部署
 
 ```bash
@@ -78,6 +80,38 @@ FOURMEME_FRONTEND_WARMUP_STABLE_RUNS=1
 FOURMEME_FRONTEND_HTML_CONCURRENCY=4
 FOURMEME_FRONTEND_ASSET_CONCURRENCY=4
 ```
+
+## Cloudflare 浏览器会话兜底
+
+如果 Four.meme 对普通 Node 请求强制 Cloudflare challenge，可以启用“人工验证浏览器会话采集”。流程是：
+
+1. 启动一个带 DevTools 端口的 Chrome，并使用独立持久 profile。
+2. 手动打开 `https://four.meme/en`，完成 Cloudflare 验证。
+3. 在 `.env` 启用浏览器会话采集。
+
+Linux 示例：
+
+```bash
+google-chrome --remote-debugging-port=9222 --user-data-dir=/root/.fourmeme-chrome
+```
+
+Windows 示例：
+
+```powershell
+& "C:\Program Files\Google\Chrome\Application\chrome.exe" --remote-debugging-port=9222 --user-data-dir="$env:USERPROFILE\.fourmeme-chrome"
+```
+
+`.env`：
+
+```env
+FOURMEME_FRONTEND_BROWSER_FETCH_ENABLED=true
+FOURMEME_FRONTEND_BROWSER_FETCH_COMMAND=node
+FOURMEME_FRONTEND_BROWSER_FETCH_ARGS=fourmeme-monitor/browser-session-fetch.mjs
+FOURMEME_BROWSER_CDP_URL=http://127.0.0.1:9222
+FOURMEME_BROWSER_FETCH_ASSETS=false
+```
+
+这个模式在 10s 常规轮询中只读取已验证浏览器里的页面 HTML；当首次抓取、资源列表变化或创建页需要刷新资源时，才按需读取 `_next/static` JS/CSS 用于原有 diff/i18n/路由解析。如果浏览器再次停在 Cloudflare challenge，脚本只会发站点级告警，需要重新人工验证。
 
 ## 常用命令
 

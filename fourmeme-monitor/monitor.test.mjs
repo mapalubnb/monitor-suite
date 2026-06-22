@@ -116,6 +116,50 @@ test("frontend fetch failures are grouped by domain and skip AI", () => {
   assert.match(notifications[0].content, /\/en\/campaign/);
 });
 
+test("cloudflare challenge failures are classified and grouped as site-level non-AI alerts", () => {
+  const err = __testables.buildFetchError("HTTP 403 (Cloudflare challenge)", {
+    statusCode: 403,
+    reason: "cloudflare_challenge",
+    responseText: "<html><title>Just a moment...</title><script src=\"/cdn-cgi/challenge-platform/h/g\"></script></html>",
+  });
+  assert.equal(__testables.isCloudflareChallengeText(err.responseText), true);
+  assert.equal(__testables.classifyFetchFailure(err), "cloudflare_challenge");
+
+  const snap = {
+    _frontendFailCounts: {
+      [__testables.urlToKey("https://four.meme/en")]: {
+        count: 6,
+        reason: "cloudflare_challenge",
+        message: "HTTP 403 (Cloudflare challenge)",
+      },
+      [__testables.urlToKey("https://four.meme/en/presale/102364633")]: {
+        count: 6,
+        reason: "cloudflare_challenge",
+        message: "浏览器会话仍停留在 Cloudflare challenge",
+      },
+    },
+  };
+  const notifications = __testables.buildFrontendFailureNotifications([
+    "https://four.meme/en",
+    "https://four.meme/en/presale/102364633",
+  ], snap);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, "⚠️ 前端 Cloudflare 拦截：four.meme");
+  assert.equal(notifications[0].skipAi, true);
+  assert.match(notifications[0].content, /普通 Node HTTP 抓取被 Cloudflare 拦截/);
+  assert.match(notifications[0].content, /影响 2 个页面/);
+});
+
+test("browser session assets keep raw content only during parsing and can be stripped before snapshot", () => {
+  const assets = __testables.normalizeBrowserFetchedAssets({
+    "/_next/static/chunks/app.js": { content: "const buyFee='1'; JSON.parse('{}')", truncated: false },
+  });
+  assert.equal(assets["/_next/static/chunks/app.js"].browserSession, true);
+  assert.equal(typeof assets["/_next/static/chunks/app.js"].rawContent, "string");
+  __testables.stripRawAssetContents(assets);
+  assert.equal("rawContent" in assets["/_next/static/chunks/app.js"], false);
+});
+
 test("AI routing skips operational noise and keeps high-value changes", () => {
   assert.equal(__testables.shouldUseAiForNotification({
     title: "⚠️ 前端抓取受限：four.meme",

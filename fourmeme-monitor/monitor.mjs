@@ -22,9 +22,11 @@
  */
 
 import { createHash } from "node:crypto";
+import { execFile } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mkdirSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import WebSocket from "ws";
 import { parseHTML } from "linkedom";
 
@@ -32,6 +34,7 @@ import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, waitQueueDrai
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FOURMEME_MONITOR_TEST === "1";
+const execFileAsync = promisify(execFile);
 
 // 加载共享 .env + 本地 .env（兼容统一部署和独立部署）
 for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) {
@@ -181,6 +184,20 @@ const CONFIG = {
   frontendAssetJitter: {
     maxFiles: 2,        // 少量 chunk 单独消失/恢复通常是 CDN/SSR 抖动
     quickConfirmDelayMs: 2_500, // 同轮快速复抓确认，避免真实变更等到下一轮
+  },
+  frontendBrowserFetch: {
+    // 可选：人工通过 Cloudflare 后的浏览器会话采集命令。
+    // 命令必须接收 URL 作为最后一个参数，并把真实页面 HTML 写到 stdout。
+    // 该模式不自动解 challenge，只复用用户已验证的浏览器 profile/session。
+    enabled: readBoolEnv("FOURMEME_FRONTEND_BROWSER_FETCH_ENABLED", false),
+    command: process.env.FOURMEME_FRONTEND_BROWSER_FETCH_COMMAND || process.execPath,
+    args: (process.env.FOURMEME_FRONTEND_BROWSER_FETCH_ARGS || join(__dirname, "browser-session-fetch.mjs"))
+      .split(/\s+/)
+      .map(s => s.trim())
+      .filter(Boolean),
+    timeoutMs: readPositiveIntEnv("FOURMEME_FRONTEND_BROWSER_FETCH_TIMEOUT_MS", 20_000),
+    minIntervalMs: readPositiveIntEnv("FOURMEME_FRONTEND_BROWSER_FETCH_MIN_INTERVAL_MS", 1_000),
+    maxHtmlBytes: readPositiveIntEnv("FOURMEME_FRONTEND_BROWSER_FETCH_MAX_HTML_BYTES", 8_000_000),
   },
   frontendDiscovery: {
     enabled: true,
@@ -351,6 +368,20 @@ function browserHeaders() {
   };
 }
 
+const CLOUDFLARE_CHALLENGE_RE = /cloudflare|cf-ray|cf-chl|challenge-platform|checking your browser|verify you are human|just a moment|turnstile|captcha/i;
+
+function isCloudflareChallengeText(text = "") {
+  return CLOUDFLARE_CHALLENGE_RE.test(String(text || ""));
+}
+
+function buildFetchError(message, { statusCode = 0, reason = "", responseText = "" } = {}) {
+  const err = new Error(message);
+  err.statusCode = statusCode;
+  err.reason = reason || "";
+  err.responseText = responseText || "";
+  return err;
+}
+
 // --- Per-domain 自适应退避 ---
 const domainBackoff = new Map(); // domain -> { delayMs, lastFail }
 
@@ -371,7 +402,7 @@ function currentBackoffState(domain) {
   return remainingMs > 0 ? { ...b, remainingMs } : null;
 }
 
-function recordFail(domain, statusCode) {
+function recordFail(domain, statusCode, reason = "") {
   const b = domainBackoff.get(domain) || { delayMs: 0, lastFail: 0 };
   if (statusCode === 429 || statusCode === 403) {
     b.delayMs = Math.min(
@@ -383,9 +414,10 @@ function recordFail(domain, statusCode) {
   }
   b.lastFail = Date.now();
   b.lastStatusCode = statusCode || 0;
+  b.lastReason = reason || b.lastReason || "";
   b.failCount = (b.failCount || 0) + 1;
   domainBackoff.set(domain, b);
-  log(`[退避] ${domain} → ${(b.delayMs / 1000).toFixed(0)}s`);
+  log(`[退避] ${domain} → ${(b.delayMs / 1000).toFixed(0)}s${reason ? `（${reason}）` : ""}`);
 }
 
 function recordSuccess(domain) {
@@ -401,6 +433,7 @@ function recordSuccess(domain) {
 
 function classifyFetchFailure(err) {
   const msg = err?.message || String(err || "");
+  if (err?.reason === "cloudflare_challenge" || isCloudflareChallengeText(`${msg}\n${err?.responseText || ""}`)) return "cloudflare_challenge";
   if (msg.includes("[退避中]")) return "backoff";
   if (/HTTP\s+(?:403|429)|风控|captcha|Cloudflare|verify you are human|access denied/i.test(msg)) return "rate_limited";
   if (/地区限制|restricted/i.test(msg)) return "restricted";
@@ -918,12 +951,15 @@ function appendHistory(module, title, summary, diffSnippet = "") {
 }
 
 /* ── HTTP 请求工具（含反风控 + 5xx 静默重试）── */
-async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
+async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, options = {}) {
   const domain = getDomain(url);
   const backoffState = currentBackoffState(domain);
-  if (backoffState) {
+  if (backoffState && !options.ignoreBackoff) {
     const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
-    throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
+    throw buildFetchError(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`, {
+      statusCode: backoffState.lastStatusCode || 0,
+      reason: backoffState.lastReason || "backoff",
+    });
   }
   const maxRetries = 2; // 5xx 最多重试 2 次（共 3 次尝试）
   let lastStatus = 0;
@@ -933,9 +969,15 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
     try {
       const res = await fetch(url, { ...opts, signal: ctrl.signal });
       if (res.status === 429 || res.status === 403) {
-        try { await res.text(); } catch {}
-        recordFail(domain, res.status);
-        throw new Error(`HTTP ${res.status} (风控)`);
+        let body = "";
+        try { body = await res.text(); } catch {}
+        const reason = isCloudflareChallengeText(body) || res.headers.get("cf-ray") ? "cloudflare_challenge" : "rate_limited";
+        recordFail(domain, res.status, reason);
+        throw buildFetchError(`HTTP ${res.status} (${reason === "cloudflare_challenge" ? "Cloudflare challenge" : "风控"})`, {
+          statusCode: res.status,
+          reason,
+          responseText: body.slice(0, 4000),
+        });
       }
       if (res.status >= 500) {
         try { await res.text(); } catch {}
@@ -966,6 +1008,156 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
     } finally {
       clearTimeout(timer);
     }
+  }
+}
+
+let frontendBrowserFetchLastAt = 0;
+async function waitForFrontendBrowserFetchSlot() {
+  const minInterval = CONFIG.frontendBrowserFetch.minIntervalMs || 0;
+  if (minInterval <= 0) return;
+  const waitMs = frontendBrowserFetchLastAt + minInterval - Date.now();
+  if (waitMs > 0) await sleep(waitMs);
+  frontendBrowserFetchLastAt = Date.now();
+}
+
+function frontendBrowserFetchConfigured() {
+  return CONFIG.frontendBrowserFetch.enabled && Boolean(CONFIG.frontendBrowserFetch.command);
+}
+
+function normalizeBrowserFetchedAssets(rawAssets = {}) {
+  const out = {};
+  for (const [assetKey, item] of Object.entries(rawAssets || {})) {
+    const content = typeof item === "string" ? item : item?.content;
+    if (!assetKey || typeof content !== "string" || !content) continue;
+    const cleanKey = assetKey.split("?")[0];
+    const ext = cleanKey.endsWith(".css") ? "css" : "js";
+    out[cleanKey] = {
+      contentHash: md5(content),
+      size: content.length,
+      strings: prioritizeFrontendStrings(extractStrings(content, ext)),
+      ext,
+      etag: "",
+      lastModified: "",
+      browserSession: true,
+      truncated: Boolean(item?.truncated),
+      rawContent: content,
+    };
+  }
+  return out;
+}
+
+async function fetchFrontendHtmlViaBrowserSession(url, { includeAssets = false } = {}) {
+  if (!frontendBrowserFetchConfigured()) {
+    throw buildFetchError("未配置人工验证浏览器会话采集命令", { reason: "browser_session_unavailable" });
+  }
+  await waitForFrontendBrowserFetchSlot();
+  const { command, args, timeoutMs, maxHtmlBytes } = CONFIG.frontendBrowserFetch;
+  const startedAt = Date.now();
+  try {
+    const env = { ...process.env, FOURMEME_BROWSER_FETCH_ASSETS: includeAssets ? "true" : "false" };
+    const { stdout, stderr } = await execFileAsync(command, [...args, url], {
+      timeout: timeoutMs,
+      maxBuffer: maxHtmlBytes,
+      windowsHide: true,
+      env,
+    });
+    const raw = String(stdout || "").trim();
+    let payload = null;
+    try {
+      payload = JSON.parse(raw);
+    } catch {
+      payload = { html: raw, assets: {} };
+    }
+    const html = String(payload?.html || "").trim();
+    if (html.length < 1000) {
+      throw buildFetchError(`浏览器会话返回内容过短（${html.length} 字节）${stderr ? `：${String(stderr).slice(0, 200)}` : ""}`, {
+        reason: "cloudflare_challenge",
+        responseText: html,
+      });
+    }
+    if (isCloudflareChallengeText(html)) {
+      throw buildFetchError("浏览器会话仍停留在 Cloudflare challenge，请先人工完成验证", {
+        reason: "cloudflare_challenge",
+        responseText: html.slice(0, 4000),
+      });
+    }
+    recordSuccess(getDomain(url));
+    return {
+      html,
+      status: 200,
+      source: "browser_session",
+      durationMs: Date.now() - startedAt,
+      etag: "",
+      lastModified: "",
+      assetContents: normalizeBrowserFetchedAssets(payload?.assets || {}),
+    };
+  } catch (err) {
+    if (err?.reason) throw err;
+    const isTimeout = err?.killed || /timed out|timeout/i.test(err?.message || "");
+    throw buildFetchError(
+      isTimeout ? `浏览器会话采集超时 ${timeoutMs}ms` : `浏览器会话采集失败：${err.message || err}`,
+      { reason: isTimeout ? "timeout" : "browser_session_error" },
+    );
+  }
+}
+
+async function fetchFrontendHtml(url, oldFeatures = null, { allowBrowserFallback = true, includeAssets = false } = {}) {
+  const startedAt = Date.now();
+  try {
+    const headers = browserHeaders();
+    if (oldFeatures?.htmlEtag) headers["If-None-Match"] = oldFeatures.htmlEtag;
+    if (oldFeatures?.htmlLastModified) headers["If-Modified-Since"] = oldFeatures.htmlLastModified;
+    const res = await fetchSafe(url, { headers });
+    if (res.status === 304 && oldFeatures) {
+      return {
+        reused: true,
+        oldFeatures,
+        status: 304,
+        source: "node_fetch",
+        durationMs: Date.now() - startedAt,
+      };
+    }
+    if (!res.ok) throw buildFetchError(`HTTP ${res.status} ${res.statusText}`, { statusCode: res.status });
+    const html = await res.text();
+    if (html.length < 1000) {
+      throw buildFetchError(`响应过短（${html.length} 字节），可能被拦截`, { reason: "error", responseText: html });
+    }
+    if (isCloudflareChallengeText(html)) {
+      recordFail(getDomain(url), res.status || 403, "cloudflare_challenge");
+      throw buildFetchError("页面疑似 Cloudflare challenge，拒绝更新前端快照", {
+        statusCode: res.status || 403,
+        reason: "cloudflare_challenge",
+        responseText: html.slice(0, 4000),
+      });
+    }
+    return {
+      html,
+      status: res.status,
+      source: "node_fetch",
+      durationMs: Date.now() - startedAt,
+      etag: res.headers.get("etag") || "",
+      lastModified: res.headers.get("last-modified") || "",
+    };
+  } catch (err) {
+    const reason = classifyFetchFailure(err);
+    if (allowBrowserFallback && frontendBrowserFetchConfigured() && ["cloudflare_challenge", "rate_limited", "backoff"].includes(reason)) {
+      logFrontendInfoRateLimited(
+        `browser-fallback:${getDomain(url)}`,
+        `[前端] Node 抓取触发 ${reason}，切换人工验证浏览器会话采集`
+      );
+      try {
+        return await fetchFrontendHtmlViaBrowserSession(url, { includeAssets });
+      } catch (fallbackErr) {
+        fallbackErr.reason = classifyFetchFailure(fallbackErr) === "cloudflare_challenge"
+          ? "cloudflare_challenge"
+          : (reason === "cloudflare_challenge" || reason === "backoff" ? "cloudflare_challenge" : classifyFetchFailure(fallbackErr));
+        throw fallbackErr;
+      }
+    }
+    if (reason === "cloudflare_challenge") {
+      err.reason = "cloudflare_challenge";
+    }
+    throw err;
   }
 }
 
@@ -1869,7 +2061,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null) {
         if (previous?.lastModified) headers["If-Modified-Since"] = previous.lastModified;
         const res = await fetchSafe(url, {
           headers,
-        }, 8_000);
+        }, 8_000, { ignoreBackoff: true });
         if (res.status === 304 && previous) {
           return {
             ...previous,
@@ -1918,6 +2110,13 @@ function frontendAssetContentsHash(assetContents) {
     .map(([file, data]) => `${file}:${data?.contentHash || ""}:${data?.size || 0}`)
     .sort();
   return items.length ? md5(items.join("\n")) : null;
+}
+
+function stripRawAssetContents(assetContents = {}) {
+  for (const item of Object.values(assetContents || {})) {
+    if (item && typeof item === "object" && "rawContent" in item) delete item.rawContent;
+  }
+  return assetContents;
 }
 
 function isCreateTokenFrontendUrl(url) {
@@ -2593,10 +2792,34 @@ function flattenI18n(obj, prefix) {
   return result;
 }
 
-async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
+function extractI18nFromRawAssetContents(assetContents = {}) {
+  let best = null;
+  for (const [assetKey, item] of Object.entries(assetContents || {})) {
+    const jsContent = item?.rawContent || item?.content || "";
+    if (!jsContent || !String(assetKey).endsWith(".js") || !jsContent.includes("JSON.parse('")) continue;
+    const data = parseI18nFromChunk(jsContent);
+    if (!data || typeof data !== "object") continue;
+    const strings = flattenI18n(data, "");
+    if (Object.keys(strings).length < 20) continue;
+    const result = { i18nStrings: strings, i18nHash: stableI18nHash(strings), i18nChunk: assetKey };
+    if (!best || Object.keys(result.i18nStrings).length > Object.keys(best.i18nStrings).length) {
+      best = result;
+    }
+  }
+  if (best) {
+    const chunkName = String(best.i18nChunk).split("/").pop();
+    log(`  [i18n] 从浏览器会话资源 ${chunkName} 提取到 ${Object.keys(best.i18nStrings).length} 个 UI 字符串`);
+  }
+  return best;
+}
+
+async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme", rawAssetContents = null) {
   // 注意：i18n 解析需要原始 JS 源码（搜索 JSON.parse('...')），
   // 而 downloadAssetContents 只保留了提取后的 strings/hash，无法复用。
   // 因此这里需要单独下载 chunk 候选文件。
+  const fromRawAssets = extractI18nFromRawAssetContents(rawAssetContents);
+  if (fromRawAssets) return fromRawAssets;
+
   const candidateUrls = [];
   if (assetUrlMap instanceof Map) {
     for (const [, url] of assetUrlMap) {
@@ -3220,13 +3443,11 @@ function chooseBetterFrontendPage(existing, candidate) {
  */
 async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   let features = null;
+  let htmlResult = null;
   const startedAt = Date.now();
   try {
-    const headers = browserHeaders();
-    if (oldFeatures?.htmlEtag) headers["If-None-Match"] = oldFeatures.htmlEtag;
-    if (oldFeatures?.htmlLastModified) headers["If-Modified-Since"] = oldFeatures.htmlLastModified;
-    const res = await fetchSafe(url, { headers });
-    if (res.status === 304 && oldFeatures) {
+    htmlResult = await fetchFrontendHtml(url, oldFeatures);
+    if (htmlResult.reused && oldFeatures) {
       return {
         data: {
           ...oldFeatures,
@@ -3235,15 +3456,13 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
         error: null,
       };
     }
-    if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-    const html = await res.text();
-    if (html.length < 1000) throw new Error(`响应过短（${html.length} 字节），可能被拦截`);
+    const html = htmlResult.html;
 
     // 第一层：纯解析
     features = extractPageFeatures(html, url);
-    features.htmlEtag = res.headers.get("etag") || "";
-    features.htmlLastModified = res.headers.get("last-modified") || "";
-    features.fetchMeta = { status: res.status, durationMs: Date.now() - startedAt };
+    features.htmlEtag = htmlResult.etag || "";
+    features.htmlLastModified = htmlResult.lastModified || "";
+    features.fetchMeta = { status: htmlResult.status, durationMs: Date.now() - startedAt, source: htmlResult.source };
     validateFrontendPageFeatures(url, html, features);
   } catch (err) {
     log(`  [${urlLabel(url)}] HTML 抓取失败：${err.message}`);
@@ -3253,7 +3472,35 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   // 第二层：按需下载资源（仅当 assetHash 变化时）
   const baseUrl = new URL(url).origin;
   const refreshAssetContents = isCreateTokenFrontendUrl(url);
-  if (oldFeatures && oldFeatures.assetHash === features.assetHash && oldFeatures.assetContents && !refreshAssetContents) {
+  const needsAssetRefresh = !oldFeatures || oldFeatures.assetHash !== features.assetHash || refreshAssetContents;
+  if (needsAssetRefresh && htmlResult?.source === "browser_session" && Object.keys(htmlResult.assetContents || {}).length === 0) {
+    try {
+      const assetHtmlResult = await fetchFrontendHtmlViaBrowserSession(url, { includeAssets: true });
+      if (assetHtmlResult?.html) {
+        const assetFeatures = extractPageFeatures(assetHtmlResult.html, url);
+        if (assetFeatures.assetHash === features.assetHash) {
+          htmlResult.assetContents = assetHtmlResult.assetContents || {};
+          features.fetchMeta.browserAssetFetchMs = assetHtmlResult.durationMs;
+        } else {
+          log(`  [${urlLabel(url)}] 浏览器资源补抓时页面资源列表已变化，保留本轮 HTML 结果`);
+        }
+      }
+    } catch (err) {
+      log(`  [${urlLabel(url)}] 浏览器资源补抓失败：${err.message}`);
+    }
+  }
+  const browserAssetContents = htmlResult?.assetContents || {};
+  const browserAssetsComplete = isAssetDownloadComplete(features.assetUrlMap, browserAssetContents, oldFeatures);
+  if (browserAssetsComplete) {
+    features.assetContents = browserAssetContents;
+    try {
+      let i18nResult = extractI18nFromStreamingHtml(features.html);
+      if (!i18nResult) i18nResult = await fetchI18nStrings(features.assetUrlMap, baseUrl, browserAssetContents);
+      if (applyI18nResult(features, i18nResult, oldFeatures)) {
+        logI18nExtractionResult(oldFeatures, i18nResult);
+      }
+    } catch (err) { log(`  [i18n] 提取异常（非致命）：${err.message}`); }
+  } else if (oldFeatures && oldFeatures.assetHash === features.assetHash && oldFeatures.assetContents && !refreshAssetContents) {
     // assetHash 未变 → 复用缓存，跳过下载
     features.assetContents = oldFeatures.assetContents;
     // i18n: 每次都从 streaming HTML 重新提取，因为 i18n 可能随 SSR 内容变化而非静态资源变化
@@ -3282,6 +3529,11 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
           features.assetContentHash = oldFeatures.assetContentHash || frontendAssetContentsHash(oldFeatures.assetContents);
           features.assetHash = oldFeatures.assetHash || features.assetHash;
           features.assetFiles = oldFeatures.assetFiles || features.assetFiles;
+        } else if (features.fetchMeta?.source === "browser_session") {
+          log(`  [${urlLabel(url)}] 浏览器 HTML 已采集，但资源下载不完整 ${downloaded}/${expected}，使用 HTML-only 基线`);
+          features.assetContents = {};
+          features.assetContentHash = null;
+          features.assetDownloadIncomplete = true;
         } else {
           throw new Error(`资源下载不完整 ${downloaded}/${expected}`);
         }
@@ -3317,6 +3569,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   }
 
   // 清除不需要持久化的大字段
+  stripRawAssetContents(features.assetContents);
   delete features.html;
   delete features.assetUrlMap; // Map 不可序列化
 
@@ -3355,23 +3608,23 @@ async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls
 
 async function fetchFrontendDiscoverySeedPages(urls = []) {
   const pages = {};
-  if (!urls.length) return pages;
+  const failedUrls = [];
+  const failedDetails = [];
+  if (!urls.length) return { pages, failedUrls, failedDetails };
   const limit = readPositiveIntEnv("FOURMEME_FRONTEND_DISCOVERY_SEED_CONCURRENCY", 2);
   const tasks = urls.map((url, i) => async () => {
     await sleep((i % limit) * 250);
     const startedAt = Date.now();
     try {
-      const res = await fetchSafe(url, { headers: browserHeaders() });
-      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-      const html = await res.text();
-      if (html.length < 1000) throw new Error(`响应过短（${html.length} 字节），可能被拦截`);
+      const htmlResult = await fetchFrontendHtml(url, null, { discoverySeed: true });
+      const html = htmlResult.html;
       const features = extractPageFeatures(html, url);
       validateFrontendPageFeatures(url, html, features);
       const routeSignals = extractRouteSignals(features.html, null, features.nextData);
       features.pageRoutes = routeSignals.routes;
       features.apiEndpoints = routeSignals.endpoints;
       features.routes = routeSignals.combined;
-      features.fetchMeta = { status: res.status, durationMs: Date.now() - startedAt, discoverySeed: true };
+      features.fetchMeta = { status: htmlResult.status, durationMs: Date.now() - startedAt, discoverySeed: true, source: htmlResult.source };
       delete features.html;
       delete features.assetUrlMap;
       return { key: urlToKey(url), data: { ...features, originalUrl: url } };
@@ -3380,6 +3633,8 @@ async function fetchFrontendDiscoverySeedPages(urls = []) {
         `discovery-seed-fail:${canonicalFrontendUrl(url)}`,
         `[前端] 发现入口抓取失败：${urlLabel(url)} ${err.message}`
       );
+      failedUrls.push(url);
+      failedDetails.push({ url, reason: classifyFetchFailure(err), message: err.message || String(err), durationMs: Date.now() - startedAt });
       return { key: urlToKey(url), data: null };
     }
   });
@@ -3389,7 +3644,7 @@ async function fetchFrontendDiscoverySeedPages(urls = []) {
       pages[r.value.key] = r.value.data;
     }
   }
-  return pages;
+  return { pages, failedUrls, failedDetails };
 }
 
 async function fetchFrontendDataWithDiscovery(oldPages = {}) {
@@ -3400,9 +3655,12 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
     .map(canonicalFrontendUrl)
     .filter(url => url && !baseUrlSet.has(url));
   const result = await fetchAllFrontendData(oldPages, baseUrls, assetCache);
+  const seedResult = await fetchFrontendDiscoverySeedPages(seedUrls);
+  result.failedUrls = [...(result.failedUrls || []), ...seedResult.failedUrls];
+  result.failedDetails = [...(result.failedDetails || []), ...seedResult.failedDetails];
   const discoveryPages = {
     ...result.pages,
-    ...(await fetchFrontendDiscoverySeedPages(seedUrls)),
+    ...seedResult.pages,
   };
   const knownUrls = new Set([
     ...baseUrls,
@@ -4169,7 +4427,8 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
     const failState = state?._frontendFailCounts?.[key] || {};
     const count = typeof failState === "object" ? (failState.count || 0) : failState;
     const reason = typeof failState === "object" ? failState.reason : "error";
-    const isBackoffLike = ["backoff", "rate_limited", "restricted"].includes(reason);
+    const isCloudflareChallenge = reason === "cloudflare_challenge";
+    const isBackoffLike = ["backoff", "rate_limited", "restricted", "cloudflare_challenge"].includes(reason);
     const threshold = isBackoffLike ? FAIL_THRESHOLD * 2 : FAIL_THRESHOLD;
     if (!(count > 0 && count % threshold === 0)) continue;
 
@@ -4180,6 +4439,7 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
         domain,
         reason,
         isBackoffLike,
+        isCloudflareChallenge,
         count,
         messages: new Set(),
         urls: [],
@@ -4195,8 +4455,14 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
     const backoffState = currentBackoffState(group.domain);
     const lines = [
       `站点 ${group.domain} 前端抓取已连续失败 ${group.count} 轮，影响 ${group.urls.length} 个页面。`,
-      `原因: ${group.reason}`,
+      `原因: ${group.isCloudflareChallenge ? "Cloudflare challenge" : group.reason}`,
     ];
+    if (group.isCloudflareChallenge) {
+      lines.push("说明: 普通 Node HTTP 抓取被 Cloudflare 拦截；脚本不会自动解挑战。");
+      lines.push(frontendBrowserFetchConfigured()
+        ? "浏览器会话兜底已配置，但当前仍未拿到正常 HTML，请确认浏览器 profile 已人工通过验证。"
+        : "浏览器会话兜底未启用，如需继续 10s 高频发现新路由，请先配置已人工验证的浏览器会话采集命令。");
+    }
     if (backoffState) {
       lines.push(`当前退避: 剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${backoffState.lastStatusCode ? `，上次状态 ${backoffState.lastStatusCode}` : ""}`);
     }
@@ -4211,7 +4477,9 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
     }
     if (group.urls.length > 12) lines.push(`- ... 还有 ${group.urls.length - 12} 个页面`);
     return {
-      title: group.isBackoffLike ? `⚠️ 前端抓取受限：${group.domain}` : `⚠️ 前端页面不可达：${group.domain}`,
+      title: group.isCloudflareChallenge
+        ? `⚠️ 前端 Cloudflare 拦截：${group.domain}`
+        : (group.isBackoffLike ? `⚠️ 前端抓取受限：${group.domain}` : `⚠️ 前端页面不可达：${group.domain}`),
       content: lines.join("\n"),
       template: "red",
       url: CONFIG.siteUrl,
@@ -8516,7 +8784,7 @@ async function startAllModules() {
       for (const [domain, b] of domainBackoff) {
         const remaining = Math.max(0, b.delayMs - (Date.now() - b.lastFail));
         if (remaining > 0) {
-          backoffLines.push(`  ${domain} ${Math.ceil(remaining / 1000)}s`);
+          backoffLines.push(`  ${domain} ${Math.ceil(remaining / 1000)}s${b.lastReason ? `（${b.lastReason}）` : ""}`);
         }
       }
 
@@ -8699,6 +8967,10 @@ export const __testables = {
   diffRoutes,
   frontendAssetChangeSignature,
   classifyFetchFailure,
+  isCloudflareChallengeText,
+  buildFetchError,
+  normalizeBrowserFetchedAssets,
+  stripRawAssetContents,
   buildStartupProgressContent,
   buildStartupReadyContent,
 };
