@@ -146,19 +146,45 @@ export function getChatId() {
 /* ══════════════════════════════════════════
    卡片 JSON 构建
    ══════════════════════════════════════════ */
-export function buildCardJson(title, content, template, diffFilePath) {
+function normalizeCardOptions(diffFilePathOrOpts) {
+  if (diffFilePathOrOpts && typeof diffFilePathOrOpts === "object" && !Array.isArray(diffFilePathOrOpts)) {
+    return diffFilePathOrOpts;
+  }
+  return { diffFilePath: diffFilePathOrOpts };
+}
+
+function buildCardActions(opts = {}) {
+  const actions = [];
+  if (opts.diffFilePath) {
+    actions.push({
+      tag: "button",
+      text: { tag: "plain_text", content: "📎 下载 Diff 详情" },
+      type: "default",
+      value: { action: "download_diff", file: opts.diffFilePath },
+    });
+  }
+  for (const action of opts.actions || []) {
+    if (!action || action.tag !== "button" || !action.text?.content || !action.value?.action) continue;
+    actions.push({
+      tag: "button",
+      text: { tag: "plain_text", content: String(action.text.content).slice(0, 30) },
+      type: action.type || "default",
+      value: action.value,
+    });
+  }
+  return actions;
+}
+
+export function buildCardJson(title, content, template, diffFilePathOrOpts) {
+  const opts = normalizeCardOptions(diffFilePathOrOpts);
   const elements = [
     { tag: "markdown", content },
   ];
-  if (diffFilePath) {
+  const actions = buildCardActions(opts);
+  if (actions.length > 0) {
     elements.push({
       tag: "action",
-      actions: [{
-        tag: "button",
-        text: { tag: "plain_text", content: "📎 下载 Diff 详情" },
-        type: "default",
-        value: { action: "download_diff", file: diffFilePath },
-      }],
+      actions,
     });
   }
   elements.push({
@@ -248,7 +274,7 @@ export async function sendCard(title, content, template = "red", opts = {}) {
       partTitle(title, i + 1, chunks.length),
       chunks[i],
       template,
-      i === 0 ? opts.diffFilePath : undefined,
+      i === 0 ? opts : {},
     );
     const res = await client.im.message.create({
       params: { receive_id_type: "chat_id" },
@@ -358,7 +384,7 @@ export async function patchCard(messageId, title, content, template = "red", opt
   const res = await client.im.message.patch({
     path: { message_id: messageId },
     data: {
-      content: buildCardJson(title, content, template, opts.diffFilePath),
+      content: buildCardJson(title, content, template, opts),
     },
   }, tokenOpt);
   if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);

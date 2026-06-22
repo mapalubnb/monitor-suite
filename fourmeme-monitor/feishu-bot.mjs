@@ -11,7 +11,8 @@
  */
 
 import { exec as execCb } from "node:child_process";
-import { readFileSync, writeFileSync, statSync, existsSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync, statSync, existsSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
@@ -97,6 +98,28 @@ function canonicalFrontendUrl(url) {
   } catch {
     return url;
   }
+}
+
+function urlLabel(url) {
+  try {
+    const u = new URL(url, "https://four.meme");
+    return u.pathname === "/" ? "首页" : u.pathname + u.search;
+  } catch {
+    return String(url || "");
+  }
+}
+
+function ensureFrontendRouteState(snap) {
+  if (!snap._frontendPendingRoutes) snap._frontendPendingRoutes = {};
+  if (!snap._frontendRouteApprovals) snap._frontendRouteApprovals = {};
+  if (!snap._frontendIgnoredRoutes) snap._frontendIgnoredRoutes = {};
+  if (!snap._frontendDiscoveredHistory) snap._frontendDiscoveredHistory = {};
+  return snap;
+}
+
+function frontendRouteActionToken(url) {
+  const source = `${canonicalFrontendUrl(url)}:${process.env.FEISHU_APP_SECRET || process.env.FEISHU_APP_ID || "fourmeme"}`;
+  return createHash("md5").update(source).digest("hex").slice(0, 16);
 }
 
 function activeFrontendPageEntries(snap) {
@@ -1193,6 +1216,150 @@ async function handleCardDownloadDiff(data) {
   }
 }
 
+function readFourmemeSnapshot() {
+  const snapPath = join(CONFIG.monitorDir, "snapshot.json");
+  if (!existsSync(snapPath)) return {};
+  try {
+    return JSON.parse(readFileSync(snapPath, "utf-8"));
+  } catch (err) {
+    throw new Error(`读取 snapshot.json 失败：${err.message}`);
+  }
+}
+
+function readFrontendRouteDecisions() {
+  const filePath = join(CONFIG.monitorDir, "frontend-route-decisions.json");
+  if (!existsSync(filePath)) return {};
+  try {
+    return JSON.parse(readFileSync(filePath, "utf-8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeFrontendRouteDecisions(decisions) {
+  const filePath = join(CONFIG.monitorDir, "frontend-route-decisions.json");
+  const tmpPath = `${filePath}.tmp`;
+  writeFileSync(tmpPath, JSON.stringify(decisions), "utf-8");
+  renameSync(tmpPath, filePath);
+}
+
+function isValidFrontendRouteUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.origin === "https://four.meme"
+      && /^\/(?:en|zh-TW)\//.test(u.pathname)
+      && !u.pathname.startsWith("/_next/")
+      && !u.pathname.startsWith("/api/")
+      && !u.pathname.startsWith("/meme-api/");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 处理前端新路由确认按钮
+ */
+async function handleFrontendRouteAction(data) {
+  const val = parseActionValue(data?.action?.value ?? data?.event?.action?.value);
+  if (!["frontend_add_route", "frontend_ignore_route"].includes(val.action)) return false;
+
+  const messageId = extractCardMessageId(data);
+  const canonical = canonicalFrontendUrl(val.url || "");
+  const expectedToken = frontendRouteActionToken(canonical);
+  const actionKey = `${val.action}:${messageId}:${canonical}`;
+  if (isCardActionProcessed(actionKey)) {
+    log(`[前端路由] 跳过重复动作：${actionKey}`);
+    return true;
+  }
+
+  if (!isValidFrontendRouteUrl(canonical) || val.token !== expectedToken) {
+    log(`[前端路由] 拒绝非法确认动作：${canonical}`);
+    if (messageId) {
+      try { await _sdkReplyText(messageId, `⚠ 新路由确认失败：URL 或 token 不合法\n${canonical || "(空)"}`); } catch {}
+    }
+    return true;
+  }
+
+  try {
+    const snap = ensureFrontendRouteState(readFourmemeSnapshot());
+    const decisions = ensureFrontendRouteState(readFrontendRouteDecisions());
+    const now = Date.now();
+    const pending = snap._frontendPendingRoutes[canonical] || { url: canonical };
+    if (val.action === "frontend_add_route") {
+      decisions._frontendRouteApprovals[canonical] = {
+        ...pending,
+        url: canonical,
+        status: "approved",
+        approvedAt: now,
+        updatedAt: now,
+      };
+      decisions._frontendPendingRoutes[canonical] = {
+        ...pending,
+        url: canonical,
+        status: "approved",
+        approvedAt: now,
+        updatedAt: now,
+      };
+      delete decisions._frontendIgnoredRoutes[canonical];
+      decisions._frontendDiscoveredHistory[canonical] = {
+        ...(snap._frontendDiscoveredHistory[canonical] || {}),
+        firstSeenAt: snap._frontendDiscoveredHistory[canonical]?.firstSeenAt || pending.firstSeenAt || now,
+        lastSeenAt: now,
+        approvedAt: now,
+        pendingApproval: false,
+      };
+      writeFrontendRouteDecisions(decisions);
+      log(`[前端路由] 已批准加入监控：${canonical}`);
+      if (messageId) {
+        await _sdkReplyText(messageId, `✅ 已加入 Four.meme 前端监控：${urlLabel(canonical)}\n下一轮前端检查会建立基线，之后按当前前端频率监控。`);
+      }
+    } else {
+      decisions._frontendIgnoredRoutes[canonical] = {
+        ...pending,
+        url: canonical,
+        status: "ignored",
+        ignoredAt: now,
+        updatedAt: now,
+      };
+      decisions._frontendPendingRoutes[canonical] = {
+        ...pending,
+        url: canonical,
+        status: "ignored",
+        ignoredAt: now,
+        updatedAt: now,
+      };
+      delete decisions._frontendRouteApprovals[canonical];
+      decisions._frontendDiscoveredHistory[canonical] = {
+        ...(snap._frontendDiscoveredHistory[canonical] || {}),
+        firstSeenAt: snap._frontendDiscoveredHistory[canonical]?.firstSeenAt || pending.firstSeenAt || now,
+        lastSeenAt: now,
+        ignoredAt: now,
+        pendingApproval: false,
+      };
+      writeFrontendRouteDecisions(decisions);
+      log(`[前端路由] 已忽略新路由：${canonical}`);
+      if (messageId) {
+        await _sdkReplyText(messageId, `已忽略 Four.meme 新路由：${urlLabel(canonical)}\n后续发现同一路由不会重复提醒。`);
+      }
+    }
+  } catch (err) {
+    log(`[前端路由] 处理失败：${err.message}`);
+    if (messageId) {
+      try { await _sdkReplyText(messageId, `⚠ 新路由确认失败：${err.message}`); } catch {}
+    }
+  }
+  return true;
+}
+
+async function handleCardAction(data) {
+  const val = parseActionValue(data?.action?.value ?? data?.event?.action?.value);
+  if (["frontend_add_route", "frontend_ignore_route"].includes(val.action)) {
+    await handleFrontendRouteAction(data);
+    return;
+  }
+  await handleCardDownloadDiff(data);
+}
+
 // 创建事件分发器
 const eventDispatcher = new lark.EventDispatcher({}).register({
   "im.message.receive_v1": async (data) => {
@@ -1246,7 +1413,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 // ── 注册卡片交互回调（长连接模式下的按钮点击）──
 // 注册两个 key 以兼容不同 SDK 版本：1.35+ 用 "card.action.trigger"，
 // 部分老版本/新卡片 schema 下可能以 "card.action.trigger_v1" 形式推送。
-const cardActionHandler = async (data) => handleCardDownloadDiff(data);
+const cardActionHandler = async (data) => handleCardAction(data);
 eventDispatcher.register({
   "card.action.trigger": cardActionHandler,
   "card.action.trigger_v1": cardActionHandler,

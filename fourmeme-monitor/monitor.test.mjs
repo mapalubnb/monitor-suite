@@ -35,6 +35,7 @@ test("configured URL validation is looser than discoverable route validation but
 });
 
 test("presale detail routes are discoverable from homepage links", () => {
+  __testables.setSnapshotForTests({});
   assert.equal(__testables.isDiscoverableFrontendUrl("https://four.meme/en/presale/102364633"), true);
   const signals = __testables.extractRouteSignals(
     `<a href="https://four.meme/en/presale/102364633"></a>`,
@@ -48,7 +49,7 @@ test("presale detail routes are discoverable from homepage links", () => {
   assert.deepEqual(discovered, ["https://four.meme/en/presale/102364633"]);
 });
 
-test("new frontend page notification records successful monitoring enrollment", () => {
+test("new frontend route notification asks for confirmation before monitoring enrollment", () => {
   const notification = __testables.buildFrontendNewPageNotification({
     originalUrl: "https://four.meme/en/presale/102364633",
     assetFiles: ["/_next/static/a.js"],
@@ -56,9 +57,36 @@ test("new frontend page notification records successful monitoring enrollment", 
     i18nStrings: { a: "b" },
     routes: ["/en/presale/102364633"],
   });
-  assert.equal(notification.title, "前端新页面发现：/en/presale/102364633");
-  assert.match(notification.content, /已成功抓取并纳入同一前端监控池/);
+  assert.equal(notification.title, "前端新路由发现：/en/presale/102364633");
+  assert.match(notification.content, /尚未加入前端监控池/);
+  assert.match(notification.aiInput, /Mame Inu Description Rule Details/);
+  assert.deepEqual(notification.cardOpts.actions.map(a => a.value.action), ["frontend_add_route", "frontend_ignore_route"]);
   assert.equal(notification.dedupeKey, "frontend:new-page:https://four.meme/en/presale/102364633");
+});
+
+test("pending or ignored frontend routes are not rediscovered until approved", () => {
+  const url = "https://four.meme/en/presale/102364633";
+  const route = "/en/presale/102364633";
+  __testables.setSnapshotForTests({
+    _frontendPendingRoutes: { [url]: { url, status: "pending", updatedAt: Date.now() } },
+  });
+  assert.equal(__testables.getFrontendRouteDecision(url), "pending");
+  assert.deepEqual(__testables.discoverFrontendUrlsFromPages({ home: { routes: [route] } }, []), []);
+
+  __testables.setSnapshotForTests({
+    _frontendIgnoredRoutes: { [url]: { url, status: "ignored", updatedAt: Date.now() } },
+  });
+  assert.equal(__testables.getFrontendRouteDecision(url), "ignored");
+  assert.deepEqual(__testables.discoverFrontendUrlsFromPages({ home: { routes: [route] } }, []), []);
+});
+
+test("approved frontend routes are included in monitor URL pool", () => {
+  const url = "https://four.meme/en/presale/102364633";
+  __testables.setSnapshotForTests({
+    frontendPages: {},
+    _frontendRouteApprovals: { [url]: { url, status: "approved", updatedAt: Date.now() } },
+  });
+  assert.ok(__testables.getFrontendMonitorUrls().includes(url));
 });
 
 test("extractTextContent ignores script content and handles greater-than in attributes", () => {

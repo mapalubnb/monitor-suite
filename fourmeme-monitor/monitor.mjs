@@ -165,6 +165,7 @@ const CONFIG = {
 
   // 快照文件
   snapshotFile: join(__dirname, "snapshot.json"),
+  frontendRouteDecisionsFile: join(__dirname, "frontend-route-decisions.json"),
 
   // ── 反风控 ──
   // 每次请求随机抖动范围（毫秒），叠加到间隔上
@@ -411,7 +412,7 @@ const md5 = (str) => createHash("md5").update(str).digest("hex");
 const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
-const CURRENT_SCHEMA_VERSION = 6;
+const CURRENT_SCHEMA_VERSION = 7;
 let snapshotWriteQueue = Promise.resolve();
 
 const REMOVED_FRONTEND_URLS = new Set([
@@ -517,6 +518,10 @@ function migrateSnapshot(data) {
     if (!Array.isArray(data.chainActorMonitor.seenTxs)) data.chainActorMonitor.seenTxs = [];
     log("[快照迁移] v5 → v6：补充合约创建者动作监听字段");
   }
+  if (ver < 7) {
+    log("[快照迁移] v6 → v7：补充前端新路由确认状态字段");
+  }
+  ensureFrontendRouteState(data);
   if (!data._frontendDiscoveredHistory) data._frontendDiscoveredHistory = {};
   if (!data._frontendNotifyDedupe) data._frontendNotifyDedupe = {};
   if (!data._frontendWarmup) data._frontendWarmup = {};
@@ -524,9 +529,64 @@ function migrateSnapshot(data) {
   return data;
 }
 
+function ensureFrontendRouteState(data) {
+  if (!data || typeof data !== "object") return data;
+  if (!data._frontendDiscoveredHistory) data._frontendDiscoveredHistory = {};
+  if (!data._frontendPendingRoutes) data._frontendPendingRoutes = {};
+  if (!data._frontendRouteApprovals) data._frontendRouteApprovals = {};
+  if (!data._frontendIgnoredRoutes) data._frontendIgnoredRoutes = {};
+  return data;
+}
+
+function routeDecisionTs(item = {}) {
+  return Number(item.updatedAt || item.approvedAt || item.ignoredAt || item.notifiedAt || item.lastSeenAt || item.firstSeenAt || 0);
+}
+
+function mergeRouteDecisionMap(target, source) {
+  if (!source || typeof source !== "object") return false;
+  let changed = false;
+  for (const [rawUrl, sourceValue] of Object.entries(source)) {
+    const canonical = canonicalFrontendUrl(sourceValue?.url || rawUrl);
+    if (!canonical || !sourceValue || typeof sourceValue !== "object") continue;
+    const targetValue = target[canonical];
+    if (!targetValue || routeDecisionTs(sourceValue) >= routeDecisionTs(targetValue)) {
+      target[canonical] = { ...targetValue, ...sourceValue, url: canonical };
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+function mergeExternalFrontendRouteStateFromFile(data, filePath) {
+  if (!data || !filePath || !existsSync(filePath)) return false;
+  let external;
+  try {
+    external = JSON.parse(readFileSync(filePath, "utf-8"));
+  } catch {
+    return false;
+  }
+  ensureFrontendRouteState(data);
+  ensureFrontendRouteState(external);
+  let changed = false;
+  changed = mergeRouteDecisionMap(data._frontendPendingRoutes, external._frontendPendingRoutes) || changed;
+  changed = mergeRouteDecisionMap(data._frontendRouteApprovals, external._frontendRouteApprovals) || changed;
+  changed = mergeRouteDecisionMap(data._frontendIgnoredRoutes, external._frontendIgnoredRoutes) || changed;
+  changed = mergeRouteDecisionMap(data._frontendDiscoveredHistory, external._frontendDiscoveredHistory) || changed;
+  return changed;
+}
+
+function mergeExternalFrontendRouteState(data = snapshot) {
+  if (!data) return false;
+  let changed = false;
+  changed = mergeExternalFrontendRouteStateFromFile(data, CONFIG.snapshotFile) || changed;
+  changed = mergeExternalFrontendRouteStateFromFile(data, CONFIG.frontendRouteDecisionsFile) || changed;
+  return changed;
+}
+
 function saveSnapshot(data) {
   snapshotWriteQueue = snapshotWriteQueue.then(() => {
     try {
+      mergeExternalFrontendRouteState(data);
       data._schemaVersion = CURRENT_SCHEMA_VERSION;
       data.lastCheck = ts();
       // 紧凑且延后序列化，避免写队列堆积多份大快照字符串。
@@ -572,10 +632,10 @@ function sendHeartbeat(title, content, template = "green") {
 /**
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
-async function sendCardViaApi(title, content, template = "red", diffFilePath, retries = 2) {
+async function sendCardViaApi(title, content, template = "red", diffFilePath, retries = 2, cardOpts = {}) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await sendCard(title, content, template, { diffFilePath });
+      return await sendCard(title, content, template, { ...cardOpts, diffFilePath });
     } catch (err) {
       log(`[IM API] 发送失败（第${attempt + 1}次）：${err.message}`);
       if (attempt < retries) await sleep(2_000 * (attempt + 1));
@@ -607,22 +667,22 @@ async function patchStartupCard(messageId, title, content, template = "blue") {
 /**
  * 编辑已发送的卡片消息（用于补充 AI 摘要）
  */
-async function patchCardViaApi(messageId, title, content, template = "red", diffFilePath) {
-  await patchCard(messageId, title, content, template, { diffFilePath });
+async function patchCardViaApi(messageId, title, content, template = "red", diffFilePath, cardOpts = {}) {
+  await patchCard(messageId, title, content, template, { ...cardOpts, diffFilePath });
 }
 
 /**
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
  * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
-async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url) {
+async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, cardOpts = {}) {
   // 卡片最上方加入监控目标网址
   const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
   // 1. 立即推送裸 diff（秒级送达）
-  let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
+  let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath, 2, cardOpts);
   if (!messageId) {
     log(`[推送] 即时通道失败，切换队列兜底：${title}`);
-    messageId = await sendCardQueued(title, urlLine + content, template, { diffFilePath });
+    messageId = await sendCardQueued(title, urlLine + content, template, { ...cardOpts, diffFilePath });
   }
 
   // 2. 异步调用 AI → 编辑原消息补充摘要（不阻塞调用方）
@@ -634,11 +694,11 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
       if (messageId) {
         try {
-          await patchCardViaApi(messageId, title, urlLine + enriched, template, diffFilePath);
+          await patchCardViaApi(messageId, title, urlLine + enriched, template, diffFilePath, cardOpts);
           log(`[AI→更新] ${title} 已补充 AI 摘要`);
         } catch (err) {
           log(`[AI→更新] 编辑失败(${err.message})，进入重试队列`);
-          scheduleAiPatchRetry({ messageId, title, content: urlLine + enriched, template, diffFilePath, summary });
+          scheduleAiPatchRetry({ messageId, title, content: urlLine + enriched, template, diffFilePath, cardOpts, summary });
         }
       } else {
         await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
@@ -661,17 +721,17 @@ async function summarizeWithRetry(input, moduleContext) {
   return "";
 }
 
-function scheduleAiPatchRetry({ messageId, title, content, template, diffFilePath, summary, attempt = 1 }) {
+function scheduleAiPatchRetry({ messageId, title, content, template, diffFilePath, cardOpts = {}, summary, attempt = 1 }) {
   const maxAttempts = readPositiveIntEnv("AI_PATCH_RETRY_ATTEMPTS", 2);
   const delayMs = Math.min(30_000, 2_000 * attempt);
   setTimeout(async () => {
     try {
-      await patchCardViaApi(messageId, title, content, template, diffFilePath);
+      await patchCardViaApi(messageId, title, content, template, diffFilePath, cardOpts);
       log(`[AI→更新] ${title} 重试补充 AI 摘要成功`);
     } catch (err) {
       if (attempt < maxAttempts) {
         log(`[AI→更新] 重试 ${attempt}/${maxAttempts} 失败(${err.message})，继续排队`);
-        scheduleAiPatchRetry({ messageId, title, content, template, diffFilePath, summary, attempt: attempt + 1 });
+        scheduleAiPatchRetry({ messageId, title, content, template, diffFilePath, cardOpts, summary, attempt: attempt + 1 });
       } else {
         log(`[AI→更新] 重试失败，追加发送 AI 摘要：${err.message}`);
         await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
@@ -1232,7 +1292,26 @@ function getFrontendMonitorUrls() {
     .map(canonicalFrontendUrl)
     .filter(url => !configuredSet.has(url))
     .filter(isDiscoverableFrontendUrl);
-  return [...new Set([...configured, ...discovered])];
+  const approved = Object.entries(snapshot?._frontendRouteApprovals || {})
+    .filter(([, item]) => item?.status === "approved")
+    .map(([url, item]) => canonicalFrontendUrl(item.url || url))
+    .filter(url => !configuredSet.has(url))
+    .filter(isDiscoverableFrontendUrl);
+  return [...new Set([...configured, ...approved, ...discovered])];
+}
+
+function getFrontendRouteDecision(url) {
+  const canonical = canonicalFrontendUrl(url);
+  if (!canonical) return "unknown";
+  if (snapshot?._frontendRouteApprovals?.[canonical]?.status === "approved") return "approved";
+  if (snapshot?._frontendIgnoredRoutes?.[canonical]?.status === "ignored") return "ignored";
+  if (snapshot?._frontendPendingRoutes?.[canonical]?.status === "pending") return "pending";
+  return "new";
+}
+
+function shouldSkipDiscoveredFrontendUrl(url) {
+  const decision = getFrontendRouteDecision(url);
+  return decision === "approved" || decision === "ignored" || decision === "pending";
 }
 
 function isConfiguredFrontendUrl(url) {
@@ -1376,6 +1455,10 @@ function discoverFrontendUrlsFromPages(pages, knownUrls = []) {
     for (const route of page.routes || []) {
       const url = routeToFrontendUrl(route);
       if (!url || known.has(url)) continue;
+      if (shouldSkipDiscoveredFrontendUrl(url)) {
+        known.add(url);
+        continue;
+      }
       if (isSuppressedDiscoveredFrontendUrl(url)) {
         known.add(url);
         continue;
@@ -2752,6 +2835,51 @@ function buildGlobalI18nResourceNotification(group) {
   };
 }
 
+function frontendRouteActionToken(url) {
+  return md5(`${canonicalFrontendUrl(url)}:${process.env.FEISHU_APP_SECRET || process.env.FEISHU_APP_ID || "fourmeme"}`).slice(0, 16);
+}
+
+function buildFrontendRouteActionButtons(url) {
+  const canonical = canonicalFrontendUrl(url);
+  const token = frontendRouteActionToken(canonical);
+  return [
+    {
+      tag: "button",
+      text: { tag: "plain_text", content: "加入监控" },
+      type: "primary",
+      value: { action: "frontend_add_route", url: canonical, token },
+    },
+    {
+      tag: "button",
+      text: { tag: "plain_text", content: "忽略" },
+      type: "default",
+      value: { action: "frontend_ignore_route", url: canonical, token },
+    },
+  ];
+}
+
+function buildFrontendNewPageAiInput(page) {
+  const label = urlLabel(page.originalUrl);
+  const text = frontendDisplaySnippet(page.textContent || "", 1200);
+  const routes = (page.routes || []).filter(r => !isApiOrEndpointRoute(r)).slice(0, 20).join("\n");
+  const i18nSamples = Object.entries(page.i18nStrings || {})
+    .slice(0, 30)
+    .map(([k, v]) => `${k}: ${frontendDisplaySnippet(v, 120)}`)
+    .join("\n");
+  return [
+    `Four.meme 发现新的前端路由：${label}`,
+    `URL: ${page.originalUrl}`,
+    "",
+    "请判断这个页面大概是什么功能、是否像活动/预售/业务页面，并用中文输出 2-4 句话。",
+    "",
+    "页面可见文案：",
+    text || "(未提取到明显可见文案)",
+    "",
+    routes ? `页面内路由信号：\n${routes}` : "",
+    i18nSamples ? `i18n 样例：\n${i18nSamples}` : "",
+  ].filter(Boolean).join("\n");
+}
+
 function buildFrontendNewPageNotification(page) {
   const label = urlLabel(page.originalUrl);
   const fileCount = (page.assetFiles || []).length;
@@ -2762,8 +2890,9 @@ function buildFrontendNewPageNotification(page) {
     `**页面：${label}**`,
     `URL: ${page.originalUrl}`,
     "",
-    "**类型：前端新页面发现**",
-    `已成功抓取并纳入同一前端监控池，后续按每 ${CONFIG.intervals.frontend / 1000}s 检查页面变化。`,
+    "**类型：前端新路由发现**",
+    `已抓取页面结构，但尚未加入前端监控池。请在卡片下方选择“加入监控”或“忽略”。`,
+    `确认加入后，脚本会在下一轮前端检查建立基线，并按每 ${CONFIG.intervals.frontend / 1000}s 检查页面变化。`,
     "",
     `资源文件：${fileCount} 个`,
     `页面文案：${textLen} 字`,
@@ -2777,12 +2906,14 @@ function buildFrontendNewPageNotification(page) {
     lines.push(preview);
   }
   return {
-    title: `前端新页面发现：${label}`,
+    title: `前端新路由发现：${label}`,
     content: lines.join("\n"),
     template: "orange",
     url: page.originalUrl,
     pageLabel: label,
     dedupeKey: `frontend:new-page:${canonicalFrontendUrl(page.originalUrl)}`,
+    aiInput: buildFrontendNewPageAiInput(page),
+    cardOpts: { actions: buildFrontendRouteActionButtons(page.originalUrl) },
   };
 }
 
@@ -3205,20 +3336,21 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
     ...seedUrls,
     ...Object.values(discoveryPages).map(p => p.originalUrl),
   ].map(canonicalFrontendUrl));
+  const pendingRoutePages = [];
   const allDiscoveredUrls = [];
 
   for (let depth = 0; depth < 2; depth++) {
     const discoveredUrls = discoverFrontendUrlsFromPages(discoveryPages, [...knownUrls]);
     if (discoveredUrls.length === 0) break;
-    log(`[前端] 从路由发现 ${discoveredUrls.length} 个新页面，立即纳入同一监控池：${discoveredUrls.map(urlLabel).join(", ")}`);
+    log(`[前端] 从路由发现 ${discoveredUrls.length} 个新页面，发送待确认通知：${discoveredUrls.map(urlLabel).join(", ")}`);
     for (const url of discoveredUrls) knownUrls.add(canonicalFrontendUrl(url));
     const extra = await fetchAllFrontendData(oldPages, discoveredUrls, assetCache);
     for (const [key, page] of Object.entries(extra.pages)) {
-      result.pages[key] = chooseBetterFrontendPage(result.pages[key], page);
       discoveryPages[key] = chooseBetterFrontendPage(discoveryPages[key], page);
+      pendingRoutePages.push(discoveryPages[key]);
     }
     if (extra.failedUrls.length > 0) {
-      log(`[前端] 路由发现候选页抓取失败，未纳入监控：${extra.failedUrls.map(urlLabel).join(", ")}`);
+      log(`[前端] 路由发现候选页抓取失败，暂不通知：${extra.failedUrls.map(urlLabel).join(", ")}`);
       if (recordFailedDiscoveredFrontendUrls(extra.failedUrls, extra.failedDetails || [])) {
         result.discoveryHistoryChanged = true;
       }
@@ -3228,6 +3360,7 @@ async function fetchFrontendDataWithDiscovery(oldPages = {}) {
   }
 
   result.discoveredUrls = allDiscoveredUrls;
+  result.pendingRoutePages = pendingRoutePages;
   return result;
 }
 
@@ -3570,7 +3703,7 @@ function formatFrontendAssetBrief(assetSummary) {
 
 function normalizeFrontendNotificationTitle(title, fallbackUrl = "") {
   const raw = String(title || "");
-  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw) || /^前端 i18n 资源变更/.test(raw)) return raw;
+  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw) || /^前端 i18n 资源变更/.test(raw) || /^前端新路由发现：/.test(raw)) return raw;
   const m = raw.match(/\/(?:en|zh-TW)\/[A-Za-z0-9/_-]+/);
   const label = m?.[0] || (fallbackUrl ? urlLabel(fallbackUrl) : "未知页面");
   return `前端变更：${label}`;
@@ -7384,13 +7517,16 @@ async function runPoolCheck() {
 async function runFrontendCheck() {
   if (!snapshot) snapshot = {};
   if (!snapshot._frontendFailCounts) snapshot._frontendFailCounts = {};
-  if (!snapshot._frontendDiscoveredHistory) snapshot._frontendDiscoveredHistory = {};
+  ensureFrontendRouteState(snapshot);
+  if (mergeExternalFrontendRouteState(snapshot)) {
+    log("[前端] 已合并飞书交互产生的新路由确认状态");
+  }
   if (!snapshot._frontendNotifyDedupe) snapshot._frontendNotifyDedupe = {};
   if (!snapshot._frontendWarmup) snapshot._frontendWarmup = {};
   frontendMetrics.lastRunAt = Date.now();
   const prunedBeforeRun = pruneFrontendSnapshot(snapshot);
   const oldPages = snapshot.frontendPages || {};
-  const { pages: newPages, failedUrls, failedDetails = [], discoveryHistoryChanged = false } = await fetchFrontendDataWithDiscovery(oldPages);
+  const { pages: newPages, failedUrls, failedDetails = [], discoveryHistoryChanged = false, pendingRoutePages = [] } = await fetchFrontendDataWithDiscovery(oldPages);
   frontendMetrics.success = Object.keys(newPages).length;
   frontendMetrics.failed = failedUrls.length;
 
@@ -7453,8 +7589,48 @@ async function runFrontendCheck() {
   }
 
   const notifications = [];
+  const routeDiscoveryNotifications = [];
   const globalI18nResourceGroups = new Map();
   let snapshotDirty = prunedBeforeRun || discoveryHistoryChanged;
+
+  for (const page of pendingRoutePages) {
+    const canonical = canonicalFrontendUrl(page.originalUrl);
+    if (!canonical || getFrontendRouteDecision(canonical) !== "new") continue;
+    const now = Date.now();
+    snapshot._frontendPendingRoutes[canonical] = {
+      url: canonical,
+      status: "pending",
+      token: frontendRouteActionToken(canonical),
+      firstSeenAt: now,
+      lastSeenAt: now,
+      notifiedAt: now,
+      updatedAt: now,
+      title: page.nextData?.page || urlLabel(canonical),
+      textPreview: frontendDisplaySnippet(page.textContent || "", 500),
+      assetCount: (page.assetFiles || []).length,
+      i18nCount: page.i18nStrings ? Object.keys(page.i18nStrings).length : 0,
+      routeCount: (page.routes || []).length,
+    };
+    snapshot._frontendDiscoveredHistory[canonical] = {
+      ...(snapshot._frontendDiscoveredHistory[canonical] || {}),
+      firstSeenAt: snapshot._frontendDiscoveredHistory[canonical]?.firstSeenAt || now,
+      lastSeenAt: now,
+      pendingApproval: true,
+    };
+    routeDiscoveryNotifications.push(buildFrontendNewPageNotification(page));
+    snapshotDirty = true;
+  }
+
+  if (routeDiscoveryNotifications.length > 0) {
+    const dedupedRouteNotifications = filterFrontendDedupe(routeDiscoveryNotifications, snapshot);
+    frontendMetrics.notifications += dedupedRouteNotifications.length;
+    await saveSnapshot(snapshot);
+    for (const n of dedupedRouteNotifications) {
+      n.title = normalizeFrontendNotificationTitle(n.title, n.url);
+      appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
+      await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端新路由 ${n.title}`, n.aiInput, undefined, null, n.url, n.cardOpts || {});
+    }
+  }
 
   // 连续 3 次抓取失败的页面发送告警（每 3 的倍数重复提醒）
   const FAIL_THRESHOLD = 3;
@@ -7490,7 +7666,6 @@ async function runFrontendCheck() {
       };
       snapshot._frontendWarmup[key] = { stableRuns: 1, firstSeenAt: Date.now() };
       snapshot.frontendPages[key] = newData;
-      notifications.push(buildFrontendNewPageNotification(newData));
       snapshotDirty = true;
       continue;
     }
@@ -7757,7 +7932,7 @@ async function runFrontendCheck() {
       n.title = normalizeFrontendNotificationTitle(n.title, n.url);
       appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
       const diffFilePath = n.fullDiff ? saveDiffLocally(n.title, n.fullDiff) : null;
-      await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, undefined, undefined, diffFilePath, n.url);
+      await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, n.aiInput, undefined, diffFilePath, n.url, n.cardOpts || {});
     }
   } else if (snapshotDirty || failCountChanged) {
     await saveSnapshot(snapshot);
@@ -8194,7 +8369,7 @@ async function startAllModules() {
         `运行 **${h}h${m}m**，总检测 **${total}** 次`,
         Object.entries(modulePollCounts).map(([k, v]) => `  ${k}: ${v}`).join("\n"),
         `当前底池：**${poolCount}** 个`,
-        `前端页面池：**${Object.keys(snapshot?.frontendPages || {}).length}** 个，最近一轮成功 ${frontendMetrics.success} / 失败 ${frontendMetrics.failed}，累计推送 ${frontendMetrics.notifications}，抑制 ${frontendMetrics.suppressed}`,
+        `前端页面池：**${Object.keys(snapshot?.frontendPages || {}).length}** 个，待确认新路由 **${Object.values(snapshot?._frontendPendingRoutes || {}).filter(r => r?.status === "pending").length}** 个，最近一轮成功 ${frontendMetrics.success} / 失败 ${frontendMetrics.failed}，累计推送 ${frontendMetrics.notifications}，抑制 ${frontendMetrics.suppressed}`,
       ];
 
       // 汇总近 2 小时内的模块错误
@@ -8363,13 +8538,22 @@ if (!IS_TEST_MODE) {
   process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 }
 
+function setSnapshotForTests(value) {
+  if (!IS_TEST_MODE) return snapshot;
+  snapshot = migrateSnapshot(value || {});
+  return snapshot;
+}
+
 export const __testables = {
   CONFIG,
   canonicalFrontendUrl,
+  getFrontendMonitorUrls,
   isConfiguredFrontendUrl,
   isDiscoverableFrontendUrl,
   isSuppressedDiscoveredFrontendUrl,
   recordFailedDiscoveredFrontendUrls,
+  getFrontendRouteDecision,
+  setSnapshotForTests,
   discoverFrontendUrlsFromPages,
   extractTextContent,
   extractHrefRoutesFromHtml,
@@ -8385,6 +8569,8 @@ export const __testables = {
   shouldConfirmI18nRemoval,
   frontendNotificationDedupeKey,
   buildFrontendNewPageNotification,
+  buildFrontendRouteActionButtons,
+  buildFrontendNewPageAiInput,
   formatI18nChangesForFullDiff,
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,
