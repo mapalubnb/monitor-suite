@@ -10,6 +10,16 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
   assert.equal(__testables.CONFIG.intervals.api, 15_000);
   assert.equal(__testables.CONFIG.jitterMs, 200);
   assert.equal(__testables.CONFIG.apiProbeStaggerMs, 200);
+  assert.equal(__testables.CONFIG.frontendScraplingFetch.timeoutMs, 80_000);
+});
+
+test("frontend fetch defaults to Scrapling stealthy mode", () => {
+  assert.equal(__testables.frontendFetchProvider(), "scrapling");
+  assert.equal(__testables.frontendScraplingFetchConfigured(), true);
+  assert.equal(__testables.frontendBrowserFetchConfigured(), false);
+  assert.equal(__testables.frontendBrowserFetchForced(), false);
+  assert.equal(__testables.frontendManagedBrowserFetchForced(), true);
+  assert.equal(__testables.frontendFetchModeLabel(), "scrapling_stealthy");
 });
 
 test("startup card copy reflects active frontend and api cadences", () => {
@@ -146,8 +156,34 @@ test("cloudflare challenge failures are classified and grouped as site-level non
   assert.equal(notifications.length, 1);
   assert.equal(notifications[0].title, "⚠️ 前端 Cloudflare 拦截：four.meme");
   assert.equal(notifications[0].skipAi, true);
-  assert.match(notifications[0].content, /普通 Node HTTP 抓取被 Cloudflare 拦截/);
+  assert.match(notifications[0].content, /Scrapling stealth 浏览器 sidecar/);
   assert.match(notifications[0].content, /影响 2 个页面/);
+});
+
+test("normal app Turnstile copy is not treated as a Cloudflare challenge", () => {
+  const html = `
+    <html><head><script src="/_next/static/chunks/app.js"></script></head>
+    <body>Protected by Cloudflare Turnstile. Captcha verification failed, please try again.</body></html>
+  `;
+  assert.equal(__testables.isCloudflareChallengeText(html), false);
+});
+
+test("asset incomplete pages emit operational alerts after consecutive rounds", () => {
+  const url = "https://four.meme/en/create-token";
+  const snap = {
+    _frontendAssetIncompleteCounts: {
+      [__testables.urlToKey(url)]: {
+        count: 3,
+        reason: "asset_incomplete",
+        message: "资源内容不完整 0/12，当前为 HTML-only 基线",
+      },
+    },
+  };
+  const notifications = __testables.buildFrontendFailureNotifications([url], snap);
+  assert.equal(notifications.length, 1);
+  assert.equal(notifications[0].title, "⚠️ 前端资源抓取不完整：four.meme");
+  assert.equal(notifications[0].skipAi, true);
+  assert.match(notifications[0].content, /资源 diff\/i18n\/chunk 级监控会暂时降级/);
 });
 
 test("browser session assets keep raw content only during parsing and can be stripped before snapshot", () => {
