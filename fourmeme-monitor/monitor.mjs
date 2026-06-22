@@ -749,6 +749,66 @@ function scheduleAiPatchRetry({ messageId, title, content, template, diffFilePat
   }, delayMs);
 }
 
+function shouldUseAiForNotification({ title = "", content = "", moduleContext = "", aiInput = "", skipAi = false } = {}) {
+  if (skipAi) return false;
+  const text = `${title}\n${moduleContext}\n${aiInput || content}`;
+
+  // 明确噪音/状态类：不需要 AI。
+  if (/抓取受限|页面不可达|请求失败|处理失败|模块异常|模块恢复|退避恢复|基线已修复|心跳|状态总览|监控日报/i.test(text)) return false;
+  if (/仅检测到构建产物|压缩变量噪音|无实质|常规构建|hash\s*轮换|部署 ID|sourceMappingURL/i.test(text)) return false;
+
+  // 用户明确需要页面内容解释的新路由。
+  if (/前端新路由|新路由发现/.test(text)) return true;
+
+  // 高价值安全/链上/合约/底池业务变更保留 AI。
+  if (/合约变更|智能合约|OpenFour|底池变更|费率|buyFee|sellFee|tradeFee|vault|dividend|staking|权限|黑白名单|whitelist|blacklist/i.test(text)) return true;
+
+  // 创建者动作：高/中风险或批量动作需要解释，单条低风险交易不需要。
+  if (/链上创建者动作/.test(text)) {
+    return /高风险|中风险|🚨|⚠️|新合约|权限|owner|admin|upgrade|transferOwnership/i.test(text)
+      || /链上创建者动作（(?:[2-9]|\d{2,})项）/.test(title);
+  }
+
+  // 前端：可见文案、页面级 i18n、路由/端点变化需要解释；全局资源未命中 DOM 默认跳过。
+  const isFrontendI18nResourceTitle = /前端 i18n 资源变更/.test(title);
+  const hasPageVisibleI18nSignal = /前端文案变更|页面文案变更|i18n 国际化字符串|页面级附加变更|可见 DOM/i.test(text);
+  if (/全局 i18n 资源变更/.test(text) || (isFrontendI18nResourceTitle && !hasPageVisibleI18nSignal)) return false;
+  if (/前端文案变更|页面文案变更|i18n 国际化字符串|前端路由\/端点变更|页面级附加变更|创建页重点文案|功能信号/i.test(text)) return true;
+  if (/前端变更/.test(title)) {
+    return /费率|fee|tax|vault|dividend|staking|enabled|新增路由|移除路由|API 端点|按钮|文案|可见/i.test(text);
+  }
+
+  // API：结构新增/删除/字段类型变化需要解释；普通值变化只在关键字段时调用。
+  if (/API 变更/.test(title)) {
+    if (/API (?:新接口结构|结构变更)|新端点响应值/.test(text)) return true;
+    return /fee|tax|rate|status|enabled|contract|address|vault|staking|dividend|limit|threshold|cap|whitelist|blacklist/i.test(text);
+  }
+
+  // GitHub：提交保留 AI；账号仓库列表只有新增/移除仓库需要。
+  if (/GitHub 新提交/.test(title)) return true;
+  if (/GitHub 项目变更/.test(title)) return /新增仓库|移除仓库/.test(text);
+
+  // 链上参数：新增/移除合约需要；单纯数量变化可由卡片说明覆盖。
+  if (/链上参数变更/.test(title)) return /新增 Agent NFT 合约|移除 Agent NFT 合约/.test(text);
+
+  return true;
+}
+
+async function sendNotificationMaybeAi({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, cardOpts = {}, skipAi = false }) {
+  if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
+    const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
+    let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath, 2, cardOpts || {});
+    if (!messageId) {
+      log(`[推送] AI 已跳过，立即通道失败，切换队列兜底：${title}`);
+      await sendCardQueued(title, urlLine + content, template, { ...(cardOpts || {}), diffFilePath });
+    } else {
+      log(`[AI] 已跳过：${title}`);
+    }
+    return messageId;
+  }
+  return sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, cardOpts);
+}
+
 /**
  * 保存 diff 详情到本地文件（不再直接发送到飞书群，改为卡片按钮触发下载）
  * @param {string} title - 通知标题（用于文件名）
@@ -5091,7 +5151,7 @@ async function runOpenFourTemplateCheck() {
     const content = formatOpenFourTemplateChanges(changes);
     await saveSnapshot(snapshot);
     appendHistory("openfour", title, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(title, content, "orange", "Four.meme OpenFour 业务模板变更", undefined, undefined, undefined, `${CONFIG.siteUrl}/zh-TW/contract/create`);
+    await sendNotificationMaybeAi({ title, content, template: "orange", moduleContext: "Four.meme OpenFour 业务模板变更", url: `${CONFIG.siteUrl}/zh-TW/contract/create` });
   } else if (snapshotChanged) {
     await saveSnapshot(snapshot);
   }
@@ -5283,7 +5343,7 @@ async function runOpenFourModuleDiscoveryCheck(context = {}) {
     const content = formatOpenFourNewModules(newModules, context);
     await saveSnapshot(snapshot);
     appendHistory("openfour", title, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(title, content, "orange", "Four.meme OpenFour Registry 新模块发现", undefined, undefined, undefined, `https://bscscan.com/address/${CONFIG.contracts.openFourRegistry}`);
+    await sendNotificationMaybeAi({ title, content, template: "orange", moduleContext: "Four.meme OpenFour Registry 新模块发现", url: `https://bscscan.com/address/${CONFIG.contracts.openFourRegistry}` });
   } else if (moduleSnapshotChanged) {
     await saveSnapshot(snapshot);
   }
@@ -7179,7 +7239,7 @@ async function runActorCheck() {
       const content = formatActorActions(actions);
       appendHistory("actor", `链上创建者动作（${actions.length}项）`, content.slice(0, 300), content);
       const color = highCount > 0 ? "red" : "yellow";
-      await sendThenEnrichWithAi(`链上创建者动作（${actions.length}项）`, content, color, "Four.meme 合约创建者动作", undefined, undefined, undefined, `https://bscscan.com/block/${toBlock}`);
+      await sendNotificationMaybeAi({ title: `链上创建者动作（${actions.length}项）`, content, template: color, moduleContext: "Four.meme 合约创建者动作", url: `https://bscscan.com/block/${toBlock}` });
     }
 
     if (Date.now() - runStart >= CONFIG.actorMonitor.maxRunMs && state.lastBlock < safeLatest) {
@@ -7440,7 +7500,7 @@ async function flushExpiredPoolRemovals() {
       log(`[底池] ${expired.length} 个移除事件已确认（缓存过期）`);
       const content = formatPoolChanges(expired);
       appendHistory("pool", `底池移除（${expired.length}项）`, content.slice(0, 300), content);
-      await sendThenEnrichWithAi(`底池移除（${expired.length}项）`, content, "red", "Four.meme 底池配置变更", undefined, undefined, undefined, CONFIG.siteUrl);
+      await sendNotificationMaybeAi({ title: `底池移除（${expired.length}项）`, content, template: "red", moduleContext: "Four.meme 底池配置变更", url: CONFIG.siteUrl });
     }
   } finally {
     snapshotMutex.release();
@@ -7578,7 +7638,7 @@ async function runPoolCheck() {
     snapshot.poolConfig = poolData;
     await saveSnapshot(snapshot);
     appendHistory("pool", `底池变更（${poolChanges.length}项）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`底池变更（${poolChanges.length}项）`, content, "red", "Four.meme 底池配置变更", undefined, undefined, undefined, CONFIG.siteUrl);
+    await sendNotificationMaybeAi({ title: `底池变更（${poolChanges.length}项）`, content, template: "red", moduleContext: "Four.meme 底池配置变更", url: CONFIG.siteUrl });
   } else {
     if (!jsonEqual(snapshot.poolConfig, poolData)) {
       snapshot.poolConfig = poolData;
@@ -7701,7 +7761,7 @@ async function runFrontendCheck() {
     for (const n of dedupedRouteNotifications) {
       n.title = normalizeFrontendNotificationTitle(n.title, n.url);
       appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
-      await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端新路由 ${n.title}`, n.aiInput, undefined, null, n.url, n.cardOpts || {});
+      await sendNotificationMaybeAi({ title: n.title, content: n.content, template: n.template, moduleContext: `Four.meme 前端新路由 ${n.title}`, aiInput: n.aiInput, url: n.url, cardOpts: n.cardOpts || {} });
     }
   }
 
@@ -7991,16 +8051,7 @@ async function runFrontendCheck() {
       n.title = normalizeFrontendNotificationTitle(n.title, n.url);
       appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
       const diffFilePath = n.fullDiff ? saveDiffLocally(n.title, n.fullDiff) : null;
-      if (n.skipAi) {
-        const urlLine = n.url ? `🔗 [${n.url}](${n.url})\n\n` : "";
-        let messageId = await sendCardViaApi(n.title, urlLine + n.content, n.template, diffFilePath, 2, n.cardOpts || {});
-        if (!messageId) {
-          log(`[推送] 前端失败告警即时通道失败，切换队列兜底：${n.title}`);
-          await sendCardQueued(n.title, urlLine + n.content, n.template, { ...(n.cardOpts || {}), diffFilePath });
-        }
-      } else {
-        await sendThenEnrichWithAi(n.title, n.content, n.template, `Four.meme 前端变更 ${n.title}`, n.aiInput, undefined, diffFilePath, n.url, n.cardOpts || {});
-      }
+      await sendNotificationMaybeAi({ title: n.title, content: n.content, template: n.template, moduleContext: `Four.meme 前端变更 ${n.title}`, aiInput: n.aiInput, diffFilePath, url: n.url, cardOpts: n.cardOpts || {}, skipAi: n.skipAi });
     }
   } else if (snapshotDirty || failCountChanged) {
     await saveSnapshot(snapshot);
@@ -8071,7 +8122,7 @@ async function runApiCheck() {
     const content = notifications.join("\n\n");
     await saveSnapshot(snapshot);
     appendHistory("api", "API 变更", content.slice(0, 300), content);
-    await sendThenEnrichWithAi("API 变更", content, "purple", "Four.meme API 变更", undefined, undefined, undefined, CONFIG.apiBase);
+    await sendNotificationMaybeAi({ title: "API 变更", content, template: "purple", moduleContext: "Four.meme API 变更", url: CONFIG.apiBase });
   } else if (apiSnapshotChanged) {
     await saveSnapshot(snapshot);
   }
@@ -8109,7 +8160,7 @@ async function runGithubCheck() {
         await saveSnapshot(snapshot);
         githubSnapshotDirty = false;
         appendHistory("github", `GitHub 项目变更（${count}项）`, content.slice(0, 300), content);
-        await sendThenEnrichWithAi(`GitHub 项目变更（${count}项）`, content, "turquoise", "Four.meme GitHub 项目变更", undefined, undefined, undefined, `https://github.com/${CONFIG.githubOwner}`);
+        await sendNotificationMaybeAi({ title: `GitHub 项目变更（${count}项）`, content, template: "turquoise", moduleContext: "Four.meme GitHub 项目变更", url: `https://github.com/${CONFIG.githubOwner}` });
       }
     } catch (err) {
       log(`[GitHub] 账号仓库列表检查失败，继续检查主仓库提交：${err.message}`);
@@ -8139,7 +8190,7 @@ async function runGithubCheck() {
     snapshot.githubLastCommitCount = newCommits.length;
     await saveSnapshot(snapshot);
     appendHistory("github", title, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(title, content, "turquoise", "Four.meme GitHub 仓库新提交", fullDiff, undefined, diffFilePath, `https://github.com/${CONFIG.githubRepo}`);
+    await sendNotificationMaybeAi({ title, content, template: "turquoise", moduleContext: "Four.meme GitHub 仓库新提交", aiInput: fullDiff, diffFilePath, url: `https://github.com/${CONFIG.githubRepo}` });
   } else {
     snapshot.githubLastPollAt = new Date().toISOString();
     if (githubSnapshotDirty) await saveSnapshot(snapshot);
@@ -8165,7 +8216,7 @@ async function runContractCheck() {
     snapshot.contractFingerprints = newFp;
     await saveSnapshot(snapshot);
     appendHistory("contract", `合约变更（${contractChanges.length}项）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`合约变更（${contractChanges.length}项）`, content, "red", "Four.meme 智能合约变更", undefined, undefined, undefined, CONFIG.siteUrl);
+    await sendNotificationMaybeAi({ title: `合约变更（${contractChanges.length}项）`, content, template: "red", moduleContext: "Four.meme 智能合约变更", url: CONFIG.siteUrl });
   } else {
     if (!jsonEqual(snapshot.contractFingerprints, newFp)) {
       snapshot.contractFingerprints = newFp;
@@ -8195,7 +8246,7 @@ async function runOnchainCheck() {
     snapshot.onchainParams = newParams;
     await saveSnapshot(snapshot);
     appendHistory("onchain", `链上参数变更（${paramChanges.length}项）`, content.slice(0, 300), content);
-    await sendThenEnrichWithAi(`链上参数变更（${paramChanges.length}项）`, content, "yellow", "Four.meme 链上参数变更", undefined, undefined, undefined, CONFIG.siteUrl);
+    await sendNotificationMaybeAi({ title: `链上参数变更（${paramChanges.length}项）`, content, template: "yellow", moduleContext: "Four.meme 链上参数变更", url: CONFIG.siteUrl });
   } else {
     if (!jsonEqual(snapshot.onchainParams, newParams)) {
       snapshot.onchainParams = newParams;
@@ -8637,6 +8688,7 @@ export const __testables = {
   i18nChangeTypeCounts,
   shouldConfirmI18nRemoval,
   frontendNotificationDedupeKey,
+  shouldUseAiForNotification,
   buildFrontendFailureNotifications,
   buildFrontendNewPageNotification,
   buildFrontendRouteActionButtons,

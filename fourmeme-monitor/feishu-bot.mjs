@@ -567,10 +567,13 @@ async function buildDailyReport() {
   } else {
     const agg = aggregateChanges(todayChanges);
 
-    // AI 总结（输入为聚合后的精简文本）
-    const aiSummary = await aiDailySummary(agg.aggregatedText);
+    // AI 总结仅用于实质事件；纯失败/恢复/构建噪音用规则摘要，减少无意义调用。
+    const shouldUseAi = agg.substantiveEvents.length > 0;
+    const aiSummary = shouldUseAi ? await aiDailySummary(agg.aggregatedText) : null;
     if (aiSummary) {
       parts.push(`**总结：** ${aiSummary}`);
+    } else if (!shouldUseAi) {
+      parts.push(`**总结：** 过去 24h 共 ${agg.totalCount} 次记录（${agg.moduleStats}），未识别到需要 AI 解读的实质业务变更。`);
     } else {
       // Fallback：无 AI 时用一行统计代替
       parts.push(`**总结：** 过去 24h 共 ${agg.totalCount} 次变更（${agg.moduleStats}），AI 分析不可用。`);

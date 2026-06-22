@@ -514,6 +514,25 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
   }
 }
 
+function shouldUseAiForNotification({ title = "", content = "", moduleContext = "", aiInput = "", skipAi = false } = {}) {
+  if (skipAi) return false;
+  const text = `${title}\n${moduleContext}\n${aiInput || content}`;
+  if (/请求失败|处理失败|退避恢复|基线已修复|页面样本无效|模块异常|模块恢复|心跳|状态/i.test(text)) return false;
+  if (/仅检测到构建产物|压缩变量噪音|hash\s*轮换|sourceMappingURL|无实质|常规构建/i.test(text)) return false;
+  return /重点变更|页面变更|文案|i18n|CAstore|金库|Vault|Factory|fee|rate|route|api|contract|address|enabled|staking|dividend/i.test(text);
+}
+
+async function sendNotificationMaybeAi({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, skipAi = false }) {
+  if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
+    const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
+    const messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
+    if (!messageId) await sendFeishu(title, urlLine + content, template);
+    else log(`[AI] 已跳过：${title}`);
+    return messageId;
+  }
+  return sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url);
+}
+
 /**
  * 保存 diff 详情到本地文件（不再直接发送到飞书群，改为卡片按钮触发下载）
  * @param {string} title - 通知标题（用于文件名）
@@ -2594,9 +2613,9 @@ async function runCheck() {
         appendHistory("flap-page", title, cardContent.slice(0, 300), changes.join("\n"));
         const fullDiff = `=== Flap.sh 手动检测详细 Diff ===\nURL: ${url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${changes.join("\n")}`;
         const diffFilePath = saveDiffLocally(title, fullDiff);
-        await sendThenEnrichWithAi(title, cardContent, "red", `Flap.sh 页面变更 ${url}`, briefingInput, (summary) => {
+        await sendNotificationMaybeAi({ title, content: cardContent, template: "red", moduleContext: `Flap.sh 页面变更 ${url}`, aiInput: briefingInput, enrichFn: (summary) => {
           return buildCardBriefing(url, summary, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges, meta.caStoreVaultDiffs);
-        }, diffFilePath, url);
+        }, diffFilePath, url });
         hasNotifiedChange = true;
         snapshot.pages[key] = features;
         snapshot.pages[key].originalUrl = url;
@@ -2920,9 +2939,9 @@ async function startMonitor() {
           appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
           const fullDiff = `=== Flap.sh 详细 Diff ===\nURL: ${n.url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${n.changes.join("\n")}`;
           const diffFilePath = saveDiffLocally(n.title, fullDiff);
-          await sendThenEnrichWithAi(n.title, cardContent, n.template, `Flap.sh 页面变更`, briefingInput, (summary) => {
+          await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: "Flap.sh 页面变更", aiInput: briefingInput, enrichFn: (summary) => {
             return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
-          }, diffFilePath, n.url);
+          }, diffFilePath, url: n.url });
           applyNotificationSnapshotUpdate(n);
         }
       }
