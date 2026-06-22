@@ -13,11 +13,9 @@ CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # 如果从源码目录运行，PM2 直接从源码子目录启动（不复制到外面）
 if [ "$CURRENT_DIR" = "$SUITE_DIR" ]; then
   FOURMEME_DIR="$SUITE_DIR/fourmeme-monitor"
-  FETCHER_DIR="$SUITE_DIR/fourmeme-fetcher-service"
   FLAP_DIR="$SUITE_DIR/flap-monitor"
 else
   FOURMEME_DIR="/root/fourmeme-monitor"
-  FETCHER_DIR="/root/fourmeme-fetcher-service"
   FLAP_DIR="/root/flap-monitor"
 fi
 
@@ -80,8 +78,6 @@ migrate_env_default_value() {
 
 migrate_fourmeme_actor_env_defaults() {
   local env_file="$1"
-  migrate_env_default_value "$env_file" "FOURMEME_FRONTEND_BROWSER_FETCH_ENABLED" "true" "false"
-  migrate_env_default_value "$env_file" "FOURMEME_FRONTEND_BROWSER_FETCH_FORCED" "true" "false"
   migrate_env_default_value "$env_file" "FOURMEME_CREATOR_PAGE_MAX_PER_RUN" "8" "2"
   migrate_env_default_value "$env_file" "FOURMEME_ACTOR_CONFIRMATIONS" "2" "1"
   migrate_env_default_value "$env_file" "FOURMEME_ACTOR_BOOTSTRAP_BLOCKS" "6" "20"
@@ -109,20 +105,6 @@ if ! command -v node &>/dev/null; then
 fi
 echo "  Node.js $(node -v)"
 
-# ── 1.5. 检查 Python ──
-echo "[1.5/6] 检查 Python..."
-if ! command -v python3 &>/dev/null; then
-  echo "  安装 Python3..."
-  apt-get update
-  apt-get install -y python3 python3-venv python3-pip
-fi
-if ! python3 -m venv --help >/dev/null 2>&1; then
-  echo "  安装 python3-venv..."
-  apt-get update
-  apt-get install -y python3-venv python3-pip
-fi
-echo "  Python $(python3 --version)"
-
 # ── 2. 检查 pm2 ──
 echo "[2/6] 检查 pm2..."
 if ! command -v pm2 &>/dev/null; then
@@ -142,9 +124,6 @@ if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/ai-client.mjs "$SHARED_DIR/"
   cp shared/feishu-client.mjs "$SHARED_DIR/"
   cp .env.example "$SUITE_DIR/.env.example"
-  mkdir -p "$FETCHER_DIR"
-  cp fourmeme-fetcher-service/scrapling_fetcher.py "$FETCHER_DIR/"
-  cp fourmeme-fetcher-service/requirements.txt "$FETCHER_DIR/"
   if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
     cp ai-models.json "$SUITE_DIR/"
     echo "  ai-models.json 已安装"
@@ -162,75 +141,6 @@ cd "$SUITE_DIR" && npm install --omit=dev && cd - >/dev/null
 sync_env_template_keys "$SUITE_DIR/.env" "$SUITE_DIR/.env.example"
 migrate_fourmeme_actor_env_defaults "$SUITE_DIR/.env"
 
-# ── 3.5. 部署 Four.meme Scrapling 抓取服务 ──
-echo "[3.5/6] 部署 fourmeme-fetcher-service → ${FETCHER_DIR}"
-mkdir -p "$FETCHER_DIR"
-if [ "$(cd fourmeme-fetcher-service && pwd)" != "$(cd "$FETCHER_DIR" 2>/dev/null && pwd)" ]; then
-  cp fourmeme-fetcher-service/scrapling_fetcher.py "$FETCHER_DIR/"
-  cp fourmeme-fetcher-service/requirements.txt "$FETCHER_DIR/"
-fi
-ln -sfn "$SUITE_DIR/.env" "$FETCHER_DIR/.env"
-if [ ! -x "$FETCHER_DIR/.venv/bin/python" ]; then
-  python3 -m venv "$FETCHER_DIR/.venv"
-fi
-"$FETCHER_DIR/.venv/bin/python" -m pip install --upgrade pip
-"$FETCHER_DIR/.venv/bin/pip" install -r "$FETCHER_DIR/requirements.txt"
-"$FETCHER_DIR/.venv/bin/python" -m patchright install --with-deps chromium
-
-pm2 delete fourmeme-fetcher-service 2>/dev/null || true
-pm2 start "$FETCHER_DIR/.venv/bin/python" --name fourmeme-fetcher-service --time -- "$FETCHER_DIR/scrapling_fetcher.py"
-FETCHER_PORT="$(grep -E '^FOURMEME_SCRAPLING_PORT=' "$SUITE_DIR/.env" 2>/dev/null | tail -n1 | cut -d= -f2- | tr -d "\"'" || true)"
-FETCHER_PORT="${FETCHER_PORT:-8787}"
-echo "  等待 fourmeme-fetcher-service 健康检查..."
-HEALTH_OK=0
-for _ in $(seq 1 45); do
-  if "$FETCHER_DIR/.venv/bin/python" - "$FETCHER_PORT" <<'PY' >/dev/null 2>&1
-import sys
-import urllib.request
-
-port = sys.argv[1]
-with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as resp:
-    if resp.status != 200:
-        raise SystemExit(1)
-PY
-  then
-    HEALTH_OK=1
-    break
-  fi
-  sleep 1
-done
-if [ "$HEALTH_OK" != "1" ]; then
-  echo "  ✗ fourmeme-fetcher-service 健康检查失败，请查看: pm2 logs fourmeme-fetcher-service"
-  exit 1
-fi
-echo "  等待 Scrapling warm-up 通过 Cloudflare..."
-WARMUP_OK=0
-for _ in $(seq 1 100); do
-  if "$FETCHER_DIR/.venv/bin/python" - "$FETCHER_PORT" <<'PY' >/dev/null 2>&1
-import json
-import sys
-import urllib.request
-
-port = sys.argv[1]
-with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as resp:
-    data = json.loads(resp.read().decode("utf-8"))
-if data.get("warmupOk") or not data.get("warmupUrl"):
-    raise SystemExit(0)
-if data.get("warmupFinished"):
-    raise SystemExit(2)
-raise SystemExit(1)
-PY
-  then
-    WARMUP_OK=1
-    break
-  fi
-  sleep 1
-done
-if [ "$WARMUP_OK" != "1" ]; then
-  echo "  ⚠ Scrapling warm-up 未确认成功，fourmeme-monitor 会继续按 10s 调度并在失败时告警；请查看 pm2 logs fourmeme-fetcher-service"
-fi
-echo "  fourmeme-fetcher-service ✓"
-
 # ── 4. 部署 fourmeme-monitor ──
 echo "[4/6] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
 mkdir -p "$FOURMEME_DIR"
@@ -239,7 +149,6 @@ if [ "$(cd fourmeme-monitor && pwd)" != "$(cd "$FOURMEME_DIR" 2>/dev/null && pwd
   cp fourmeme-monitor/monitor.mjs "$FOURMEME_DIR/"
   cp fourmeme-monitor/package.json "$FOURMEME_DIR/"
   cp fourmeme-monitor/feishu-bot.mjs "$FOURMEME_DIR/"
-  cp fourmeme-monitor/browser-session-fetch.mjs "$FOURMEME_DIR/"
   # 创建 shared 软链接（让 import "../shared/..." 能正确解析）
   ln -sfn "$SHARED_DIR" "$FOURMEME_DIR/../shared"
   ln -sfn "$SUITE_DIR/ai-models.json" "$FOURMEME_DIR/../ai-models.json"

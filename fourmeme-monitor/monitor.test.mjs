@@ -10,39 +10,6 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
   assert.equal(__testables.CONFIG.intervals.api, 15_000);
   assert.equal(__testables.CONFIG.jitterMs, 200);
   assert.equal(__testables.CONFIG.apiProbeStaggerMs, 200);
-  assert.equal(__testables.CONFIG.frontendScraplingFetch.timeoutMs, 80_000);
-});
-
-test("frontend fetch defaults to Scrapling stealthy mode", () => {
-  assert.equal(__testables.frontendFetchProvider(), "scrapling");
-  assert.equal(__testables.frontendScraplingFetchConfigured(), true);
-  assert.equal(__testables.frontendBrowserFetchConfigured(), false);
-  assert.equal(__testables.frontendBrowserFetchForced(), false);
-  assert.equal(__testables.frontendManagedBrowserFetchForced(), true);
-  assert.equal(__testables.frontendSyncAssetFetchEnabled(), false);
-  assert.equal(__testables.configuredFrontendHtmlConcurrency(), 4);
-  assert.equal(__testables.effectiveFrontendHtmlConcurrency(), 4);
-  assert.equal(__testables.frontendFetchModeLabel(), "scrapling_stealthy");
-});
-
-test("Four.meme API fallback is limited to meme-api URLs and uses Scrapling by default", () => {
-  assert.equal(__testables.CONFIG.fourMemeApiFetch.scraplingFallbackEnabled, true);
-  assert.equal(__testables.CONFIG.fourMemeApiFetch.directRetryMs, 300_000);
-  assert.equal(__testables.fourMemeApiScraplingFallbackConfigured(), true);
-  assert.equal(__testables.isFourMemeApiUrl("https://four.meme/meme-api/v1/public/config"), true);
-  assert.equal(__testables.isFourMemeApiUrl("https://four.meme/en"), false);
-  assert.equal(__testables.isFourMemeApiUrl("https://api.github.com/repos/x/y"), false);
-});
-
-test("Scrapling text response wrapper behaves like the fetch Response subset used by monitors", async () => {
-  const res = __testables.makeTextResponse({
-    status: 200,
-    text: "{\"code\":0,\"data\":[1]}",
-    headers: { "Content-Type": "application/json" },
-  });
-  assert.equal(res.ok, true);
-  assert.equal(res.headers.get("content-type"), "application/json");
-  assert.deepEqual(await res.json(), { code: 0, data: [1] });
 });
 
 test("startup card copy reflects active frontend and api cadences", () => {
@@ -147,76 +114,6 @@ test("frontend fetch failures are grouped by domain and skip AI", () => {
   assert.match(notifications[0].content, /影响 2 个页面/);
   assert.match(notifications[0].content, /\/en\/announcement/);
   assert.match(notifications[0].content, /\/en\/campaign/);
-});
-
-test("cloudflare challenge failures are classified and grouped as site-level non-AI alerts", () => {
-  const err = __testables.buildFetchError("HTTP 403 (Cloudflare challenge)", {
-    statusCode: 403,
-    reason: "cloudflare_challenge",
-    responseText: "<html><title>Just a moment...</title><script src=\"/cdn-cgi/challenge-platform/h/g\"></script></html>",
-  });
-  assert.equal(__testables.isCloudflareChallengeText(err.responseText), true);
-  assert.equal(__testables.classifyFetchFailure(err), "cloudflare_challenge");
-
-  const snap = {
-    _frontendFailCounts: {
-      [__testables.urlToKey("https://four.meme/en")]: {
-        count: 6,
-        reason: "cloudflare_challenge",
-        message: "HTTP 403 (Cloudflare challenge)",
-      },
-      [__testables.urlToKey("https://four.meme/en/presale/102364633")]: {
-        count: 6,
-        reason: "cloudflare_challenge",
-        message: "浏览器会话仍停留在 Cloudflare challenge",
-      },
-    },
-  };
-  const notifications = __testables.buildFrontendFailureNotifications([
-    "https://four.meme/en",
-    "https://four.meme/en/presale/102364633",
-  ], snap);
-  assert.equal(notifications.length, 1);
-  assert.equal(notifications[0].title, "⚠️ 前端 Cloudflare 拦截：four.meme");
-  assert.equal(notifications[0].skipAi, true);
-  assert.match(notifications[0].content, /Scrapling stealth 浏览器 sidecar/);
-  assert.match(notifications[0].content, /影响 2 个页面/);
-});
-
-test("normal app Turnstile copy is not treated as a Cloudflare challenge", () => {
-  const html = `
-    <html><head><script src="/_next/static/chunks/app.js"></script></head>
-    <body>Protected by Cloudflare Turnstile. Captcha verification failed, please try again.</body></html>
-  `;
-  assert.equal(__testables.isCloudflareChallengeText(html), false);
-});
-
-test("asset incomplete pages emit operational alerts after consecutive rounds", () => {
-  const url = "https://four.meme/en/create-token";
-  const snap = {
-    _frontendAssetIncompleteCounts: {
-      [__testables.urlToKey(url)]: {
-        count: 3,
-        reason: "asset_incomplete",
-        message: "资源内容不完整 0/12，当前为 HTML-only 基线",
-      },
-    },
-  };
-  const notifications = __testables.buildFrontendFailureNotifications([url], snap);
-  assert.equal(notifications.length, 1);
-  assert.equal(notifications[0].title, "⚠️ 前端资源抓取不完整：four.meme");
-  assert.equal(notifications[0].skipAi, true);
-  assert.match(notifications[0].content, /资源 diff\/i18n\/chunk 级监控会暂时降级/);
-});
-
-test("browser session assets keep raw content only during parsing and can be stripped before snapshot", () => {
-  const assets = __testables.normalizeBrowserFetchedAssets({
-    "/_next/static/chunks/app.js": { content: "const buyFee='1'; JSON.parse('{}')", truncated: false },
-  });
-  assert.equal(assets["/_next/static/chunks/app.js"].browserSession, true);
-  assert.equal(typeof assets["/_next/static/chunks/app.js"].rawContent, "string");
-  __testables.stripRawAssetContents(assets);
-  assert.equal("rawContent" in assets["/_next/static/chunks/app.js"], false);
 });
 
 test("AI routing skips operational noise and keeps high-value changes", () => {
