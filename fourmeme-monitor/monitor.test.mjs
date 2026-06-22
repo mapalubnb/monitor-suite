@@ -349,3 +349,63 @@ test("classifyFetchFailure distinguishes backoff and rate limits", () => {
   assert.equal(__testables.classifyFetchFailure(new Error("[退避中] four.meme")), "backoff");
   assert.equal(__testables.classifyFetchFailure(new Error("HTTP 429 (风控)")), "rate_limited");
 });
+
+test("unchanged create-token assets reuse previous asset contents", () => {
+  const oldFeatures = {
+    assetHash: "same-assets",
+    assetContents: {
+      "main.js": { contentHash: "old", size: 100, strings: ["Create Token", "buyFee"], ext: "js" },
+    },
+  };
+  const features = { assetHash: "same-assets" };
+  assert.equal(
+    __testables.shouldReuseFrontendAssetContents("https://four.meme/en/create-token", oldFeatures, features),
+    true,
+  );
+});
+
+test("frontend asset store stores shared asset summaries once", () => {
+  const store = {};
+  const first = {
+    "a.js": { url: "https://four.meme/_next/a.js", contentHash: "h1", size: 10, strings: ["Create"], ext: "js" },
+    "b.js": { url: "https://four.meme/_next/b.js", contentHash: "h2", size: 20, strings: ["Launch"], ext: "js" },
+  };
+  const second = {
+    "a.js": { url: "https://four.meme/_next/a.js", contentHash: "h1", size: 10, strings: ["Create"], ext: "js" },
+  };
+  const firstRefs = __testables.compactFrontendAssetContents(first, store);
+  const secondRefs = __testables.compactFrontendAssetContents(second, store);
+  assert.deepEqual(firstRefs, { "a.js": "h1", "b.js": "h2" });
+  assert.deepEqual(secondRefs, { "a.js": "h1" });
+  assert.deepEqual(Object.keys(store).sort(), ["h1", "h2"]);
+  assert.deepEqual(__testables.hydrateFrontendAssetContents(secondRefs, store), {
+    "a.js": { contentHash: "h1", size: 10, strings: ["Create"], ext: "js", url: "https://four.meme/_next/a.js" },
+  });
+});
+
+test("module metrics keep bounded duration history and totals", () => {
+  const metrics = __testables.createModuleMetricsState();
+  __testables.recordModuleMetric(metrics, "frontend", { durationMs: 10, requestCount: 3, backoffCount: 1, errorCount: 0 });
+  __testables.recordModuleMetric(metrics, "frontend", { durationMs: 30, requestCount: 2, backoffCount: 0, errorCount: 1 });
+  const summary = __testables.summarizeModuleMetrics(metrics, "frontend");
+  assert.equal(summary.runs, 2);
+  assert.equal(summary.lastDurationMs, 30);
+  assert.equal(summary.avgDurationMs, 20);
+  assert.equal(summary.requestCount, 5);
+  assert.equal(summary.backoffCount, 1);
+  assert.equal(summary.errorCount, 1);
+});
+
+test("host limiter spaces same-host tasks without changing caller order", async () => {
+  let now = 0;
+  const waits = [];
+  const limiter = __testables.createHostLimiter({
+    minDelayMs: 100,
+    now: () => now,
+    sleepFn: async (ms) => { waits.push(ms); now += ms; },
+  });
+  await limiter.schedule("https://four.meme/a", async () => "first");
+  const second = await limiter.schedule("https://four.meme/b", async () => "second");
+  assert.equal(second, "second");
+  assert.deepEqual(waits, [100]);
+});

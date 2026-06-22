@@ -22,6 +22,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mkdirSync, readdirSync, unlinkSync, statSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -194,6 +195,7 @@ const CONFIG = {
     ],
   },
   apiProbeStaggerMs: readNonNegativeIntEnv("FOURMEME_API_PROBE_STAGGER_MS", 200),
+  hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 80),
 
   // ── BSC RPC ──
   bscRpcUrls: [
@@ -358,12 +360,6 @@ function getDomain(url) {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
-function shouldBackoff(domain) {
-  const b = domainBackoff.get(domain);
-  if (!b) return false;
-  return Date.now() - b.lastFail < b.delayMs;
-}
-
 function currentBackoffState(domain) {
   const b = domainBackoff.get(domain);
   if (!b) return null;
@@ -412,6 +408,118 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function createHostLimiter({ minDelayMs = 0, now = () => Date.now(), sleepFn = sleep } = {}) {
+  const chains = new Map();
+  const lastStartedAt = new Map();
+  const delayMs = Math.max(0, Number(minDelayMs) || 0);
+
+  function hostKey(url) {
+    try { return new URL(url).host; } catch { return String(url || ""); }
+  }
+
+  async function schedule(url, task) {
+    const host = hostKey(url);
+    const previous = chains.get(host) || Promise.resolve();
+    const current = previous.catch(() => {}).then(async () => {
+      if (delayMs > 0 && lastStartedAt.has(host)) {
+        const waitMs = delayMs - (now() - lastStartedAt.get(host));
+        if (waitMs > 0) await sleepFn(waitMs);
+      }
+      lastStartedAt.set(host, now());
+      return task();
+    });
+    chains.set(host, current);
+    current.finally(() => {
+      if (chains.get(host) === current) chains.delete(host);
+    }).catch(() => {});
+    return current;
+  }
+
+  return { schedule };
+}
+
+const hostRequestLimiter = createHostLimiter({ minDelayMs: CONFIG.hostRequestMinDelayMs });
+
+function shouldLimitHostRequest(url) {
+  if (CONFIG.hostRequestMinDelayMs <= 0) return false;
+  try {
+    const hostname = new URL(url).hostname;
+    return hostname === "four.meme" || hostname.endsWith(".four.meme");
+  } catch {
+    return false;
+  }
+}
+
+function scheduleHostRequest(url, task) {
+  return shouldLimitHostRequest(url) ? hostRequestLimiter.schedule(url, task) : task();
+}
+
+const moduleMetricContext = new AsyncLocalStorage();
+
+function createModuleMetricsState() {
+  return {};
+}
+
+function metricBucket(metrics, name) {
+  if (!metrics[name]) {
+    metrics[name] = {
+      runs: 0,
+      durations: [],
+      lastDurationMs: 0,
+      requestCount: 0,
+      backoffCount: 0,
+      errorCount: 0,
+      lastRunAt: 0,
+    };
+  }
+  return metrics[name];
+}
+
+function recordModuleMetric(metrics, name, sample = {}) {
+  const bucket = metricBucket(metrics, name);
+  const durationMs = Math.max(0, Math.round(Number(sample.durationMs) || 0));
+  bucket.runs++;
+  bucket.lastDurationMs = durationMs;
+  bucket.lastRunAt = Date.now();
+  bucket.requestCount += Math.max(0, Math.round(Number(sample.requestCount) || 0));
+  bucket.backoffCount += Math.max(0, Math.round(Number(sample.backoffCount) || 0));
+  bucket.errorCount += Math.max(0, Math.round(Number(sample.errorCount) || 0));
+  bucket.durations.push(durationMs);
+  if (bucket.durations.length > 120) bucket.durations.splice(0, bucket.durations.length - 120);
+  return summarizeModuleMetrics(metrics, name);
+}
+
+function summarizeModuleMetrics(metrics, name) {
+  const bucket = metrics?.[name];
+  if (!bucket) {
+    return {
+      runs: 0,
+      lastDurationMs: 0,
+      avgDurationMs: 0,
+      requestCount: 0,
+      backoffCount: 0,
+      errorCount: 0,
+    };
+  }
+  const durations = bucket.durations || [];
+  const avgDurationMs = durations.length
+    ? Math.round(durations.reduce((sum, value) => sum + value, 0) / durations.length)
+    : 0;
+  return {
+    runs: bucket.runs || 0,
+    lastDurationMs: bucket.lastDurationMs || 0,
+    avgDurationMs,
+    requestCount: bucket.requestCount || 0,
+    backoffCount: bucket.backoffCount || 0,
+    errorCount: bucket.errorCount || 0,
+  };
+}
+
+function recordCurrentModuleRequest() {
+  const sample = moduleMetricContext.getStore();
+  if (sample) sample.requestCount++;
+}
+
 /* ══════════════════════════════════════════
    工具函数
    ══════════════════════════════════════════ */
@@ -421,7 +529,7 @@ const md5 = (str) => createHash("md5").update(str).digest("hex");
 const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
-const CURRENT_SCHEMA_VERSION = 7;
+const CURRENT_SCHEMA_VERSION = 8;
 let snapshotWriteQueue = Promise.resolve();
 
 const REMOVED_FRONTEND_URLS = new Set([
@@ -530,10 +638,14 @@ function migrateSnapshot(data) {
   if (ver < 7) {
     log("[快照迁移] v6 → v7：补充前端新路由确认状态字段");
   }
+  if (ver < 8) {
+    log("[快照迁移] v7 → v8：启用前端资源摘要去重存储");
+  }
   ensureFrontendRouteState(data);
   if (!data._frontendDiscoveredHistory) data._frontendDiscoveredHistory = {};
   if (!data._frontendNotifyDedupe) data._frontendNotifyDedupe = {};
   if (!data._frontendWarmup) data._frontendWarmup = {};
+  hydrateFrontendSnapshotAssets(data);
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
 }
@@ -599,7 +711,7 @@ function saveSnapshot(data) {
       data._schemaVersion = CURRENT_SCHEMA_VERSION;
       data.lastCheck = ts();
       // 紧凑且延后序列化，避免写队列堆积多份大快照字符串。
-      const serialized = JSON.stringify(data);
+      const serialized = JSON.stringify(compactFrontendSnapshotForDisk(data));
       const tmpFile = CONFIG.snapshotFile + ".tmp";
       writeFileSync(tmpFile, serialized, "utf-8");
       renameSync(tmpFile, CONFIG.snapshotFile);
@@ -918,6 +1030,19 @@ function appendHistory(module, title, summary, diffSnippet = "") {
 }
 
 /* ── HTTP 请求工具（含反风控 + 5xx 静默重试）── */
+async function fetchWithTimeout(url, opts, timeoutMs) {
+  return scheduleHostRequest(url, async () => {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      recordCurrentModuleRequest();
+      return await fetch(url, { ...opts, signal: ctrl.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+}
+
 async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
   const domain = getDomain(url);
   const backoffState = currentBackoffState(domain);
@@ -928,10 +1053,8 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
   const maxRetries = 2; // 5xx 最多重试 2 次（共 3 次尝试）
   let lastStatus = 0;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
-      const res = await fetch(url, { ...opts, signal: ctrl.signal });
+      const res = await fetchWithTimeout(url, opts, timeoutMs);
       if (res.status === 429 || res.status === 403) {
         try { await res.text(); } catch {}
         recordFail(domain, res.status);
@@ -963,8 +1086,6 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
         throw new Error(`请求超时 ${timeoutMs}ms (重试${maxRetries}次): ${url}`);
       }
       throw err;
-    } finally {
-      clearTimeout(timer);
     }
   }
 }
@@ -982,10 +1103,8 @@ async function fetchProbe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
     const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
     throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
   }
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...opts, signal: ctrl.signal });
+    const res = await fetchWithTimeout(url, opts, timeoutMs);
     if (res.status === 429 || res.status === 403) {
       try { await res.text(); } catch {}
       recordFail(domain, res.status);
@@ -999,8 +1118,6 @@ async function fetchProbe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
       throw new Error(`请求超时 ${timeoutMs}ms: ${url}`);
     }
     throw err;
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -1118,10 +1235,6 @@ async function bscRpcBatch(calls) {
   throw lastErr || new Error("所有 BSC RPC 节点 batch 均不可用");
 }
 
-/* ── ABI 编解码辅助 ── */
-function encodeAddress(addr) {
-  return addr.toLowerCase().replace("0x", "").padStart(64, "0");
-}
 function encodeUint256(n) {
   return BigInt(n).toString(16).padStart(64, "0");
 }
@@ -1873,6 +1986,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null) {
         if (res.status === 304 && previous) {
           return {
             ...previous,
+            url: previous.url || url,
             fromCache: true,
           };
         }
@@ -1881,6 +1995,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null) {
         const ext = assetKey.endsWith(".css") ? "css" : "js";
         const strings = prioritizeFrontendStrings(extractStrings(content, ext));
         return {
+          url,
           contentHash: md5(content),
           size: content.length,
           strings,
@@ -1920,6 +2035,75 @@ function frontendAssetContentsHash(assetContents) {
   return items.length ? md5(items.join("\n")) : null;
 }
 
+function normalizeFrontendAssetSummary(assetKey, data, fallbackHash = "") {
+  if (!data || typeof data !== "object") return null;
+  const contentHash = data.contentHash || fallbackHash;
+  if (!contentHash) return null;
+  const summary = {
+    contentHash,
+    size: data.size || 0,
+    strings: Array.isArray(data.strings) ? data.strings : [],
+    ext: data.ext || (String(assetKey).endsWith(".css") ? "css" : "js"),
+  };
+  if (data.url) summary.url = data.url;
+  if (data.etag) summary.etag = data.etag;
+  if (data.lastModified) summary.lastModified = data.lastModified;
+  return summary;
+}
+
+function compactFrontendAssetContents(assetContents, store = {}) {
+  const refs = {};
+  for (const [assetKey, data] of Object.entries(assetContents || {})) {
+    const summary = normalizeFrontendAssetSummary(assetKey, data);
+    if (!summary) continue;
+    refs[assetKey] = summary.contentHash;
+    if (!store[summary.contentHash]) store[summary.contentHash] = summary;
+  }
+  return refs;
+}
+
+function hydrateFrontendAssetContents(refs, store = {}) {
+  const assetContents = {};
+  for (const [assetKey, ref] of Object.entries(refs || {})) {
+    const contentHash = typeof ref === "string" ? ref : ref?.contentHash;
+    if (!contentHash) continue;
+    const summary = normalizeFrontendAssetSummary(assetKey, store[contentHash], contentHash);
+    if (!summary) continue;
+    if (typeof ref === "object" && ref?.url) summary.url = ref.url;
+    assetContents[assetKey] = summary;
+  }
+  return assetContents;
+}
+
+function hydrateFrontendSnapshotAssets(data) {
+  if (!data?.frontendPages || !data?._frontendAssetStore) return data;
+  for (const page of Object.values(data.frontendPages)) {
+    if (page?.assetContents || !page?.assetContentRefs) continue;
+    const hydrated = hydrateFrontendAssetContents(page.assetContentRefs, data._frontendAssetStore);
+    if (Object.keys(hydrated).length > 0) page.assetContents = hydrated;
+  }
+  return data;
+}
+
+function compactFrontendSnapshotForDisk(data) {
+  if (!data?.frontendPages) return data;
+  const diskData = { ...data, frontendPages: {}, _frontendAssetStore: {} };
+  const sourceStore = data._frontendAssetStore || {};
+
+  for (const [key, page] of Object.entries(data.frontendPages)) {
+    const diskPage = { ...page };
+    const assetContents = page?.assetContents
+      || hydrateFrontendAssetContents(page?.assetContentRefs, sourceStore);
+    if (assetContents && Object.keys(assetContents).length > 0) {
+      diskPage.assetContentRefs = compactFrontendAssetContents(assetContents, diskData._frontendAssetStore);
+      delete diskPage.assetContents;
+    }
+    diskData.frontendPages[key] = diskPage;
+  }
+
+  return diskData;
+}
+
 function isCreateTokenFrontendUrl(url) {
   try {
     const path = new URL(url, CONFIG.siteUrl).pathname.replace(/\/+$/, "");
@@ -1927,6 +2111,16 @@ function isCreateTokenFrontendUrl(url) {
   } catch {
     return false;
   }
+}
+
+function shouldReuseFrontendAssetContents(_url, oldFeatures, features) {
+  return Boolean(
+    oldFeatures?.assetHash
+    && features?.assetHash
+    && oldFeatures.assetHash === features.assetHash
+    && oldFeatures.assetContents
+    && Object.keys(oldFeatures.assetContents).length > 0
+  );
 }
 
 function normalizeFrontendSignalSnippet(text, index = 0, length = 0) {
@@ -3047,10 +3241,6 @@ function extractRouteSignals(html, assetContents, nextData) {
   };
 }
 
-function extractRoutes(html, assetContents, nextData) {
-  return extractRouteSignals(html, assetContents, nextData).combined;
-}
-
 function diffRoutes(oldRoutes, newRoutes) {
   const cleanOldRoutes = sanitizeRouteListForDiff(oldRoutes);
   const cleanNewRoutes = sanitizeRouteListForDiff(newRoutes);
@@ -3252,8 +3442,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
 
   // 第二层：按需下载资源（仅当 assetHash 变化时）
   const baseUrl = new URL(url).origin;
-  const refreshAssetContents = isCreateTokenFrontendUrl(url);
-  if (oldFeatures && oldFeatures.assetHash === features.assetHash && oldFeatures.assetContents && !refreshAssetContents) {
+  if (shouldReuseFrontendAssetContents(url, oldFeatures, features)) {
     // assetHash 未变 → 复用缓存，跳过下载
     features.assetContents = oldFeatures.assetContents;
     // i18n: 每次都从 streaming HTML 重新提取，因为 i18n 可能随 SSR 内容变化而非静态资源变化
@@ -3856,109 +4045,6 @@ async function maybeSuppressTransientAssetJitter(label, oldData, newData, assetD
   const sameSignature = assetDiffSignature(freshDiff) === assetDiffSignature(assetDiff);
   log(`[前端] ${label} 快速复抓后仍存在资源变化${sameSignature ? "（签名一致）" : "（签名变化）"}，立即推送`);
   return { suppress: false };
-}
-
-function formatFrontendChanges(assetDiff, textDiff, pageLabel, oldAssets, newAssets) {
-  const lines = [];
-  const prefix = pageLabel ? `**📄 ${pageLabel}**` : "";
-  if (prefix) lines.push(prefix);
-
-  const hasAssetChanges = assetDiff &&
-    (assetDiff.matched.length > 0 || assetDiff.added.length > 0 || assetDiff.removed.length > 0);
-
-  if (hasAssetChanges) {
-    // ── 概览统计 ──
-    const parts = [];
-    if (assetDiff.unchanged) parts.push(`不变 ${assetDiff.unchanged}`);
-    if (assetDiff.renamed) parts.push(`重命名 ${assetDiff.renamed}`);
-    if (assetDiff.matched.length) parts.push(`修改 ${assetDiff.matched.length}`);
-    if (assetDiff.added.length) parts.push(`新增 ${assetDiff.added.length}`);
-    if (assetDiff.removed.length) parts.push(`移除 ${assetDiff.removed.length}`);
-    lines.push(`**📦 资源文件变更：** ${parts.join(" | ")}`);
-
-    const noiseOnlyFiles = [];
-    const allConfigDiffs = [];
-
-    for (const m of assetDiff.matched) {
-      const realAdded = (m.addedStrings || []).filter(s => !isNoiseString(s));
-      const realRemoved = (m.removedStrings || []).filter(s => !isNoiseString(s));
-      const totalNoise = (m.addedStrings.length - realAdded.length) + (m.removedStrings.length - realRemoved.length);
-      const totalReal = realAdded.length + realRemoved.length;
-
-      // 提取结构化配置变更
-      const configDiffs = extractConfigDiffs(m.removedStrings, m.addedStrings);
-      if (configDiffs.length > 0) {
-        for (const cd of configDiffs) {
-          allConfigDiffs.push({ ...cd, file: m.newFile || m.oldFile });
-        }
-      }
-
-      if (totalReal > 0 || totalNoise > 0) {
-        noiseOnlyFiles.push({
-          label: m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`,
-          noise: totalReal + totalNoise,
-        });
-      }
-    }
-
-    // ── 配置参数变更（结构化 key→value） ──
-    if (allConfigDiffs.length > 0) {
-      lines.push("");
-      lines.push("**🔧 配置参数变更：**");
-      for (const cd of allConfigDiffs) {
-        lines.push(`  ${cd.field}: ${cd.oldVal} → ${cd.newVal}  (${cd.file})`);
-      }
-    }
-
-    // ── 构建产物汇总（一行带过） ──
-    if (noiseOnlyFiles.length > 0) {
-      const totalNoise = noiseOnlyFiles.reduce((s, f) => s + f.noise, 0);
-      lines.push(`\n🔇 构建产物变化：${noiseOnlyFiles.length} 文件 ${totalNoise} 处字符串差异（已收敛，不作为业务文案变更推送）`);
-    }
-
-    // ── 新增/移除文件：全局字符串池对比 ──
-    if (assetDiff.added.length > 0 || assetDiff.removed.length > 0) {
-      const oldGlobalStrings = new Set();
-      const newGlobalStrings = new Set();
-      for (const data of Object.values(oldAssets || {})) {
-        for (const s of (data.strings || [])) oldGlobalStrings.add(s);
-      }
-      for (const data of Object.values(newAssets || {})) {
-        for (const s of (data.strings || [])) newGlobalStrings.add(s);
-      }
-      const globallyAdded = [...newGlobalStrings].filter(s => !oldGlobalStrings.has(s) && !isNoiseString(s));
-      const globallyRemoved = [...oldGlobalStrings].filter(s => !newGlobalStrings.has(s) && !isNoiseString(s));
-
-      if (globallyAdded.length > 0 || globallyRemoved.length > 0) {
-        lines.push(`📊 全局资源字符串池：新增 ${globallyAdded.length} | 移除 ${globallyRemoved.length}（构建产物变化，已收敛）`);
-      }
-
-      if (assetDiff.added.length > 0 || assetDiff.removed.length > 0) {
-        const fileParts = [];
-        if (assetDiff.added.length > 0) fileParts.push(`新增 ${assetDiff.added.length} 文件`);
-        if (assetDiff.removed.length > 0) fileParts.push(`移除 ${assetDiff.removed.length} 文件`);
-        lines.push(`📦 ${fileParts.join("、")}（chunk 重组/构建产物变化，已收敛）`);
-      }
-    }
-  }
-
-  // 页面文案 diff
-  if (textDiff) {
-    if (textDiff.reordered) {
-      lines.push("**📝 页面文案顺序调整（内容不变）**");
-    } else if (textDiff.changes.length > 0) {
-      lines.push("**📝 页面文案变更：**");
-      lines.push("```");
-      for (const c of textDiff.changes.slice(0, 20)) {
-        if (c.type === "modified") { lines.push(`- ${c.oldText}`); lines.push(`+ ${c.newText}`); }
-        else if (c.type === "added") { lines.push(`+ ${(c.text.length > 120 ? c.text.slice(0, 120) + "..." : c.text)}`); }
-        else if (c.type === "removed") { lines.push(`- ${(c.text.length > 120 ? c.text.slice(0, 120) + "..." : c.text)}`); }
-      }
-      lines.push("```");
-      if (textDiff.changes.length > 20) lines.push(`... 还有 ${textDiff.changes.length - 20} 处变更`);
-    }
-  }
-  return lines.join("\n");
 }
 
 function hasFrontendAssetChanges(assetDiff) {
@@ -7409,6 +7495,7 @@ function startActorBlockFeed(actorRunner) {
 let snapshot = loadSnapshot();
 let startTime = Date.now();
 let modulePollCounts = { pool: 0, frontend: 0, api: 0, openfourTemplates: 0, github: 0, contract: 0, onchain: 0, actor: 0 };
+const moduleMetrics = createModuleMetricsState();
 const apiEmptyArrayLogState = new Map();
 const frontendMetrics = {
   lastRunAt: 0,
@@ -7570,8 +7657,12 @@ function createModuleRunner(name, fn, intervalMs) {
     try {
       do {
         pending = false;
+        const metricSample = { durationMs: 0, requestCount: 0, backoffCount: 0, errorCount: 0 };
+        const startedAt = Date.now();
         try {
-          await fn();
+          await moduleMetricContext.run(metricSample, fn);
+          metricSample.durationMs = Date.now() - startedAt;
+          recordModuleMetric(moduleMetrics, name, metricSample);
           modulePollCounts[name]++;
           // warn if recovering from backoff skips (only notify if significant)
           if (backoffSkips > 0) {
@@ -7590,12 +7681,17 @@ function createModuleRunner(name, fn, intervalMs) {
           clearModuleError(name);
           try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
         } catch (err) {
+          metricSample.durationMs = Date.now() - startedAt;
           if (err.message?.includes("[退避中]")) {
+            metricSample.backoffCount = 1;
+            recordModuleMetric(moduleMetrics, name, metricSample);
             backoffSkips++;
             if (backoffSkips === 1 || backoffSkips % 10 === 0) {
               log(`[${name}] 退避中，已跳过 ${backoffSkips} 次`);
             }
           } else {
+            metricSample.errorCount = 1;
+            recordModuleMetric(moduleMetrics, name, metricSample);
             log(`[${name}] 异常：${err.message}`);
             recordModuleError(name, err.message);
           }
@@ -8699,6 +8795,13 @@ export const __testables = {
   diffRoutes,
   frontendAssetChangeSignature,
   classifyFetchFailure,
+  shouldReuseFrontendAssetContents,
+  compactFrontendAssetContents,
+  hydrateFrontendAssetContents,
+  createModuleMetricsState,
+  recordModuleMetric,
+  summarizeModuleMetrics,
+  createHostLimiter,
   buildStartupProgressContent,
   buildStartupReadyContent,
 };
