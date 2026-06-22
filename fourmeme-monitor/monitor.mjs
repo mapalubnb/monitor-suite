@@ -1074,6 +1074,18 @@ function frontendManagedBrowserFetchForced() {
   return (frontendFetchProvider() === "scrapling" && frontendScraplingFetchConfigured()) || frontendBrowserFetchForced();
 }
 
+function configuredFrontendHtmlConcurrency() {
+  return readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 4);
+}
+
+function effectiveFrontendHtmlConcurrency() {
+  const requested = configuredFrontendHtmlConcurrency();
+  if (frontendFetchProvider() === "scrapling" && frontendScraplingFetchConfigured()) {
+    return Math.max(1, Math.min(requested, readPositiveIntEnv("FOURMEME_SCRAPLING_MAX_PAGES", 4)));
+  }
+  return requested;
+}
+
 function frontendFetchModeLabel() {
   if (frontendFetchProvider() === "scrapling" && frontendScraplingFetchConfigured()) return "scrapling_stealthy";
   if (frontendBrowserFetchForced()) return "browser_session_forced";
@@ -3978,7 +3990,7 @@ async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls
   const pages = {};
   const failedUrls = [];
   const failedDetails = [];
-  const limit = readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6);
+  const limit = effectiveFrontendHtmlConcurrency();
   const tasks = urls.map((url, i) => async () => {
     await sleep((i % limit) * 300);
       const key = urlToKey(url);
@@ -9070,7 +9082,7 @@ function buildStartupReadyContent() {
     `**前端监控:** ${pageCount} 个页面（固定入口 ${entryPageCount}，路由发现页面纳入同一监控池）— 每 ${CONFIG.intervals.frontend / 1000}s`,
     `  抓取模式 ${frontendFetchModeLabel()}`,
     `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面同层纳入`,
-    `  HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)} / 资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)} / 资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
+    `  HTML 并发 ${effectiveFrontendHtmlConcurrency()} / 资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)} / 资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
     `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
     `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
     `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
@@ -9398,6 +9410,8 @@ export const __testables = {
   frontendBrowserFetchConfigured,
   frontendBrowserFetchForced,
   frontendManagedBrowserFetchForced,
+  configuredFrontendHtmlConcurrency,
+  effectiveFrontendHtmlConcurrency,
   frontendFetchModeLabel,
   frontendCloudflareFailureHint,
   fourMemeApiScraplingFallbackConfigured,

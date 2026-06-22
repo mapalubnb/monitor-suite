@@ -95,6 +95,8 @@ HEADLESS = read_bool("FOURMEME_SCRAPLING_HEADLESS", True)
 SOLVE_CLOUDFLARE = read_bool("FOURMEME_SCRAPLING_SOLVE_CLOUDFLARE", True)
 NETWORK_IDLE = read_bool("FOURMEME_SCRAPLING_WAIT_NETWORK_IDLE", False)
 DISABLE_RESOURCES = read_bool("FOURMEME_SCRAPLING_DISABLE_RESOURCES", False)
+HTML_LOAD_DOM = read_bool("FOURMEME_SCRAPLING_HTML_LOAD_DOM", False)
+HTML_DISABLE_RESOURCES = read_bool("FOURMEME_SCRAPLING_HTML_DISABLE_RESOURCES", True)
 PROXY = os.getenv("FOURMEME_SCRAPLING_PROXY", "").strip() or None
 WARMUP_URL = os.getenv("FOURMEME_SCRAPLING_WARMUP_URL", "https://four.meme/en").strip()
 FETCH_TOKEN = os.getenv("FOURMEME_SCRAPLING_TOKEN", "").strip()
@@ -358,7 +360,14 @@ class FetcherRuntime:
 
         started = time.time()
         async with self.sem:
-            page = await self.session.fetch(url, timeout=timeout_ms)
+            page = await self.session.fetch(
+                url,
+                timeout=timeout_ms,
+                solve_cloudflare=SOLVE_CLOUDFLARE,
+                load_dom=HTML_LOAD_DOM,
+                network_idle=NETWORK_IDLE,
+                disable_resources=HTML_DISABLE_RESOURCES,
+            )
             html = response_text(page)
             status = int(getattr(page, "status", 200) or 200)
             result: dict[str, Any] = {
@@ -578,6 +587,8 @@ class Handler(BaseHTTPRequestHandler):
             "solveCloudflare": SOLVE_CLOUDFLARE,
             "networkIdle": NETWORK_IDLE,
             "disableResources": DISABLE_RESOURCES,
+            "htmlLoadDom": HTML_LOAD_DOM,
+            "htmlDisableResources": HTML_DISABLE_RESOURCES,
             "allowedHosts": ALLOWED_HOSTS,
             "requiresToken": bool(FETCH_TOKEN),
             "assetMax": MAX_ASSETS,
