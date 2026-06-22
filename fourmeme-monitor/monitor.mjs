@@ -684,6 +684,7 @@ function scheduleAiPatchRetry({ messageId, title, content, template, diffFilePat
  */
 function saveDiffLocally(title, diffText) {
   if (!diffText || diffText.length < 50) return null;
+  if (!hasMeaningfulFrontendDiffBody(diffText)) return null;
   try {
     const diffDir = join(__dirname, "diffs");
     if (!existsSync(diffDir)) mkdirSync(diffDir, { recursive: true });
@@ -2544,6 +2545,151 @@ function formatI18nChanges(changes) {
   return lines.join("\n");
 }
 
+function normalizeI18nSearchText(value) {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function i18nValueIsSearchable(value) {
+  const normalized = normalizeI18nSearchText(value);
+  if (!normalized) return false;
+  if (/[\u4e00-\u9fff]/.test(normalized)) return normalized.length >= 2;
+  return normalized.length >= 4;
+}
+
+function pageTextContainsI18nValue(pageText, value) {
+  if (!i18nValueIsSearchable(value)) return false;
+  return normalizeI18nSearchText(pageText).includes(normalizeI18nSearchText(value));
+}
+
+function isI18nChangeVisibleOnPage(change, oldText = "", newText = "") {
+  if (!change) return false;
+  if (change.type === "added") return pageTextContainsI18nValue(newText, change.value);
+  if (change.type === "removed") return pageTextContainsI18nValue(oldText, change.value);
+  if (change.type === "modified") {
+    return pageTextContainsI18nValue(oldText, change.oldValue)
+      || pageTextContainsI18nValue(newText, change.newValue);
+  }
+  return false;
+}
+
+function partitionI18nChangesByPageVisibility(changes, oldText = "", newText = "") {
+  const visible = [];
+  const resourceOnly = [];
+  for (const change of changes || []) {
+    if (isI18nChangeVisibleOnPage(change, oldText, newText)) visible.push(change);
+    else resourceOnly.push(change);
+  }
+  return { visible, resourceOnly };
+}
+
+function i18nChangeSignature(changes) {
+  const payload = (changes || []).map(c => ({
+    type: c.type,
+    key: c.key,
+    oldValue: c.oldValue ?? c.value ?? "",
+    newValue: c.newValue ?? c.value ?? "",
+  })).sort((a, b) => `${a.type}:${a.key}`.localeCompare(`${b.type}:${b.key}`));
+  return md5(JSON.stringify(payload));
+}
+
+function addGlobalI18nResourceChange(groups, page, changes) {
+  if (!changes?.length) return;
+  const signature = i18nChangeSignature(changes);
+  if (!signature) return;
+  let group = groups.get(signature);
+  if (!group) {
+    group = { signature, changes, pages: [] };
+    groups.set(signature, group);
+  }
+  const url = page?.originalUrl || "";
+  const pageKey = canonicalFrontendUrl(url) || url || urlLabel(url);
+  if (!group.pages.some(p => p.key === pageKey)) {
+    group.pages.push({
+      key: pageKey,
+      label: url ? urlLabel(url) : "未知页面",
+      url,
+    });
+  }
+}
+
+function formatI18nChangesForFullDiff(changes, title = "i18n 国际化字符串变更") {
+  if (!changes?.length) return "";
+  const added = changes.filter(c => c.type === "added");
+  const modified = changes.filter(c => c.type === "modified");
+  const removed = changes.filter(c => c.type === "removed");
+  const lines = [
+    `[ ${title} ]`,
+    `  统计: 新增 ${added.length} | 修改 ${modified.length} | 删除 ${removed.length}`,
+  ];
+
+  if (added.length > 0) {
+    lines.push("");
+    lines.push("--- 新增翻译 ---");
+    for (const c of added) lines.push(`  + ${c.key}: ${c.value}`);
+  }
+  if (modified.length > 0) {
+    lines.push("");
+    lines.push("--- 修改翻译 ---");
+    for (const c of modified) {
+      lines.push(`  ~ ${c.key}`);
+      lines.push(`    - ${c.oldValue}`);
+      lines.push(`    + ${c.newValue}`);
+    }
+  }
+  if (removed.length > 0) {
+    lines.push("");
+    lines.push("--- 删除翻译 ---");
+    for (const c of removed) lines.push(`  - ${c.key}: ${c.value}`);
+  }
+  return lines.join("\n");
+}
+
+function buildGlobalI18nResourceNotification(group) {
+  const pages = compactFrontendUrlList(group.pages || []);
+  const pageCount = pages.length;
+  const title = pageCount > 1
+    ? `前端 i18n 资源变更（影响 ${pageCount} 页）`
+    : `前端 i18n 资源变更：${pages[0]?.label || "全局资源"}`;
+  const lines = [
+    "**类型：全局 i18n 资源变更**",
+    "这些翻译只在 Next streaming resources 中变化，未匹配到具体页面可见 DOM；本轮按全局资源汇总，避免误报为每个页面新增文案。",
+    "",
+  ];
+  if (pageCount > 0) {
+    lines.push(`**关联页面：** ${pageCount} 个`);
+    for (const p of pages.slice(0, 20)) lines.push(`- ${p.label}${p.url ? `：${p.url}` : ""}`);
+    if (pageCount > 20) lines.push(`- ... 还有 ${pageCount - 20} 个页面`);
+    lines.push("");
+  }
+  lines.push(formatI18nChanges(group.changes));
+
+  const fullDiff = buildFullDiffText(
+    "全局 i18n 资源",
+    null,
+    null,
+    null,
+    null,
+    [],
+    null,
+    null,
+    CONFIG.siteUrl,
+    group.changes,
+    { i18nTitle: "全局 i18n 资源变更", affectedPages: pages },
+  );
+
+  return {
+    title,
+    content: lines.join("\n"),
+    template: "orange",
+    fullDiff,
+    url: CONFIG.siteUrl,
+    pageLabel: "全局 i18n 资源",
+  };
+}
+
 /* ── 路由/端点发现 ── */
 
 function extractRouteSignals(html, assetContents, nextData) {
@@ -3283,7 +3429,7 @@ function formatFrontendAssetBrief(assetSummary) {
 
 function normalizeFrontendNotificationTitle(title, fallbackUrl = "") {
   const raw = String(title || "");
-  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw)) return raw;
+  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw) || /^前端 i18n 资源变更/.test(raw)) return raw;
   const m = raw.match(/\/(?:en|zh-TW)\/[A-Za-z0-9/_-]+/);
   const label = m?.[0] || (fallbackUrl ? urlLabel(fallbackUrl) : "未知页面");
   return `前端变更：${label}`;
@@ -3668,12 +3814,30 @@ function filterFrontendDedupe(notifications, state, windowMs = readPositiveIntEn
  * 构建完整 diff 详情文本（用于文件附件）
  * 资产内容只展示结构化配置和汇总，页面文案/i18n/路由仍完整展示。
  */
-function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignalDiff, recoveredAssets, oldAssets, newAssets, pageUrl = "") {
+function hasMeaningfulFrontendDiffBody(diffText) {
+  if (!diffText) return false;
+  const bodyLines = String(diffText).split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  return bodyLines.some(line => {
+    if (/^=+$/.test(line)) return false;
+    if (/^-+$/.test(line)) return false;
+    if (/^时间:/.test(line)) return false;
+    if (/^前端变更详细 Diff/.test(line)) return false;
+    return true;
+  });
+}
+
+function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignalDiff, recoveredAssets, oldAssets, newAssets, pageUrl = "", i18nChanges = null, options = {}) {
   const lines = [];
   lines.push("=".repeat(60));
   lines.push(`前端变更详细 Diff — ${label}`);
   lines.push(`时间: ${ts()}`);
   lines.push("=".repeat(60));
+
+  if (options.affectedPages?.length > 0) {
+    lines.push("");
+    lines.push("[ 影响页面 ]");
+    for (const p of options.affectedPages) lines.push(`  - ${p.label}${p.url ? `：${p.url}` : ""}`);
+  }
 
   // ── 资源变更概览 ──
   if (assetDiff) {
@@ -3746,6 +3910,11 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignal
     lines.push("[ 关键业务指纹变更 ]");
     for (const s of businessSignalDiff.removed || []) lines.push(`  - ${s}`);
     for (const s of businessSignalDiff.added || []) lines.push(`  + ${s}`);
+  }
+
+  if (i18nChanges?.length > 0) {
+    lines.push("");
+    lines.push(formatI18nChangesForFullDiff(i18nChanges, options.i18nTitle || "i18n 国际化字符串变更"));
   }
 
   // ── 部署抖动恢复 ──
@@ -7139,6 +7308,7 @@ async function runFrontendCheck() {
   }
 
   const notifications = [];
+  const globalI18nResourceGroups = new Map();
   let snapshotDirty = prunedBeforeRun || discoveryHistoryChanged;
 
   // 连续 3 次抓取失败的页面发送告警（每 3 的倍数重复提醒）
@@ -7201,6 +7371,7 @@ async function runFrontendCheck() {
     let cachedAssetDiff = null; // 缓存资源 diff 结果，避免重复计算
     let businessSignalDiff = null;
     let i18nChanges = null;
+    let pageI18nChanges = null;
     let i18nChanged = false;
     let routeChanged = false;
 
@@ -7266,12 +7437,24 @@ async function runFrontendCheck() {
     // ── 2. i18n diff（优先展示，中文内容最具可读性）──
     if (oldData.i18nHash && newData.i18nHash && oldData.i18nHash !== newData.i18nHash) {
       i18nChanges = diffI18nStrings(oldData.i18nStrings, newData.i18nStrings);
-      const i18nFormatted = formatI18nChanges(i18nChanges);
+      const { visible, resourceOnly } = partitionI18nChangesByPageVisibility(
+        i18nChanges,
+        oldData.textContent || "",
+        newData.textContent || "",
+      );
+      pageI18nChanges = visible;
+      addGlobalI18nResourceChange(globalI18nResourceGroups, newData, resourceOnly);
+      const i18nFormatted = formatI18nChanges(visible);
       if (i18nFormatted) {
         contentParts.push(i18nFormatted);
         pageContentParts.push(i18nFormatted);
         hasNonAssetChange = true;
         i18nChanged = true;
+      } else if (resourceOnly.length > 0) {
+        logFrontendInfoRateLimited(
+          `i18n-resource-only:${i18nChangeSignature(resourceOnly)}`,
+          `[前端] 检测到 ${resourceOnly.length} 条 i18n 资源变更，未匹配到页面可见 DOM，改为全局汇总`
+        );
       }
     } else if (!oldData.i18nHash && newData.i18nHash && newData.i18nStrings) {
       // 首次出现 i18n 数据
@@ -7373,9 +7556,9 @@ async function runFrontendCheck() {
       log(`[前端] ${label} 变化！`);
 
       // 构建详细 diff 文件（复用已计算的 assetDiff）
-      const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, businessSignalDiff, [], oldData.assetContents, newData.assetContents, newData.originalUrl);
+      const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, businessSignalDiff, [], oldData.assetContents, newData.assetContents, newData.originalUrl, pageI18nChanges);
       const assetSummary = cachedAssetDiff ? analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents, newData.originalUrl) : null;
-      const semanticSignature = frontendSemanticChangeSignature({ assetSummary, businessSignalDiff, i18nChanges, textDiff, routeDiff });
+      const semanticSignature = frontendSemanticChangeSignature({ assetSummary, businessSignalDiff, i18nChanges: pageI18nChanges, textDiff, routeDiff });
       const contentV2 = [
         `**页面：${label}**`,
         `URL: ${newData.originalUrl}`,
@@ -7399,6 +7582,10 @@ async function runFrontendCheck() {
     // 在所有 diff 完成后更新快照
     snapshot.frontendPages[key] = newData;
     snapshotDirty = true;
+  }
+
+  for (const group of globalI18nResourceGroups.values()) {
+    notifications.push(buildGlobalI18nResourceNotification(group));
   }
 
   if (notifications.length > 0) {
@@ -8032,6 +8219,10 @@ export const __testables = {
   shouldLogI18nExtraction,
   extractRouteSignals,
   diffI18nStrings,
+  partitionI18nChangesByPageVisibility,
+  formatI18nChangesForFullDiff,
+  buildFullDiffText,
+  hasMeaningfulFrontendDiffBody,
   diffRoutes,
   frontendAssetChangeSignature,
   classifyFetchFailure,

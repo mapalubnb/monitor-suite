@@ -93,6 +93,52 @@ test("unchanged i18n extraction stays quiet after baseline", () => {
   assert.equal(__testables.shouldLogI18nExtraction({ i18nHash: "same-hash" }, i18nResult), false);
 });
 
+test("i18n changes are attributed to visible page text only", () => {
+  const changes = [
+    { type: "added", key: "launch.notEligibleForPresale", value: "You are not eligible for this presale" },
+    { type: "added", key: "launch.visible", value: "Visible launch copy" },
+    { type: "modified", key: "launch.button", oldValue: "Old Button", newValue: "New Button" },
+  ];
+  const partitioned = __testables.partitionI18nChangesByPageVisibility(
+    changes,
+    "Old Button",
+    "Create Token Visible launch copy New Button",
+  );
+  assert.deepEqual(partitioned.visible.map(c => c.key), ["launch.visible", "launch.button"]);
+  assert.deepEqual(partitioned.resourceOnly.map(c => c.key), ["launch.notEligibleForPresale"]);
+});
+
+test("full frontend diff includes i18n details for pure i18n changes", () => {
+  const diffText = __testables.buildFullDiffText(
+    "/en/create-token",
+    null,
+    null,
+    null,
+    null,
+    [],
+    null,
+    null,
+    "https://four.meme/en/create-token",
+    [{ type: "added", key: "launch.notEligibleForPresale", value: "You are not eligible for this presale" }],
+  );
+  assert.match(diffText, /i18n 国际化字符串变更/);
+  assert.match(diffText, /launch\.notEligibleForPresale/);
+  assert.match(diffText, /You are not eligible for this presale/);
+  assert.equal(__testables.hasMeaningfulFrontendDiffBody(diffText), true);
+});
+
+test("header-only frontend diff is not considered meaningful", () => {
+  const diffText = [
+    "============================================================",
+    "前端变更详细 Diff — /zh-TW/agentic",
+    "时间: 2026/6/22 09:59:54",
+    "============================================================",
+    "",
+    "============================================================",
+  ].join("\n");
+  assert.equal(__testables.hasMeaningfulFrontendDiffBody(diffText), false);
+});
+
 test("failed discovered frontend URLs are suppressed during cooldown", () => {
   const route = `/codex-suppressed-${Date.now()}`;
   const url = `https://four.meme/zh-TW${route}`;
