@@ -563,6 +563,7 @@ function isFlapAssetOnlyNotification(notification) {
   const meta = notification.meta || {};
   const assetStats = meta.assetStats;
   if (!assetStats) return false;
+  if (hasPageSpecificAssetChange(notification)) return false;
   if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return false;
   if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return false;
   if (hasItems(meta.caStoreVaultDiffs)) return false;
@@ -585,6 +586,7 @@ function isSharedResourceChangeCandidate(notification) {
   if (!notification || notification.isRecoveryNotice || notification.content) return false;
   const assetStats = notification.meta?.assetStats;
   if (!assetStats || hasFlapPageLevelChange(notification)) return false;
+  if (hasPageSpecificAssetChange(notification)) return false;
   if (hasItems(assetStats.configDiffs)) return true;
   if (hasItems(assetStats.vaultDiffs)) return true;
   if (hasItems(assetStats.jsTextDiffs)) return true;
@@ -627,6 +629,7 @@ function resourceChangeFingerprint(notification) {
     .filter(line => line && !line.startsWith("📦 前端资源变更") && !line.startsWith("🔇 构建噪音"));
   return stableKey({
     files: hasStructuredResourceDiff ? [] : (assetStats.substantiveFileNames || []),
+    semanticProfile: assetStats.semanticProfile || null,
     configDiffs: assetStats.configDiffs || [],
     vaultDiffs: assetStats.vaultDiffs || [],
     jsTextDiffs: assetStats.jsTextDiffs || [],
@@ -652,6 +655,10 @@ function maxStat(notifications, field) {
   return Math.max(0, ...notifications.map(n => Number(n.meta?.assetStats?.[field] || 0)));
 }
 
+function assetPathToFilename(path) {
+  return String(path || "").split("?")[0].split("/").pop();
+}
+
 function extractAssetFileNamesFromChanges(changes = []) {
   const names = [];
   const fileRe = /[\w.-]+\.(?:js|css)\b/g;
@@ -661,15 +668,69 @@ function extractAssetFileNamesFromChanges(changes = []) {
   return uniqueStrings(names);
 }
 
+function getPageRouteFromAssetPath(path) {
+  const clean = String(path || "").split("?")[0];
+  const m = clean.match(/\/_next\/static\/chunks\/app\/(.+?)\/page-[^/]+\.js$/);
+  if (!m) return "";
+  const route = decodeURIComponent(m[1]).replace(/\[(chain)\]/g, ":$1");
+  if (route === "launch") return "launch";
+  if (route === "create") return "create";
+  if (/CAstore$/i.test(route)) return "CAstore";
+  return route;
+}
+
+function classifyAssetPath(path) {
+  const clean = String(path || "").split("?")[0];
+  const name = assetPathToFilename(clean);
+  const route = getPageRouteFromAssetPath(clean);
+  if (route) return { kind: "page", route, file: clean || name };
+  if (/\/_next\/static\/chunks\/app\/layout-/i.test(clean)) return { kind: "layout", file: clean || name };
+  if (/\/_next\/static\/chunks\/app\/(?:loading|error|not-found)-/i.test(clean)) return { kind: "system", file: clean || name };
+  if (!name) return { kind: "other", file: "" };
+  if (/^webpack-[a-f0-9]+\.js$/i.test(name)) return { kind: "runtime", file: clean || name };
+  if (/^(framework|main|main-app|polyfills|app|runtime)-/i.test(name)) return { kind: "runtime", file: clean || name };
+  if (/\.css$/i.test(name)) return { kind: "style", file: clean || name };
+  if (/^\d+-[a-f0-9]+\.js$/i.test(name)) return { kind: "shared", file: clean || name };
+  if (/\.js$/i.test(name)) return { kind: "script", file: clean || name };
+  return { kind: "other", file: clean || name };
+}
+
 function classifyAssetFileName(filename) {
-  const name = String(filename || "").split("/").pop();
-  if (!name) return "other";
-  if (/^webpack-[a-f0-9]+\.js$/i.test(name)) return "runtime";
-  if (/^(framework|main|polyfills|app|runtime)-/i.test(name)) return "runtime";
-  if (/\.css$/i.test(name)) return "style";
-  if (/^\d+-[a-f0-9]+\.js$/i.test(name)) return "shared";
-  if (/\.js$/i.test(name)) return "script";
-  return "other";
+  return classifyAssetPath(filename).kind;
+}
+
+function buildAssetSemanticProfile(assetPaths = [], assetStats = {}) {
+  const profile = {
+    runtime: [],
+    shared: [],
+    page: [],
+    pageRoutes: [],
+    appShell: [],
+    style: [],
+    script: [],
+    other: [],
+    businessSignals: summarizeBusinessSignals(assetStats),
+  };
+  for (const assetPath of uniqueStrings(assetPaths)) {
+    const classified = classifyAssetPath(assetPath);
+    if (classified.kind === "page") {
+      profile.page.push(classified);
+      if (classified.route && !profile.pageRoutes.includes(classified.route)) profile.pageRoutes.push(classified.route);
+    } else if (classified.kind === "layout" || classified.kind === "system") {
+      profile.appShell.push(classified);
+    } else if (profile[classified.kind]) {
+      profile[classified.kind].push(classified);
+    } else {
+      profile.other.push(classified);
+    }
+  }
+  profile.pageRoutes.sort();
+  return profile;
+}
+
+function hasPageSpecificAssetChange(notification) {
+  const profile = notification?.meta?.assetStats?.semanticProfile;
+  return Array.isArray(profile?.pageRoutes) && profile.pageRoutes.length > 0;
 }
 
 function summarizeBusinessSignals(assetStats = {}) {
@@ -683,28 +744,31 @@ function summarizeBusinessSignals(assetStats = {}) {
 
 function buildResourceSemanticSummary(assetStats, notifications = []) {
   const files = uniqueStrings([
+    ...(assetStats?.substantiveAssetPaths || []),
     ...(assetStats?.substantiveFileNames || []),
     ...notifications.flatMap(n => extractAssetFileNamesFromChanges(n.changes)),
   ]);
-  const grouped = {
-    runtime: files.filter(f => classifyAssetFileName(f) === "runtime"),
-    shared: files.filter(f => classifyAssetFileName(f) === "shared"),
-    script: files.filter(f => classifyAssetFileName(f) === "script"),
-    style: files.filter(f => classifyAssetFileName(f) === "style"),
-  };
+  const profile = assetStats?.semanticProfile || buildAssetSemanticProfile(files, assetStats);
   const businessSignals = summarizeBusinessSignals(assetStats);
   const lines = [];
-  if (grouped.runtime.length > 0) {
-    lines.push(`- webpack runtime/bootstrap: ${grouped.runtime.length} 文件，运行时代码或 chunk 加载器更新；原始 minified 片段已移入下载 Diff。`);
+  if (profile.runtime.length > 0) {
+    lines.push(`- webpack runtime/bootstrap: ${profile.runtime.length} 文件，运行时代码或 chunk 加载器更新；原始 minified 片段已移入下载 Diff。`);
   }
-  if (grouped.shared.length > 0) {
-    lines.push(`- 共享应用 chunk: ${grouped.shared.length} 文件，已完成业务文案/配置提取。`);
+  if (profile.appShell.length > 0) {
+    const labels = uniqueStrings(profile.appShell.map(item => item.kind));
+    lines.push(`- 全站 app shell: ${profile.appShell.length} 文件（${labels.join(", ")}），可能影响布局、加载、错误页或兜底页面。`);
   }
-  if (grouped.script.length > 0) {
-    lines.push(`- 页面/业务脚本 chunk: ${grouped.script.length} 文件，已完成结构化信号提取。`);
+  if (profile.shared.length > 0) {
+    lines.push(`- 共享应用 chunk: ${profile.shared.length} 文件，已完成业务文案/配置提取。`);
   }
-  if (grouped.style.length > 0) {
-    lines.push(`- 样式资源: ${grouped.style.length} 文件。`);
+  if (profile.page.length > 0) {
+    lines.push(`- 页面专属 chunk: ${profile.page.length} 文件（${profile.pageRoutes.join(", ")}），按对应页面优先判断。`);
+  }
+  if (profile.script.length > 0) {
+    lines.push(`- 页面/业务脚本 chunk: ${profile.script.length} 文件，已完成结构化信号提取。`);
+  }
+  if (profile.style.length > 0) {
+    lines.push(`- 样式资源: ${profile.style.length} 文件。`);
   }
   lines.push(businessSignals.length > 0
     ? `- 结构化业务信号: ${businessSignals.join("、")}。`
@@ -715,18 +779,18 @@ function buildResourceSemanticSummary(assetStats, notifications = []) {
 function summarizePageAssetChange(notification) {
   const assetStats = notification.meta?.assetStats || {};
   const files = uniqueStrings([
+    ...(assetStats.substantiveAssetPaths || []),
     ...(assetStats.substantiveFileNames || []),
     ...extractAssetFileNamesFromChanges(notification.changes),
   ]);
-  const runtimeFiles = files.filter(f => classifyAssetFileName(f) === "runtime");
-  const sharedFiles = files.filter(f => classifyAssetFileName(f) === "shared");
-  const scriptFiles = files.filter(f => classifyAssetFileName(f) === "script");
-  const styleFiles = files.filter(f => classifyAssetFileName(f) === "style");
+  const profile = assetStats.semanticProfile || buildAssetSemanticProfile(files, assetStats);
   const parts = [];
-  if (runtimeFiles.length > 0) parts.push(`webpack runtime/bootstrap ${runtimeFiles.join(", ")}：运行时代码更新，原始片段已隐藏`);
-  if (sharedFiles.length > 0) parts.push(`共享应用 chunk ${sharedFiles.join(", ")}：已做业务信号提取`);
-  if (scriptFiles.length > 0) parts.push(`页面/业务脚本 ${scriptFiles.join(", ")}：已做结构化信号提取`);
-  if (styleFiles.length > 0) parts.push(`样式资源 ${styleFiles.join(", ")}`);
+  if (profile.page.length > 0) parts.push(`页面专属 chunk ${profile.pageRoutes.join(", ")}：优先按对应页面推送`);
+  if (profile.runtime.length > 0) parts.push(`webpack runtime/bootstrap ${profile.runtime.map(i => assetPathToFilename(i.file)).join(", ")}：运行时代码更新，原始片段已隐藏`);
+  if (profile.appShell.length > 0) parts.push(`app shell ${profile.appShell.map(i => assetPathToFilename(i.file)).join(", ")}：布局/加载/错误页相关`);
+  if (profile.shared.length > 0) parts.push(`共享应用 chunk ${profile.shared.map(i => assetPathToFilename(i.file)).join(", ")}：已做业务信号提取`);
+  if (profile.script.length > 0) parts.push(`页面/业务脚本 ${profile.script.map(i => assetPathToFilename(i.file)).join(", ")}：已做结构化信号提取`);
+  if (profile.style.length > 0) parts.push(`样式资源 ${profile.style.map(i => assetPathToFilename(i.file)).join(", ")}`);
   const signals = summarizeBusinessSignals(assetStats);
   parts.push(signals.length > 0 ? `业务信号 ${signals.join("、")}` : "未发现结构化业务信号");
   return `${notification.url}: ${parts.join("；")}`;
@@ -1868,45 +1932,76 @@ function buildVaultFactoryChangeTitle(changes, prefix = "") {
  * @param {string} baseUrl
  * @returns {{ [filename]: { contentHash, size, strings, ext, vaultConfigs? } }}
  */
-async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh") {
+function planAssetContentDownload(oldFeatures, newFeatures) {
+  const oldContents = oldFeatures?.assetContents || {};
+  const oldAssetFiles = new Set(oldFeatures?.assetFiles || []);
+  const reusedContents = {};
+  const reuseFilenames = [];
+  const toDownload = [];
+
+  for (const path of newFeatures?.assetFiles || []) {
+    const filename = assetPathToFilename(path);
+    if (oldAssetFiles.has(path) && oldContents[filename]) {
+      reusedContents[filename] = oldContents[filename];
+      reuseFilenames.push(filename);
+    } else {
+      toDownload.push(path);
+    }
+  }
+
+  return { reusedContents, reuseFilenames: reuseFilenames.sort(), toDownload };
+}
+
+async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", options = {}) {
   const results = {};
   const BATCH = 6;
   const STAGGER = 80;
+  const roundAssetCache = options.roundAssetCache || null;
+  const fetchAsset = options.fetchAsset || ((url, fetchOptions) => fetchSafe(url, fetchOptions));
   for (let i = 0; i < assetPaths.length; i += BATCH) {
     const batch = assetPaths.slice(i, i + BATCH);
     const tasks = batch.map((path, idx) =>
       sleep(idx * STAGGER).then(async () => {
         try {
           const url = baseUrl + path;
-          const res = await fetchSafe(url, {
-            headers: { ...browserHeaders(), "Accept": "*/*" },
-          });
-          if (!res.ok) return null;
-          const content = await res.text();
-          const filename = path.split("/").pop();
-          const ext = filename.endsWith(".css") ? "css" : "js";
-          const entry = {
-            filename,
-            contentHash: md5(content),
-            size: content.length,
-            strings: extractStrings(content, ext),
-            ext,
-          };
-          // 对含 Vault 关键词的 JS 文件提取结构化配置
-          if (ext === "js" && /(?:Vault|enabled.*constraints|constraints.*enabled|DividendBps)/i.test(content)) {
-            entry.vaultConfigs = extractVaultConfigs(content);
-            if (entry.vaultConfigs.length > 0) {
-              log(`  [金库 Vault] ${filename}: 提取到 ${entry.vaultConfigs.length} 个配置对象`);
+          const cacheKey = url.split("?")[0];
+          if (roundAssetCache?.has(cacheKey)) return await roundAssetCache.get(cacheKey);
+          const loadPromise = (async () => {
+            const res = await fetchAsset(url, {
+              headers: { ...browserHeaders(), "Accept": "*/*" },
+            });
+            if (!res.ok) return null;
+            const content = await res.text();
+            const filename = assetPathToFilename(path);
+            const ext = filename.endsWith(".css") ? "css" : "js";
+            const entry = {
+              filename,
+              path: path.split("?")[0],
+              contentHash: md5(content),
+              size: content.length,
+              strings: extractStrings(content, ext),
+              ext,
+            };
+            // 对含 Vault 关键词的 JS 文件提取结构化配置
+            if (ext === "js" && /(?:Vault|enabled.*constraints|constraints.*enabled|DividendBps)/i.test(content)) {
+              entry.vaultConfigs = extractVaultConfigs(content);
+              if (entry.vaultConfigs.length > 0) {
+                log(`  [金库 Vault] ${filename}: 提取到 ${entry.vaultConfigs.length} 个配置对象`);
+              }
             }
-          }
-          // 提取 vaultTypes 金库工厂注册列表
-          if (ext === "js" && content.includes("vaultTypes:[")) {
-            const vf = extractVaultFactories(content);
-            if (vf && vf.factories.length > 0) {
-              entry.vaultFactories = vf;
-              log(`  [金库工厂 VaultFactory] ${filename}: 提取到 ${vf.factories.length} 个工厂 (vaultPortal: ${vf.vaultPortal || "N/A"})`);
+            // 提取 vaultTypes 金库工厂注册列表
+            if (ext === "js" && content.includes("vaultTypes:[")) {
+              const vf = extractVaultFactories(content);
+              if (vf && vf.factories.length > 0) {
+                entry.vaultFactories = vf;
+                log(`  [金库工厂 VaultFactory] ${filename}: 提取到 ${vf.factories.length} 个工厂 (vaultPortal: ${vf.vaultPortal || "N/A"})`);
+              }
             }
-          }
+            return entry;
+          })();
+          if (roundAssetCache) roundAssetCache.set(cacheKey, loadPromise);
+          const entry = await loadPromise;
+          if (roundAssetCache) roundAssetCache.set(cacheKey, entry);
           return entry;
         } catch { return null; }
       })
@@ -1919,6 +2014,17 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh") {
     }
   }
   return results;
+}
+
+async function hydrateAssetContents(features, oldFeatures = null, options = {}) {
+  if (oldFeatures?.assetContents && oldFeatures.assetHash === features.assetHash) {
+    features.assetContents = oldFeatures.assetContents;
+    return { downloaded: 0, reused: Object.keys(features.assetContents || {}).length };
+  }
+  const plan = planAssetContentDownload(oldFeatures, features);
+  const downloaded = await downloadAssetContents(plan.toDownload, "https://flap.sh", options);
+  features.assetContents = { ...plan.reusedContents, ...downloaded };
+  return { downloaded: Object.keys(downloaded).length, reused: plan.reuseFilenames.length };
 }
 
 /* ── i18n 语言包提取 ── */
@@ -2402,6 +2508,8 @@ function diffFrontendAssets(oldAssets, newAssets) {
         const newStrSet = new Set(newData.strings || []);
         result.matched.push({
           oldFile: file, newFile: file,
+          oldPath: oldAssets[file].path || file,
+          newPath: newData.path || file,
           addedStrings: (newData.strings || []).filter(s => !oldStrSet.has(s)),
           removedStrings: (oldAssets[file].strings || []).filter(s => !newStrSet.has(s)),
         });
@@ -2463,6 +2571,8 @@ function diffFrontendAssets(oldAssets, newAssets) {
         const newStrSet = new Set(newData.strings || []);
         result.matched.push({
           oldFile, newFile,
+          oldPath: oldData.path || oldFile,
+          newPath: newData.path || newFile,
           addedStrings: (newData.strings || []).filter(s => !oldStrSet.has(s)),
           removedStrings: (oldData.strings || []).filter(s => !newStrSet.has(s)),
         });
@@ -2496,6 +2606,8 @@ function diffFrontendAssets(oldAssets, newAssets) {
       const newStrSet = new Set(newData.strings || []);
       result.matched.push({
         oldFile: p.oldFile, newFile: p.newFile,
+        oldPath: oldData.path || p.oldFile,
+        newPath: newData.path || p.newFile,
         addedStrings: (newData.strings || []).filter(s => !oldStrSet.has(s)),
         removedStrings: (oldData.strings || []).filter(s => !newStrSet.has(s)),
       });
@@ -2817,6 +2929,7 @@ function diffFeatures(oldF, newF) {
           substantiveFiles.push({ ...m, realAdded, realRemoved, totalNoise, configDiffs });
         }
       }
+      const substantiveAssetPaths = uniqueStrings(substantiveFiles.map(f => f.newPath || f.oldPath || f.newFile || f.oldFile));
 
       // ── 提取 JS 字符串 diff 中的业务文案（中文文案、Vault 描述等）──
       const jsTextDiffs = [];
@@ -2866,6 +2979,8 @@ function diffFeatures(oldF, newF) {
         substantiveFiles: substantiveFiles.length,
         substantiveCount: substantiveFiles.reduce((s, f) => s + f.realAdded.length + f.realRemoved.length, 0),
         substantiveFileNames: substantiveFiles.map(f => f.newFile || f.oldFile),
+        substantiveAssetPaths,
+        semanticProfile: buildAssetSemanticProfile(substantiveAssetPaths, { configDiffs: allConfigDiffs, vaultDiffs, jsTextDiffs }),
         configDiffs: allConfigDiffs,
         vaultDiffs,
         jsTextDiffs,
@@ -3092,6 +3207,7 @@ async function runCheck() {
   let hasDetectedChange = false;
   let hasNotifiedChange = false;
   const notifications = [];
+  const roundAssetCache = new Map();
 
   // 并行抓取所有页面
   const tasks = CONFIG.urls.map((url, i) => sleep(i * 300).then(async () => {
@@ -3109,7 +3225,9 @@ async function runCheck() {
       assertValidFlapPage(url, html, features);
       const i18n = await fetchI18nStrings(features.assetFiles);
       if (i18n) { features.i18nStrings = i18n.i18nStrings; features.i18nHash = i18n.i18nHash; features.i18nChunk = i18n.i18nChunk; }
-      features.assetContents = await downloadAssetContents(features.assetFiles);
+      const oldForAssets = snapshot.pages[key];
+      const oldAssetQuality = oldForAssets ? getStoredFeatureQuality(url, oldForAssets) : null;
+      await hydrateAssetContents(features, oldAssetQuality?.valid ? oldForAssets : null, { roundAssetCache });
 
       // ── 手动检测：Vault Factory 变更 ──
       for (const entry of Object.values(features.assetContents || {})) {
@@ -3159,7 +3277,6 @@ async function runCheck() {
             url,
             severity: "yellow",
             reason: oldQuality.reasons.join("; "),
-            action: "已用当前有效页面重建基线；本次不按页面文案变更推送，避免旧坏快照造成误报。",
             detail: formatQualityIssue(url, oldQuality),
           }),
           "yellow"
@@ -3245,6 +3362,7 @@ async function startMonitor() {
 
   if (needsInit) {
     log("首次运行，正在并行建立基线……");
+    const initAssetCache = new Map();
     const tasks = CONFIG.urls.map((url, i) => sleep(i * 300).then(async () => {
       const key = urlToKey(url);
       const html = await fetchPage(url);
@@ -3254,9 +3372,8 @@ async function startMonitor() {
       const i18n = await fetchI18nStrings(features.assetFiles);
       if (i18n) { features.i18nStrings = i18n.i18nStrings; features.i18nHash = i18n.i18nHash; features.i18nChunk = i18n.i18nChunk; }
       // 下载资源内容用于内容级 diff
-      const assetContents = await downloadAssetContents(features.assetFiles);
-      features.assetContents = assetContents;
-      const dlCount = Object.keys(assetContents).length;
+      const hydrateStats = await hydrateAssetContents(features, null, { roundAssetCache: initAssetCache });
+      const dlCount = hydrateStats.downloaded;
       return { key, features, i18n, dlCount };
     }));
     const results = await Promise.allSettled(tasks);
@@ -3299,6 +3416,7 @@ async function startMonitor() {
 
     try {
       const notifications = [];
+      const roundAssetCache = new Map();
 
       const applyNotificationSnapshotUpdate = (notification) => {
         const updates = [
@@ -3351,7 +3469,6 @@ async function startMonitor() {
                 severity: "orange",
                 reason: error.message,
                 consecutiveFailures: fc.count,
-                action: "检查服务器出口、HTTP 状态和目标页面可达性；恢复后会自动重新比对。",
               }),
               template: "orange",
               isRecoveryNotice: true,
@@ -3384,7 +3501,7 @@ async function startMonitor() {
             const i18n = await fetchI18nStrings(features.assetFiles);
             if (i18n) { features.i18nStrings = i18n.i18nStrings; features.i18nHash = i18n.i18nHash; features.i18nChunk = i18n.i18nChunk; }
             // 下载资源内容用于内容级 diff
-            features.assetContents = await downloadAssetContents(features.assetFiles);
+            await hydrateAssetContents(features, oldQuality?.valid ? oldFeatures : null, { roundAssetCache });
           }
 
           if (failCounts[key]) failCounts[key].count = 0;
@@ -3404,7 +3521,6 @@ async function startMonitor() {
                 severity: "yellow",
                 skipped,
                 reason: "此前触发 403/429/退避，本轮已完成全量比对。",
-                action: "关注本轮是否同时出现页面变更；退避期间的中间状态可能无法逐次还原。",
               }),
               template: "yellow",
               isRecoveryNotice: true,
@@ -3469,7 +3585,6 @@ async function startMonitor() {
                 url,
                 severity: "yellow",
                 reason: oldQuality.reasons.join("; "),
-                action: "已重建基线；本次不按页面文案变更推送。",
                 detail: formatQualityIssue(url, oldQuality),
               }),
               template: "yellow",
@@ -3518,7 +3633,6 @@ async function startMonitor() {
                 severity: "orange",
                 reason: err.message,
                 consecutiveFailures: fc.count,
-                action: err.pageQuality ? "检查抓取到的 HTML 是否为错误页/风控页；恢复后会自动重试。" : "检查页面解析逻辑和最近资源结构变更。",
               }),
               template: "orange",
               isRecoveryNotice: true,
@@ -3723,6 +3837,10 @@ export const __testables = {
   diffFrontendAssets,
   extractPageFeatures,
   extractStrings,
+  downloadAssetContents,
+  planAssetContentDownload,
+  buildAssetSemanticProfile,
+  classifyAssetPath,
   buildBriefingInput,
   buildCardBriefing,
   buildOperationalNoticeContent,

@@ -227,6 +227,123 @@ test("asset string extraction keeps business strings beyond the ordinary cap", (
   assert(strings.some(s => s.includes("新增金库费率配置")));
 });
 
+test("round asset cache reuses shared chunks across pages", async () => {
+  const roundAssetCache = new Map();
+  let fetchCount = 0;
+  const fetchAsset = async (url) => {
+    fetchCount++;
+    return { ok: true, text: async () => `const label = "asset ${url} business words";` };
+  };
+
+  const [first, second] = await Promise.all([
+    __testables.downloadAssetContents(
+      ["/_next/static/chunks/8101-a.js", "/_next/static/chunks/webpack-a.js"],
+      "https://flap.sh",
+      { roundAssetCache, fetchAsset },
+    ),
+    __testables.downloadAssetContents(
+      ["/_next/static/chunks/8101-a.js", "/_next/static/chunks/app/launch/page-a.js"],
+      "https://flap.sh",
+      { roundAssetCache, fetchAsset },
+    ),
+  ]);
+
+  assert.equal(fetchCount, 3);
+  assert.equal(first["8101-a.js"].contentHash, second["8101-a.js"].contentHash);
+});
+
+test("asset download plan reuses unchanged assets and fetches only new paths", () => {
+  const oldFeatures = {
+    assetFiles: ["/_next/static/chunks/webpack-a.js", "/_next/static/chunks/8101-a.js"],
+    assetContents: {
+      "webpack-a.js": { filename: "webpack-a.js", path: "/_next/static/chunks/webpack-a.js", contentHash: "runtime" },
+      "8101-a.js": { filename: "8101-a.js", path: "/_next/static/chunks/8101-a.js", contentHash: "shared" },
+    },
+  };
+  const newFeatures = {
+    assetFiles: ["/_next/static/chunks/webpack-a.js", "/_next/static/chunks/app/launch/page-b.js"],
+  };
+
+  const plan = __testables.planAssetContentDownload(oldFeatures, newFeatures);
+
+  assert.deepEqual(plan.reuseFilenames, ["webpack-a.js"]);
+  assert.deepEqual(plan.toDownload, ["/_next/static/chunks/app/launch/page-b.js"]);
+  assert.equal(plan.reusedContents["webpack-a.js"].contentHash, "runtime");
+});
+
+test("asset semantic profile classifies page chunks and shared runtime chunks", () => {
+  const profile = __testables.buildAssetSemanticProfile([
+    "/_next/static/chunks/webpack-167217394b1418fd.js",
+    "/_next/static/chunks/8101-706af7c3a9ce2627.js",
+    "/_next/static/chunks/app/launch/page-58c52ba25a5f0aae.js",
+    "/_next/static/chunks/app/layout-dc8bafd06bb8b592.js",
+  ]);
+
+  assert(profile.runtime.some(item => item.file.includes("webpack-167217394b1418fd.js")));
+  assert(profile.shared.some(item => item.file.includes("8101-706af7c3a9ce2627.js")));
+  assert.deepEqual(profile.pageRoutes, ["launch"]);
+  assert(profile.appShell.some(item => item.kind === "layout"));
+});
+
+test("page-specific chunk changes remain page-level notifications", () => {
+  const notifications = [
+    {
+      url: "https://flap.sh/launch",
+      title: "Flap 页面变更",
+      template: "red",
+      changes: ["📦 前端资源变更： 修改 1"],
+      meta: {
+        assetStats: {
+          unchanged: 28,
+          modified: 1,
+          substantiveFileNames: ["page-58c52ba25a5f0aae.js"],
+          substantiveAssetPaths: ["/_next/static/chunks/app/launch/page-58c52ba25a5f0aae.js"],
+          semanticProfile: __testables.buildAssetSemanticProfile(["/_next/static/chunks/app/launch/page-58c52ba25a5f0aae.js"]),
+          configDiffs: [],
+          vaultDiffs: [],
+          jsTextDiffs: [],
+        },
+        textChangeCount: 0,
+        textChanges: [],
+        i18nChangeCount: 0,
+        i18nDiffs: [],
+        caStoreVaultDiffs: [],
+      },
+      snapshotUpdate: { key: "launch", features: {} },
+    },
+    {
+      url: "https://flap.sh/create",
+      title: "Flap 页面变更",
+      template: "red",
+      changes: ["📦 前端资源变更： 修改 1"],
+      meta: {
+        assetStats: {
+          unchanged: 28,
+          modified: 1,
+          substantiveFileNames: ["page-314a5953cbeca095.js"],
+          substantiveAssetPaths: ["/_next/static/chunks/app/create/page-314a5953cbeca095.js"],
+          semanticProfile: __testables.buildAssetSemanticProfile(["/_next/static/chunks/app/create/page-314a5953cbeca095.js"]),
+          configDiffs: [],
+          vaultDiffs: [],
+          jsTextDiffs: [],
+        },
+        textChangeCount: 0,
+        textChanges: [],
+        i18nChangeCount: 0,
+        i18nDiffs: [],
+        caStoreVaultDiffs: [],
+      },
+      snapshotUpdate: { key: "create", features: {} },
+    },
+  ];
+
+  const grouped = __testables.coalesceFlapNotifications(notifications);
+
+  assert.equal(grouped.length, 2);
+  assert.equal(grouped[0].url, "https://flap.sh/launch");
+  assert.equal(grouped[1].url, "https://flap.sh/create");
+});
+
 test("manual Flap check can reuse the same notification coalescing path", () => {
   const notifications = [
     {
