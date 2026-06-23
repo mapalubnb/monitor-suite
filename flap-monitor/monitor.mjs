@@ -22,6 +22,7 @@ import { fileURLToPath } from "node:url";
 import { sendCard, sendCardQueued, patchCard, pinMessage, waitQueueDrain } from "../shared/feishu-client.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
 
 // 加载 .env 文件（共享配置 + 本地配置）
 for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) {
@@ -59,6 +60,7 @@ const CONFIG = {
     minTextLength: 20,
     minAssetFiles: 2,
   },
+  assetStringLimit: 300,
 
   // 心跳推送开关；默认关闭，只影响周期性状态心跳，不影响页面变更/异常告警
   heartbeatEnabled: process.env.HEARTBEAT_ENABLED === "true",
@@ -81,6 +83,7 @@ const CONFIG = {
  * 每个条目: { pattern: RegExp, label: string }
  */
 const BUSINESS_KEYWORDS = [
+  { pattern: /金库|金庫/i,         label: "金库" },
   { pattern: /Vault/i,            label: "Vault" },
   { pattern: /Dividend/i,         label: "Dividend(分红)" },
   { pattern: /DividendBps/i,      label: "DividendBps" },
@@ -123,6 +126,12 @@ const NOISE_PATTERNS = [
  */
 function isNoiseString(s) {
   return NOISE_PATTERNS.some(p => p.test(s));
+}
+
+const BUSINESS_STRING_RE = /[\u4e00-\u9fff]|Vault|金库|金庫|CAstore|CA Store|fee|rate|tax|税|稅|dividend|staking|质押|質押|燃烧|燃燒|回购|回購|factory|template/i;
+
+function isBusinessAssetString(s) {
+  return BUSINESS_STRING_RE.test(String(s || ""));
 }
 
 /**
@@ -362,6 +371,17 @@ const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 
+function emptyFlapChangeMeta() {
+  return {
+    assetStats: null,
+    textChangeCount: 0,
+    textChanges: [],
+    i18nChangeCount: 0,
+    i18nDiffs: [],
+    caStoreVaultDiffs: [],
+  };
+}
+
 /* ── 快照读写 ── */
 const CURRENT_SCHEMA_VERSION = 5;
 const CA_STORE_VAULT_SCHEMA_VERSION = 2;
@@ -531,6 +551,146 @@ async function sendNotificationMaybeAi({ title, content, template = "red", modul
     return messageId;
   }
   return sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url);
+}
+
+function hasItems(value) {
+  return Array.isArray(value) && value.length > 0;
+}
+
+function isFlapAssetOnlyNotification(notification) {
+  if (!notification || notification.isRecoveryNotice || notification.content) return false;
+  const meta = notification.meta || {};
+  const assetStats = meta.assetStats;
+  if (!assetStats) return false;
+  if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return false;
+  if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return false;
+  if (hasItems(meta.caStoreVaultDiffs)) return false;
+  if (hasItems(assetStats.configDiffs)) return false;
+  if (hasItems(assetStats.vaultDiffs)) return false;
+  if (hasItems(assetStats.jsTextDiffs)) return false;
+  if (detectBusinessPriority(notification.changes || []).hit) return false;
+  return true;
+}
+
+function uniqueStrings(values) {
+  return [...new Set(values.filter(Boolean).map(String))];
+}
+
+function parseNoiseFileNames(changes = []) {
+  const names = [];
+  for (const line of changes) {
+    const m = String(line).match(/构建噪音：.*?\(([^)]+)\)/);
+    if (!m) continue;
+    for (const name of m[1].split(/\s*,\s*/)) names.push(name.trim());
+  }
+  return names;
+}
+
+function maxStat(notifications, field) {
+  return Math.max(0, ...notifications.map(n => Number(n.meta?.assetStats?.[field] || 0)));
+}
+
+function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
+  const titlePrefix = options.titlePrefix || "";
+  const affectedUrls = uniqueStrings(assetOnlyNotifications.map(n => n.url));
+  const substantiveFileNames = uniqueStrings(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.substantiveFileNames || []));
+  const noiseFileNames = uniqueStrings(assetOnlyNotifications.flatMap(n => parseNoiseFileNames(n.changes)));
+  const assetStats = {
+    unchanged: maxStat(assetOnlyNotifications, "unchanged"),
+    renamed: maxStat(assetOnlyNotifications, "renamed"),
+    modified: substantiveFileNames.length || maxStat(assetOnlyNotifications, "modified"),
+    added: maxStat(assetOnlyNotifications, "added"),
+    removed: maxStat(assetOnlyNotifications, "removed"),
+    noiseFiles: noiseFileNames.length || maxStat(assetOnlyNotifications, "noiseFiles"),
+    noiseCount: maxStat(assetOnlyNotifications, "noiseCount"),
+    substantiveFiles: substantiveFileNames.length || maxStat(assetOnlyNotifications, "substantiveFiles"),
+    substantiveCount: maxStat(assetOnlyNotifications, "substantiveCount"),
+    substantiveFileNames,
+    configDiffs: [],
+    vaultDiffs: [],
+    jsTextDiffs: [],
+  };
+
+  const changes = [
+    `📦 Flap 全站前端资源变更：影响页面：${affectedUrls.length} 个`,
+    "受影响页面：",
+    ...affectedUrls.map(url => `- ${url}`),
+    "",
+    substantiveFileNames.length
+      ? `去重资源文件：${substantiveFileNames.slice(0, 12).join(", ")}`
+      : "去重资源文件：未提取到明确文件名",
+    noiseFileNames.length
+      ? `构建噪音文件：${noiseFileNames.slice(0, 12).join(", ")}`
+      : "",
+    "本轮未提取到页面文案、i18n、CAstore 金库或业务配置变更；按全站资源变动合并推送，避免每个页面重复告警。",
+    "",
+    "各页面资源摘要：",
+    ...assetOnlyNotifications.map(n => `- ${n.url}: ${n.changes.filter(Boolean).join(" / ")}`),
+  ].filter(Boolean);
+
+  const content = [
+    "**结论摘要**",
+    "- 结论: 未发现业务变更，仅检测到共享前端资源更新。",
+    `- 影响页面: ${affectedUrls.length} 个`,
+    "- 处理: 已按全站资源变动合并为一条通知，避免重复刷屏。",
+    "",
+    "**影响页面**",
+    ...affectedUrls.map(url => `- [${url}](${url})`),
+    "",
+    "**资源统计**",
+    `- 修改文件（去重）: ${assetStats.modified}`,
+    `- 构建噪音: ${assetStats.noiseFiles} 文件 ${assetStats.noiseCount} 处`,
+    substantiveFileNames.length ? `- 资源文件: ${substantiveFileNames.slice(0, 8).join(", ")}` : "",
+    "",
+    "**页面明细**",
+    ...assetOnlyNotifications.map(n => `- ${n.url}: ${n.changes.filter(Boolean).join(" / ")}`),
+  ].filter(Boolean).join("\n");
+
+  return {
+    url: "https://flap.sh",
+    title: `${titlePrefix}Flap 全站前端资源变更`,
+    template: "orange",
+    changes,
+    content,
+    meta: { ...emptyFlapChangeMeta(), assetStats },
+    moduleContext: "Flap.sh 全站前端资源变更",
+    skipAi: true,
+    snapshotUpdates: assetOnlyNotifications.flatMap(n => n.snapshotUpdates || (n.snapshotUpdate ? [n.snapshotUpdate] : [])),
+  };
+}
+
+function coalesceFlapNotifications(notifications, options = {}) {
+  const result = [];
+  const assetOnly = [];
+  for (const notification of notifications || []) {
+    if (isFlapAssetOnlyNotification(notification)) assetOnly.push(notification);
+    else result.push(notification);
+  }
+  if (assetOnly.length > 0) result.push(buildSiteWideAssetNotification(assetOnly, options));
+  return result;
+}
+
+function applyBusinessPriorityTitle(notification, { titlePrefix = "" } = {}) {
+  const biz = detectBusinessPriority(notification.changes || []);
+  if (biz.hit) {
+    notification.title = `${titlePrefix}⚡ 重点变更：${biz.keywords.slice(0, 3).join("/")}`;
+    notification.template = "red";
+  }
+  return notification;
+}
+
+async function sendFlapChangeNotification(notification, { moduleContext = "Flap.sh 页面变更", diffTitle = "=== Flap.sh 详细 Diff ===", titlePrefix = "" } = {}) {
+  const n = applyBusinessPriorityTitle(notification, { titlePrefix });
+  if (n.meta.assetStats && n.meta.i18nDiffs) n.meta.assetStats.i18nDiffs = n.meta.i18nDiffs;
+  const briefingInput = buildBriefingInput(n.url, n.changes, n.meta.assetStats, n.meta.caStoreVaultDiffs);
+  const cardContent = n.content || buildCardBriefing(n.url, null, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
+  appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
+  const fullDiff = `${diffTitle}\nURL: ${n.url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${n.changes.join("\n")}`;
+  const diffFilePath = saveDiffLocally(n.title, fullDiff);
+  await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput: briefingInput, enrichFn: (summary) => {
+    return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
+  }, diffFilePath, url: n.url, skipAi: n.skipAi });
+  return n;
 }
 
 /**
@@ -777,16 +937,45 @@ function saveDetailedDiff(url, changes) {
   }
 }
 
+function countBusinessConfigDiffs(assetStats) {
+  return (assetStats?.configDiffs || []).filter(isBusinessConfigDiff).length;
+}
+
+function buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs) {
+  const summary = [];
+  if (caStoreVaultDiffs.length > 0) summary.push(`CAstore 金库 ${caStoreVaultDiffs.length} 项`);
+  if (assetStats?.vaultDiffs?.length > 0) summary.push(`Vault 配置 ${assetStats.vaultDiffs.length} 项`);
+  if ((textChanges?.length || textChangeCount || 0) > 0) summary.push(`页面文案 ${textChanges?.length || textChangeCount} 处`);
+  if ((i18nDiffs?.length || i18nChangeCount || 0) > 0) summary.push(`i18n 文案 ${i18nDiffs?.length || i18nChangeCount} 处`);
+  if (assetStats?.jsTextDiffs?.length > 0) summary.push(`功能文案 ${assetStats.jsTextDiffs.length} 处`);
+  const configCount = countBusinessConfigDiffs(assetStats);
+  if (configCount > 0) summary.push(`业务配置 ${configCount} 项`);
+  if (summary.length === 0 && assetStats) summary.push("未提取到结构化业务变更，仅有资源层变化");
+  if (summary.length === 0) summary.push("检测到页面变化");
+  return summary;
+}
+
+function truncateCardText(value, max = 180) {
+  const s = String(value || "");
+  return s.length > max ? `${s.slice(0, max)}...` : s;
+}
+
 /**
  * 构建飞书卡片简报内容。
- * 展示优先级：具体变更事实 → AI 摘要 → 资源统计。
+ * 展示优先级：结论摘要 → 重点变更 → AI/资源/详情。
  */
 function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs = []) {
   const lines = [];
 
-  lines.push(`**监控页面:** ${url}`);
+  const summary = buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs);
+  const hasBusinessChange = summary.some(s => !s.includes("未提取到结构化业务变更"));
+
+  lines.push("**结论摘要**");
+  lines.push(`- 监控页面: [${url}](${url})`);
+  lines.push(`- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`);
+  lines.push(`- 建议动作: ${hasBusinessChange ? "优先查看下方重点变更；需要完整上下文时下载 Diff。" : "先看资源统计确认是否为常规构建；需要追踪时下载 Diff。"}`);
   lines.push("");
-  lines.push("**重点变更:**");
+  lines.push("**重点变更**");
   lines.push("");
 
   let hasStructuredChange = false;
@@ -803,14 +992,14 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       } else if (d.type === "modified") {
         lines.push(`  ✏️ **${label}**`);
         if (d.oldName && d.newName && d.oldName !== d.newName) lines.push(`  名称: ${d.oldName} → ${d.newName}`);
-        lines.push(`  旧文案: ${d.oldDescription || "(空)"}`);
-        lines.push(`  新文案: ${d.newDescription || "(空)"}`);
+        lines.push(`  旧文案: ${truncateCardText(d.oldDescription || "(空)")}`);
+        lines.push(`  新文案: ${truncateCardText(d.newDescription || "(空)")}`);
       } else if (d.type === "added") {
         lines.push(`  🟢 新增金库: **${label}**`);
-        lines.push(`  文案: ${d.newDescription || "(空)"}`);
+        lines.push(`  文案: ${truncateCardText(d.newDescription || "(空)")}`);
       } else if (d.type === "removed") {
         lines.push(`  🔴 移除金库: **${label}**`);
-        lines.push(`  原文案: ${d.oldDescription || "(空)"}`);
+        lines.push(`  原文案: ${truncateCardText(d.oldDescription || "(空)")}`);
       }
     }
     lines.push("");
@@ -843,20 +1032,21 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     const added = textChanges.filter(c => c.type === "added");
     const removed = textChanges.filter(c => c.type === "removed");
     lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
-    for (const c of modified) {
+    for (const c of modified.slice(0, 6)) {
       lines.push("  ✏️ 修改");
-      lines.push(`  旧: ${c.oldText}`);
-      lines.push(`  新: ${c.newText}`);
-      if (c.ctxBefore) lines.push(`  上文: ${c.ctxBefore}`);
+      lines.push(`  旧: ${truncateCardText(c.oldText)}`);
+      lines.push(`  新: ${truncateCardText(c.newText)}`);
+      if (c.ctxBefore) lines.push(`  上文: ${truncateCardText(c.ctxBefore, 90)}`);
     }
-    for (const c of added) {
-      lines.push(`  🟢 新增: ${c.text}`);
-      if (c.ctxBefore) lines.push(`  上文: ${c.ctxBefore}`);
+    for (const c of added.slice(0, 6)) {
+      lines.push(`  🟢 新增: ${truncateCardText(c.text)}`);
+      if (c.ctxBefore) lines.push(`  上文: ${truncateCardText(c.ctxBefore, 90)}`);
     }
-    for (const c of removed) {
-      lines.push(`  🔴 删除: ${c.text}`);
-      if (c.ctxBefore) lines.push(`  上文: ${c.ctxBefore}`);
+    for (const c of removed.slice(0, 6)) {
+      lines.push(`  🔴 删除: ${truncateCardText(c.text)}`);
+      if (c.ctxBefore) lines.push(`  上文: ${truncateCardText(c.ctxBefore, 90)}`);
     }
+    if (textChanges.length > 18) lines.push(`  ... 还有 ${textChanges.length - 18} 处文案变更，查看完整 Diff。`);
     lines.push("");
   } else if (textChangeCount > 0) {
     hasStructuredChange = true;
@@ -874,21 +1064,24 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     lines.push(`**📝 UI 文案变更（i18n，共 ${i18nDiffs.length} 处）：**`);
     if (added.length > 0) {
       lines.push(`  **新增 ${added.length} 条：**`);
-      for (const d of added) {
-        lines.push(`  🟢 \`${d.key}\`: ${d.value}`);
+      for (const d of added.slice(0, 12)) {
+        lines.push(`  🟢 \`${d.key}\`: ${truncateCardText(d.value)}`);
       }
+      if (added.length > 12) lines.push(`  ... 还有 ${added.length - 12} 条新增 i18n`);
     }
     if (modified.length > 0) {
       lines.push(`  **修改 ${modified.length} 条：**`);
-      for (const d of modified) {
-        lines.push(`  ✏️ \`${d.key}\`: "${d.oldValue}" → "${d.newValue}"`);
+      for (const d of modified.slice(0, 12)) {
+        lines.push(`  ✏️ \`${d.key}\`: "${truncateCardText(d.oldValue, 90)}" → "${truncateCardText(d.newValue, 90)}"`);
       }
+      if (modified.length > 12) lines.push(`  ... 还有 ${modified.length - 12} 条修改 i18n`);
     }
     if (removed.length > 0) {
       lines.push(`  **删除 ${removed.length} 条：**`);
-      for (const d of removed) {
-        lines.push(`  🔴 \`${d.key}\`: ${d.value || "(空)"}`);
+      for (const d of removed.slice(0, 12)) {
+        lines.push(`  🔴 \`${d.key}\`: ${truncateCardText(d.value || "(空)")}`);
       }
+      if (removed.length > 12) lines.push(`  ... 还有 ${removed.length - 12} 条删除 i18n`);
     }
     lines.push("");
   } else if (i18nChangeCount > 0) {
@@ -929,16 +1122,17 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     const totalItems = paired.length + unpairedAdded.length + unpairedRemoved.length;
     if (totalItems > 0) {
       lines.push(`**💬 功能文案变更（${totalItems} 处）：**`);
-      for (const p of paired) {
-        lines.push(`  旧: ${p.oldText}`);
-        lines.push(`  新: ${p.newText}`);
+      for (const p of paired.slice(0, 8)) {
+        lines.push(`  旧: ${truncateCardText(p.oldText)}`);
+        lines.push(`  新: ${truncateCardText(p.newText)}`);
       }
-      for (const a of unpairedAdded) {
-        lines.push(`  🟢 ${a.text}`);
+      for (const a of unpairedAdded.slice(0, 8)) {
+        lines.push(`  🟢 ${truncateCardText(a.text)}`);
       }
-      for (const r of unpairedRemoved) {
-        lines.push(`  🔴 ${r.text}`);
+      for (const r of unpairedRemoved.slice(0, 8)) {
+        lines.push(`  🔴 ${truncateCardText(r.text)}`);
       }
+      if (totalItems > 24) lines.push(`  ... 还有 ${totalItems - 24} 处功能文案变更，查看完整 Diff。`);
       lines.push("");
     }
   }
@@ -958,7 +1152,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   }
 
   if (!hasStructuredChange) {
-    lines.push("未提取到结构化文案/金库/配置变更，查看下方资源统计和完整 Diff。");
+    lines.push("未提取到结构化文案/金库/配置变更，先看资源统计和完整 Diff。");
     lines.push("");
   }
 
@@ -972,13 +1166,17 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   if (assetStats) {
     lines.push("---");
     lines.push("");
+    lines.push("**资源统计**");
     const statParts = [];
     if (assetStats.modified) statParts.push(`修改 ${assetStats.modified}`);
     if (assetStats.added) statParts.push(`新增 ${assetStats.added}`);
     if (assetStats.removed) statParts.push(`移除 ${assetStats.removed}`);
     if (assetStats.renamed) statParts.push(`重命名 ${assetStats.renamed}`);
     if (assetStats.noiseFiles) statParts.push(`噪音 ${assetStats.noiseFiles} 文件`);
-    lines.push(`**资源：** ${statParts.join(" | ") || "无变化"}`);
+    lines.push(`- 概览: ${statParts.join(" | ") || "无变化"}`);
+    if (assetStats.substantiveFileNames?.length > 0) {
+      lines.push(`- 文件: ${assetStats.substantiveFileNames.slice(0, 8).join(", ")}`);
+    }
   }
 
   lines.push("");
@@ -1098,7 +1296,10 @@ function extractStrings(content, ext) {
     const selRe = /([.#][\w-]{6,})/g;
     while ((m = selRe.exec(content)) !== null) strings.add(m[0]);
   }
-  return [...strings].sort();
+  const sorted = [...strings].sort();
+  const business = sorted.filter(isBusinessAssetString);
+  const ordinary = sorted.filter(s => !isBusinessAssetString(s));
+  return uniqueStrings([...business, ...ordinary]).slice(0, CONFIG.assetStringLimit);
 }
 
 /**
@@ -1352,11 +1553,31 @@ function factoryListToMap(factories) {
   return map;
 }
 
+function buildOperationalNoticeContent({ status, url, severity = "orange", reason = "", consecutiveFailures = 0, skipped = 0, action = "", detail = "" } = {}) {
+  const lines = [
+    `**状态:** ${status || "Flap 监控状态变化"}`,
+    url ? `**影响页面:** [${url}](${url})` : "",
+    consecutiveFailures ? `**连续失败:** ${consecutiveFailures} 次` : "",
+    skipped ? `**跳过检测:** ${skipped} 次` : "",
+    reason ? `**原因:** ${reason}` : "",
+    "",
+    `**建议动作:** ${action || (severity === "yellow" ? "关注下一轮自动检测结果；如持续出现请检查抓取出口和页面结构。" : "检查监控日志和服务器出口；恢复后会自动重新比对。")}`,
+    detail ? "" : "",
+    detail || "",
+  ];
+  return lines.filter(line => line !== "").join("\n");
+}
+
 /**
  * 格式化 vault factory 变更为飞书卡片内容
  */
 function formatVaultFactoryChanges(changes) {
-  const lines = [];
+  const lines = [
+    "**结论摘要**",
+    `- 新增 ${changes.added.length} 个 / 移除 ${changes.removed.length} 个 / 修改 ${changes.modified.length} 个`,
+    `- 建议动作: ${changes.added.length > 0 ? "优先确认新增工厂是否应在 CAstore/Launch 前端可见；新增可见工厂会置顶通知。" : "检查下方配置变更是否影响前端入口或金库参数。"}`,
+    "",
+  ];
   if (changes.added.length > 0) {
     lines.push("**🆕 新增金库工厂:**");
     for (const v of changes.added) {
@@ -1374,12 +1595,14 @@ function formatVaultFactoryChanges(changes) {
       const vaultUrl = `https://flap.sh/launch?vaultfactory=${v.factory}`;
       lines.push(`  🔗 [打开金库页面](${vaultUrl})`);
     }
+    lines.push("");
   }
   if (changes.removed.length > 0) {
     lines.push("**❌ 移除金库工厂:**");
     for (const v of changes.removed) {
       lines.push(`  ~~${v.name}~~ \`${v.factory}\``);
     }
+    lines.push("");
   }
   if (changes.modified.length > 0) {
     lines.push("**✏️ 金库工厂配置变更:**");
@@ -1388,7 +1611,7 @@ function formatVaultFactoryChanges(changes) {
       for (const d of v.diffs) lines.push(`    ${d}`);
     }
   }
-  return lines.join("\n");
+  return lines.filter(Boolean).join("\n");
 }
 
 function buildVaultFactoryChangeTitle(changes, prefix = "") {
@@ -1434,7 +1657,7 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh") {
             filename,
             contentHash: md5(content),
             size: content.length,
-            strings: extractStrings(content, ext).slice(0, 200),
+            strings: extractStrings(content, ext),
             ext,
           };
           // 对含 Vault 关键词的 JS 文件提取结构化配置
@@ -1666,8 +1889,8 @@ function normalizeVaultName(name) {
 function isCaStoreVaultHeading(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-  if (/^(hot vaults|ca store|home|store|ai oracle|rank|profile|create|search|support|docs|debox)$/i.test(t)) return false;
-  return /vault|stocks|lista|custom vault factory|split/i.test(t);
+  if (/^(hot vaults|热门金库|熱門金庫|ca store|home|store|ai oracle|rank|profile|create|search|support|docs|debox)$/i.test(t)) return false;
+  return /vault|金库|金庫|stocks|lista|custom vault factory|split|分红|分紅|质押|質押|燃烧|燃燒|回购|回購|稅收|税收/i.test(t);
 }
 
 function isCaStoreAreaHeading(text) {
@@ -1675,7 +1898,7 @@ function isCaStoreAreaHeading(text) {
   if (!t) return false;
   if (isCaStoreVaultHeading(t)) return false;
   if (/^(home|store|rank|profile|create|search|support|docs|debox)$/i.test(t)) return false;
-  return /vaults|store|featured|official|popular|hot/i.test(t);
+  return /vaults|store|featured|official|popular|hot|热门金库|熱門金庫/i.test(t);
 }
 
 function cleanVaultDescription(text) {
@@ -2522,6 +2745,7 @@ async function runCheck() {
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
   let hasDetectedChange = false;
   let hasNotifiedChange = false;
+  const notifications = [];
 
   // 并行抓取所有页面
   const tasks = CONFIG.urls.map((url, i) => sleep(i * 300).then(async () => {
@@ -2584,7 +2808,14 @@ async function runCheck() {
         hasDetectedChange = true;
         const sent = await sendFeishu(
           "Flap 基线已修复",
-          `${formatQualityIssue(url, oldQuality)}\n\n当前抓取样本有效，已重建基线；本次不按页面文案变更推送，避免旧坏快照造成误报。`,
+          buildOperationalNoticeContent({
+            status: "Flap 基线已修复",
+            url,
+            severity: "yellow",
+            reason: oldQuality.reasons.join("; "),
+            action: "已用当前有效页面重建基线；本次不按页面文案变更推送，避免旧坏快照造成误报。",
+            detail: formatQualityIssue(url, oldQuality),
+          }),
           "yellow"
         );
         if (sent) {
@@ -2602,23 +2833,14 @@ async function runCheck() {
         saveHtmlSnapshot(url, html);
         // 保存详细 diff 到文件
         saveDetailedDiff(url, changes);
-        // 检测业务优先级
-        const biz = detectBusinessPriority(changes);
-        const title = biz.hit ? `⚡ 手动检测 — 重点变更：${biz.keywords.slice(0, 3).join("/")}` : "手动检测 — 页面变更";
-        // 构建精简 AI 输入 → 先推裸卡片 → 异步 AI 补充
-        // 桥接 i18nDiffs 到 assetStats，让 buildBriefingInput 能访问完整文案列表
-        if (meta.assetStats && meta.i18nDiffs) meta.assetStats.i18nDiffs = meta.i18nDiffs;
-        const briefingInput = buildBriefingInput(url, changes, meta.assetStats, meta.caStoreVaultDiffs);
-        const cardContent = buildCardBriefing(url, null, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges, meta.caStoreVaultDiffs);
-        appendHistory("flap-page", title, cardContent.slice(0, 300), changes.join("\n"));
-        const fullDiff = `=== Flap.sh 手动检测详细 Diff ===\nURL: ${url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${changes.join("\n")}`;
-        const diffFilePath = saveDiffLocally(title, fullDiff);
-        await sendNotificationMaybeAi({ title, content: cardContent, template: "red", moduleContext: `Flap.sh 页面变更 ${url}`, aiInput: briefingInput, enrichFn: (summary) => {
-          return buildCardBriefing(url, summary, meta.assetStats, meta.textChangeCount, meta.i18nChangeCount, meta.i18nDiffs, meta.textChanges, meta.caStoreVaultDiffs);
-        }, diffFilePath, url });
-        hasNotifiedChange = true;
-        snapshot.pages[key] = features;
-        snapshot.pages[key].originalUrl = url;
+        notifications.push({
+          url,
+          changes,
+          meta,
+          title: "手动检测 — 页面变更",
+          template: "red",
+          snapshotUpdate: { key, features: { ...features, originalUrl: url } },
+        });
       } else {
         if (shouldRefreshDerivedFeatureBaseline(oldFeatures, features)) {
           snapshot.pages[key] = features;
@@ -2629,6 +2851,17 @@ async function runCheck() {
         }
       }
     } catch (err) { log(`  [失败] ${url} — ${err.message}`); }
+  }
+  for (const n of coalesceFlapNotifications(notifications, { titlePrefix: "手动检测 — " })) {
+    await sendFlapChangeNotification(n, { moduleContext: `Flap.sh 手动检测 ${n.url}`, diffTitle: "=== Flap.sh 手动检测详细 Diff ===", titlePrefix: "手动检测 — " });
+    const updates = [
+      ...(n.snapshotUpdates || []),
+      ...(n.snapshotUpdate ? [n.snapshotUpdate] : []),
+    ];
+    for (const update of updates) {
+      snapshot.pages[update.key] = update.features;
+    }
+    hasNotifiedChange = true;
   }
   saveSnapshot(snapshot);
   if (hasDetectedChange) {
@@ -2722,11 +2955,19 @@ async function startMonitor() {
       const notifications = [];
 
       const applyNotificationSnapshotUpdate = (notification) => {
-        if (!notification?.snapshotUpdate) return false;
-        const { key, features } = notification.snapshotUpdate;
-        snapshot.pages[key] = features;
-        saveSnapshot(snapshot);
-        return true;
+        const updates = [
+          ...(notification?.snapshotUpdates || []),
+          ...(notification?.snapshotUpdate ? [notification.snapshotUpdate] : []),
+        ];
+        let changed = false;
+        for (const update of updates) {
+          if (!update) continue;
+          const { key, features } = update;
+          snapshot.pages[key] = features;
+          changed = true;
+        }
+        if (changed) saveSnapshot(snapshot);
+        return changed;
       };
 
       // 并行抓取所有页面（加错开延迟），每个 task 携带自身 url/key，确保失败时也能归因
@@ -2758,7 +2999,14 @@ async function startMonitor() {
             log(`[错误] ${url} 连续 ${fc.count} 次失败：${error.message}`);
             notifications.push({
               title: "页面请求失败",
-              content: `**URL:** ${url}\n**连续失败:** ${fc.count} 次\n**错误:** ${error.message}`,
+              content: buildOperationalNoticeContent({
+                status: "页面请求失败",
+                url,
+                severity: "orange",
+                reason: error.message,
+                consecutiveFailures: fc.count,
+                action: "检查服务器出口、HTTP 状态和目标页面可达性；恢复后会自动重新比对。",
+              }),
               template: "orange",
               isRecoveryNotice: true,
             });
@@ -2804,6 +3052,14 @@ async function startMonitor() {
               changes: [`退避恢复：此前因风控跳过 ${skipped} 次检测，退避期间的中间状态变更可能未被捕获`],
               meta: { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [] },
               title: `⚠ 退避恢复：${url}`,
+              content: buildOperationalNoticeContent({
+                status: "退避恢复",
+                url,
+                severity: "yellow",
+                skipped,
+                reason: "此前触发 403/429/退避，本轮已完成全量比对。",
+                action: "关注本轮是否同时出现页面变更；退避期间的中间状态可能无法逐次还原。",
+              }),
               template: "yellow",
               isRecoveryNotice: true,
             });
@@ -2862,6 +3118,14 @@ async function startMonitor() {
               ],
               meta: { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [] },
               title: "Flap 基线已修复",
+              content: buildOperationalNoticeContent({
+                status: "Flap 基线已修复",
+                url,
+                severity: "yellow",
+                reason: oldQuality.reasons.join("; "),
+                action: "已重建基线；本次不按页面文案变更推送。",
+                detail: formatQualityIssue(url, oldQuality),
+              }),
               template: "yellow",
               isRecoveryNotice: true,
               snapshotUpdate: { key, features },
@@ -2902,7 +3166,14 @@ async function startMonitor() {
             log(`[错误] ${url} 处理失败 ${fc.count} 次：${err.message}`);
             notifications.push({
               title: err.pageQuality ? "页面样本无效" : "页面处理失败",
-              content: `**URL:** ${url}\n**连续失败:** ${fc.count} 次\n**错误:** ${err.message}`,
+              content: buildOperationalNoticeContent({
+                status: err.pageQuality ? "页面样本无效" : "页面处理失败",
+                url,
+                severity: "orange",
+                reason: err.message,
+                consecutiveFailures: fc.count,
+                action: err.pageQuality ? "检查抓取到的 HTML 是否为错误页/风控页；恢复后会自动重试。" : "检查页面解析逻辑和最近资源结构变更。",
+              }),
               template: "orange",
               isRecoveryNotice: true,
             });
@@ -2910,9 +3181,10 @@ async function startMonitor() {
         }
       }
 
-      if (notifications.length > 0) {
-        for (let ni = 0; ni < notifications.length; ni++) {
-          const n = notifications[ni];
+      const notificationsToSend = coalesceFlapNotifications(notifications);
+      if (notificationsToSend.length > 0) {
+        for (let ni = 0; ni < notificationsToSend.length; ni++) {
+          const n = notificationsToSend[ni];
 
           // 退避恢复通知直接发送，不需要 AI 分析
           if (n.isRecoveryNotice) {
@@ -2922,26 +3194,7 @@ async function startMonitor() {
             continue;
           }
 
-          // AI 已异步化，无需在通知间等待
-
-          // 检测业务优先级
-          const biz = detectBusinessPriority(n.changes);
-          if (biz.hit) {
-            n.title = `⚡ 重点变更：${biz.keywords.slice(0, 3).join("/")}`;
-            n.template = "red";
-          }
-
-          // 构建精简 AI 输入 → 先推裸卡片 → 异步 AI 补充
-          // 桥接 i18nDiffs 到 assetStats
-          if (n.meta.assetStats && n.meta.i18nDiffs) n.meta.assetStats.i18nDiffs = n.meta.i18nDiffs;
-          const briefingInput = buildBriefingInput(n.url, n.changes, n.meta.assetStats, n.meta.caStoreVaultDiffs);
-          const cardContent = buildCardBriefing(n.url, null, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
-          appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
-          const fullDiff = `=== Flap.sh 详细 Diff ===\nURL: ${n.url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${n.changes.join("\n")}`;
-          const diffFilePath = saveDiffLocally(n.title, fullDiff);
-          await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: "Flap.sh 页面变更", aiInput: briefingInput, enrichFn: (summary) => {
-            return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
-          }, diffFilePath, url: n.url });
+          await sendFlapChangeNotification(n);
           applyNotificationSnapshotUpdate(n);
         }
       }
@@ -3078,21 +3331,23 @@ async function startMonitor() {
 
 const command = process.argv[2];
 
-if (command === "check") {
-  runCheck().then(() => process.exit(0)).catch((err) => { log(`检测异常：${err.message}`); process.exit(1); });
-} else if (command === "help" || command === "-h" || command === "--help") {
-  console.log(`用法:
+if (!IS_TEST_MODE) {
+  if (command === "check") {
+    runCheck().then(() => process.exit(0)).catch((err) => { log(`检测异常：${err.message}`); process.exit(1); });
+  } else if (command === "help" || command === "-h" || command === "--help") {
+    console.log(`用法:
   node monitor.mjs          启动持续监控（守护进程模式）
   node monitor.mjs check    手动触发一次检测
   node monitor.mjs help     显示帮助
 
 信号:
   kill -USR1 <PID>           立即触发一次检测`);
-} else {
-  startMonitor().catch(err => {
-    log(`监控启动异常：${err.message}`);
-    process.exit(1);
-  });
+  } else {
+    startMonitor().catch(err => {
+      log(`监控启动异常：${err.message}`);
+      process.exit(1);
+    });
+  }
 }
 
 // ── 优雅退出：等待通知队列排空 ──
@@ -3106,9 +3361,30 @@ async function gracefulShutdown(signal) {
   try { saveSnapshot(loadSnapshot() || {}); } catch {}
   process.exit(0);
 }
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+if (!IS_TEST_MODE) {
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+}
 
-process.on("unhandledRejection", (err) => {
-  log(`[未捕获异常] ${err?.message || err}`);
-});
+export const __testables = {
+  CONFIG,
+  emptyFlapChangeMeta,
+  isFlapAssetOnlyNotification,
+  buildSiteWideAssetNotification,
+  coalesceFlapNotifications,
+  applyBusinessPriorityTitle,
+  diffFeatures,
+  diffFrontendAssets,
+  extractPageFeatures,
+  extractStrings,
+  buildBriefingInput,
+  buildCardBriefing,
+  buildOperationalNoticeContent,
+  formatVaultFactoryChanges,
+};
+
+if (!IS_TEST_MODE) {
+  process.on("unhandledRejection", (err) => {
+    log(`[未捕获异常] ${err?.message || err}`);
+  });
+}
