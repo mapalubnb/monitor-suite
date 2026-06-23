@@ -330,6 +330,61 @@ test("site-wide asset card leads with no business-change conclusion", () => {
   assert(notification.content.indexOf("影响页面") < notification.content.indexOf("页面明细"));
 });
 
+test("site-wide asset-only notification is not promoted by negative business words", () => {
+  const notification = __testables.buildSiteWideAssetNotification([
+    {
+      url: "https://flap.sh/bnb/CAstore",
+      changes: ["📦 前端资源变更： 不变 28 | 修改 2"],
+      meta: {
+        assetStats: { unchanged: 28, renamed: 0, modified: 2, added: 0, removed: 0, noiseFiles: 0, noiseCount: 0, substantiveFiles: 1, substantiveCount: 2, substantiveFileNames: ["webpack-167217394b1418fd.js"] },
+      },
+      snapshotUpdate: { key: "castore", features: {} },
+    },
+  ]);
+
+  assert.match(notification.changes.join("\n"), /CAstore 金库/);
+  __testables.applyBusinessPriorityTitle(notification);
+
+  assert.equal(notification.title, "Flap 全站前端资源变更");
+  assert.equal(notification.template, "orange");
+});
+
+test("site-wide asset card summarizes runtime resources without raw webpack fragments", () => {
+  const notification = __testables.buildSiteWideAssetNotification([
+    {
+      url: "https://flap.sh/bnb/CAstore",
+      changes: [
+        "📦 前端资源变更： 不变 28 | 修改 2",
+        "📝 webpack-fcd3cb604bdd2e6d.js → webpack-167217394b1418fd.js (46 处实质变更 + 4 噪音已过滤)",
+        "  - !=typeof trustedTypes&&trustedTypes.createPolicy&&(d=trustedTypes.createPolicy(",
+        "  - ),t=0;t",
+      ],
+      meta: {
+        assetStats: { unchanged: 28, renamed: 0, modified: 2, added: 0, removed: 0, noiseFiles: 0, noiseCount: 0, substantiveFiles: 2, substantiveCount: 46, substantiveFileNames: ["8101-706af7c3a9ce2627.js", "webpack-167217394b1418fd.js"] },
+      },
+      snapshotUpdate: { key: "castore", features: {} },
+    },
+    {
+      url: "https://flap.sh/launch",
+      changes: [
+        "📦 前端资源变更： 不变 28 | 修改 2",
+        "📝 webpack-fcd3cb604bdd2e6d.js → webpack-167217394b1418fd.js (46 处实质变更 + 4 噪音已过滤)",
+        "  - !=typeof trustedTypes&&trustedTypes.createPolicy&&(d=trustedTypes.createPolicy(",
+      ],
+      meta: {
+        assetStats: { unchanged: 28, renamed: 0, modified: 2, added: 0, removed: 0, noiseFiles: 0, noiseCount: 0, substantiveFiles: 2, substantiveCount: 46, substantiveFileNames: ["8101-706af7c3a9ce2627.js", "webpack-167217394b1418fd.js"] },
+      },
+      snapshotUpdate: { key: "launch", features: {} },
+    },
+  ]);
+
+  assert.match(notification.content, /资源语义摘要/);
+  assert.match(notification.content, /webpack runtime\/bootstrap/);
+  assert.match(notification.content, /共享应用 chunk/);
+  assert.doesNotMatch(notification.content, /trustedTypes|t=0;t/);
+  assert.doesNotMatch(notification.content, /!=typeof/);
+});
+
 test("vault factory card summarizes counts before details", () => {
   const content = __testables.formatVaultFactoryChanges({
     added: [{ name: "Gift Vault", factory: "0xabc", showInCAStore: true, ai: false, enabled: true, constraints: { min: 1 } }],

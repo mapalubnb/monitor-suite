@@ -652,6 +652,86 @@ function maxStat(notifications, field) {
   return Math.max(0, ...notifications.map(n => Number(n.meta?.assetStats?.[field] || 0)));
 }
 
+function extractAssetFileNamesFromChanges(changes = []) {
+  const names = [];
+  const fileRe = /[\w.-]+\.(?:js|css)\b/g;
+  for (const line of changes || []) {
+    for (const match of String(line || "").matchAll(fileRe)) names.push(match[0]);
+  }
+  return uniqueStrings(names);
+}
+
+function classifyAssetFileName(filename) {
+  const name = String(filename || "").split("/").pop();
+  if (!name) return "other";
+  if (/^webpack-[a-f0-9]+\.js$/i.test(name)) return "runtime";
+  if (/^(framework|main|polyfills|app|runtime)-/i.test(name)) return "runtime";
+  if (/\.css$/i.test(name)) return "style";
+  if (/^\d+-[a-f0-9]+\.js$/i.test(name)) return "shared";
+  if (/\.js$/i.test(name)) return "script";
+  return "other";
+}
+
+function summarizeBusinessSignals(assetStats = {}) {
+  const parts = [];
+  const configCount = (assetStats.configDiffs || []).filter(isBusinessConfigDiff).length;
+  if ((assetStats.jsTextDiffs || []).length > 0) parts.push(`功能文案 ${assetStats.jsTextDiffs.length} 处`);
+  if (configCount > 0) parts.push(`业务配置 ${configCount} 项`);
+  if ((assetStats.vaultDiffs || []).length > 0) parts.push(`Vault 配置 ${assetStats.vaultDiffs.length} 项`);
+  return parts;
+}
+
+function buildResourceSemanticSummary(assetStats, notifications = []) {
+  const files = uniqueStrings([
+    ...(assetStats?.substantiveFileNames || []),
+    ...notifications.flatMap(n => extractAssetFileNamesFromChanges(n.changes)),
+  ]);
+  const grouped = {
+    runtime: files.filter(f => classifyAssetFileName(f) === "runtime"),
+    shared: files.filter(f => classifyAssetFileName(f) === "shared"),
+    script: files.filter(f => classifyAssetFileName(f) === "script"),
+    style: files.filter(f => classifyAssetFileName(f) === "style"),
+  };
+  const businessSignals = summarizeBusinessSignals(assetStats);
+  const lines = [];
+  if (grouped.runtime.length > 0) {
+    lines.push(`- webpack runtime/bootstrap: ${grouped.runtime.length} 文件，运行时代码或 chunk 加载器更新；原始 minified 片段已移入下载 Diff。`);
+  }
+  if (grouped.shared.length > 0) {
+    lines.push(`- 共享应用 chunk: ${grouped.shared.length} 文件，已完成业务文案/配置提取。`);
+  }
+  if (grouped.script.length > 0) {
+    lines.push(`- 页面/业务脚本 chunk: ${grouped.script.length} 文件，已完成结构化信号提取。`);
+  }
+  if (grouped.style.length > 0) {
+    lines.push(`- 样式资源: ${grouped.style.length} 文件。`);
+  }
+  lines.push(businessSignals.length > 0
+    ? `- 结构化业务信号: ${businessSignals.join("、")}。`
+    : "- 结构化业务信号: 当前提取未发现 UI 文案、业务配置、Vault/Factory 或合约相关变化。");
+  return lines;
+}
+
+function summarizePageAssetChange(notification) {
+  const assetStats = notification.meta?.assetStats || {};
+  const files = uniqueStrings([
+    ...(assetStats.substantiveFileNames || []),
+    ...extractAssetFileNamesFromChanges(notification.changes),
+  ]);
+  const runtimeFiles = files.filter(f => classifyAssetFileName(f) === "runtime");
+  const sharedFiles = files.filter(f => classifyAssetFileName(f) === "shared");
+  const scriptFiles = files.filter(f => classifyAssetFileName(f) === "script");
+  const styleFiles = files.filter(f => classifyAssetFileName(f) === "style");
+  const parts = [];
+  if (runtimeFiles.length > 0) parts.push(`webpack runtime/bootstrap ${runtimeFiles.join(", ")}：运行时代码更新，原始片段已隐藏`);
+  if (sharedFiles.length > 0) parts.push(`共享应用 chunk ${sharedFiles.join(", ")}：已做业务信号提取`);
+  if (scriptFiles.length > 0) parts.push(`页面/业务脚本 ${scriptFiles.join(", ")}：已做结构化信号提取`);
+  if (styleFiles.length > 0) parts.push(`样式资源 ${styleFiles.join(", ")}`);
+  const signals = summarizeBusinessSignals(assetStats);
+  parts.push(signals.length > 0 ? `业务信号 ${signals.join("、")}` : "未发现结构化业务信号");
+  return `${notification.url}: ${parts.join("；")}`;
+}
+
 function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   const titlePrefix = options.titlePrefix || "";
   const affectedUrls = uniqueStrings(assetOnlyNotifications.map(n => n.url));
@@ -677,6 +757,8 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     vaultDiffs,
     jsTextDiffs,
   };
+  const resourceSemanticLines = buildResourceSemanticSummary(assetStats, assetOnlyNotifications);
+  const pageSemanticLines = assetOnlyNotifications.map(n => `- ${summarizePageAssetChange(n)}`);
 
   const changes = [
     `📦 Flap 全站前端资源变更：影响页面：${affectedUrls.length} 个`,
@@ -703,7 +785,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     ...vaultDiffs.map(vd => `  ${vd.type || "changed"}: ${vd.name || JSON.stringify(vd)}`),
     "",
     "各页面资源摘要：",
-    ...assetOnlyNotifications.map(n => `- ${n.url}: ${n.changes.filter(Boolean).join(" / ")}`),
+    ...pageSemanticLines,
   ].filter(Boolean);
 
   const contentLines = [
@@ -716,6 +798,9 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     "",
     "**影响页面**",
     ...affectedUrls.map(url => `- [${url}](${url})`),
+    "",
+    "**资源语义摘要**",
+    ...resourceSemanticLines,
     "",
     hasBusinessResourceDiffs ? "**重点变更**" : "",
     jsTextDiffs.length > 0 ? `**💬 功能文案变更（${jsTextDiffs.length} 处）：**` : "",
@@ -738,7 +823,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     substantiveFileNames.length ? `- 资源文件: ${substantiveFileNames.slice(0, 8).join(", ")}` : "",
     "",
     "**页面明细**",
-    ...assetOnlyNotifications.map(n => `- ${n.url}: ${n.changes.filter(Boolean).join(" / ")}`),
+    ...pageSemanticLines,
   ];
 
   const fullDiffLines = [
@@ -768,7 +853,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     meta: { ...emptyFlapChangeMeta(), assetStats, fullDiffLines },
     moduleContext: "Flap.sh 全站前端资源变更",
     skipAi: !hasBusinessResourceDiffs,
-    skipBusinessPriorityTitle: hasBusinessResourceDiffs,
+    skipBusinessPriorityTitle: true,
     snapshotUpdates: assetOnlyNotifications.flatMap(n => n.snapshotUpdates || (n.snapshotUpdate ? [n.snapshotUpdate] : [])),
   };
 }
