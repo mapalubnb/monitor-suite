@@ -660,7 +660,7 @@ function ensureFrontendRouteState(data) {
 }
 
 function routeDecisionTs(item = {}) {
-  return Number(item.updatedAt || item.approvedAt || item.ignoredAt || item.notifiedAt || item.lastSeenAt || item.firstSeenAt || 0);
+  return Number(item.updatedAt || item.approvedAt || item.ignoredAt || item.failedDiscoveryAt || item.notifiedAt || item.lastSeenAt || item.firstSeenAt || 0);
 }
 
 function mergeRouteDecisionMap(target, source) {
@@ -8768,6 +8768,7 @@ export const __testables = {
   isDiscoverableFrontendUrl,
   isSuppressedDiscoveredFrontendUrl,
   recordFailedDiscoveredFrontendUrls,
+  mergeRouteDecisionMap,
   getFrontendRouteDecision,
   setSnapshotForTests,
   discoverFrontendUrlsFromPages,
