@@ -670,8 +670,17 @@ function mergeRouteDecisionMap(target, source) {
     const canonical = canonicalFrontendUrl(sourceValue?.url || rawUrl);
     if (!canonical || !sourceValue || typeof sourceValue !== "object") continue;
     const targetValue = target[canonical];
-    if (!targetValue || routeDecisionTs(sourceValue) >= routeDecisionTs(targetValue)) {
-      target[canonical] = { ...targetValue, ...sourceValue, url: canonical };
+    const nextValue = { ...targetValue, ...sourceValue, url: canonical };
+    if (!targetValue) {
+      target[canonical] = nextValue;
+      changed = true;
+      continue;
+    }
+    const sourceTs = routeDecisionTs(sourceValue);
+    const targetTs = routeDecisionTs(targetValue);
+    if (sourceTs < targetTs) continue;
+    if (sourceTs > targetTs || !jsonEqual(nextValue, targetValue)) {
+      target[canonical] = nextValue;
       changed = true;
     }
   }

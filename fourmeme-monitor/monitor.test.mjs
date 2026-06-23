@@ -330,6 +330,19 @@ test("failed discovered frontend URL state wins over older discovery history", (
   assert.equal(target[url].lastFailureStatus, 404);
 });
 
+test("unchanged frontend route state is not reported as a merged change", () => {
+  const url = `https://four.meme/zh-TW/codex-unchanged-route-${Date.now()}`;
+  const target = {
+    [url]: { url, firstSeenAt: 1000, lastSeenAt: 2000, failedDiscoveryAt: 5000, lastFailureStatus: 404 },
+  };
+  const before = structuredClone(target);
+  const source = {
+    [url]: { ...target[url] },
+  };
+  assert.equal(__testables.mergeRouteDecisionMap(target, source), false);
+  assert.deepEqual(target, before);
+});
+
 test("diffRoutes suppresses small remove-only SSR jitter", () => {
   const diff = __testables.diffRoutes(["/zh-TW/create-token", "/zh-TW/advanced"], ["/zh-TW/create-token"]);
   assert.deepEqual(diff, { added: [], removed: [] });
