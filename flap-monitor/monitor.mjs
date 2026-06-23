@@ -379,6 +379,7 @@ function emptyFlapChangeMeta() {
     i18nChangeCount: 0,
     i18nDiffs: [],
     caStoreVaultDiffs: [],
+    fullDiffLines: [],
   };
 }
 
@@ -572,6 +573,67 @@ function isFlapAssetOnlyNotification(notification) {
   return true;
 }
 
+function hasFlapPageLevelChange(notification) {
+  const meta = notification?.meta || {};
+  if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return true;
+  if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return true;
+  if (hasItems(meta.caStoreVaultDiffs)) return true;
+  return false;
+}
+
+function isSharedResourceChangeCandidate(notification) {
+  if (!notification || notification.isRecoveryNotice || notification.content) return false;
+  const assetStats = notification.meta?.assetStats;
+  if (!assetStats || hasFlapPageLevelChange(notification)) return false;
+  if (hasItems(assetStats.configDiffs)) return true;
+  if (hasItems(assetStats.vaultDiffs)) return true;
+  if (hasItems(assetStats.jsTextDiffs)) return true;
+  return detectBusinessPriority(notification.changes || []).hit;
+}
+
+function stableForCompare(value) {
+  if (Array.isArray(value)) {
+    return value.map(stableForCompare).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
+  }
+  if (value && typeof value === "object") {
+    const out = {};
+    for (const key of Object.keys(value).sort()) out[key] = stableForCompare(value[key]);
+    return out;
+  }
+  return value;
+}
+
+function stableKey(value) {
+  return JSON.stringify(stableForCompare(value));
+}
+
+function uniqueRecords(records = []) {
+  const seen = new Set();
+  const out = [];
+  for (const record of records || []) {
+    const key = stableKey(record);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(record);
+  }
+  return out;
+}
+
+function resourceChangeFingerprint(notification) {
+  const assetStats = notification.meta?.assetStats || {};
+  const hasStructuredResourceDiff = hasItems(assetStats.configDiffs) || hasItems(assetStats.vaultDiffs) || hasItems(assetStats.jsTextDiffs);
+  const detailLines = (notification.changes || [])
+    .map(line => String(line || "").trim())
+    .filter(line => line && !line.startsWith("📦 前端资源变更") && !line.startsWith("🔇 构建噪音"));
+  return stableKey({
+    files: hasStructuredResourceDiff ? [] : (assetStats.substantiveFileNames || []),
+    configDiffs: assetStats.configDiffs || [],
+    vaultDiffs: assetStats.vaultDiffs || [],
+    jsTextDiffs: assetStats.jsTextDiffs || [],
+    fallbackDetails: hasStructuredResourceDiff ? [] : detailLines,
+  });
+}
+
 function uniqueStrings(values) {
   return [...new Set(values.filter(Boolean).map(String))];
 }
@@ -595,6 +657,11 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   const affectedUrls = uniqueStrings(assetOnlyNotifications.map(n => n.url));
   const substantiveFileNames = uniqueStrings(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.substantiveFileNames || []));
   const noiseFileNames = uniqueStrings(assetOnlyNotifications.flatMap(n => parseNoiseFileNames(n.changes)));
+  const configDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.configDiffs || []));
+  const vaultDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.vaultDiffs || []));
+  const jsTextDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.jsTextDiffs || []));
+  const businessConfigDiffs = configDiffs.filter(isBusinessConfigDiff);
+  const hasBusinessResourceDiffs = businessConfigDiffs.length > 0 || vaultDiffs.length > 0 || jsTextDiffs.length > 0;
   const assetStats = {
     unchanged: maxStat(assetOnlyNotifications, "unchanged"),
     renamed: maxStat(assetOnlyNotifications, "renamed"),
@@ -606,9 +673,9 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     substantiveFiles: substantiveFileNames.length || maxStat(assetOnlyNotifications, "substantiveFiles"),
     substantiveCount: maxStat(assetOnlyNotifications, "substantiveCount"),
     substantiveFileNames,
-    configDiffs: [],
-    vaultDiffs: [],
-    jsTextDiffs: [],
+    configDiffs,
+    vaultDiffs,
+    jsTextDiffs,
   };
 
   const changes = [
@@ -622,21 +689,49 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     noiseFileNames.length
       ? `构建噪音文件：${noiseFileNames.slice(0, 12).join(", ")}`
       : "",
-    "本轮未提取到页面文案、i18n、CAstore 金库或业务配置变更；按全站资源变动合并推送，避免每个页面重复告警。",
+    hasBusinessResourceDiffs
+      ? "本轮变更来自多页面共享前端资源，未提取到页面文案、i18n 或 CAstore 金库级差异；按全站资源变动合并推送，避免每个页面重复告警。"
+      : "本轮未提取到页面文案、i18n、CAstore 金库或业务配置变更；按全站资源变动合并推送，避免每个页面重复告警。",
+    jsTextDiffs.length > 0 ? "" : "",
+    jsTextDiffs.length > 0 ? `功能文案变更：${jsTextDiffs.length} 处` : "",
+    ...jsTextDiffs.map(d => `  ${d.type === "removed" ? "-" : "+"} ${d.text} (${d.file || "unknown"})`),
+    businessConfigDiffs.length > 0 ? "" : "",
+    businessConfigDiffs.length > 0 ? `配置变更：${businessConfigDiffs.length} 项` : "",
+    ...businessConfigDiffs.map(cd => `  ${cd.field}: ${cd.oldVal} → ${cd.newVal} (${cd.file || "unknown"})`),
+    vaultDiffs.length > 0 ? "" : "",
+    vaultDiffs.length > 0 ? `Vault 配置变更：${vaultDiffs.length} 项` : "",
+    ...vaultDiffs.map(vd => `  ${vd.type || "changed"}: ${vd.name || JSON.stringify(vd)}`),
     "",
     "各页面资源摘要：",
     ...assetOnlyNotifications.map(n => `- ${n.url}: ${n.changes.filter(Boolean).join(" / ")}`),
   ].filter(Boolean);
 
-  const content = [
+  const contentLines = [
     "**结论摘要**",
-    "- 结论: 未发现业务变更，仅检测到共享前端资源更新。",
+    hasBusinessResourceDiffs
+      ? "- 结论: 检测到共享前端资源中的功能文案/配置变更，已按全站前端资源变更聚合为一条通知。"
+      : "- 结论: 未发现业务变更，仅检测到共享前端资源更新。",
     `- 影响页面: ${affectedUrls.length} 个`,
-    "- 处理: 已按全站资源变动合并为一条通知，避免重复刷屏。",
+    "- 聚合: 同一批共享资源变更已合并，避免重复刷屏。",
     "",
     "**影响页面**",
     ...affectedUrls.map(url => `- [${url}](${url})`),
     "",
+    hasBusinessResourceDiffs ? "**重点变更**" : "",
+    jsTextDiffs.length > 0 ? `**💬 功能文案变更（${jsTextDiffs.length} 处）：**` : "",
+    ...jsTextDiffs.map(d => `  ${d.type === "removed" ? "🔴" : "🟢"} ${truncateCardText(d.text)}${d.file ? ` (${d.file})` : ""}`),
+    businessConfigDiffs.length > 0 ? `**🔧 配置变更（${businessConfigDiffs.length} 项）：**` : "",
+    ...businessConfigDiffs.map(cd => `  \`${cd.field}\`: ${cd.oldVal} → ${cd.newVal}${cd.file ? ` (${cd.file})` : ""}`),
+    vaultDiffs.length > 0 ? `**🏦 Vault 配置变更（${vaultDiffs.length} 项）：**` : "",
+    ...vaultDiffs.map(vd => `  ${vd.type || "changed"}: ${vd.name || JSON.stringify(vd)}`),
+    hasBusinessResourceDiffs ? "" : "",
+    hasBusinessResourceDiffs ? "---" : "",
+    hasBusinessResourceDiffs ? "" : "",
+    hasBusinessResourceDiffs ? "**AI 分析:**" : "",
+    hasBusinessResourceDiffs ? "AI 分析异步生成中，变更已先推送。" : "",
+    hasBusinessResourceDiffs ? "" : "",
+    hasBusinessResourceDiffs ? "---" : "",
+    hasBusinessResourceDiffs ? "" : "",
     "**资源统计**",
     `- 修改文件（去重）: ${assetStats.modified}`,
     `- 构建噪音: ${assetStats.noiseFiles} 文件 ${assetStats.noiseCount} 处`,
@@ -644,7 +739,25 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     "",
     "**页面明细**",
     ...assetOnlyNotifications.map(n => `- ${n.url}: ${n.changes.filter(Boolean).join(" / ")}`),
-  ].filter(Boolean).join("\n");
+  ];
+
+  const fullDiffLines = [
+    "【Flap 全站前端资源变更】",
+    `影响页面: ${affectedUrls.length} 个`,
+    ...affectedUrls.map(url => `- ${url}`),
+    "",
+    substantiveFileNames.length ? `资源文件: ${substantiveFileNames.join(", ")}` : "资源文件: 未提取到明确文件名",
+    noiseFileNames.length ? `构建噪音文件: ${noiseFileNames.join(", ")}` : "",
+    "",
+    ...assetOnlyNotifications.flatMap((n) => {
+      const lines = [`【页面明细】${n.url}`];
+      if (n.meta?.fullDiffLines?.length) lines.push(...n.meta.fullDiffLines);
+      else lines.push(...(n.changes || []));
+      return lines.concat("");
+    }),
+  ].filter(line => line !== "");
+
+  const content = contentLines.filter(Boolean).join("\n");
 
   return {
     url: "https://flap.sh",
@@ -652,9 +765,10 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     template: "orange",
     changes,
     content,
-    meta: { ...emptyFlapChangeMeta(), assetStats },
+    meta: { ...emptyFlapChangeMeta(), assetStats, fullDiffLines },
     moduleContext: "Flap.sh 全站前端资源变更",
-    skipAi: true,
+    skipAi: !hasBusinessResourceDiffs,
+    skipBusinessPriorityTitle: hasBusinessResourceDiffs,
     snapshotUpdates: assetOnlyNotifications.flatMap(n => n.snapshotUpdates || (n.snapshotUpdate ? [n.snapshotUpdate] : [])),
   };
 }
@@ -662,15 +776,28 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
 function coalesceFlapNotifications(notifications, options = {}) {
   const result = [];
   const assetOnly = [];
+  const sharedResourceGroups = new Map();
   for (const notification of notifications || []) {
-    if (isFlapAssetOnlyNotification(notification)) assetOnly.push(notification);
-    else result.push(notification);
+    if (isFlapAssetOnlyNotification(notification)) {
+      assetOnly.push(notification);
+    } else if (isSharedResourceChangeCandidate(notification)) {
+      const key = resourceChangeFingerprint(notification);
+      if (!sharedResourceGroups.has(key)) sharedResourceGroups.set(key, []);
+      sharedResourceGroups.get(key).push(notification);
+    } else {
+      result.push(notification);
+    }
+  }
+  for (const group of sharedResourceGroups.values()) {
+    if (group.length > 1) result.push(buildSiteWideAssetNotification(group, options));
+    else result.push(...group);
   }
   if (assetOnly.length > 0) result.push(buildSiteWideAssetNotification(assetOnly, options));
   return result;
 }
 
 function applyBusinessPriorityTitle(notification, { titlePrefix = "" } = {}) {
+  if (notification.skipBusinessPriorityTitle) return notification;
   const biz = detectBusinessPriority(notification.changes || []);
   if (biz.hit) {
     notification.title = `${titlePrefix}⚡ 重点变更：${biz.keywords.slice(0, 3).join("/")}`;
@@ -679,15 +806,38 @@ function applyBusinessPriorityTitle(notification, { titlePrefix = "" } = {}) {
   return notification;
 }
 
+function enrichExistingCardContentWithAi(content, summary) {
+  const placeholder = "AI 分析异步生成中，变更已先推送。";
+  if (String(content || "").includes(placeholder)) {
+    return String(content).replace(placeholder, summary);
+  }
+  return `${content}\n\n---\n\n**AI 分析:**\n${summary}`;
+}
+
+function buildFlapFullDiff({ diffTitle = "=== Flap.sh 详细 Diff ===", url = "", changes = [], meta = {} } = {}) {
+  const detailLines = Array.isArray(meta?.fullDiffLines) && meta.fullDiffLines.length > 0
+    ? meta.fullDiffLines
+    : changes;
+  return [
+    diffTitle,
+    `URL: ${url}`,
+    `时间: ${ts()}`,
+    "=".repeat(50),
+    "",
+    ...(detailLines || []),
+  ].join("\n");
+}
+
 async function sendFlapChangeNotification(notification, { moduleContext = "Flap.sh 页面变更", diffTitle = "=== Flap.sh 详细 Diff ===", titlePrefix = "" } = {}) {
   const n = applyBusinessPriorityTitle(notification, { titlePrefix });
   if (n.meta.assetStats && n.meta.i18nDiffs) n.meta.assetStats.i18nDiffs = n.meta.i18nDiffs;
   const briefingInput = buildBriefingInput(n.url, n.changes, n.meta.assetStats, n.meta.caStoreVaultDiffs);
   const cardContent = n.content || buildCardBriefing(n.url, null, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
   appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
-  const fullDiff = `${diffTitle}\nURL: ${n.url}\n时间: ${ts()}\n${"=".repeat(50)}\n\n${n.changes.join("\n")}`;
+  const fullDiff = buildFlapFullDiff({ diffTitle, url: n.url, changes: n.changes, meta: n.meta });
   const diffFilePath = saveDiffLocally(n.title, fullDiff);
   await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput: briefingInput, enrichFn: (summary) => {
+    if (n.content) return enrichExistingCardContentWithAi(n.content, summary);
     return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
   }, diffFilePath, url: n.url, skipAi: n.skipAi });
   return n;
@@ -973,7 +1123,6 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   lines.push("**结论摘要**");
   lines.push(`- 监控页面: [${url}](${url})`);
   lines.push(`- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`);
-  lines.push(`- 建议动作: ${hasBusinessChange ? "优先查看下方重点变更；需要完整上下文时下载 Diff。" : "先看资源统计确认是否为常规构建；需要追踪时下载 Diff。"}`);
   lines.push("");
   lines.push("**重点变更**");
   lines.push("");
@@ -1159,7 +1308,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   lines.push("---");
   lines.push("");
   lines.push("**AI 分析:**");
-  lines.push(aiSummary || "AI 分析中，稍后自动更新。");
+  lines.push(aiSummary || "AI 分析异步生成中，变更已先推送。");
   lines.push("");
 
   // ═══ 6. 资源统计（最后，最不重要）═══
@@ -1553,15 +1702,14 @@ function factoryListToMap(factories) {
   return map;
 }
 
-function buildOperationalNoticeContent({ status, url, severity = "orange", reason = "", consecutiveFailures = 0, skipped = 0, action = "", detail = "" } = {}) {
+function buildOperationalNoticeContent({ status, url, severity = "orange", reason = "", consecutiveFailures = 0, skipped = 0, detail = "" } = {}) {
   const lines = [
     `**状态:** ${status || "Flap 监控状态变化"}`,
     url ? `**影响页面:** [${url}](${url})` : "",
     consecutiveFailures ? `**连续失败:** ${consecutiveFailures} 次` : "",
     skipped ? `**跳过检测:** ${skipped} 次` : "",
     reason ? `**原因:** ${reason}` : "",
-    "",
-    `**建议动作:** ${action || (severity === "yellow" ? "关注下一轮自动检测结果；如持续出现请检查抓取出口和页面结构。" : "检查监控日志和服务器出口；恢复后会自动重新比对。")}`,
+    severity ? `**级别:** ${severity}` : "",
     detail ? "" : "",
     detail || "",
   ];
@@ -1575,7 +1723,6 @@ function formatVaultFactoryChanges(changes) {
   const lines = [
     "**结论摘要**",
     `- 新增 ${changes.added.length} 个 / 移除 ${changes.removed.length} 个 / 修改 ${changes.modified.length} 个`,
-    `- 建议动作: ${changes.added.length > 0 ? "优先确认新增工厂是否应在 CAstore/Launch 前端可见；新增可见工厂会置顶通知。" : "检查下方配置变更是否影响前端入口或金库参数。"}`,
     "",
   ];
   if (changes.added.length > 0) {
@@ -2424,6 +2571,98 @@ function diffTextContent(oldText, newText) {
   return { changes, reordered: false };
 }
 
+function buildAssetFullDiffLines({ assetDiff, substantiveFiles, noiseOnlyFiles, allConfigDiffs, vaultDiffs }) {
+  const lines = ["【前端资源完整 Diff】"];
+  const statParts = [];
+  if (assetDiff.unchanged) statParts.push(`不变 ${assetDiff.unchanged}`);
+  if (assetDiff.renamed) statParts.push(`重命名 ${assetDiff.renamed}`);
+  if (assetDiff.matched.length) statParts.push(`修改 ${assetDiff.matched.length}`);
+  if (assetDiff.added.length) statParts.push(`新增 ${assetDiff.added.length}`);
+  if (assetDiff.removed.length) statParts.push(`移除 ${assetDiff.removed.length}`);
+  lines.push(`资源统计: ${statParts.join(" | ") || "无变化"}`);
+
+  if (allConfigDiffs.length > 0) {
+    lines.push("");
+    lines.push("【配置参数完整变更】");
+    for (const cd of allConfigDiffs) lines.push(`${cd.field}: ${cd.oldVal} → ${cd.newVal} (${cd.file || "unknown"})`);
+  }
+
+  if (vaultDiffs.length > 0) {
+    lines.push("");
+    lines.push("【Vault 配置完整变更】");
+    for (const vd of vaultDiffs) {
+      if (vd.type === "modified") {
+        lines.push(`${vd.name} - 修改 ${vd.fieldChanges.length} 个字段`);
+        for (const fc of vd.fieldChanges) lines.push(`  ${fc.key}: ${fc.oldVal} → ${fc.newVal}`);
+      } else if (vd.type === "added") {
+        lines.push(`${vd.name} - 新增`);
+        for (const [key, value] of Object.entries(vd.fields || {})) lines.push(`  ${key}: ${value}`);
+      } else {
+        lines.push(`${vd.type || "changed"}: ${vd.name || JSON.stringify(vd)}`);
+      }
+    }
+  }
+
+  if (substantiveFiles.length > 0) {
+    lines.push("");
+    lines.push("【资源字符串完整变更】");
+    for (const m of substantiveFiles) {
+      const label = m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`;
+      lines.push(`文件: ${label}`);
+      if (m.totalNoise > 0) lines.push(`噪音过滤: ${m.totalNoise} 处`);
+      for (const s of m.realRemoved) lines.push(`  - ${s}`);
+      for (const s of m.realAdded) lines.push(`  + ${s}`);
+      lines.push("");
+    }
+  }
+
+  if (noiseOnlyFiles.length > 0) {
+    lines.push("【构建噪音】");
+    for (const f of noiseOnlyFiles) lines.push(`${f.label}: ${f.noise} 处`);
+  }
+  if (assetDiff.added.length > 0) {
+    lines.push("");
+    lines.push("【新增资源文件】");
+    for (const f of assetDiff.added) lines.push(`+ ${f}`);
+  }
+  if (assetDiff.removed.length > 0) {
+    lines.push("");
+    lines.push("【移除资源文件】");
+    for (const f of assetDiff.removed) lines.push(`- ${f}`);
+  }
+  return lines.filter(line => line !== "");
+}
+
+function appendTextFullDiffLines(target, textDiff) {
+  target.push("【页面文案完整 Diff】");
+  if (textDiff.reordered) {
+    target.push("页面文案顺序/标点调整，内容未发生实质变更");
+    return;
+  }
+  for (const c of textDiff.changes || []) {
+    if (c.type === "modified") {
+      target.push("修改:");
+      target.push(`  旧: ${c.oldText}`);
+      target.push(`  新: ${c.newText}`);
+    } else if (c.type === "added") {
+      target.push(`新增: ${c.text}`);
+    } else if (c.type === "removed") {
+      target.push(`删除: ${c.text}`);
+    }
+    if (c.ctxBefore) target.push(`  上文: ${c.ctxBefore}`);
+    if (c.ctxAfter) target.push(`  下文: ${c.ctxAfter}`);
+  }
+}
+
+function appendI18nFullDiffLines(target, i18nDiff) {
+  target.push("【UI 文案 i18n 完整 Diff】");
+  for (const c of i18nDiff || []) {
+    if (c.type === "modified") target.push(`${c.key}: "${c.oldValue}" → "${c.newValue}"`);
+    else if (c.type === "added") target.push(`新增 ${c.key}: "${c.value}"`);
+    else if (c.type === "removed") target.push(`删除 ${c.key}: "${c.value}"`);
+  }
+}
+
 function flattenKeys(obj, prefix = "", result = {}) {
   if (obj === null || obj === undefined) return result;
   if (typeof obj !== "object") { result[prefix] = typeof obj; return result; }
@@ -2434,7 +2673,7 @@ function flattenKeys(obj, prefix = "", result = {}) {
 
 function diffFeatures(oldF, newF) {
   const changes = [];
-  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [], caStoreVaultDiffs: [] };
+  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [], caStoreVaultDiffs: [], fullDiffLines: [] };
 
   if (oldF.nextDataHash && newF.nextDataHash && oldF.nextDataHash !== newF.nextDataHash) {
     changes.push("页面数据（__NEXT_DATA__）变更");
@@ -2445,6 +2684,9 @@ function diffFeatures(oldF, newF) {
       const removed = oldKeys.filter(k => !newKeys.includes(k));
       if (added.length) changes.push(`  新增字段：${added.slice(0, 10).join(", ")}`);
       if (removed.length) changes.push(`  移除字段：${removed.slice(0, 10).join(", ")}`);
+      meta.fullDiffLines.push("【页面数据 __NEXT_DATA__ 完整 Diff】");
+      for (const key of added) meta.fullDiffLines.push(`+ ${key}`);
+      for (const key of removed) meta.fullDiffLines.push(`- ${key}`);
     }
   }
 
@@ -2454,6 +2696,8 @@ function diffFeatures(oldF, newF) {
     if (caStoreVaultDiffs.length > 0) {
       meta.caStoreVaultDiffs = caStoreVaultDiffs;
       changes.push(...formatCaStoreVaultDiffsForChanges(caStoreVaultDiffs));
+      meta.fullDiffLines.push("【CAstore 金库完整 Diff】");
+      meta.fullDiffLines.push(...formatCaStoreVaultDiffsForChanges(caStoreVaultDiffs));
     }
   }
 
@@ -2541,6 +2785,13 @@ function diffFeatures(oldF, newF) {
         vaultDiffs,
         jsTextDiffs,
       };
+      meta.fullDiffLines.push(...buildAssetFullDiffLines({
+        assetDiff,
+        substantiveFiles,
+        noiseOnlyFiles,
+        allConfigDiffs,
+        vaultDiffs,
+      }));
 
       // ── 详细 diff 输出（存文件用）──
       const statParts = [];
@@ -2604,15 +2855,22 @@ function diffFeatures(oldF, newF) {
       const removed = [...oldSet].filter(f => !newSet.has(f));
       if (added.length) changes.push(`  新增：${added.slice(0, 5).map(f => f.split("/").pop()).join(", ")}`);
       if (removed.length) changes.push(`  移除：${removed.slice(0, 5).map(f => f.split("/").pop()).join(", ")}`);
+      meta.fullDiffLines.push("【前端资源文件完整 Diff】");
+      for (const f of added) meta.fullDiffLines.push(`+ ${f}`);
+      for (const f of removed) meta.fullDiffLines.push(`- ${f}`);
     }
   }
   if (oldF.contentHash && newF.contentHash && oldF.contentHash !== newF.contentHash) {
     const textDiff = diffTextContent(oldF.textContent, newF.textContent);
     if (textDiff) {
-      if (textDiff.reordered) { changes.push("页面文案顺序/标点调整（内容不变）"); }
+      if (textDiff.reordered) {
+        changes.push("页面文案顺序/标点调整（内容不变）");
+        appendTextFullDiffLines(meta.fullDiffLines, textDiff);
+      }
       else {
         meta.textChangeCount = textDiff.changes.length;
         meta.textChanges = textDiff.changes;
+        appendTextFullDiffLines(meta.fullDiffLines, textDiff);
         const truncSeg = (s, max = 120) => s && s.length > max ? s.slice(0, max) + "…" : s;
         for (const c of textDiff.changes.slice(0, 20)) {
           const ctx = c.ctxBefore ? `  上文: ${truncSeg(c.ctxBefore, 60)}` : "";
@@ -2638,6 +2896,7 @@ function diffFeatures(oldF, newF) {
     if (i18nDiff.length > 0) {
       meta.i18nChangeCount = i18nDiff.length;
       meta.i18nDiffs = i18nDiff;
+      appendI18nFullDiffLines(meta.fullDiffLines, i18nDiff);
       changes.push("📝 UI 文案（i18n）变更：");
       for (const c of i18nDiff.slice(0, 30)) {
         if (c.type === "modified") { changes.push(`  ✏️ ${c.key}: "${(c.oldValue.length > 60 ? c.oldValue.slice(0, 60) + "…" : c.oldValue)}" → "${(c.newValue.length > 60 ? c.newValue.slice(0, 60) + "…" : c.newValue)}"`); }
@@ -2651,6 +2910,8 @@ function diffFeatures(oldF, newF) {
     const keyCount = Object.keys(newF.i18nStrings).length;
     meta.i18nChangeCount = keyCount;
     changes.push(`📝 i18n 国际化字符串首次检测到：${keyCount} 条翻译`);
+    meta.fullDiffLines.push("【UI 文案 i18n 首次检测】");
+    for (const [key, value] of Object.entries(newF.i18nStrings)) meta.fullDiffLines.push(`${key}: ${value}`);
   }
   return { changes, meta };
 }
@@ -3381,6 +3642,7 @@ export const __testables = {
   buildCardBriefing,
   buildOperationalNoticeContent,
   formatVaultFactoryChanges,
+  buildFlapFullDiff,
 };
 
 if (!IS_TEST_MODE) {

@@ -144,6 +144,54 @@ test("asset notifications containing business keywords stay page-level", () => {
   assert.equal(grouped[0].url, "https://flap.sh/bnb/CAstore");
 });
 
+test("shared business resource diffs across pages are coalesced into one site-wide notification", () => {
+  const sharedMeta = {
+    assetStats: {
+      unchanged: 28,
+      renamed: 2,
+      modified: 2,
+      added: 0,
+      removed: 0,
+      noiseFiles: 0,
+      noiseCount: 0,
+      substantiveFiles: 2,
+      substantiveCount: 10,
+      substantiveFileNames: ["8101-025ad0379fc93d08.js", "webpack-fcd3cb604bdd2e6d.js"],
+      configDiffs: [
+        { field: "fees", oldVal: "(新增)", newVal: "void", file: "8101-025ad0379fc93d08.js" },
+        { field: "maxFeePerGas", oldVal: "(新增)", newVal: "void", file: "8101-025ad0379fc93d08.js" },
+      ],
+      vaultDiffs: [],
+      jsTextDiffs: [
+        { type: "added", text: "Create an account and generate a wallet", file: "8101-025ad0379fc93d08.js" },
+      ],
+    },
+    textChangeCount: 0,
+    textChanges: [],
+    i18nChangeCount: 0,
+    i18nDiffs: [],
+    caStoreVaultDiffs: [],
+  };
+  const notifications = ["https://flap.sh/bnb/CAstore", "https://flap.sh/create", "https://flap.sh/launch"].map((url, i) => ({
+    url,
+    title: "Flap 页面变更",
+    template: "red",
+    changes: ["📦 前端资源变更： 不变 28 | 重命名 2 | 修改 2", "🔧 配置参数变更：", "  fees: (新增) → void"],
+    meta: JSON.parse(JSON.stringify(sharedMeta)),
+    snapshotUpdate: { key: `p${i}`, features: { marker: i } },
+  }));
+
+  const grouped = __testables.coalesceFlapNotifications(notifications);
+
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].title, "Flap 全站前端资源变更");
+  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.match(grouped[0].content, /功能文案变更/);
+  assert.match(grouped[0].content, /配置变更/);
+  assert.equal(grouped[0].skipBusinessPriorityTitle, true);
+  assert.equal(grouped[0].snapshotUpdates.length, 3);
+});
+
 test("CAstore Chinese vault headings are extracted as structured vault sections", () => {
   const html = `
     <main>
@@ -261,7 +309,8 @@ test("page change card puts summary and important copy before resource details",
   assert(content.startsWith("**结论摘要**"));
   assert(content.indexOf("**重点变更**") < content.indexOf("**资源统计**"));
   assert(content.indexOf("禮物稅收金庫") < content.indexOf("vault-page.js"));
-  assert.match(content, /建议动作/);
+  assert.doesNotMatch(content, /建议动作/);
+  assert.match(content, /AI 分析异步生成中，变更已先推送/);
 });
 
 test("site-wide asset card leads with no business-change conclusion", () => {
@@ -300,10 +349,29 @@ test("operational notice card is readable and action oriented", () => {
     severity: "orange",
     reason: "HTTP 403",
     consecutiveFailures: 3,
-    action: "检查服务器出口是否被限制；恢复后会自动全量比对。",
   });
 
   assert(content.startsWith("**状态:** 页面请求失败"));
-  assert.match(content, /\*\*建议动作:\*\*/);
-  assert(content.indexOf("HTTP 403") < content.indexOf("建议动作"));
+  assert.doesNotMatch(content, /建议动作/);
+  assert.match(content, /HTTP 403/);
+});
+
+test("full diff uses detailed lines without summary truncation", () => {
+  const diff = __testables.buildFlapFullDiff({
+    diffTitle: "=== Flap.sh 详细 Diff ===",
+    url: "https://flap.sh",
+    changes: ["📝 chunk.js (20 处实质变更)", "  ... 还有 12 处新增"],
+    meta: {
+      fullDiffLines: [
+        "【前端资源完整 Diff】",
+        "文件: chunk.js",
+        "+ long added string 001",
+        "+ long added string 020",
+      ],
+    },
+  });
+
+  assert.match(diff, /long added string 001/);
+  assert.match(diff, /long added string 020/);
+  assert.doesNotMatch(diff, /\.\.\. 还有 12 处新增/);
 });
