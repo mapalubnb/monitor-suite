@@ -194,6 +194,12 @@ const CONFIG = {
       /^\/v\d+\/resolve-ens$/i,
     ],
   },
+  frontendStaticIndex: {
+    enabled: readBoolEnv("FOURMEME_FRONTEND_STATIC_INDEX", true),
+    maxAssets: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_ASSETS", 400),
+    maxRounds: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_ROUNDS", 2),
+    maxNewAssetsPerRun: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_NEW_ASSETS_PER_RUN", 80),
+  },
   apiProbeStaggerMs: readNonNegativeIntEnv("FOURMEME_API_PROBE_STAGGER_MS", 200),
   hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 80),
 
@@ -2961,6 +2967,21 @@ function partitionI18nChangesByPageVisibility(changes, oldText = "", newText = "
   return { visible, resourceOnly };
 }
 
+function i18nChangeValue(change) {
+  if (!change) return "";
+  if (change.type === "modified") return change.newValue ?? change.value ?? "";
+  return change.value ?? change.newValue ?? "";
+}
+
+function i18nNamespace(key = "") {
+  const parts = String(key || "").split(".").filter(Boolean);
+  return parts[0] || "global";
+}
+
+function namespaceLabel(namespace = "") {
+  return namespace || "global";
+}
+
 function i18nChangeSignature(changes) {
   const payload = (changes || []).map(c => ({
     type: c.type,
@@ -3035,6 +3056,468 @@ function addGlobalI18nResourceChange(groups, page, changes) {
   }
 }
 
+function normalizeGlobalI18nResourceGroup(group = {}) {
+  const changes = group.changes || [];
+  const namespaceSet = new Set(changes.map(c => i18nNamespace(c.key)).filter(Boolean));
+  const namespaces = [...namespaceSet].sort();
+  return {
+    signature: group.signature || i18nChangeSignature(changes),
+    namespaces,
+    primaryNamespace: namespaces.length === 1 ? namespaces[0] : "mixed",
+    changes,
+    pages: compactFrontendUrlList(group.pages || []),
+  };
+}
+
+function globalI18nWatchKey(group = {}) {
+  const normalized = normalizeGlobalI18nResourceGroup(group);
+  if (!normalized.signature) return "";
+  return `${normalized.primaryNamespace}:${normalized.signature}`;
+}
+
+function ensureGlobalI18nResourceWatchState(state = snapshot) {
+  if (!state._globalI18nResourceWatch) state._globalI18nResourceWatch = {};
+  return state._globalI18nResourceWatch;
+}
+
+function mergeGlobalI18nPages(existingPages = [], nextPages = []) {
+  const byKey = new Map();
+  for (const page of [...existingPages, ...nextPages]) {
+    const key = page?.key || canonicalFrontendUrl(page?.url || "") || page?.label || "";
+    if (!key) continue;
+    byKey.set(key, {
+      key,
+      label: page.label || urlLabel(page.url || key),
+      url: page.url || "",
+    });
+  }
+  return [...byKey.values()];
+}
+
+function registerGlobalI18nResourceWatch(state, group) {
+  const watch = ensureGlobalI18nResourceWatchState(state);
+  const normalized = normalizeGlobalI18nResourceGroup(group);
+  const watchKey = globalI18nWatchKey(normalized);
+  if (!watchKey) return { item: null, isNew: false, changed: false };
+
+  const now = Date.now();
+  const prev = watch[watchKey];
+  const item = {
+    ...(prev || {}),
+    key: watchKey,
+    signature: normalized.signature,
+    namespaces: normalized.namespaces,
+    primaryNamespace: normalized.primaryNamespace,
+    changes: normalized.changes,
+    pages: mergeGlobalI18nPages(prev?.pages || [], normalized.pages),
+    status: prev?.status || "pending",
+    firstSeenAt: prev?.firstSeenAt || now,
+    lastSeenAt: now,
+    lastCheckedAt: prev?.lastCheckedAt || 0,
+    resourceNotifiedAt: prev?.resourceNotifiedAt || 0,
+    confirmedAt: prev?.confirmedAt || 0,
+    confirmationNotifiedAt: prev?.confirmationNotifiedAt || 0,
+    evidence: prev?.evidence || [],
+  };
+  watch[watchKey] = item;
+  return { item, isNew: !prev, changed: true };
+}
+
+function globalI18nWatchKeywords(item = {}) {
+  const namespaces = item.namespaces?.length ? item.namespaces : [item.primaryNamespace].filter(Boolean);
+  const keys = (item.changes || []).map(c => c.key).filter(Boolean);
+  const values = (item.changes || []).map(i18nChangeValue).filter(i18nValueIsSearchable);
+  return {
+    namespaces,
+    keys,
+    values,
+    sampleValues: values.slice(0, 8),
+  };
+}
+
+function routeMatchesGlobalI18nWatch(route, item) {
+  const normalized = normalizeRouteString(route).toLowerCase();
+  if (!normalized) return false;
+  return globalI18nWatchKeywords(item).namespaces.some(ns => ns && normalized.includes(ns.toLowerCase()));
+}
+
+function assetStringsMatchGlobalI18nWatch(strings = [], item) {
+  const text = strings.join("\n");
+  if (!text) return null;
+  const lowerText = text.toLowerCase();
+  const { namespaces, keys, sampleValues } = globalI18nWatchKeywords(item);
+  const namespaceHits = namespaces.filter(ns => ns && lowerText.includes(ns.toLowerCase()));
+  const keyHits = keys.filter(key => lowerText.includes(String(key).toLowerCase())).slice(0, 5);
+  const valueHits = sampleValues.filter(value => normalizeI18nSearchText(text).includes(normalizeI18nSearchText(value))).slice(0, 5);
+  if (namespaceHits.length > 0 && (keyHits.length > 0 || valueHits.length > 0)) {
+    return { namespaceHits, keyHits, valueHits };
+  }
+  return null;
+}
+
+function detectGlobalI18nResourceEvidence(item, pages = {}) {
+  const evidence = [];
+  const seen = new Set();
+
+  function addEvidence(type, page, detail, strength = "strong") {
+    const url = page?.originalUrl || "";
+    const key = `${type}:${canonicalFrontendUrl(url)}:${detail}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    evidence.push({
+      type,
+      strength,
+      pageLabel: url ? urlLabel(url) : "未知页面",
+      url,
+      detail,
+      detectedAt: Date.now(),
+    });
+  }
+
+  for (const page of Object.values(pages || {})) {
+    if (!page) continue;
+    const pageText = page.textContent || "";
+    for (const change of item.changes || []) {
+      if (isI18nChangeVisibleOnPage(change, "", pageText)) {
+        addEvidence("visible_text", page, `${change.key}: ${frontendDisplaySnippet(i18nChangeValue(change), 100)}`, "strong");
+      }
+    }
+    for (const route of page.routes || []) {
+      if (routeMatchesGlobalI18nWatch(route, item)) {
+        const type = isApiOrEndpointRoute(route) ? "api_endpoint" : "route";
+        addEvidence(type, page, route, type === "route" ? "strong" : "medium");
+      }
+    }
+    const allStrings = [];
+    for (const data of Object.values(page.assetContents || {})) {
+      if (Array.isArray(data?.strings)) allStrings.push(...data.strings);
+    }
+    const assetHit = assetStringsMatchGlobalI18nWatch(allStrings, item);
+    if (assetHit) {
+      const parts = [];
+      if (assetHit.namespaceHits.length) parts.push(`namespace=${assetHit.namespaceHits.join(",")}`);
+      if (assetHit.keyHits.length) parts.push(`keys=${assetHit.keyHits.join(",")}`);
+      if (assetHit.valueHits.length) parts.push(`values=${assetHit.valueHits.map(v => frontendDisplaySnippet(v, 50)).join(" | ")}`);
+      addEvidence("asset_usage", page, parts.join("; "), "medium");
+    }
+  }
+
+  return evidence;
+}
+
+function isGlobalI18nResourceEvidenceSufficient(evidence = []) {
+  return evidence.some(e => e.strength === "strong" || e.type === "api_endpoint");
+}
+
+function buildGlobalI18nResourceConfirmNotification(item) {
+  const namespace = namespaceLabel(item.primaryNamespace);
+  const evidence = item.evidence || [];
+  const strongCount = evidence.filter(e => e.strength === "strong").length;
+  const elapsedMin = item.firstSeenAt ? Math.max(0, Math.round((Date.now() - item.firstSeenAt) / 60_000)) : 0;
+  const lines = [
+    `**类型：全局 i18n 资源上线确认**`,
+    `命名空间：\`${namespace}\``,
+    `资源首次发现：${item.firstSeenAt ? new Date(item.firstSeenAt).toLocaleString("zh-CN", { hour12: false }) : "未知"}`,
+    `确认耗时：${elapsedMin} 分钟`,
+    "",
+    `**确认依据：** ${evidence.length} 条（强证据 ${strongCount} 条）`,
+  ];
+  for (const e of evidence.slice(0, 12)) {
+    const label = e.url ? `[${e.pageLabel}](${e.url})` : e.pageLabel;
+    const typeLabel = {
+      visible_text: "页面可见文案",
+      route: "可访问路由信号",
+      api_endpoint: "API 端点信号",
+      static_asset: "静态资源代码信号",
+      static_route: "静态资源路由信号",
+      asset_usage: "JS 资源使用信号",
+    }[e.type] || e.type;
+    lines.push(`- ${typeLabel}：${label} — ${e.detail}`);
+  }
+  if (evidence.length > 12) lines.push(`- ... 还有 ${evidence.length - 12} 条依据`);
+  lines.push("");
+  lines.push(formatI18nChanges((item.changes || []).slice(0, 30)));
+
+  const fullDiff = buildFullDiffText(
+    `${namespace} i18n 资源上线确认`,
+    null,
+    null,
+    null,
+    null,
+    [],
+    null,
+    null,
+    CONFIG.siteUrl,
+    item.changes || [],
+    { i18nTitle: `${namespace} i18n 资源上线确认`, affectedPages: item.pages || [] },
+  );
+
+  return {
+    title: `前端功能上线确认：${namespace}`,
+    content: lines.join("\n"),
+    template: "red",
+    fullDiff,
+    url: CONFIG.siteUrl,
+    pageLabel: `${namespace} 上线确认`,
+    dedupeKey: `frontend:i18n-resource-confirmed:${item.key}`,
+  };
+}
+
+function confirmGlobalI18nResourceWatches(state, pages = {}) {
+  const watch = ensureGlobalI18nResourceWatchState(state);
+  const notifications = [];
+  let changed = false;
+  const now = Date.now();
+  for (const item of Object.values(watch)) {
+    if (!item || item.status === "confirmed") continue;
+    item.lastCheckedAt = now;
+    const evidence = [
+      ...detectGlobalI18nResourceEvidence(item, pages),
+      ...detectGlobalI18nStaticEvidence(item, state),
+    ];
+    if (!isGlobalI18nResourceEvidenceSufficient(evidence)) {
+      if (evidence.length > 0) item.evidence = evidence;
+      changed = true;
+      continue;
+    }
+    item.status = "confirmed";
+    item.confirmedAt = item.confirmedAt || now;
+    item.evidence = evidence;
+    changed = true;
+    if (!item.confirmationNotifiedAt) {
+      item.confirmationNotifiedAt = now;
+      notifications.push(buildGlobalI18nResourceConfirmNotification(item));
+    }
+  }
+  return { notifications, changed };
+}
+
+function pendingGlobalI18nResourceWatches(state = snapshot) {
+  return Object.values(ensureGlobalI18nResourceWatchState(state))
+    .filter(item => item && item.status !== "confirmed");
+}
+
+function canonicalStaticAssetPath(value = "") {
+  const raw = String(value || "").split("?")[0].replace(/^\/+/, "");
+  if (/^static\/.+\.(?:js|css)$/i.test(raw)) {
+    return `/_next/${raw}`;
+  }
+  try {
+    const url = new URL(value, CONFIG.siteUrl);
+    if (url.origin !== CONFIG.siteUrl) return "";
+    if (!/^\/_next\/static\/.+\.(?:js|css)$/i.test(url.pathname)) return "";
+    return url.pathname;
+  } catch {
+    const path = String(value || "").split("?")[0];
+    return /^\/_next\/static\/.+\.(?:js|css)$/i.test(path) ? path : "";
+  }
+}
+
+function staticAssetUrl(path = "") {
+  const canonical = canonicalStaticAssetPath(path);
+  return canonical ? CONFIG.siteUrl + canonical : "";
+}
+
+function extractStaticAssetPathsFromText(text = "") {
+  const paths = new Set();
+  const re = /(?:https?:\/\/four\.meme)?((?:\/_next\/)?static\/[^"'<>)\s\\]+?\.(?:js|css))(?:\?[^"'<>)\s\\]*)?/gi;
+  let m;
+  while ((m = re.exec(String(text || ""))) !== null) {
+    const path = canonicalStaticAssetPath(m[1]);
+    if (path) paths.add(path);
+  }
+  return [...paths];
+}
+
+function staticAssetKind(path = "") {
+  if (/\/_next\/static\/[^/]+\/_buildManifest\.js$/i.test(path)) return "build-manifest";
+  if (/\/_next\/static\/[^/]+\/_ssgManifest\.js$/i.test(path)) return "ssg-manifest";
+  if (/\/_next\/static\/chunks\/app\//i.test(path)) return "app-chunk";
+  if (/\/_next\/static\/chunks\//i.test(path)) return "chunk";
+  if (/\/_next\/static\/css\//i.test(path)) return "css";
+  return "asset";
+}
+
+function extractRouteLikeStringsFromStaticStrings(strings = []) {
+  return [...new Set((strings || [])
+    .map(s => normalizeRouteString(s).split("?")[0])
+    .filter(route => isTrackableRouteString(route) || isApiOrEndpointRoute(route))
+  )].sort();
+}
+
+function buildStaticAssetSummary(path, data = {}) {
+  const strings = Array.isArray(data.strings) ? data.strings : [];
+  return {
+    path,
+    url: data.url || staticAssetUrl(path),
+    kind: staticAssetKind(path),
+    contentHash: data.contentHash || "",
+    size: data.size || 0,
+    strings,
+    routes: extractRouteLikeStringsFromStaticStrings(strings),
+    discoveredAt: Date.now(),
+  };
+}
+
+function mergeStaticAssetIndexFromPages(state, pages = {}) {
+  if (!CONFIG.frontendStaticIndex.enabled) return false;
+  if (!state._frontendStaticIndex) state._frontendStaticIndex = { assets: {}, lastUpdatedAt: 0 };
+  const index = state._frontendStaticIndex;
+  if (!index.assets) index.assets = {};
+  let changed = false;
+
+  for (const page of Object.values(pages || {})) {
+    for (const path of page.assetFiles || []) {
+      const canonical = canonicalStaticAssetPath(path);
+      if (!canonical) continue;
+      const data = page.assetContents?.[canonical] || page.assetContents?.[path] || {};
+      const summary = buildStaticAssetSummary(canonical, data);
+      const prev = index.assets[canonical];
+      if (!prev || prev.contentHash !== summary.contentHash || prev.size !== summary.size) {
+        index.assets[canonical] = {
+          ...prev,
+          ...summary,
+          seenOnPages: mergeGlobalI18nPages(prev?.seenOnPages || [], [{ key: canonicalFrontendUrl(page.originalUrl), label: urlLabel(page.originalUrl), url: page.originalUrl }]),
+          lastSeenAt: Date.now(),
+        };
+        changed = true;
+      } else {
+        const seenOnPages = mergeGlobalI18nPages(prev.seenOnPages || [], [{ key: canonicalFrontendUrl(page.originalUrl), label: urlLabel(page.originalUrl), url: page.originalUrl }]);
+        if (seenOnPages.length !== (prev.seenOnPages || []).length) {
+          prev.seenOnPages = seenOnPages;
+          prev.lastSeenAt = Date.now();
+          changed = true;
+        }
+      }
+    }
+  }
+  if (changed) index.lastUpdatedAt = Date.now();
+  return changed;
+}
+
+function collectStaticAssetExpansionPaths(state, pages = {}) {
+  if (!CONFIG.frontendStaticIndex.enabled) return [];
+  const index = state._frontendStaticIndex || { assets: {} };
+  const known = new Set(Object.keys(index.assets || {}));
+  for (const page of Object.values(pages || {})) {
+    for (const path of page.assetFiles || []) {
+      const canonical = canonicalStaticAssetPath(path);
+      if (canonical) known.add(canonical);
+    }
+  }
+
+  const candidates = [];
+  const addCandidate = (path) => {
+    const canonical = canonicalStaticAssetPath(path);
+    if (!canonical || known.has(canonical)) return;
+    known.add(canonical);
+    candidates.push(canonical);
+  };
+
+  for (const page of Object.values(pages || {})) {
+    for (const path of page.assetFiles || []) {
+      const canonical = canonicalStaticAssetPath(path);
+      if (!canonical) continue;
+      if (/\/_next\/static\/chunks\/(?:webpack|framework|main|app|pages)\b/i.test(canonical)) {
+        for (const data of Object.values(page.assetContents || {})) {
+          for (const discovered of extractStaticAssetPathsFromText((data?.strings || []).join("\n"))) {
+            addCandidate(discovered);
+          }
+        }
+      }
+    }
+    for (const discovered of extractStaticAssetPathsFromText(page.html || "")) addCandidate(discovered);
+  }
+
+  for (const asset of Object.values(index.assets || {})) {
+    for (const discovered of extractStaticAssetPathsFromText((asset.strings || []).join("\n"))) addCandidate(discovered);
+  }
+
+  const buildIds = new Set();
+  for (const path of known) {
+    const m = path.match(/^\/_next\/static\/([^/]+)\//);
+    if (m) buildIds.add(m[1]);
+  }
+  for (const buildId of buildIds) {
+    addCandidate(`/_next/static/${buildId}/_buildManifest.js`);
+    addCandidate(`/_next/static/${buildId}/_ssgManifest.js`);
+  }
+
+  return candidates.slice(0, CONFIG.frontendStaticIndex.maxNewAssetsPerRun);
+}
+
+async function refreshFrontendStaticIndex(state, pages = {}, assetCache = null) {
+  if (!CONFIG.frontendStaticIndex.enabled) return { changed: false, assetsFetched: 0 };
+  let changed = mergeStaticAssetIndexFromPages(state, pages);
+  let fetched = 0;
+
+  for (let round = 0; round < CONFIG.frontendStaticIndex.maxRounds; round++) {
+    const candidates = collectStaticAssetExpansionPaths(state, pages);
+    if (candidates.length === 0) break;
+    const remaining = Math.max(0, CONFIG.frontendStaticIndex.maxAssets - Object.keys(state._frontendStaticIndex?.assets || {}).length);
+    if (remaining <= 0) break;
+    const selected = candidates.slice(0, remaining);
+    const assetMap = new Map(selected.map(path => [path, staticAssetUrl(path)]));
+    log(`[前端] 静态资源索引扩展：${selected.length} 个构建产物`);
+    const contents = await downloadAssetContents(assetMap, assetCache);
+    const syntheticPages = {};
+    for (const [path, data] of Object.entries(contents || {})) {
+      syntheticPages[path] = {
+        originalUrl: CONFIG.siteUrl,
+        assetFiles: [path],
+        assetContents: { [path]: data },
+      };
+      fetched++;
+    }
+    if (Object.keys(syntheticPages).length === 0) break;
+    if (mergeStaticAssetIndexFromPages(state, syntheticPages)) changed = true;
+  }
+
+  return { changed, assetsFetched: fetched };
+}
+
+function detectGlobalI18nStaticEvidence(item, state = snapshot) {
+  const index = state?._frontendStaticIndex;
+  if (!index?.assets) return [];
+  const evidence = [];
+  const seen = new Set();
+  const { namespaces, keys, sampleValues } = globalI18nWatchKeywords(item);
+
+  function add(type, asset, detail, strength = "strong") {
+    const key = `${type}:${asset.path}:${detail}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    evidence.push({
+      type,
+      strength,
+      pageLabel: asset.kind || "静态资源",
+      url: asset.url || staticAssetUrl(asset.path),
+      detail,
+      detectedAt: Date.now(),
+    });
+  }
+
+  for (const asset of Object.values(index.assets)) {
+    const strings = asset.strings || [];
+    const text = strings.join("\n");
+    const normalizedText = normalizeI18nSearchText(text);
+    const keyHits = keys.filter(key => text.toLowerCase().includes(String(key).toLowerCase())).slice(0, 5);
+    const valueHits = sampleValues.filter(value => normalizedText.includes(normalizeI18nSearchText(value))).slice(0, 5);
+    const routeHits = (asset.routes || []).filter(route => routeMatchesGlobalI18nWatch(route, item)).slice(0, 5);
+    const pathHit = namespaces.some(ns => ns && asset.path.toLowerCase().includes(ns.toLowerCase()));
+
+    if (routeHits.length > 0 && (keyHits.length > 0 || valueHits.length > 0 || pathHit)) {
+      add("static_route", asset, `routes=${routeHits.join(", ")}${keyHits.length ? `; keys=${keyHits.join(",")}` : ""}`, "strong");
+    } else if (pathHit && (keyHits.length > 0 || valueHits.length > 0)) {
+      add("static_asset", asset, `${asset.path}${keyHits.length ? `; keys=${keyHits.join(",")}` : ""}${valueHits.length ? `; values=${valueHits.map(v => frontendDisplaySnippet(v, 50)).join(" | ")}` : ""}`, "strong");
+    } else if (keyHits.length >= 2 || (keyHits.length > 0 && valueHits.length > 0)) {
+      add("static_asset", asset, `keys=${keyHits.join(",")}${valueHits.length ? `; values=${valueHits.map(v => frontendDisplaySnippet(v, 50)).join(" | ")}` : ""}`, "medium");
+    }
+  }
+
+  return evidence;
+}
+
 function formatI18nChangesForFullDiff(changes, title = "i18n 国际化字符串变更") {
   if (!changes?.length) return "";
   const added = changes.filter(c => c.type === "added");
@@ -3068,14 +3551,20 @@ function formatI18nChangesForFullDiff(changes, title = "i18n 国际化字符串�
 }
 
 function buildGlobalI18nResourceNotification(group) {
-  const pages = compactFrontendUrlList(group.pages || []);
+  const normalized = normalizeGlobalI18nResourceGroup(group);
+  const pages = normalized.pages;
   const pageCount = pages.length;
+  const namespaceText = normalized.namespaces.length > 0
+    ? normalized.namespaces.map(ns => `\`${namespaceLabel(ns)}\``).join("、")
+    : "`global`";
   const title = pageCount > 1
     ? `前端 i18n 资源变更（影响 ${pageCount} 页）`
     : `前端 i18n 资源变更：${pages[0]?.label || "全局资源"}`;
   const lines = [
     "**类型：全局 i18n 资源变更**",
     "这些翻译只在 Next streaming resources 中变化，未匹配到具体页面可见 DOM；本轮按全局资源汇总，避免误报为每个页面新增文案。",
+    `命名空间：${namespaceText}`,
+    "状态：已进入上线确认队列；后续一旦发现页面可见文案、相关路由/API 或 JS 使用信号，会单独推送上线确认。",
     "",
   ];
   if (pageCount > 0) {
@@ -3084,7 +3573,7 @@ function buildGlobalI18nResourceNotification(group) {
     if (pageCount > 20) lines.push(`- ... 还有 ${pageCount - 20} 个页面`);
     lines.push("");
   }
-  lines.push(formatI18nChanges(group.changes));
+  lines.push(formatI18nChanges(normalized.changes));
 
   const fullDiff = buildFullDiffText(
     "全局 i18n 资源",
@@ -3096,7 +3585,7 @@ function buildGlobalI18nResourceNotification(group) {
     null,
     null,
     CONFIG.siteUrl,
-    group.changes,
+    normalized.changes,
     { i18nTitle: "全局 i18n 资源变更", affectedPages: pages },
   );
 
@@ -3107,7 +3596,7 @@ function buildGlobalI18nResourceNotification(group) {
     fullDiff,
     url: CONFIG.siteUrl,
     pageLabel: "全局 i18n 资源",
-    dedupeKey: `frontend:i18n-resource:${group.signature}`,
+    dedupeKey: `frontend:i18n-resource:${normalized.signature}`,
   };
 }
 
@@ -8144,7 +8633,24 @@ async function runFrontendCheck() {
   }
 
   for (const group of globalI18nResourceGroups.values()) {
-    notifications.push(buildGlobalI18nResourceNotification(group));
+    const { item } = registerGlobalI18nResourceWatch(snapshot, group);
+    if (item) snapshotDirty = true;
+    if (item && !item.resourceNotifiedAt) {
+      item.resourceNotifiedAt = Date.now();
+      notifications.push(buildGlobalI18nResourceNotification(item));
+    }
+  }
+
+  const confirmationPages = { ...newPages };
+  for (const page of pendingRoutePages) {
+    if (page?.originalUrl) confirmationPages[urlToKey(page.originalUrl)] = page;
+  }
+  const staticIndexResult = await refreshFrontendStaticIndex(snapshot, confirmationPages);
+  if (staticIndexResult.changed) snapshotDirty = true;
+  const globalI18nConfirm = confirmGlobalI18nResourceWatches(snapshot, confirmationPages);
+  if (globalI18nConfirm.changed) snapshotDirty = true;
+  if (globalI18nConfirm.notifications.length > 0) {
+    notifications.push(...globalI18nConfirm.notifications);
   }
 
   if (notifications.length > 0) {
@@ -8792,6 +9298,16 @@ export const __testables = {
   partitionI18nChangesByPageVisibility,
   i18nChangeSignature,
   i18nChangeTypeCounts,
+  normalizeGlobalI18nResourceGroup,
+  globalI18nWatchKey,
+  registerGlobalI18nResourceWatch,
+  confirmGlobalI18nResourceWatches,
+  extractStaticAssetPathsFromText,
+  mergeStaticAssetIndexFromPages,
+  detectGlobalI18nStaticEvidence,
+  buildGlobalI18nResourceNotification,
+  buildGlobalI18nResourceConfirmNotification,
+  isGlobalI18nResourceEvidenceSufficient,
   shouldConfirmI18nRemoval,
   frontendNotificationDedupeKey,
   shouldUseAiForNotification,

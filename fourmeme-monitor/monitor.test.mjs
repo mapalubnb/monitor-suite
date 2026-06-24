@@ -409,6 +409,117 @@ test("frontend asset store stores shared asset summaries once", () => {
   });
 });
 
+test("global i18n resource watch notifies resource once and confirmation once", () => {
+  const state = {};
+  const group = {
+    signature: "sig-community",
+    changes: [
+      { type: "added", key: "community.topMembers", value: "Top members" },
+      { type: "added", key: "community.shareCommunity", value: "Share Community" },
+    ],
+    pages: [
+      { key: "https://four.meme/en/create-token", label: "/en/create-token", url: "https://four.meme/en/create-token" },
+    ],
+  };
+
+  const first = __testables.registerGlobalI18nResourceWatch(state, group);
+  assert.equal(first.isNew, true);
+  assert.equal(first.item.primaryNamespace, "community");
+  const resourceNotice = __testables.buildGlobalI18nResourceNotification(first.item);
+  assert.equal(resourceNotice.dedupeKey, "frontend:i18n-resource:sig-community");
+  assert.match(resourceNotice.content, /上线确认队列/);
+
+  const second = __testables.registerGlobalI18nResourceWatch(state, group);
+  assert.equal(second.isNew, false);
+
+  const pending = __testables.confirmGlobalI18nResourceWatches(state, {
+    create: {
+      originalUrl: "https://four.meme/en/create-token",
+      textContent: "Create Token",
+      routes: [],
+      assetContents: {
+        "community.js": {
+          strings: ["community.topMembers", "Top members", "community"],
+        },
+      },
+    },
+  });
+  assert.equal(pending.notifications.length, 0);
+  assert.equal(state._globalI18nResourceWatch[first.item.key].status, "pending");
+
+  const confirmed = __testables.confirmGlobalI18nResourceWatches(state, {
+    community: {
+      originalUrl: "https://four.meme/en/community",
+      textContent: "Top members Share Community",
+      routes: ["/en/community"],
+      assetContents: {},
+    },
+  });
+  assert.equal(confirmed.notifications.length, 1);
+  assert.equal(state._globalI18nResourceWatch[first.item.key].status, "confirmed");
+  assert.equal(confirmed.notifications[0].dedupeKey, `frontend:i18n-resource-confirmed:${first.item.key}`);
+
+  const repeated = __testables.confirmGlobalI18nResourceWatches(state, {
+    community: {
+      originalUrl: "https://four.meme/en/community",
+      textContent: "Top members Share Community",
+      routes: ["/en/community"],
+      assetContents: {},
+    },
+  });
+  assert.equal(repeated.notifications.length, 0);
+});
+
+test("global i18n resource watch confirms from static assets without probing guessed pages", () => {
+  const state = {};
+  const group = {
+    signature: "sig-community-static",
+    changes: [
+      { type: "added", key: "community.topMembers", value: "Top members" },
+      { type: "added", key: "community.members", value: "Members" },
+    ],
+    pages: [
+      { key: "https://four.meme/en/create-token", label: "/en/create-token", url: "https://four.meme/en/create-token" },
+    ],
+  };
+  const { item } = __testables.registerGlobalI18nResourceWatch(state, group);
+
+  const extracted = __testables.extractStaticAssetPathsFromText(
+    `self.__BUILD_MANIFEST={"app/community/page":["static/chunks/app/community/page-abc123.js"]}`,
+  );
+  assert.deepEqual(extracted, ["/_next/static/chunks/app/community/page-abc123.js"]);
+
+  assert.equal(__testables.mergeStaticAssetIndexFromPages(state, {
+    staticPage: {
+      originalUrl: "https://four.meme/en/create-token",
+      assetFiles: ["/_next/static/chunks/app/community/page-abc123.js"],
+      assetContents: {
+        "/_next/static/chunks/app/community/page-abc123.js": {
+          url: "https://four.meme/_next/static/chunks/app/community/page-abc123.js",
+          contentHash: "h-community",
+          size: 1200,
+          strings: ["/en/community", "community.topMembers", "Top members", "community.members", "Members"],
+          ext: "js",
+        },
+      },
+    },
+  }), true);
+
+  const evidence = __testables.detectGlobalI18nStaticEvidence(item, state);
+  assert(evidence.some(e => e.type === "static_route"));
+  const confirmed = __testables.confirmGlobalI18nResourceWatches(state, {
+    create: {
+      originalUrl: "https://four.meme/en/create-token",
+      textContent: "Create Token",
+      routes: [],
+      assetContents: {},
+    }
+  });
+  assert.equal(confirmed.notifications.length, 1);
+  assert.equal(state._globalI18nResourceWatch[item.key].status, "confirmed");
+  assert.match(confirmed.notifications[0].content, /静态资源路由信号/);
+});
+
 test("module metrics keep bounded duration history and totals", () => {
   const metrics = __testables.createModuleMetricsState();
   __testables.recordModuleMetric(metrics, "frontend", { durationMs: 10, requestCount: 3, backoffCount: 1, errorCount: 0 });
