@@ -539,6 +539,7 @@ function shouldUseAiForNotification({ title = "", content = "", moduleContext = 
   if (skipAi) return false;
   const text = `${title}\n${moduleContext}\n${aiInput || content}`;
   if (/请求失败|处理失败|退避恢复|基线已修复|页面样本无效|模块异常|模块恢复|心跳|状态/i.test(text)) return false;
+  if (/全站前端资源变更|Flap\.sh 全站前端资源变更|Flap 全站前端资源变更/i.test(text)) return true;
   if (/仅检测到构建产物|压缩变量噪音|hash\s*轮换|sourceMappingURL|无实质|常规构建/i.test(text)) return false;
   return /重点变更|页面变更|文案|i18n|CAstore|金库|Vault|Factory|fee|rate|route|api|contract|address|enabled|staking|dividend/i.test(text);
 }
@@ -821,73 +822,72 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     vaultDiffs,
     jsTextDiffs,
   };
-  const resourceSemanticLines = buildResourceSemanticSummary(assetStats, assetOnlyNotifications);
-  const pageSemanticLines = assetOnlyNotifications.map(n => `- ${summarizePageAssetChange(n)}`);
+  const semanticFiles = uniqueStrings([
+    ...substantiveFileNames,
+    ...assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.substantiveAssetPaths || []),
+    ...assetOnlyNotifications.flatMap(n => extractAssetFileNamesFromChanges(n.changes)),
+  ]);
+  const semanticProfile = buildAssetSemanticProfile(semanticFiles, assetStats);
+  const resourceScopeParts = [
+    semanticProfile.runtime.length ? `runtime ${semanticProfile.runtime.length}` : "",
+    semanticProfile.appShell.length ? `app shell ${semanticProfile.appShell.length}` : "",
+    semanticProfile.shared.length ? `共享 chunk ${semanticProfile.shared.length}` : "",
+    semanticProfile.page.length ? `页面 chunk ${semanticProfile.page.length}` : "",
+    semanticProfile.script.length ? `业务脚本 ${semanticProfile.script.length}` : "",
+    semanticProfile.style.length ? `样式 ${semanticProfile.style.length}` : "",
+  ].filter(Boolean);
+  const resourceScope = resourceScopeParts.length > 0 ? resourceScopeParts.join(" / ") : "未识别资源类型";
+  const localSignalSummary = hasBusinessResourceDiffs
+    ? [
+        jsTextDiffs.length > 0 ? `功能文案 ${jsTextDiffs.length} 处` : "",
+        businessConfigDiffs.length > 0 ? `业务配置 ${businessConfigDiffs.length} 项` : "",
+        vaultDiffs.length > 0 ? `Vault 配置 ${vaultDiffs.length} 项` : "",
+      ].filter(Boolean).join("；")
+    : "未提取到 UI 文案、业务配置、Vault/Factory 或合约相关变化";
+  const compactAffectedUrls = affectedUrls.length > 6
+    ? [...affectedUrls.slice(0, 6), `... 还有 ${affectedUrls.length - 6} 个页面`]
+    : affectedUrls;
+  const localSignalLines = hasBusinessResourceDiffs
+    ? [
+        ...jsTextDiffs.slice(0, 4).map(d => `- ${d.type === "removed" ? "移除" : "新增"}文案: ${truncateCardText(d.text, 120)}${d.file ? ` (${d.file})` : ""}`),
+        ...businessConfigDiffs.slice(0, 6).map(cd => `- 配置: \`${cd.field}\` ${cd.oldVal} -> ${cd.newVal}${cd.file ? ` (${cd.file})` : ""}`),
+        ...vaultDiffs.slice(0, 4).map(vd => `- Vault: ${vd.type || "changed"} ${vd.name || JSON.stringify(vd)}`),
+      ]
+    : ["- 本地结构化提取未发现业务信号，AI 将基于完整 Diff 复核。"];
 
   const changes = [
-    `📦 Flap 全站前端资源变更：影响页面：${affectedUrls.length} 个`,
+    `📦 Flap 全站前端资源变更：影响页面 ${affectedUrls.length} 个，修改资源 ${assetStats.modified} 个`,
+    `本地初筛：${localSignalSummary}`,
+    `资源范围：${resourceScope}`,
+    "完整 Diff 已进入 AI 分析，并可在卡片详情中下载。",
+    "",
     "受影响页面：",
     ...affectedUrls.map(url => `- ${url}`),
-    "",
-    substantiveFileNames.length
-      ? `去重资源文件：${substantiveFileNames.slice(0, 12).join(", ")}`
-      : "去重资源文件：未提取到明确文件名",
-    noiseFileNames.length
-      ? `构建噪音文件：${noiseFileNames.slice(0, 12).join(", ")}`
-      : "",
-    hasBusinessResourceDiffs
-      ? "本轮变更来自多页面共享前端资源，未提取到页面文案、i18n 或 CAstore 金库级差异；按全站资源变动合并推送，避免每个页面重复告警。"
-      : "本轮未提取到页面文案、i18n、CAstore 金库或业务配置变更；按全站资源变动合并推送，避免每个页面重复告警。",
-    jsTextDiffs.length > 0 ? "" : "",
-    jsTextDiffs.length > 0 ? `功能文案变更：${jsTextDiffs.length} 处` : "",
-    ...jsTextDiffs.map(d => `  ${d.type === "removed" ? "-" : "+"} ${d.text} (${d.file || "unknown"})`),
-    businessConfigDiffs.length > 0 ? "" : "",
-    businessConfigDiffs.length > 0 ? `配置变更：${businessConfigDiffs.length} 项` : "",
-    ...businessConfigDiffs.map(cd => `  ${cd.field}: ${cd.oldVal} → ${cd.newVal} (${cd.file || "unknown"})`),
-    vaultDiffs.length > 0 ? "" : "",
-    vaultDiffs.length > 0 ? `Vault 配置变更：${vaultDiffs.length} 项` : "",
-    ...vaultDiffs.map(vd => `  ${vd.type || "changed"}: ${vd.name || JSON.stringify(vd)}`),
-    "",
-    "各页面资源摘要：",
-    ...pageSemanticLines,
+    hasBusinessResourceDiffs ? "" : "",
+    hasBusinessResourceDiffs ? "本地业务信号：" : "",
+    ...localSignalLines,
   ].filter(Boolean);
 
   const contentLines = [
     "**结论摘要**",
     hasBusinessResourceDiffs
-      ? "- 结论: 检测到共享前端资源中的功能文案/配置变更，已按全站前端资源变更聚合为一条通知。"
-      : "- 结论: 未发现业务变更，仅检测到共享前端资源更新。",
+      ? `- 本地初筛: 检测到 ${localSignalSummary}。`
+      : "- 本地初筛: 未发现结构化业务变更，AI 会基于完整 Diff 复核。",
     `- 影响页面: ${affectedUrls.length} 个`,
-    "- 聚合: 同一批共享资源变更已合并，避免重复刷屏。",
+    `- 资源范围: ${resourceScope}`,
+    `- 资源统计: 修改 ${assetStats.modified} 个，新增 ${assetStats.added} 个，移除 ${assetStats.removed} 个，重命名 ${assetStats.renamed} 个`,
+    "",
+    "**AI 分析**",
+    "AI 分析异步生成中，变更已先推送。",
     "",
     "**影响页面**",
-    ...affectedUrls.map(url => `- [${url}](${url})`),
+    ...compactAffectedUrls.map(url => url.startsWith("...") ? `- ${url}` : `- [${url}](${url})`),
     "",
-    "**资源语义摘要**",
-    ...resourceSemanticLines,
+    "**本地信号**",
+    ...localSignalLines,
     "",
-    hasBusinessResourceDiffs ? "**重点变更**" : "",
-    jsTextDiffs.length > 0 ? `**💬 功能文案变更（${jsTextDiffs.length} 处）：**` : "",
-    ...jsTextDiffs.map(d => `  ${d.type === "removed" ? "🔴" : "🟢"} ${truncateCardText(d.text)}${d.file ? ` (${d.file})` : ""}`),
-    businessConfigDiffs.length > 0 ? `**🔧 配置变更（${businessConfigDiffs.length} 项）：**` : "",
-    ...businessConfigDiffs.map(cd => `  \`${cd.field}\`: ${cd.oldVal} → ${cd.newVal}${cd.file ? ` (${cd.file})` : ""}`),
-    vaultDiffs.length > 0 ? `**🏦 Vault 配置变更（${vaultDiffs.length} 项）：**` : "",
-    ...vaultDiffs.map(vd => `  ${vd.type || "changed"}: ${vd.name || JSON.stringify(vd)}`),
-    hasBusinessResourceDiffs ? "" : "",
-    hasBusinessResourceDiffs ? "---" : "",
-    hasBusinessResourceDiffs ? "" : "",
-    hasBusinessResourceDiffs ? "**AI 分析:**" : "",
-    hasBusinessResourceDiffs ? "AI 分析异步生成中，变更已先推送。" : "",
-    hasBusinessResourceDiffs ? "" : "",
-    hasBusinessResourceDiffs ? "---" : "",
-    hasBusinessResourceDiffs ? "" : "",
-    "**资源统计**",
-    `- 修改文件（去重）: ${assetStats.modified}`,
-    `- 构建噪音: ${assetStats.noiseFiles} 文件 ${assetStats.noiseCount} 处`,
-    substantiveFileNames.length ? `- 资源文件: ${substantiveFileNames.slice(0, 8).join(", ")}` : "",
-    "",
-    "**页面明细**",
-    ...pageSemanticLines,
+    "**详情**",
+    "- 完整资源 Diff 已作为 AI 输入；卡片按钮可下载本轮详情。",
   ];
 
   const fullDiffLines = [
@@ -906,7 +906,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     }),
   ].filter(line => line !== "");
 
-  const content = contentLines.filter(Boolean).join("\n");
+  const content = contentLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 
   return {
     url: "https://flap.sh",
@@ -916,7 +916,8 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     content,
     meta: { ...emptyFlapChangeMeta(), assetStats, fullDiffLines },
     moduleContext: "Flap.sh 全站前端资源变更",
-    skipAi: !hasBusinessResourceDiffs,
+    skipAi: false,
+    useFullDiffForAi: true,
     skipBusinessPriorityTitle: true,
     snapshotUpdates: assetOnlyNotifications.flatMap(n => n.snapshotUpdates || (n.snapshotUpdate ? [n.snapshotUpdate] : [])),
   };
@@ -985,7 +986,8 @@ async function sendFlapChangeNotification(notification, { moduleContext = "Flap.
   appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
   const fullDiff = buildFlapFullDiff({ diffTitle, url: n.url, changes: n.changes, meta: n.meta });
   const diffFilePath = saveDiffLocally(n.title, fullDiff);
-  await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput: briefingInput, enrichFn: (summary) => {
+  const aiInput = n.useFullDiffForAi ? fullDiff : briefingInput;
+  await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput, enrichFn: (summary) => {
     if (n.content) return enrichExistingCardContentWithAi(n.content, summary);
     return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
   }, diffFilePath, url: n.url, skipAi: n.skipAi });

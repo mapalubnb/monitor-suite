@@ -50,11 +50,12 @@ test("shared Flap asset-only page changes are summarized into one site-wide noti
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.equal(grouped[0].url, "https://flap.sh");
-  assert.match(grouped[0].changes.join("\n"), /影响页面：2 个/);
+  assert.match(grouped[0].changes.join("\n"), /影响页面 2 个/);
   assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.sh\/bnb\/CAstore/);
   assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.sh\/launch/);
   assert.match(grouped[0].content, /\[https:\/\/flap\.sh\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
-  assert.equal(grouped[0].skipAi, true);
+  assert.equal(grouped[0].skipAi, false);
+  assert.equal(grouped[0].useFullDiffForAi, true);
   assert.equal(grouped[0].snapshotUpdates.length, 2);
 });
 
@@ -186,9 +187,12 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.equal(grouped[0].url, "https://flap.sh");
-  assert.match(grouped[0].content, /功能文案变更/);
-  assert.match(grouped[0].content, /配置变更/);
+  assert.match(grouped[0].content, /功能文案 1 处/);
+  assert.match(grouped[0].content, /业务配置 2 项/);
+  assert.match(grouped[0].content, /完整资源 Diff 已作为 AI 输入/);
   assert.equal(grouped[0].skipBusinessPriorityTitle, true);
+  assert.equal(grouped[0].skipAi, false);
+  assert.equal(grouped[0].useFullDiffForAi, true);
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
 
@@ -443,8 +447,11 @@ test("site-wide asset card leads with no business-change conclusion", () => {
   ]);
 
   assert(notification.content.startsWith("**结论摘要**"));
-  assert(notification.content.indexOf("未发现业务变更") < notification.content.indexOf("资源统计"));
-  assert(notification.content.indexOf("影响页面") < notification.content.indexOf("页面明细"));
+  assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**AI 分析**"));
+  assert(notification.content.indexOf("**AI 分析**") < notification.content.indexOf("**影响页面**"));
+  assert.match(notification.content, /完整资源 Diff 已作为 AI 输入/);
+  assert.equal(notification.skipAi, false);
+  assert.equal(notification.useFullDiffForAi, true);
 });
 
 test("site-wide asset-only notification is not promoted by negative business words", () => {
@@ -459,7 +466,7 @@ test("site-wide asset-only notification is not promoted by negative business wor
     },
   ]);
 
-  assert.match(notification.changes.join("\n"), /CAstore 金库/);
+  assert.equal(notification.skipBusinessPriorityTitle, true);
   __testables.applyBusinessPriorityTitle(notification);
 
   assert.equal(notification.title, "Flap 全站前端资源变更");
@@ -495,9 +502,9 @@ test("site-wide asset card summarizes runtime resources without raw webpack frag
     },
   ]);
 
-  assert.match(notification.content, /资源语义摘要/);
-  assert.match(notification.content, /webpack runtime\/bootstrap/);
-  assert.match(notification.content, /共享应用 chunk/);
+  assert.match(notification.content, /资源范围/);
+  assert.match(notification.content, /runtime/);
+  assert.match(notification.content, /共享 chunk/);
   assert.doesNotMatch(notification.content, /trustedTypes|t=0;t/);
   assert.doesNotMatch(notification.content, /!=typeof/);
 });
