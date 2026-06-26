@@ -189,7 +189,7 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.equal(grouped[0].url, "https://flap.sh");
   assert.match(grouped[0].content, /功能文案 1 处/);
   assert.match(grouped[0].content, /业务配置 2 项/);
-  assert.match(grouped[0].content, /完整资源 Diff 已作为 AI 输入/);
+  assert.match(grouped[0].content, /\*\*AI 分析\*\*/);
   assert.equal(grouped[0].skipBusinessPriorityTitle, true);
   assert.equal(grouped[0].skipAi, false);
   assert.equal(grouped[0].useFullDiffForAi, true);
@@ -202,6 +202,7 @@ test("CAstore Chinese vault headings are extracted as structured vault sections"
       <h2>热门金库</h2>
       <h3>禮物稅收金庫</h3>
       <p>指定一個 X 帳戶作為禮物擁有者，可以將交易費用分配給任何 EVM 地址。</p>
+      <a href="/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003">Open</a>
       <h3>LP质押分红金库</h3>
       <p>将你的 LP 代币质押进金库，获得 BNB 分红奖励。</p>
       <h3>黑洞排行榜燃烧分红金库</h3>
@@ -217,7 +218,39 @@ test("CAstore Chinese vault headings are extracted as structured vault sections"
     "黑洞排行榜燃烧分红金库",
   ]);
   assert.equal(features.caStoreVaults[0].area, "热门金库");
+  assert.equal(features.caStoreVaults[0].factory, "0x08E41a61C5D25420E3cb314Bc513EC99B2841003");
   assert.match(features.caStoreVaults[1].description, /LP 代币质押进金库/);
+});
+
+test("CAstore vault change notification is simple, linked, AI-ready and suppresses duplicate page card", () => {
+  const diff = {
+    type: "added",
+    area: "热门金库",
+    name: "禮物稅收金庫",
+    newDescription: "指定一個 X 帳戶作為禮物擁有者，可以將交易費用分配給任何 EVM 地址。",
+    factory: "0x08E41a61C5D25420E3cb314Bc513EC99B2841003",
+  };
+  const notification = __testables.buildCaStoreVaultChangeNotification(diff, {});
+
+  assert.equal(notification.title, "CAstore 金库变更：禮物稅收金庫");
+  assert.match(notification.content, /金库名字/);
+  assert.match(notification.content, /禮物稅收金庫/);
+  assert.match(notification.content, /指定一個 X 帳戶/);
+  assert.match(notification.content, /\[https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\]/);
+  assert.match(notification.content, /AI 分析异步生成中/);
+  assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
+
+  const pageNotification = {
+    changes: ["🏦 CAstore 金库内容变更：", "  🟢 新增金库: 热门金库 / 禮物稅收金庫"],
+    meta: {
+      assetStats: null,
+      textChangeCount: 0,
+      i18nChangeCount: 0,
+      caStoreVaultDiffs: [diff],
+    },
+  };
+  assert.equal(__testables.getStandaloneCaStoreVaultDiffs(pageNotification).length, 1);
+  assert.equal(__testables.shouldSuppressCaStoreOnlyPageNotification(pageNotification), true);
 });
 
 test("asset string extraction keeps business strings beyond the ordinary cap", () => {
@@ -449,7 +482,7 @@ test("site-wide asset card leads with no business-change conclusion", () => {
   assert(notification.content.startsWith("**结论摘要**"));
   assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**AI 分析**"));
   assert(notification.content.indexOf("**AI 分析**") < notification.content.indexOf("**影响页面**"));
-  assert.match(notification.content, /完整资源 Diff 已作为 AI 输入/);
+  assert.doesNotMatch(notification.content, /完整资源 Diff/);
   assert.equal(notification.skipAi, false);
   assert.equal(notification.useFullDiffForAi, true);
 });

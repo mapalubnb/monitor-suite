@@ -379,6 +379,7 @@ function emptyFlapChangeMeta() {
     i18nChangeCount: 0,
     i18nDiffs: [],
     caStoreVaultDiffs: [],
+    nextDataChanged: false,
     fullDiffLines: [],
   };
 }
@@ -503,13 +504,14 @@ function isTooLongForSingleCard(content) {
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
  * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
-async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url) {
+async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, summarizeFn = aiSummarize) {
   // 卡片最上方加入监控目标网址
   const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
   const messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
 
   if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
-    aiSummarize(aiInput || content, moduleContext).then(async (summary) => {
+    const summarize = summarizeFn || aiSummarize;
+    summarize(aiInput || content, moduleContext).then(async (summary) => {
       if (!summary) return;
       const enriched = enrichFn
         ? enrichFn(summary)
@@ -533,6 +535,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
       }
     }).catch(err => log(`[AI 摘要] 异步摘要异常：${err.message}`));
   }
+  return messageId;
 }
 
 function shouldUseAiForNotification({ title = "", content = "", moduleContext = "", aiInput = "", skipAi = false } = {}) {
@@ -853,13 +856,12 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
         ...businessConfigDiffs.slice(0, 6).map(cd => `- 配置: \`${cd.field}\` ${cd.oldVal} -> ${cd.newVal}${cd.file ? ` (${cd.file})` : ""}`),
         ...vaultDiffs.slice(0, 4).map(vd => `- Vault: ${vd.type || "changed"} ${vd.name || JSON.stringify(vd)}`),
       ]
-    : ["- 本地结构化提取未发现业务信号，AI 将基于完整 Diff 复核。"];
+    : ["- 本地结构化提取未发现业务信号。"];
 
   const changes = [
     `📦 Flap 全站前端资源变更：影响页面 ${affectedUrls.length} 个，修改资源 ${assetStats.modified} 个`,
     `本地初筛：${localSignalSummary}`,
     `资源范围：${resourceScope}`,
-    "完整 Diff 已进入 AI 分析，并可在卡片详情中下载。",
     "",
     "受影响页面：",
     ...affectedUrls.map(url => `- ${url}`),
@@ -872,7 +874,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     "**结论摘要**",
     hasBusinessResourceDiffs
       ? `- 本地初筛: 检测到 ${localSignalSummary}。`
-      : "- 本地初筛: 未发现结构化业务变更，AI 会基于完整 Diff 复核。",
+      : "- 本地初筛: 未发现结构化业务变更。",
     `- 影响页面: ${affectedUrls.length} 个`,
     `- 资源范围: ${resourceScope}`,
     `- 资源统计: 修改 ${assetStats.modified} 个，新增 ${assetStats.added} 个，移除 ${assetStats.removed} 个，重命名 ${assetStats.renamed} 个`,
@@ -885,9 +887,6 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     "",
     "**本地信号**",
     ...localSignalLines,
-    "",
-    "**详情**",
-    "- 完整资源 Diff 已作为 AI 输入；卡片按钮可下载本轮详情。",
   ];
 
   const fullDiffLines = [
@@ -995,10 +994,10 @@ async function sendFlapChangeNotification(notification, { moduleContext = "Flap.
 }
 
 /**
- * 保存 diff 详情到本地文件（不再直接发送到飞书群，改为卡片按钮触发下载）
+ * 保存 diff 详情到本地文件（不直接展开在飞书卡片正文中）
  * @param {string} title - 通知标题（用于文件名）
  * @param {string} diffText - 完整 diff 文本内容
- * @returns {string|null} 本地文件路径（供卡片按钮引用），内容过短时返回 null
+ * @returns {string|null} 本地文件路径，内容过短时返回 null
  */
 function saveDiffLocally(title, diffText) {
   if (!diffText || diffText.length < 50) return null;
@@ -1043,38 +1042,23 @@ import { AI, aiSummarize as _aiSummarizeBase } from "../shared/ai-client.mjs";
 
 const AI_CONFIG = AI; // 兼容旧代码引用
 
-const AI_SYSTEM_PROMPT = `你是 Flap.sh（Web3 平台）的前端变更监控分析师，输出极简监控简报。
+const AI_SYSTEM_PROMPT = `你是 Flap.sh 变更监控分析师。判断 diff 是构建噪音还是业务变化。
+重点看：Vault/fee/dividend/constraints/enabled、UI/i18n 文案、功能逻辑、链上参数、路由。
+中文输出，不超过 160 字：
+**判定:** 纯构建噪音/有业务变化/新增功能
+**要点:** 1-3 条；纯噪音写“无业务影响”。`;
 
-分析 diff 时，严格区分：
-- 构建噪音：hash 轮换、Vercel 部署 ID(dpl_)、minifier 变量重命名(单字母互换)、webpack moduleID 变化
-- 实质变更：业务配置(Vault/fee/dividend/constraints/enabled)、UI 文案、功能逻辑、链上参数、路由变化
-
-**重点关注 i18n/UI 文案变更**：
-- 文案已为中文，直接引用关键内容
-- 按功能模块归类概括（如"分红代币选择"、"风险提示"、"错误信息"等）
-- 标注哪些是用户可见的新功能界面
-
-输出格式（严格遵守，不要偏离）：
-
-**整体判定：** [一句话：纯构建噪音/有实质变更/重大配置变更/新增功能]
-
-**一、新增功能/文案**
-• [按功能模块归类，引用关键中文文案]
-• [标注用户影响：如"用户在发射页面可选择分红代币类型"]
-
-**二、配置/参数变更**
-• [字段级变化，如有]
-• [纯噪音时写：全部为 minifier 变量重命名与部署 ID 轮换，无业务影响]
-
-**三、风险评估**
-• [低危/中危/高危] + 一句话理由
-
-中文，不超过 350 字。不要输出"三"以外的额外段落。`;
+const CA_STORE_VAULT_AI_PROMPT = `根据金库名字、文案和链接，用中文介绍用途和注意点。
+不要编造收益率、TVL、链上数据或未给出的参数。不超过 90 字。`;
 
 const AI_BRIEFING_INPUT_LIMIT = 6000; // 给 AI 的输入上限（提升以容纳完整 i18n 文案列表）
 
 async function aiSummarize(diffContent, moduleContext = "", _retries = 1) {
-  return _aiSummarizeBase(diffContent, AI_SYSTEM_PROMPT, moduleContext, { retries: _retries });
+  return _aiSummarizeBase(diffContent, AI_SYSTEM_PROMPT, moduleContext, { retries: _retries, maxTokens: 320 });
+}
+
+async function aiIntroduceCaStoreVault(input, moduleContext = "", _retries = 1) {
+  return _aiSummarizeBase(input, CA_STORE_VAULT_AI_PROMPT, moduleContext, { retries: _retries, maxTokens: 180 });
 }
 
 /**
@@ -1346,7 +1330,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       lines.push(`  🔴 删除: ${truncateCardText(c.text)}`);
       if (c.ctxBefore) lines.push(`  上文: ${truncateCardText(c.ctxBefore, 90)}`);
     }
-    if (textChanges.length > 18) lines.push(`  ... 还有 ${textChanges.length - 18} 处文案变更，查看完整 Diff。`);
+    if (textChanges.length > 18) lines.push(`  ... 还有 ${textChanges.length - 18} 处文案变更`);
     lines.push("");
   } else if (textChangeCount > 0) {
     hasStructuredChange = true;
@@ -1432,7 +1416,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       for (const r of unpairedRemoved.slice(0, 8)) {
         lines.push(`  🔴 ${truncateCardText(r.text)}`);
       }
-      if (totalItems > 24) lines.push(`  ... 还有 ${totalItems - 24} 处功能文案变更，查看完整 Diff。`);
+      if (totalItems > 24) lines.push(`  ... 还有 ${totalItems - 24} 处功能文案变更`);
       lines.push("");
     }
   }
@@ -1452,7 +1436,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   }
 
   if (!hasStructuredChange) {
-    lines.push("未提取到结构化文案/金库/配置变更，先看资源统计和完整 Diff。");
+    lines.push("未提取到结构化文案/金库/配置变更。");
     lines.push("");
   }
 
@@ -1478,9 +1462,6 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       lines.push(`- 文件: ${assetStats.substantiveFileNames.slice(0, 8).join(", ")}`);
     }
   }
-
-  lines.push("");
-  lines.push("*完整 Diff 可通过卡片按钮下载。*");
 
   return lines.join("\n");
 }
@@ -2248,6 +2229,15 @@ function cleanVaultDescription(text) {
     .trim();
 }
 
+function extractVaultFactoryAddress(text) {
+  const raw = String(text || "");
+  const linkMatch = raw.match(/vaultfactory=(0x[a-fA-F0-9]{40})/i);
+  if (linkMatch) return linkMatch[1];
+  const fieldMatch = raw.match(/(?:factory|vaultFactory)\s*[:=]\s*["']?(0x[a-fA-F0-9]{40})["']?/i);
+  if (fieldMatch) return fieldMatch[1];
+  return null;
+}
+
 function extractCaStoreVaultSections(html) {
   const headings = [];
   const headingRe = /<h([1-4])[^>]*>([\s\S]*?)<\/h\1>/gi;
@@ -2267,9 +2257,11 @@ function extractCaStoreVaultSections(html) {
       continue;
     }
     const next = headings[i + 1];
-    const rawDescription = htmlFragmentToText(html.slice(h.end, next ? next.start : html.length));
+    const rawSectionHtml = html.slice(h.end, next ? next.start : html.length);
+    const rawDescription = htmlFragmentToText(rawSectionHtml);
     const description = cleanVaultDescription(rawDescription);
     if (!description && !/custom vault factory/i.test(h.name)) continue;
+    const factory = extractVaultFactoryAddress(rawSectionHtml);
     const areaKey = normalizeVaultName(currentArea || "Featured Vaults");
     const nameKey = normalizeVaultName(h.name);
     const baseKey = `${areaKey}::${nameKey}`;
@@ -2284,6 +2276,7 @@ function extractCaStoreVaultSections(html) {
       position: sections.length + 1,
       key: `${baseKey}#${occurrence}`,
       description,
+      factory,
       signature: md5(`${h.name}\n${description}`),
     });
   }
@@ -2345,7 +2338,7 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
   for (const [key, nv] of newMap) {
     const ov = oldMap.get(key);
     if (!ov) {
-      changes.push({ type: "added", name: nv.name, area: nv.area, newDescription: nv.description });
+      changes.push({ type: "added", name: nv.name, area: nv.area, newDescription: nv.description, factory: nv.factory || null });
       continue;
     }
     if ((ov.signature || md5(`${ov.name}\n${ov.description || ""}`)) !== (nv.signature || md5(`${nv.name}\n${nv.description || ""}`))) {
@@ -2357,13 +2350,16 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
         newName: nv.name,
         oldDescription: ov.description || "",
         newDescription: nv.description || "",
+        oldFactory: ov.factory || null,
+        newFactory: nv.factory || null,
+        factory: nv.factory || ov.factory || null,
       });
     }
   }
 
   for (const [key, ov] of oldMap) {
     if (!newMap.has(key)) {
-      changes.push({ type: "removed", name: ov.name, area: ov.area, oldDescription: ov.description || "" });
+      changes.push({ type: "removed", name: ov.name, area: ov.area, oldDescription: ov.description || "", factory: ov.factory || null });
     }
   }
 
@@ -2399,6 +2395,142 @@ function formatCaStoreVaultDiffsForChanges(diffs) {
     }
   }
   return lines;
+}
+
+function isValidFactoryAddress(value) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(value || ""));
+}
+
+function buildVaultLaunchUrl(factory) {
+  return isValidFactoryAddress(factory)
+    ? `https://flap.sh/launch?vaultfactory=${factory}`
+    : "";
+}
+
+function resolveCaStoreVaultFactory(change, vaultFactoryMap = {}) {
+  const direct = change?.factory || change?.newFactory || change?.oldFactory;
+  if (isValidFactoryAddress(direct)) return direct;
+
+  const candidateNames = [
+    change?.name,
+    change?.newName,
+    change?.oldName,
+  ].map(normalizeVaultName).filter(Boolean);
+  if (candidateNames.length === 0) return null;
+
+  const factories = Object.values(vaultFactoryMap || {});
+  for (const wanted of candidateNames) {
+    const exact = factories.find(f => normalizeVaultName(f?.name) === wanted);
+    if (exact?.factory && isValidFactoryAddress(exact.factory)) return exact.factory;
+  }
+  for (const wanted of candidateNames) {
+    const fuzzy = factories.find((f) => {
+      const name = normalizeVaultName(f?.name);
+      return name && (name.includes(wanted) || wanted.includes(name));
+    });
+    if (fuzzy?.factory && isValidFactoryAddress(fuzzy.factory)) return fuzzy.factory;
+  }
+  return null;
+}
+
+function caStoreVaultChangeLabel(type) {
+  if (type === "added") return "新增金库";
+  if (type === "modified") return "金库文案更新";
+  if (type === "removed") return "移除金库";
+  return "金库变更";
+}
+
+function getCaStoreVaultDisplayName(change) {
+  return change?.name || change?.newName || change?.oldName || "未知金库";
+}
+
+function getCaStoreVaultCopy(change) {
+  if (change?.type === "removed") return change.oldDescription || "(空)";
+  return change?.newDescription || change?.oldDescription || "(空)";
+}
+
+function buildCaStoreVaultAiInput(change, factory, launchUrl) {
+  return [
+    "用中文介绍该 CAstore 金库用途和注意点，不编造数据。",
+    "",
+    `变更类型: ${caStoreVaultChangeLabel(change?.type)}`,
+    `金库名字: ${getCaStoreVaultDisplayName(change)}`,
+    `金库文案: ${getCaStoreVaultCopy(change)}`,
+    factory ? `Vault Factory: ${factory}` : "Vault Factory: 未匹配到",
+    launchUrl ? `金库链接: ${launchUrl}` : "金库链接: 未匹配到",
+  ].join("\n");
+}
+
+function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, options = {}) {
+  const titlePrefix = options.titlePrefix || "";
+  const name = getCaStoreVaultDisplayName(change);
+  const copy = getCaStoreVaultCopy(change);
+  const factory = resolveCaStoreVaultFactory(change, vaultFactoryMap);
+  const launchUrl = buildVaultLaunchUrl(factory);
+  const typeLabel = caStoreVaultChangeLabel(change?.type);
+  const contentLines = [
+    `**金库名字**`,
+    name,
+    "",
+    `**变更类型**`,
+    typeLabel,
+    "",
+    `**文案**`,
+    truncateCardText(copy, 500),
+    "",
+    `**金库地址**`,
+    launchUrl ? `[${launchUrl}](${launchUrl})` : "未匹配到 vault factory 地址。",
+    factory ? `Factory: \`${factory}\`` : "",
+    "",
+    `**AI 介绍**`,
+    "AI 分析异步生成中，变更已先推送。",
+  ];
+  const content = contentLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+
+  return {
+    title: `${titlePrefix}CAstore 金库变更：${name}`,
+    content,
+    template: change?.type === "removed" ? "orange" : "red",
+    url: launchUrl || "https://flap.sh/bnb/CAstore",
+    moduleContext: "Flap.sh CAstore 金库内容介绍",
+    aiInput: buildCaStoreVaultAiInput(change, factory, launchUrl),
+    factory,
+    launchUrl,
+    change,
+  };
+}
+
+function getStandaloneCaStoreVaultDiffs(notification) {
+  return (notification?.meta?.caStoreVaultDiffs || [])
+    .filter(d => ["added", "modified", "removed"].includes(d.type));
+}
+
+function shouldSuppressCaStoreOnlyPageNotification(notification) {
+  const meta = notification?.meta || {};
+  const standaloneCount = getStandaloneCaStoreVaultDiffs(notification).length;
+  return standaloneCount > 0
+    && standaloneCount === (meta.caStoreVaultDiffs || []).length
+    && !meta.assetStats
+    && !meta.nextDataChanged
+    && (meta.textChangeCount || 0) === 0
+    && (meta.i18nChangeCount || 0) === 0;
+}
+
+async function sendCaStoreVaultChangeNotification(notification) {
+  appendHistory("castore-vault", notification.title, notification.content.slice(0, 500), notification.aiInput || "");
+  const messageId = await sendThenEnrichWithAi(
+    notification.title,
+    notification.content,
+    notification.template,
+    notification.moduleContext,
+    notification.aiInput,
+    (summary) => enrichExistingCardContentWithAi(notification.content, summary),
+    null,
+    notification.url,
+    aiIntroduceCaStoreVault,
+  );
+  if (messageId) await pinMessage(messageId);
+  return messageId;
 }
 
 const FLAP_ERROR_PAGE_PATTERNS = [
@@ -2872,9 +3004,10 @@ function flattenKeys(obj, prefix = "", result = {}) {
 
 function diffFeatures(oldF, newF) {
   const changes = [];
-  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [], caStoreVaultDiffs: [], fullDiffLines: [] };
+  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [], caStoreVaultDiffs: [], nextDataChanged: false, fullDiffLines: [] };
 
   if (oldF.nextDataHash && newF.nextDataHash && oldF.nextDataHash !== newF.nextDataHash) {
+    meta.nextDataChanged = true;
     changes.push("页面数据（__NEXT_DATA__）变更");
     if (oldF.nextData?.props && newF.nextData?.props) {
       const oldKeys = Object.keys(flattenKeys(oldF.nextData.props));
@@ -3318,7 +3451,13 @@ async function runCheck() {
     } catch (err) { log(`  [失败] ${url} — ${err.message}`); }
   }
   for (const n of coalesceFlapNotifications(notifications, { titlePrefix: "手动检测 — " })) {
-    await sendFlapChangeNotification(n, { moduleContext: `Flap.sh 手动检测 ${n.url}`, diffTitle: "=== Flap.sh 手动检测详细 Diff ===", titlePrefix: "手动检测 — " });
+    for (const diff of getStandaloneCaStoreVaultDiffs(n)) {
+      const card = buildCaStoreVaultChangeNotification(diff, snapshot.vaultFactories || {}, { titlePrefix: "手动检测 — " });
+      await sendCaStoreVaultChangeNotification(card);
+    }
+    if (!shouldSuppressCaStoreOnlyPageNotification(n)) {
+      await sendFlapChangeNotification(n, { moduleContext: `Flap.sh 手动检测 ${n.url}`, diffTitle: "=== Flap.sh 手动检测详细 Diff ===", titlePrefix: "手动检测 — " });
+    }
     const updates = [
       ...(n.snapshotUpdates || []),
       ...(n.snapshotUpdate ? [n.snapshotUpdate] : []),
@@ -3656,7 +3795,13 @@ async function startMonitor() {
             continue;
           }
 
-          await sendFlapChangeNotification(n);
+          for (const diff of getStandaloneCaStoreVaultDiffs(n)) {
+            const card = buildCaStoreVaultChangeNotification(diff, snapshot.vaultFactories || {});
+            await sendCaStoreVaultChangeNotification(card);
+          }
+          if (!shouldSuppressCaStoreOnlyPageNotification(n)) {
+            await sendFlapChangeNotification(n);
+          }
           applyNotificationSnapshotUpdate(n);
         }
       }
@@ -3846,6 +3991,9 @@ export const __testables = {
   buildBriefingInput,
   buildCardBriefing,
   buildOperationalNoticeContent,
+  buildCaStoreVaultChangeNotification,
+  getStandaloneCaStoreVaultDiffs,
+  shouldSuppressCaStoreOnlyPageNotification,
   formatVaultFactoryChanges,
   buildFlapFullDiff,
 };
