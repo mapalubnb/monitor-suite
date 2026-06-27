@@ -586,6 +586,45 @@ test("global i18n resource watch confirms from static assets without probing gue
   assert.match(confirmed.notifications[0].content, /静态资源路由信号/);
 });
 
+test("failed static asset expansion candidates are cooled down", () => {
+  const state = {
+    _frontendStaticIndex: {
+      assets: {
+        "/_next/static/chunks/app/layout-a.js": {
+          path: "/_next/static/chunks/app/layout-a.js",
+          strings: [],
+        },
+      },
+    },
+  };
+  const pages = {
+    create: {
+      originalUrl: "https://four.meme/en/create-token",
+      assetFiles: ["/_next/static/chunks/app/layout-a.js"],
+      assetContents: {
+        "/_next/static/chunks/app/layout-a.js": {
+          strings: ['"/_next/static/build123/_buildManifest.js"', '"/_next/static/build123/_ssgManifest.js"'],
+        },
+      },
+    },
+  };
+
+  const first = __testables.collectStaticAssetExpansionPaths(state, pages);
+  assert.deepEqual(first, [
+    "/_next/static/build123/_buildManifest.js",
+    "/_next/static/build123/_ssgManifest.js",
+  ]);
+
+  assert.equal(__testables.recordStaticAssetExpansionResults(state, first, {}), true);
+  assert.equal(Object.keys(state._frontendStaticIndex.failedAssets).length, 2);
+  assert.deepEqual(__testables.collectStaticAssetExpansionPaths(state, pages), []);
+
+  assert.equal(__testables.recordStaticAssetExpansionResults(state, [first[0]], {
+    [first[0]]: { contentHash: "ok", size: 10, strings: [] },
+  }), true);
+  assert.equal(state._frontendStaticIndex.failedAssets[first[0]], undefined);
+});
+
 test("module metrics keep bounded duration history and totals", () => {
   const metrics = __testables.createModuleMetricsState();
   __testables.recordModuleMetric(metrics, "frontend", { durationMs: 10, requestCount: 3, backoffCount: 1, errorCount: 0 });

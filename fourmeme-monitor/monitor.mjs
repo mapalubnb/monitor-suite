@@ -199,6 +199,8 @@ const CONFIG = {
     maxAssets: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_ASSETS", 400),
     maxRounds: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_ROUNDS", 2),
     maxNewAssetsPerRun: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_NEW_ASSETS_PER_RUN", 80),
+    failureCooldownMs: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_FAILURE_COOLDOWN_MINUTES", 60) * 60_000,
+    maxFailedAssets: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_FAILED_ASSETS", 200),
   },
   apiProbeStaggerMs: readNonNegativeIntEnv("FOURMEME_API_PROBE_STAGGER_MS", 200),
   hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 80),
@@ -3359,11 +3361,65 @@ function buildStaticAssetSummary(path, data = {}) {
   };
 }
 
-function mergeStaticAssetIndexFromPages(state, pages = {}) {
-  if (!CONFIG.frontendStaticIndex.enabled) return false;
+function ensureFrontendStaticIndex(state) {
   if (!state._frontendStaticIndex) state._frontendStaticIndex = { assets: {}, lastUpdatedAt: 0 };
   const index = state._frontendStaticIndex;
   if (!index.assets) index.assets = {};
+  if (!index.failedAssets) index.failedAssets = {};
+  return index;
+}
+
+function isStaticAssetFailureCooling(index, path, now = Date.now()) {
+  const failed = index?.failedAssets?.[path];
+  return !!failed && Number(failed.retryAfter || 0) > now;
+}
+
+function trimStaticAssetFailures(index) {
+  const entries = Object.entries(index.failedAssets || {});
+  const max = CONFIG.frontendStaticIndex.maxFailedAssets;
+  if (entries.length <= max) return false;
+  entries
+    .sort((a, b) => Number(a[1]?.lastFailAt || 0) - Number(b[1]?.lastFailAt || 0))
+    .slice(0, entries.length - max)
+    .forEach(([path]) => delete index.failedAssets[path]);
+  return true;
+}
+
+function recordStaticAssetExpansionResults(state, attemptedPaths = [], contents = {}) {
+  const index = ensureFrontendStaticIndex(state);
+  const now = Date.now();
+  const contentKeys = new Set(Object.keys(contents || {}).map(canonicalStaticAssetPath).filter(Boolean));
+  let changed = false;
+
+  for (const rawPath of attemptedPaths || []) {
+    const path = canonicalStaticAssetPath(rawPath);
+    if (!path) continue;
+    if (contentKeys.has(path)) {
+      if (index.failedAssets[path]) {
+        delete index.failedAssets[path];
+        changed = true;
+      }
+      continue;
+    }
+    const prev = index.failedAssets[path] || {};
+    index.failedAssets[path] = {
+      path,
+      url: staticAssetUrl(path),
+      count: (prev.count || 0) + 1,
+      firstFailAt: prev.firstFailAt || now,
+      lastFailAt: now,
+      retryAfter: now + CONFIG.frontendStaticIndex.failureCooldownMs,
+    };
+    changed = true;
+  }
+
+  if (trimStaticAssetFailures(index)) changed = true;
+  return changed;
+}
+
+function mergeStaticAssetIndexFromPages(state, pages = {}) {
+  if (!CONFIG.frontendStaticIndex.enabled) return false;
+  const index = ensureFrontendStaticIndex(state);
   let changed = false;
 
   for (const page of Object.values(pages || {})) {
@@ -3380,12 +3436,14 @@ function mergeStaticAssetIndexFromPages(state, pages = {}) {
           seenOnPages: mergeGlobalI18nPages(prev?.seenOnPages || [], [{ key: canonicalFrontendUrl(page.originalUrl), label: urlLabel(page.originalUrl), url: page.originalUrl }]),
           lastSeenAt: Date.now(),
         };
+        if (index.failedAssets?.[canonical]) delete index.failedAssets[canonical];
         changed = true;
       } else {
         const seenOnPages = mergeGlobalI18nPages(prev.seenOnPages || [], [{ key: canonicalFrontendUrl(page.originalUrl), label: urlLabel(page.originalUrl), url: page.originalUrl }]);
         if (seenOnPages.length !== (prev.seenOnPages || []).length) {
           prev.seenOnPages = seenOnPages;
           prev.lastSeenAt = Date.now();
+          if (index.failedAssets?.[canonical]) delete index.failedAssets[canonical];
           changed = true;
         }
       }
@@ -3397,8 +3455,9 @@ function mergeStaticAssetIndexFromPages(state, pages = {}) {
 
 function collectStaticAssetExpansionPaths(state, pages = {}) {
   if (!CONFIG.frontendStaticIndex.enabled) return [];
-  const index = state._frontendStaticIndex || { assets: {} };
+  const index = ensureFrontendStaticIndex(state);
   const known = new Set(Object.keys(index.assets || {}));
+  const now = Date.now();
   for (const page of Object.values(pages || {})) {
     for (const path of page.assetFiles || []) {
       const canonical = canonicalStaticAssetPath(path);
@@ -3410,6 +3469,7 @@ function collectStaticAssetExpansionPaths(state, pages = {}) {
   const addCandidate = (path) => {
     const canonical = canonicalStaticAssetPath(path);
     if (!canonical || known.has(canonical)) return;
+    if (isStaticAssetFailureCooling(index, canonical, now)) return;
     known.add(canonical);
     candidates.push(canonical);
   };
@@ -3436,7 +3496,7 @@ function collectStaticAssetExpansionPaths(state, pages = {}) {
   const buildIds = new Set();
   for (const path of known) {
     const m = path.match(/^\/_next\/static\/([^/]+)\//);
-    if (m) buildIds.add(m[1]);
+    if (m && !["chunks", "css", "media"].includes(m[1])) buildIds.add(m[1]);
   }
   for (const buildId of buildIds) {
     addCandidate(`/_next/static/${buildId}/_buildManifest.js`);
@@ -3458,8 +3518,8 @@ async function refreshFrontendStaticIndex(state, pages = {}, assetCache = null) 
     if (remaining <= 0) break;
     const selected = candidates.slice(0, remaining);
     const assetMap = new Map(selected.map(path => [path, staticAssetUrl(path)]));
-    log(`[前端] 静态资源索引扩展：${selected.length} 个构建产物`);
     const contents = await downloadAssetContents(assetMap, assetCache);
+    if (recordStaticAssetExpansionResults(state, selected, contents)) changed = true;
     const syntheticPages = {};
     for (const [path, data] of Object.entries(contents || {})) {
       syntheticPages[path] = {
@@ -3469,6 +3529,7 @@ async function refreshFrontendStaticIndex(state, pages = {}, assetCache = null) 
       };
       fetched++;
     }
+    if (Object.keys(syntheticPages).length > 0) log(`[前端] 静态资源索引扩展：${Object.keys(syntheticPages).length} 个构建产物`);
     if (Object.keys(syntheticPages).length === 0) break;
     if (mergeStaticAssetIndexFromPages(state, syntheticPages)) changed = true;
   }
@@ -9305,6 +9366,8 @@ export const __testables = {
   confirmGlobalI18nResourceWatches,
   extractStaticAssetPathsFromText,
   mergeStaticAssetIndexFromPages,
+  collectStaticAssetExpansionPaths,
+  recordStaticAssetExpansionResults,
   detectGlobalI18nStaticEvidence,
   buildGlobalI18nResourceNotification,
   buildGlobalI18nResourceConfirmNotification,
