@@ -597,6 +597,63 @@ function isSharedResourceChangeCandidate(notification) {
   return detectBusinessPriority(notification.changes || []).hit;
 }
 
+function hasStructuredSharedAssetStats(assetStats) {
+  if (!assetStats) return false;
+  if (hasItems(assetStats.configDiffs)) return true;
+  if (hasItems(assetStats.vaultDiffs)) return true;
+  if (hasItems(assetStats.jsTextDiffs)) return true;
+  return false;
+}
+
+function hasExtractableSharedResourceChange(notification) {
+  if (!notification || notification.isRecoveryNotice || notification.content) return false;
+  const assetStats = notification.meta?.assetStats;
+  if (!assetStats || !hasFlapPageLevelChange(notification)) return false;
+  if (hasPageSpecificAssetChange(notification)) return false;
+  return hasStructuredSharedAssetStats(assetStats);
+}
+
+function extractSharedResourceNotification(notification) {
+  const meta = notification.meta || {};
+  const assetStats = meta.assetStats || {};
+  return {
+    ...notification,
+    meta: { ...emptyFlapChangeMeta(), assetStats, fullDiffLines: meta.fullDiffLines || [] },
+    snapshotUpdates: [
+      ...(notification.snapshotUpdates || []),
+      ...(notification.snapshotUpdate ? [notification.snapshotUpdate] : []),
+    ],
+    snapshotUpdate: undefined,
+  };
+}
+
+function stripSharedResourceNotification(notification) {
+  if (!hasExtractableSharedResourceChange(notification)) return notification;
+  const meta = { ...(notification.meta || {}) };
+  meta.assetStats = null;
+  meta.fullDiffLines = (meta.fullDiffLines || []).filter(line => {
+    const text = String(line || "");
+    return !/前端资源|配置参数|Vault 配置/.test(text);
+  });
+  const changes = (notification.changes || []).filter(line => {
+    const text = String(line || "");
+    return !/前端资源变更|配置参数变更|Vault 配置变更/.test(text);
+  });
+  return { ...notification, changes, meta };
+}
+
+function hasNotificationPayload(notification) {
+  if (!notification) return false;
+  if (notification.content) return true;
+  const meta = notification.meta || {};
+  if ((notification.changes || []).length > 0) return true;
+  if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return true;
+  if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return true;
+  if (hasItems(meta.caStoreVaultDiffs)) return true;
+  if (meta.assetStats) return true;
+  return false;
+}
+
 function stableForCompare(value) {
   if (Array.isArray(value)) {
     return value.map(stableForCompare).sort((a, b) => JSON.stringify(a).localeCompare(JSON.stringify(b)));
@@ -933,6 +990,13 @@ function coalesceFlapNotifications(notifications, options = {}) {
       const key = resourceChangeFingerprint(notification);
       if (!sharedResourceGroups.has(key)) sharedResourceGroups.set(key, []);
       sharedResourceGroups.get(key).push(notification);
+    } else if (hasExtractableSharedResourceChange(notification)) {
+      const sharedNotification = extractSharedResourceNotification(notification);
+      const key = resourceChangeFingerprint(sharedNotification);
+      if (!sharedResourceGroups.has(key)) sharedResourceGroups.set(key, []);
+      sharedResourceGroups.get(key).push(sharedNotification);
+      const pageNotification = stripSharedResourceNotification(notification);
+      if (hasNotificationPayload(pageNotification)) result.push(pageNotification);
     } else {
       result.push(notification);
     }
@@ -1834,6 +1898,107 @@ function factoryListToMap(factories) {
   return map;
 }
 
+function extractVaultFactoryMapFromFeatures(features) {
+  for (const entry of Object.values(features?.assetContents || {})) {
+    if (entry.vaultFactories && entry.vaultFactories.factories.length > 0) {
+      return factoryListToMap(entry.vaultFactories.factories);
+    }
+  }
+  return null;
+}
+
+function pageVaultFactoryWeight(url) {
+  if (/\/bnb\/CAstore\b/i.test(url)) return 3;
+  if (/\/launch\b/i.test(url)) return 2;
+  if (/\/create\b/i.test(url)) return 1;
+  return 0;
+}
+
+function mergeRoundVaultFactoryMaps(entries = []) {
+  const grouped = new Map();
+  for (const entry of entries) {
+    const map = entry?.map || {};
+    for (const [addr, factory] of Object.entries(map)) {
+      if (!grouped.has(addr)) grouped.set(addr, []);
+      grouped.get(addr).push({
+        url: entry.url || "",
+        weight: pageVaultFactoryWeight(entry.url || ""),
+        factory,
+      });
+    }
+  }
+
+  const merged = {};
+  const conflicts = [];
+  for (const [addr, items] of grouped) {
+    const base = { ...items.slice().sort((a, b) => b.weight - a.weight)[0].factory };
+    for (const field of ["name", "enabled", "showInCAStore", "ai"]) {
+      const byValue = new Map();
+      for (const item of items) {
+        const key = JSON.stringify(item.factory[field]);
+        const current = byValue.get(key) || { score: 0, urls: [], value: item.factory[field] };
+        current.score += Math.max(1, item.weight);
+        current.urls.push(item.url);
+        byValue.set(key, current);
+      }
+      const ranked = [...byValue.values()].sort((a, b) => b.score - a.score);
+      base[field] = ranked[0].value;
+      if (ranked.length > 1) {
+        conflicts.push({ factory: addr, name: base.name, field, values: ranked });
+      }
+    }
+    const constraintSource = items
+      .filter(item => item.factory.constraints)
+      .sort((a, b) => b.weight - a.weight)[0];
+    base.constraints = constraintSource?.factory.constraints || null;
+    merged[addr] = base;
+  }
+  return { map: merged, conflicts };
+}
+
+function collectRoundVaultFactory(roundEntries, url, features) {
+  const map = extractVaultFactoryMapFromFeatures(features);
+  if (map) roundEntries.push({ url, map });
+  return map;
+}
+
+async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries, titlePrefix = "", linkUrl = "https://flap.sh/bnb/CAstore", sendCardFn = sendCardViaApi } = {}) {
+  if (!roundVaultFactoryEntries?.length) return { sent: false, changed: false };
+  const { map: currentVFMap, conflicts } = mergeRoundVaultFactoryMaps(roundVaultFactoryEntries);
+  const oldVFMap = snapshot.vaultFactories || {};
+  const hasOldData = Object.keys(oldVFMap).length > 0;
+  if (!hasOldData) {
+    snapshot.vaultFactories = currentVFMap;
+    log(`[金库工厂 VaultFactory] 首次记录 ${Object.keys(currentVFMap).length} 个金库工厂`);
+    return { sent: false, changed: true, initialized: true };
+  }
+
+  const vfChanges = diffVaultFactories(oldVFMap, currentVFMap);
+  const hasVFChanges = vfChanges.added.length > 0 || vfChanges.removed.length > 0 || vfChanges.modified.length > 0;
+  if (!hasVFChanges) {
+    if (conflicts.length > 0) {
+      log(`[金库工厂 VaultFactory] 本轮 ${conflicts.length} 个字段跨页面提取不一致，已按页面优先级稳定合并，未发现最终变更`);
+    }
+    return { sent: false, changed: false };
+  }
+
+  log(`[金库工厂 VaultFactory] 检测到变更：新增 ${vfChanges.added.length}，移除 ${vfChanges.removed.length}，修改 ${vfChanges.modified.length}`);
+  const vfContent = formatVaultFactoryChanges(vfChanges);
+  const conflictNote = conflicts.length > 0
+    ? `\n\n**提取说明**\n- 本轮 ${conflicts.length} 个字段在不同页面资源中不一致，已按 CAstore > launch > create 优先级合并后推送，避免重复震荡。`
+    : "";
+  const vfTitle = buildVaultFactoryChangeTitle(vfChanges, `🏦 ${titlePrefix}`);
+  appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
+  const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
+  const vfMsgId = await sendCardFn(vfTitle, `🔗 [${linkUrl}](${linkUrl})\n\n${vfContent}${conflictNote}`, vfTemplate);
+  if (vfChanges.added.length > 0 && vfMsgId) {
+    await pinMessage(vfMsgId);
+  }
+  snapshot.vaultFactories = currentVFMap;
+  saveSnapshot(snapshot);
+  return { sent: Boolean(vfMsgId), changed: true, changes: vfChanges };
+}
+
 function buildOperationalNoticeContent({ status, url, severity = "orange", reason = "", consecutiveFailures = 0, skipped = 0, detail = "" } = {}) {
   const lines = [
     `**状态:** ${status || "Flap 监控状态变化"}`,
@@ -2514,6 +2679,22 @@ function shouldSuppressCaStoreOnlyPageNotification(notification) {
     && !meta.nextDataChanged
     && (meta.textChangeCount || 0) === 0
     && (meta.i18nChangeCount || 0) === 0;
+}
+
+function omitStandaloneCaStoreVaultDiffs(notification) {
+  const standaloneDiffs = getStandaloneCaStoreVaultDiffs(notification);
+  if (standaloneDiffs.length === 0) return notification;
+  const standaloneKeys = new Set(standaloneDiffs.map(stableKey));
+  const meta = { ...(notification.meta || {}) };
+  meta.caStoreVaultDiffs = (meta.caStoreVaultDiffs || []).filter(diff => !standaloneKeys.has(stableKey(diff)));
+  meta.fullDiffLines = (meta.fullDiffLines || []).filter(line => !/^🏦 CAstore 金库/.test(String(line || "")));
+  const changes = (notification.changes || []).filter(line => !/^🏦 CAstore 金库/.test(String(line || "")) && !/^  [🟢🔴✏️]/.test(String(line || "")));
+  return {
+    ...notification,
+    changes,
+    meta,
+    caStoreStandaloneSent: true,
+  };
 }
 
 async function sendCaStoreVaultChangeNotification(notification) {
@@ -3343,6 +3524,7 @@ async function runCheck() {
   let hasNotifiedChange = false;
   const notifications = [];
   const roundAssetCache = new Map();
+  const roundVaultFactoryEntries = [];
 
   // 并行抓取所有页面
   const tasks = CONFIG.urls.map((url, i) => sleep(i * 300).then(async () => {
@@ -3364,35 +3546,7 @@ async function runCheck() {
       const oldAssetQuality = oldForAssets ? getStoredFeatureQuality(url, oldForAssets) : null;
       await hydrateAssetContents(features, oldAssetQuality?.valid ? oldForAssets : null, { roundAssetCache });
 
-      // ── 手动检测：Vault Factory 变更 ──
-      for (const entry of Object.values(features.assetContents || {})) {
-        if (entry.vaultFactories && entry.vaultFactories.factories.length > 0) {
-          const currentVFMap = factoryListToMap(entry.vaultFactories.factories);
-          const oldVFMap = snapshot.vaultFactories || {};
-          if (Object.keys(oldVFMap).length === 0) {
-            snapshot.vaultFactories = currentVFMap;
-            log(`  [金库工厂 VaultFactory] 首次记录 ${Object.keys(currentVFMap).length} 个金库工厂`);
-          } else {
-            const vfChanges = diffVaultFactories(oldVFMap, currentVFMap);
-            const hasVFC = vfChanges.added.length > 0 || vfChanges.removed.length > 0 || vfChanges.modified.length > 0;
-            if (hasVFC) {
-              hasDetectedChange = true;
-              const vfContent = formatVaultFactoryChanges(vfChanges);
-              const vfTitle = buildVaultFactoryChangeTitle(vfChanges, "🏦 手动检测 — ");
-              log(`  [金库工厂 VaultFactory] ${vfTitle}`);
-              appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
-              const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
-              const vfMsgId = await sendCardViaApi(vfTitle, vfContent, vfTemplate);
-              if (vfChanges.added.length > 0 && vfMsgId) {
-                await pinMessage(vfMsgId);
-              }
-              hasNotifiedChange = true;
-              snapshot.vaultFactories = currentVFMap;
-            }
-          }
-          break;
-        }
-      }
+      collectRoundVaultFactory(roundVaultFactoryEntries, url, features);
 
       if (!snapshot.pages[key]) {
         log(`  [初始化] ${url} — 首次记录`);
@@ -3450,13 +3604,22 @@ async function runCheck() {
       }
     } catch (err) { log(`  [失败] ${url} — ${err.message}`); }
   }
+  const vfResult = await sendRoundVaultFactoryChange({
+    snapshot,
+    roundVaultFactoryEntries,
+    titlePrefix: "手动检测 — ",
+  });
+  if (vfResult.changed) hasDetectedChange = true;
+  if (vfResult.sent) hasNotifiedChange = true;
+
   for (const n of coalesceFlapNotifications(notifications, { titlePrefix: "手动检测 — " })) {
     for (const diff of getStandaloneCaStoreVaultDiffs(n)) {
       const card = buildCaStoreVaultChangeNotification(diff, snapshot.vaultFactories || {}, { titlePrefix: "手动检测 — " });
       await sendCaStoreVaultChangeNotification(card);
     }
-    if (!shouldSuppressCaStoreOnlyPageNotification(n)) {
-      await sendFlapChangeNotification(n, { moduleContext: `Flap.sh 手动检测 ${n.url}`, diffTitle: "=== Flap.sh 手动检测详细 Diff ===", titlePrefix: "手动检测 — " });
+    const pageNotification = omitStandaloneCaStoreVaultDiffs(n);
+    if (!shouldSuppressCaStoreOnlyPageNotification(n) && hasNotificationPayload(pageNotification)) {
+      await sendFlapChangeNotification(pageNotification, { moduleContext: `Flap.sh 手动检测 ${n.url}`, diffTitle: "=== Flap.sh 手动检测详细 Diff ===", titlePrefix: "手动检测 — " });
     }
     const updates = [
       ...(n.snapshotUpdates || []),
@@ -3518,23 +3681,22 @@ async function startMonitor() {
       return { key, features, i18n, dlCount };
     }));
     const results = await Promise.allSettled(tasks);
+    const initVaultFactoryEntries = [];
     for (const r of results) {
       if (r.status === "fulfilled") {
         const { key, features, i18n, dlCount } = r.value;
         snapshot.pages[key] = features;
         const url = features.originalUrl;
         log(`  ${url} — 正常（资源 ${features.assetFiles.length} 个，已下载 ${dlCount} 个，Next 数据: ${features.nextDataHash ? "有" : "无"}，国际化 i18n: ${i18n ? Object.keys(i18n.i18nStrings).length + " 条" : "无"}）`);
-        // 基线阶段提取 vault factories
-        for (const entry of Object.values(features.assetContents || {})) {
-          if (entry.vaultFactories && entry.vaultFactories.factories.length > 0) {
-            snapshot.vaultFactories = factoryListToMap(entry.vaultFactories.factories);
-            log(`  [金库工厂 VaultFactory] 基线记录 ${Object.keys(snapshot.vaultFactories).length} 个金库工厂`);
-            break;
-          }
-        }
+        collectRoundVaultFactory(initVaultFactoryEntries, url, features);
       } else {
         log(`  基线获取失败：${r.reason?.message}`);
       }
+    }
+    if (initVaultFactoryEntries.length > 0) {
+      const { map } = mergeRoundVaultFactoryMaps(initVaultFactoryEntries);
+      snapshot.vaultFactories = map;
+      log(`  [金库工厂 VaultFactory] 基线记录 ${Object.keys(snapshot.vaultFactories).length} 个金库工厂`);
     }
     saveSnapshot(snapshot);
   }
@@ -3558,6 +3720,7 @@ async function startMonitor() {
     try {
       const notifications = [];
       const roundAssetCache = new Map();
+      const roundVaultFactoryEntries = [];
 
       const applyNotificationSnapshotUpdate = (notification) => {
         const updates = [
@@ -3668,41 +3831,7 @@ async function startMonitor() {
             });
           }
 
-          // ── Vault Factory 注册变更检测 ──
-          // 从新下载的 assetContents 中聚合所有 vaultFactories
-          let currentVFMap = null;
-          for (const entry of Object.values(features.assetContents || {})) {
-            if (entry.vaultFactories && entry.vaultFactories.factories.length > 0) {
-              currentVFMap = factoryListToMap(entry.vaultFactories.factories);
-              break; // vaultTypes 只在一个 chunk 中
-            }
-          }
-          if (currentVFMap) {
-            const oldVFMap = snapshot.vaultFactories || {};
-            const hasOldData = Object.keys(oldVFMap).length > 0;
-            if (!hasOldData) {
-              // 首次记录
-              snapshot.vaultFactories = currentVFMap;
-              log(`[金库工厂 VaultFactory] 首次记录 ${Object.keys(currentVFMap).length} 个金库工厂`);
-            } else {
-              const vfChanges = diffVaultFactories(oldVFMap, currentVFMap);
-              const hasVFChanges = vfChanges.added.length > 0 || vfChanges.removed.length > 0 || vfChanges.modified.length > 0;
-              if (hasVFChanges) {
-                log(`[金库工厂 VaultFactory] 检测到变更：新增 ${vfChanges.added.length}，移除 ${vfChanges.removed.length}，修改 ${vfChanges.modified.length}`);
-                const vfContent = formatVaultFactoryChanges(vfChanges);
-                const vfTitle = buildVaultFactoryChangeTitle(vfChanges, "🏦 ");
-                appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
-                // 直接推送，不走普通页面变更通知流程；新增金库时置顶
-                const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
-                const vfMsgId = await sendCardViaApi(vfTitle, `🔗 [${url}](${url})\n\n` + vfContent, vfTemplate);
-                if (vfChanges.added.length > 0 && vfMsgId) {
-                  await pinMessage(vfMsgId);
-                }
-                snapshot.vaultFactories = currentVFMap;
-                saveSnapshot(snapshot);
-              }
-            }
-          }
+          collectRoundVaultFactory(roundVaultFactoryEntries, url, features);
 
           if (!oldFeatures) {
             snapshot.pages[key] = features;
@@ -3782,6 +3911,8 @@ async function startMonitor() {
         }
       }
 
+      await sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries });
+
       const notificationsToSend = coalesceFlapNotifications(notifications);
       if (notificationsToSend.length > 0) {
         for (let ni = 0; ni < notificationsToSend.length; ni++) {
@@ -3799,8 +3930,9 @@ async function startMonitor() {
             const card = buildCaStoreVaultChangeNotification(diff, snapshot.vaultFactories || {});
             await sendCaStoreVaultChangeNotification(card);
           }
-          if (!shouldSuppressCaStoreOnlyPageNotification(n)) {
-            await sendFlapChangeNotification(n);
+          const pageNotification = omitStandaloneCaStoreVaultDiffs(n);
+          if (!shouldSuppressCaStoreOnlyPageNotification(n) && hasNotificationPayload(pageNotification)) {
+            await sendFlapChangeNotification(pageNotification);
           }
           applyNotificationSnapshotUpdate(n);
         }
@@ -3994,7 +4126,10 @@ export const __testables = {
   buildCaStoreVaultChangeNotification,
   getStandaloneCaStoreVaultDiffs,
   shouldSuppressCaStoreOnlyPageNotification,
+  omitStandaloneCaStoreVaultDiffs,
   formatVaultFactoryChanges,
+  mergeRoundVaultFactoryMaps,
+  diffVaultFactories,
   buildFlapFullDiff,
 };
 

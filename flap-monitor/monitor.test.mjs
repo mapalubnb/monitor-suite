@@ -101,6 +101,66 @@ test("specific Flap page content changes remain page-level notifications", () =>
   assert.equal(grouped[1].title, "Flap 全站前端资源变更");
 });
 
+test("shared resource diffs are extracted and coalesced even when one page has CAstore changes", () => {
+  const sharedMeta = {
+    assetStats: {
+      unchanged: 20,
+      modified: 2,
+      renamed: 1,
+      substantiveFileNames: ["1094-58c02e471cdb0fcb.js", "webpack-41b2e37c796e2aae.js"],
+      substantiveAssetPaths: ["/_next/static/chunks/1094-58c02e471cdb0fcb.js", "/_next/static/chunks/webpack-41b2e37c796e2aae.js"],
+      semanticProfile: __testables.buildAssetSemanticProfile([
+        "/_next/static/chunks/1094-58c02e471cdb0fcb.js",
+        "/_next/static/chunks/webpack-41b2e37c796e2aae.js",
+      ]),
+      configDiffs: [
+        { field: "enabled", oldVal: "(新增)", newVal: "!0", file: "1094-58c02e471cdb0fcb.js" },
+        { field: "showInCAStore", oldVal: "(新增)", newVal: "!1", file: "1094-58c02e471cdb0fcb.js" },
+      ],
+      jsTextDiffs: [
+        { type: "added", text: "you can still view its tax info while indexing.", file: "1094-58c02e471cdb0fcb.js" },
+      ],
+      vaultDiffs: [],
+    },
+    textChangeCount: 0,
+    textChanges: [],
+    i18nChangeCount: 0,
+    i18nDiffs: [],
+    caStoreVaultDiffs: [],
+  };
+  const notifications = [
+    {
+      url: "https://flap.sh/bnb/CAstore",
+      title: "Flap 页面变更",
+      template: "red",
+      changes: ["🏦 CAstore 金库内容变更：", "  🔴 移除金库: Hot Vaults / Perpetual Short Vault", "📦 前端资源变更：修改 2", "🔧 配置参数变更："],
+      meta: {
+        ...JSON.parse(JSON.stringify(sharedMeta)),
+        caStoreVaultDiffs: [{ type: "removed", area: "Hot Vaults", name: "Perpetual Short Vault", oldDescription: "A BNB-margin short-only vault." }],
+      },
+      snapshotUpdate: { key: "castore", features: {} },
+    },
+    ...["https://flap.sh/create", "https://flap.sh/launch"].map((url, i) => ({
+      url,
+      title: "Flap 页面变更",
+      template: "red",
+      changes: ["📦 前端资源变更：修改 2", "🔧 配置参数变更："],
+      meta: JSON.parse(JSON.stringify(sharedMeta)),
+      snapshotUpdate: { key: `p${i}`, features: {} },
+    })),
+  ];
+
+  const grouped = __testables.coalesceFlapNotifications(notifications);
+
+  assert.equal(grouped.length, 2);
+  assert.equal(grouped[0].url, "https://flap.sh/bnb/CAstore");
+  assert.equal(grouped[0].meta.assetStats, null);
+  assert.equal(grouped[0].meta.caStoreVaultDiffs.length, 1);
+  assert.equal(grouped[1].title, "Flap 全站前端资源变更");
+  assert.equal(grouped[1].url, "https://flap.sh");
+  assert.equal(grouped[1].snapshotUpdates.length, 3);
+});
+
 test("asset notifications containing business keywords stay page-level", () => {
   const notifications = [
     {
@@ -251,6 +311,33 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   };
   assert.equal(__testables.getStandaloneCaStoreVaultDiffs(pageNotification).length, 1);
   assert.equal(__testables.shouldSuppressCaStoreOnlyPageNotification(pageNotification), true);
+});
+
+test("standalone CAstore vault card can be omitted from mixed page card", () => {
+  const notification = {
+    url: "https://flap.sh/bnb/CAstore",
+    changes: [
+      "🏦 CAstore 金库内容变更：",
+      "  🔴 移除金库: Hot Vaults / Perpetual Short Vault",
+      "✏️ 文案修改：",
+    ],
+    meta: {
+      assetStats: null,
+      textChangeCount: 1,
+      textChanges: [{ type: "removed", text: "Perpetual Short Vault" }],
+      i18nChangeCount: 0,
+      i18nDiffs: [],
+      caStoreVaultDiffs: [{ type: "removed", area: "Hot Vaults", name: "Perpetual Short Vault" }],
+      fullDiffLines: ["🏦 CAstore 金库内容变更：", "✏️ 页面文案完整 Diff"],
+    },
+  };
+
+  const stripped = __testables.omitStandaloneCaStoreVaultDiffs(notification);
+
+  assert.equal(stripped.meta.caStoreVaultDiffs.length, 0);
+  assert(stripped.changes.every(line => !line.includes("CAstore 金库")));
+  assert.equal(stripped.meta.textChanges.length, 1);
+  assert.equal(__testables.shouldSuppressCaStoreOnlyPageNotification(notification), false);
 });
 
 test("asset string extraction keeps business strings beyond the ordinary cap", () => {
@@ -552,6 +639,34 @@ test("vault factory card summarizes counts before details", () => {
   assert(content.startsWith("**结论摘要**"));
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
+});
+
+test("round vault factory aggregation stabilizes conflicting page snapshots", () => {
+  const factory = "0xD5f57C8FbFFE993ca7c73858DEBE18f79ff4a3F8";
+  const entries = [
+    {
+      url: "https://flap.sh/bnb/CAstore",
+      map: { [factory]: { name: "ShortOnlyVaultOracle", factory, enabled: true, showInCAStore: false, ai: false, constraints: null } },
+    },
+    {
+      url: "https://flap.sh/launch",
+      map: { [factory]: { name: "ShortOnlyVaultOracle", factory, enabled: true, showInCAStore: true, ai: false, constraints: null } },
+    },
+    {
+      url: "https://flap.sh/create",
+      map: { [factory]: { name: "ShortOnlyVaultOracle", factory, enabled: true, showInCAStore: false, ai: false, constraints: null } },
+    },
+  ];
+
+  const { map, conflicts } = __testables.mergeRoundVaultFactoryMaps(entries);
+  const diff = __testables.diffVaultFactories({
+    [factory]: { name: "ShortOnlyVaultOracle", factory, enabled: true, showInCAStore: true, ai: false, constraints: null },
+  }, map);
+
+  assert.equal(map[factory].showInCAStore, false);
+  assert(conflicts.some(c => c.field === "showInCAStore"));
+  assert.equal(diff.modified.length, 1);
+  assert.deepEqual(diff.modified[0].diffs, ["showInCAStore: true → false"]);
 });
 
 test("operational notice card is readable and action oriented", () => {
