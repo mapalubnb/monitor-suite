@@ -152,6 +152,72 @@ test("AI routing skips operational noise and keeps high-value changes", () => {
   }), true);
 });
 
+test("token list optional sample fields do not trigger API structure noise", () => {
+  const oldStruct = {
+    token_search_new: {
+      code: "number",
+      msg: "string",
+      data: "array",
+      "data[]": "array",
+      "data[0].tokenAddress": "string",
+      "data[0].symbol": "string",
+      "data[0].templateId": "string",
+      "data[0].hold": "number",
+    },
+    token_search_cap: {
+      code: "number",
+      msg: "string",
+      data: "array",
+      "data[]": "array",
+      "data[0].tokenAddress": "string",
+      "data[0].symbol": "string",
+      "data[0].taxFee": "number",
+      "data[0].feeBurn": "number",
+    },
+    token_ranking_cap: {
+      code: "number",
+      msg: "string",
+      data: "array",
+      "data[]": "array",
+      "data[0].tokenAddress": "string",
+      "data[0].shortName": "string",
+      "data[0].min30Increase": "number",
+    },
+  };
+  const newStruct = {
+    token_search_new: {
+      code: "number",
+      msg: "string",
+      data: "array",
+      "data[]": "array",
+      "data[0].tokenAddress": "string",
+      "data[0].symbol": "string",
+    },
+    token_search_cap: {
+      code: "number",
+      msg: "string",
+      data: "array",
+      "data[]": "array",
+      "data[0].tokenAddress": "string",
+      "data[0].symbol": "string",
+    },
+    token_ranking_cap: {
+      code: "number",
+      msg: "string",
+      data: "array",
+      "data[]": "array",
+      "data[0].tokenAddress": "string",
+    },
+  };
+
+  assert.deepEqual(__testables.diffApiStructures(oldStruct, newStruct), []);
+
+  newStruct.token_search_new["data[0].tokenAddress"] = "number";
+  const changes = __testables.diffApiStructures(oldStruct, newStruct);
+  assert.equal(changes.length, 1);
+  assert.deepEqual(changes[0].changed, ["data[0].tokenAddress: string → number"]);
+});
+
 test("extractTextContent ignores script content and handles greater-than in attributes", () => {
   const html = `<main data-x="a > b"><h1>Create Token</h1><script>throw new Error("<bad>")</script><p>Tax Fee</p></main>`;
   assert.equal(__testables.extractTextContent(html), "Create Token Tax Fee");

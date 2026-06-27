@@ -5198,6 +5198,7 @@ const TOKEN_LIST_VOLATILE_FIELD_PATTERNS = [
   /^data\[0\]\.(?:min|min\d+|hour|hour\d+|day\d+)Increase$/,
   /^data\[0\]\.(?:min|min\d+|hour|hour\d+|day\d+)Vol$/,
   /^data\[0\]\.(?:taxFee|taxFeeSell|feeBurn)$/,
+  /^data\[0\]\.(?:hold|shortName|templateId)$/,
 ];
 
 const API_STRUCTURE_VOLATILE_FIELD_PATTERNS = new Map([
@@ -9330,6 +9331,7 @@ export const __testables = {
   createHostLimiter,
   buildStartupProgressContent,
   buildStartupReadyContent,
+  diffApiStructures,
 };
 
 if (!IS_TEST_MODE) {
