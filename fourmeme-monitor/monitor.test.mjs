@@ -360,6 +360,42 @@ test("frontend notification dedupe key ignores full diff timestamps", () => {
   assert.equal(first, second);
 });
 
+test("single-page frontend merged card does not repeat URL in body", () => {
+  const card = __testables.buildMergedFrontendAssetNotification({
+    pages: [{ label: "/en/announcement", url: "https://four.meme/en/announcement" }],
+    items: [{
+      pageLabel: "/en/announcement",
+      url: "https://four.meme/en/announcement",
+      pageContent: "**📝 页面文案变更：**\n\n**新增：**\n- Live feed",
+    }],
+    assetContent: "",
+    fullDiffs: [],
+    template: "orange",
+    signature: "announcement-copy",
+  });
+
+  assert.equal(card.title, "前端变更：/en/announcement");
+  assert.equal(card.url, "https://four.meme/en/announcement");
+  assert.doesNotMatch(card.content, /URL:/);
+  assert.equal((card.content.match(/https:\/\/four\.meme\/en\/announcement/g) || []).length, 0);
+  assert.match(card.content, /\*\*📄 \/en\/announcement\*\*/);
+  assert.match(card.content, /\*\*\/en\/announcement\*\*/);
+});
+
+test("frontend text change card content is readable without code block scrolling", () => {
+  const content = __testables.formatFrontendTextChanges([
+    { type: "added", text: "Create Token Loading FOUR MEME Announcement Live feed Disclaimer: Digital assets are highly speculative and involve significant risk of loss." },
+    { type: "removed", text: "Create Token Loading FOUR MEME Announcement Latest 2026.02.02 FOUR.MEME Tax Mode is Live Learn more 2025.12.09" },
+    { type: "modified", oldText: "Latest announcements", newText: "Live feed" },
+  ]);
+
+  assert.doesNotMatch(content, /```/);
+  assert.match(content, /\*\*新增：\*\*/);
+  assert.match(content, /\*\*移除：\*\*/);
+  assert.match(content, /原：Latest announcements/);
+  assert.match(content, /新：Live feed/);
+});
+
 test("small i18n remove-only changes require consecutive confirmation", () => {
   const oldStrings = Object.fromEntries(Array.from({ length: 1102 }, (_, i) => [`k${i}`, `v${i}`]));
   const newStrings = { ...oldStrings };

@@ -4408,6 +4408,37 @@ function diffTextContent(oldText, newText) {
   return { changes, reordered: false };
 }
 
+function formatFrontendTextChanges(changes = [], limit = 20) {
+  const selected = (changes || []).slice(0, limit);
+  if (selected.length === 0) return "";
+  const added = selected.filter(c => c.type === "added");
+  const removed = selected.filter(c => c.type === "removed");
+  const modified = selected.filter(c => c.type === "modified");
+  const lines = ["**📝 页面文案变更：**"];
+  const snippet = (value, max = 180) => frontendDisplaySnippet(value, max);
+
+  if (modified.length > 0) {
+    lines.push("");
+    lines.push("**修改：**");
+    for (const c of modified) {
+      lines.push(`- 原：${snippet(c.oldText)}`);
+      lines.push(`  新：${snippet(c.newText)}`);
+    }
+  }
+  if (added.length > 0) {
+    lines.push("");
+    lines.push("**新增：**");
+    for (const c of added) lines.push(`- ${snippet(c.text)}`);
+  }
+  if (removed.length > 0) {
+    lines.push("");
+    lines.push("**移除：**");
+    for (const c of removed) lines.push(`- ${snippet(c.text)}`);
+  }
+  if ((changes || []).length > limit) lines.push(`\n还有 ${(changes || []).length - limit} 处变更，完整内容见 Diff 详情。`);
+  return lines.join("\n");
+}
+
 function frontendRoutePath(url) {
   try {
     return new URL(url, CONFIG.siteUrl).pathname.replace(/\/+$/, "") || "/";
@@ -4698,7 +4729,6 @@ function buildMergedFrontendAssetNotification(group) {
     lines.push("");
   } else if (pages[0]) {
     lines.push(`**📄 ${pages[0].label}**`);
-    if (pages[0].url) lines.push(`URL: ${pages[0].url}`);
     lines.push("");
   }
   if (group.assetContent) lines.push(group.assetContent);
@@ -4710,7 +4740,7 @@ function buildMergedFrontendAssetNotification(group) {
     lines.push("**📌 页面级附加变更：**");
     for (const n of pageSpecific) {
       lines.push("");
-      lines.push(`**${n.pageLabel || urlLabel(n.url)}**${n.url ? `：${n.url}` : ""}`);
+      lines.push(`**${n.pageLabel || urlLabel(n.url)}**`);
       lines.push(n.pageContent);
     }
   }
@@ -8593,15 +8623,7 @@ async function runFrontendCheck() {
           pageContentParts.push(pageContent);
           hasNonAssetChange = true;
         } else if (textDiff.changes.length > 0) {
-          const lines = ["**📝 页面文案变更：**", "```"];
-          for (const c of textDiff.changes.slice(0, 20)) {
-            if (c.type === "modified") { lines.push(`- ${c.oldText}`); lines.push(`+ ${c.newText}`); }
-            else if (c.type === "added") { lines.push(`+ ${(c.text.length > 120 ? c.text.slice(0, 120) + "..." : c.text)}`); }
-            else if (c.type === "removed") { lines.push(`- ${(c.text.length > 120 ? c.text.slice(0, 120) + "..." : c.text)}`); }
-          }
-          lines.push("```");
-          if (textDiff.changes.length > 20) lines.push(`... 还有 ${textDiff.changes.length - 20} 处变更`);
-          const pageContent = lines.join("\n");
+          const pageContent = formatFrontendTextChanges(textDiff.changes, 20);
           contentParts.push(pageContent);
           pageContentParts.push(pageContent);
           hasNonAssetChange = true;
@@ -8671,7 +8693,6 @@ async function runFrontendCheck() {
       const semanticSignature = frontendSemanticChangeSignature({ assetSummary, businessSignalDiff, i18nChanges: pageI18nChanges, textDiff, routeDiff });
       const contentV2 = [
         `**页面：${label}**`,
-        `URL: ${newData.originalUrl}`,
         "",
         contentParts.join("\n\n"),
       ].join("\n");
@@ -9395,6 +9416,8 @@ export const __testables = {
   buildStartupProgressContent,
   buildStartupReadyContent,
   diffApiStructures,
+  buildMergedFrontendAssetNotification,
+  formatFrontendTextChanges,
 };
 
 if (!IS_TEST_MODE) {
