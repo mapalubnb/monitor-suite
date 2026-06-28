@@ -385,15 +385,71 @@ test("single-page frontend merged card does not repeat URL in body", () => {
 test("frontend text change card content is readable without code block scrolling", () => {
   const content = __testables.formatFrontendTextChanges([
     { type: "added", text: "Create Token Loading FOUR MEME Announcement Live feed Disclaimer: Digital assets are highly speculative and involve significant risk of loss." },
-    { type: "removed", text: "Create Token Loading FOUR MEME Announcement Latest 2026.02.02 FOUR.MEME Tax Mode is Live Learn more 2025.12.09" },
+    { type: "removed", text: "Create Token Loading FOUR MEME Announcement Latest < header class= max-w-3xl 2026.02.02 FOUR.MEME Tax Mode is Live Learn more 2025.12.09" },
     { type: "modified", oldText: "Latest announcements", newText: "Live feed" },
   ]);
 
   assert.doesNotMatch(content, /```/);
   assert.match(content, /\*\*新增：\*\*/);
   assert.match(content, /\*\*移除：\*\*/);
-  assert.match(content, /原：Latest announcements/);
-  assert.match(content, /新：Live feed/);
+  assert.match(content, /原：<font color="red">Latest announcements<\/font>/);
+  assert.match(content, /新：<font color="green">Live feed<\/font>/);
+  assert.match(content, /<font color="green">Create Token Loading/);
+  assert.match(content, /<font color="red">Create Token Loading/);
+  assert.match(content, /&lt; header/);
+});
+
+test("fourmeme diff cards use inline red-green highlights without scroll blocks", () => {
+  const samples = [
+    __testables.formatPoolChanges([
+      {
+        type: "参数变更",
+        symbol: "BNB",
+        fieldChanges: ['buyFee: "1" → "2"'],
+      },
+    ]),
+    __testables.formatFrontendSignalChanges({
+      added: ["文案: Live feed"],
+      removed: ["文案: Latest announcements"],
+    }),
+    __testables.formatI18nChanges([
+      { type: "added", key: "announcement.liveFeed", value: "Live feed" },
+      { type: "modified", key: "announcement.title", oldValue: "Latest", newValue: "Live" },
+      { type: "removed", key: "announcement.old", value: "Old announcement" },
+    ]),
+    __testables.formatRouteChanges({
+      added: ["/en/live"],
+      removed: ["/en/latest"],
+    }),
+    __testables.formatApiChanges([
+      { type: "结构变更", endpoint: "public_config", added: ["data.newField (string)"], removed: ["data.oldField"], changed: ["data.flag: boolean → string"] },
+    ], {}),
+    __testables.formatApiValueChanges([
+      { type: "值变更", endpoint: "public_config", fieldChanges: [
+        { action: "added", key: "data.new", value: "yes" },
+        { action: "removed", key: "data.old", value: "no" },
+        { action: "changed", key: "data.flag", old: false, new: true },
+      ] },
+    ]),
+    __testables.formatOpenFourTemplateChanges({
+      added: [{ id: "1", name: "Gift", status: "PUBLISHED", tag: "vault" }],
+      statusChanged: [{ item: { id: "2", name: "Agent", status: "PUBLISHED" }, oldStatus: "DRAFT", newStatus: "PUBLISHED" }],
+    }),
+    __testables.formatContractChanges([
+      { type: "合约地址变化", label: "TokenManager", oldAddress: "0xold", address: "0xnew", oldHash: "hashOld", newHash: "hashNew" },
+    ]),
+    __testables.formatOnchainChanges([
+      { type: "Agent NFT 数量变更", old: 1, new: 2 },
+      { type: "新增 Agent NFT 合约", addresses: ["0x0000000000000000000000000000000000000001"] },
+      { type: "移除 Agent NFT 合约", addresses: ["0x0000000000000000000000000000000000000002"] },
+    ]),
+  ];
+
+  for (const content of samples) {
+    assert.doesNotMatch(content, /```/);
+  }
+  assert(samples.some(content => content.includes('<font color="green">')));
+  assert(samples.some(content => content.includes('<font color="red">')));
 });
 
 test("small i18n remove-only changes require consecutive confirmation", () => {

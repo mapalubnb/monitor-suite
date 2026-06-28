@@ -1381,14 +1381,54 @@ function annotateField(fieldName) {
   return POOL_FIELD_LABELS[fieldName] || "";
 }
 
+function escapeCardText(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+function diffSnippet(value, max = 180) {
+  return escapeCardText(frontendDisplaySnippet(value, max));
+}
+
+function colorText(value, color, max = 180) {
+  return `<font color="${color}">${diffSnippet(value, max)}</font>`;
+}
+
+function addedText(value, max = 180) {
+  return colorText(value, "green", max);
+}
+
+function removedText(value, max = 180) {
+  return colorText(value, "red", max);
+}
+
+function changedText(value, max = 180) {
+  return colorText(value, "orange", max);
+}
+
+function formatAddedLine(label, value = "", max = 180) {
+  const suffix = value === "" || value === undefined || value === null ? "" : `: ${addedText(value, max)}`;
+  return `- ${addedText(label, 120)}${suffix}`;
+}
+
+function formatRemovedLine(label, value = "", max = 180) {
+  const suffix = value === "" || value === undefined || value === null ? "" : `: ${removedText(value, max)}`;
+  return `- ${removedText(label, 120)}${suffix}`;
+}
+
+function formatValueChangeLine(label, oldValue, newValue, max = 180) {
+  return `- ${diffSnippet(label, 120)}：${removedText(oldValue, max)} → ${addedText(newValue, max)}`;
+}
+
 function formatPoolChanges(changes) {
   const lines = [];
   for (const c of changes) {
     if (c.type === "新增底池") {
       lines.push(`**🟢 新增底池：${c.symbol}**`);
-      lines.push("```");
-      lines.push(`+ 地址:     ${c.address}`);
-      lines.push(`+ 状态:     ${c.status}`);
+      lines.push(formatAddedLine("地址", c.address));
+      lines.push(formatAddedLine("状态", c.status));
       // 输出所有 WATCH_FIELDS 中有值的字段，附带中文注释
       const d = c.details || {};
       for (const f of WATCH_FIELDS) {
@@ -1396,7 +1436,7 @@ function formatPoolChanges(changes) {
         const val = d[f];
         if (val === undefined || val === null || val === "") continue;
         const label = annotateField(f);
-        lines.push(`+ ${f}: ${val}${label ? "  ← " + label : ""}`);
+        lines.push(`${formatAddedLine(f, val)}${label ? `  ← ${diffSnippet(label)}` : ""}`);
       }
       // 输出 WATCH_FIELDS 之外的额外字段（如未来 API 新增的字段）
       const watchSet = new Set(WATCH_FIELDS);
@@ -1406,31 +1446,31 @@ function formatPoolChanges(changes) {
       );
       for (const [k, v] of extraFields.slice(0, 10)) {
         if (v === undefined || v === null || v === "") continue;
-        lines.push(`+ ${k}: ${v}`);
+        lines.push(formatAddedLine(k, v));
       }
-      lines.push("```");
       lines.push("---");
     } else if (c.type === "移除底池") {
       lines.push(`**🔴 移除底池：${c.symbol}**`);
-      lines.push("```");
-      lines.push(`- 地址: ${c.address}`);
+      lines.push(formatRemovedLine("地址", c.address));
       if (c.details) {
         for (const f of ["buyFee", "sellFee", "b0Amount", "totalBAmount", "status"]) {
-          if (c.details[f] !== undefined) lines.push(`- ${f}: ${c.details[f]}${annotateField(f) ? "  ← " + annotateField(f) : ""}`);
+          if (c.details[f] !== undefined) lines.push(`${formatRemovedLine(f, c.details[f])}${annotateField(f) ? `  ← ${diffSnippet(annotateField(f))}` : ""}`);
         }
       }
-      lines.push("```");
       lines.push("---");
     } else if (c.type === "参数变更") {
       lines.push(`**🟡 参数变更：${c.symbol}**`);
-      lines.push("```");
       for (const fc of c.fieldChanges) {
         // fc 格式: "buyFee: "0.01" → "0.02""
         const fieldName = fc.split(":")[0].trim();
         const label = annotateField(fieldName);
-        lines.push(`~ ${fc}${label ? "  ← " + label : ""}`);
+        const parsed = fc.match(/^([^:]+):\s*(.*?)\s*→\s*(.*)$/);
+        if (parsed) {
+          lines.push(`${formatValueChangeLine(parsed[1].trim(), parsed[2], parsed[3])}${label ? `  ← ${diffSnippet(label)}` : ""}`);
+        } else {
+          lines.push(`- ${changedText(fc)}`);
+        }
       }
-      lines.push("```");
       lines.push("---");
     }
   }
@@ -2308,12 +2348,13 @@ function formatFrontendSignalChanges(diff, label = "关键业务指纹") {
   const added = diff?.added || [];
   const removed = diff?.removed || [];
   if (added.length === 0 && removed.length === 0) return "";
-  const lines = [`**🔎 ${label}变化：**`, "```"];
-  for (const s of removed.slice(0, 20)) lines.push(`- ${s.length > 160 ? s.slice(0, 160) + "..." : s}`);
+  const lines = [`**🔎 ${label}变化：**`];
+  if (removed.length > 0) lines.push("", "**移除：**");
+  for (const s of removed.slice(0, 20)) lines.push(formatRemovedLine(s, "", 160));
   if (removed.length > 20) lines.push(`  ... 还有 ${removed.length - 20} 项移除`);
-  for (const s of added.slice(0, 20)) lines.push(`+ ${s.length > 160 ? s.slice(0, 160) + "..." : s}`);
+  if (added.length > 0) lines.push("", "**新增：**");
+  for (const s of added.slice(0, 20)) lines.push(formatAddedLine(s, "", 160));
   if (added.length > 20) lines.push(`  ... 还有 ${added.length - 20} 项新增`);
-  lines.push("```");
   return lines.join("\n");
 }
 
@@ -2450,17 +2491,17 @@ function formatNextDataChanges(changes) {
       case "locales":
         lines.push(`  🌐 locales: ${JSON.stringify(c.old)} → ${JSON.stringify(c.new)}`); break;
       case "runtimeConfig.added":
-        lines.push(`  🟢 配置新增 \`${c.key}\`: ${c.value}`); break;
+        lines.push(formatAddedLine(`配置 ${c.key}`, c.value)); break;
       case "runtimeConfig.changed":
-        lines.push(`  ✏️ 配置变更 \`${c.key}\`: ${c.old} → ${c.new}`); break;
+        lines.push(formatValueChangeLine(`配置 ${c.key}`, c.old, c.new)); break;
       case "runtimeConfig.removed":
-        lines.push(`  🔴 配置移除 \`${c.key}\`: ${c.value}`); break;
+        lines.push(formatRemovedLine(`配置 ${c.key}`, c.value)); break;
       case "props.added":
-        lines.push(`  🟢 新增 \`${c.key}\`: ${c.value}`); break;
+        lines.push(formatAddedLine(c.key, c.value)); break;
       case "props.changed":
-        lines.push(`  ✏️ 变更 \`${c.key}\`: ${c.old} → ${c.new}`); break;
+        lines.push(formatValueChangeLine(c.key, c.old, c.new)); break;
       case "props.removed":
-        lines.push(`  🔴 移除 \`${c.key}\`: ${c.value}`); break;
+        lines.push(formatRemovedLine(c.key, c.value)); break;
     }
   }
   if (changes.length > 30) lines.push(`  ... 还有 ${changes.length - 30} 处变更`);
@@ -2908,21 +2949,21 @@ function formatI18nChanges(changes) {
   if (added.length > 0) {
     lines.push("");
     for (const c of added.slice(0, 20)) {
-      lines.push(`  🟢 \`${shortKey(c.key)}\` ${clip(c.value, 70)}`);
+      lines.push(formatAddedLine(shortKey(c.key), clip(c.value, 70)));
     }
     if (added.length > 20) lines.push(`  ... 还有 ${added.length - 20} 条新增`);
   }
   if (modified.length > 0) {
     lines.push("");
     for (const c of modified.slice(0, 10)) {
-      lines.push(`  ✏️ \`${shortKey(c.key)}\` ${clip(c.oldValue, 30)} → ${clip(c.newValue, 30)}`);
+      lines.push(formatValueChangeLine(shortKey(c.key), clip(c.oldValue, 60), clip(c.newValue, 60)));
     }
     if (modified.length > 10) lines.push(`  ... 还有 ${modified.length - 10} 条修改`);
   }
   if (removed.length > 0) {
     lines.push("");
     for (const c of removed.slice(0, 10)) {
-      lines.push(`  🔴 \`${shortKey(c.key)}\` ${clip(c.value, 50)}`);
+      lines.push(formatRemovedLine(shortKey(c.key), clip(c.value, 70)));
     }
     if (removed.length > 10) lines.push(`  ... 还有 ${removed.length - 10} 条删除`);
   }
@@ -3832,11 +3873,11 @@ function formatRouteChanges(routeDiff) {
   if (!hasChanges) return "";
   const lines = ["**🗺️ 路由/端点变更：**"];
   for (const r of (routeDiff.added || []).slice(0, 20)) {
-    lines.push(`  🟢 新增: \`${r}\``);
+    lines.push(formatAddedLine("新增", r));
   }
   if ((routeDiff.added || []).length > 20) lines.push(`  ... 还有 ${routeDiff.added.length - 20} 个新增`);
   for (const r of (routeDiff.removed || []).slice(0, 20)) {
-    lines.push(`  🔴 移除: \`${r}\``);
+    lines.push(formatRemovedLine("移除", r));
   }
   if ((routeDiff.removed || []).length > 20) lines.push(`  ... 还有 ${routeDiff.removed.length - 20} 个移除`);
   return lines.join("\n");
@@ -4415,25 +4456,24 @@ function formatFrontendTextChanges(changes = [], limit = 20) {
   const removed = selected.filter(c => c.type === "removed");
   const modified = selected.filter(c => c.type === "modified");
   const lines = ["**📝 页面文案变更：**"];
-  const snippet = (value, max = 180) => frontendDisplaySnippet(value, max);
 
   if (modified.length > 0) {
     lines.push("");
     lines.push("**修改：**");
     for (const c of modified) {
-      lines.push(`- 原：${snippet(c.oldText)}`);
-      lines.push(`  新：${snippet(c.newText)}`);
+      lines.push(`- 原：${removedText(c.oldText)}`);
+      lines.push(`  新：${addedText(c.newText)}`);
     }
   }
   if (added.length > 0) {
     lines.push("");
     lines.push("**新增：**");
-    for (const c of added) lines.push(`- ${snippet(c.text)}`);
+    for (const c of added) lines.push(`- ${addedText(c.text)}`);
   }
   if (removed.length > 0) {
     lines.push("");
     lines.push("**移除：**");
-    for (const c of removed) lines.push(`- ${snippet(c.text)}`);
+    for (const c of removed) lines.push(`- ${removedText(c.text)}`);
   }
   if ((changes || []).length > limit) lines.push(`\n还有 ${(changes || []).length - limit} 处变更，完整内容见 Diff 详情。`);
   return lines.join("\n");
@@ -4541,7 +4581,7 @@ function formatFrontendAssetBrief(assetSummary) {
     lines.push("");
     lines.push("**功能/配置变化：**");
     for (const cd of assetSummary.configDiffs.slice(0, 12)) {
-      lines.push(`- ${cd.field}: ${frontendDisplaySnippet(cd.oldVal, 60)} -> ${frontendDisplaySnippet(cd.newVal, 60)}`);
+      lines.push(formatValueChangeLine(cd.field, cd.oldVal, cd.newVal, 80));
     }
     if (assetSummary.configDiffs.length > 12) lines.push(`- 还有 ${assetSummary.configDiffs.length - 12} 项配置变化，见 diff 附件`);
   }
@@ -5494,9 +5534,7 @@ function inferEndpointPurpose(endpoint, fields, values) {
   }
   if (sampleLines.length > 0) {
     parts.push(`**📎 关键字段样本：**`);
-    parts.push("```");
-    parts.push(...sampleLines);
-    parts.push("```");
+    for (const line of sampleLines) parts.push(`- ${diffSnippet(line, 160)}`);
     if (meaningful.length > 15) parts.push(`  ... 还有 ${meaningful.length - 15} 个字段`);
   }
   return parts.join("\n");
@@ -5510,11 +5548,21 @@ function formatApiChanges(changes, apiValues) {
     lines.push(`**📡 API ${c.type}：${link}**`);
     if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
     if (c.added?.length || c.removed?.length || c.changed?.length) {
-      lines.push("```");
-      for (const f of c.added || []) lines.push(`+ ${f}`);
-      for (const f of c.removed || []) lines.push(`- ${f}`);
-      for (const f of c.changed || []) lines.push(`~ ${f}`);
-      lines.push("```");
+      if (c.added?.length) {
+        lines.push("**新增字段：**");
+        for (const f of c.added) lines.push(formatAddedLine(f, "", 180));
+      }
+      if (c.removed?.length) {
+        lines.push("**删除字段：**");
+        for (const f of c.removed) lines.push(formatRemovedLine(f, "", 180));
+      }
+      if (c.changed?.length) {
+        lines.push("**类型变化：**");
+        for (const f of c.changed) {
+          const parsed = String(f).match(/^([^:]+):\s*(.*?)\s*→\s*(.*)$/);
+          lines.push(parsed ? formatValueChangeLine(parsed[1], parsed[2], parsed[3]) : `- ${changedText(f)}`);
+        }
+      }
     }
     // 对新接口 / 有新增字段的变更，尝试推断业务用途
     if (c.type === "新接口结构" || (c.added && c.added.length > 0)) {
@@ -5647,13 +5695,11 @@ function formatApiValueChanges(changes) {
       if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
       const entries = Object.entries(c.values).filter(([k]) => !isDynamicField(k));
       if (entries.length > 0) {
-        lines.push("```");
         for (const [k, v] of entries.slice(0, 30)) {
           const display = typeof v === "string" && v.length > 100 ? v.slice(0, 100) + "..." : v;
-          lines.push(`  ${k}: ${display}`);
+          lines.push(`- ${diffSnippet(k)}: ${diffSnippet(display, 120)}`);
         }
         if (entries.length > 30) lines.push(`  ... 还有 ${entries.length - 30} 个字段`);
-        lines.push("```");
       }
     } else {
       const label = apiEndpointLabel(c.endpoint);
@@ -5661,14 +5707,12 @@ function formatApiValueChanges(changes) {
       lines.push(`**📊 API 响应值变更：${link}**`);
       if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
       if (c.fieldChanges) {
-        lines.push("```");
         for (const fc of c.fieldChanges.slice(0, 20)) {
-          if (fc.action === "added") lines.push(`+ ${fc.key}: ${fc.value}`);
-          else if (fc.action === "removed") lines.push(`- ${fc.key}: ${fc.value}`);
-          else if (fc.action === "changed") lines.push(`~ ${fc.key}: ${fc.old} → ${fc.new}`);
+          if (fc.action === "added") lines.push(formatAddedLine(fc.key, fc.value));
+          else if (fc.action === "removed") lines.push(formatRemovedLine(fc.key, fc.value));
+          else if (fc.action === "changed") lines.push(formatValueChangeLine(fc.key, fc.old, fc.new));
         }
         if (c.fieldChanges.length > 20) lines.push(`  ... 还有 ${c.fieldChanges.length - 20} 处变更`);
-        lines.push("```");
       }
     }
     lines.push("---");
@@ -5782,21 +5826,20 @@ function formatOpenFourTemplateChanges(changes) {
   for (const item of changes.added) {
     const marker = String(item.status).toUpperCase() === "PUBLISHED" ? "🆕 新模板上线" : "🆕 新模板";
     lines.push(`**${marker}：${item.name || item.id}**`);
-    lines.push("```");
-    lines.push(formatOpenFourTemplate(item));
-    lines.push("```");
+    for (const line of formatOpenFourTemplate(item).split("\n")) {
+      const [key, ...rest] = line.split(":");
+      lines.push(formatAddedLine(key.trim(), rest.join(":").trim(), 180));
+    }
     lines.push("---");
   }
 
   for (const c of changes.statusChanged) {
     const marker = String(c.newStatus).toUpperCase() === "PUBLISHED" ? "🚀 模板已发布" : "🔄 模板状态变化";
     lines.push(`**${marker}：${c.item.name || c.item.id}**`);
-    lines.push("```");
-    lines.push(`id: ${c.item.id}`);
-    lines.push(`status: ${c.oldStatus || "空"} -> ${c.newStatus || "空"}`);
-    if (c.item.tag) lines.push(`tag: ${c.item.tag}`);
-    if (c.item.userAddress) lines.push(`author: ${c.item.userAddress}`);
-    lines.push("```");
+    lines.push(`- id: ${diffSnippet(c.item.id)}`);
+    lines.push(formatValueChangeLine("status", c.oldStatus || "空", c.newStatus || "空"));
+    if (c.item.tag) lines.push(`- tag: ${diffSnippet(c.item.tag)}`);
+    if (c.item.userAddress) lines.push(`- author: ${diffSnippet(c.item.userAddress)}`);
     lines.push("---");
   }
 
@@ -5980,10 +6023,8 @@ function formatOpenFourNewModules(newModules, context = {}) {
 
   for (const item of newModules) {
     lines.push(`**${item.address}**`);
-    lines.push("```");
-    lines.push(`roles: ${item.roles.join(", ") || "unknown"}`);
-    lines.push(`presetIds: ${item.presetIds.join(", ") || "unknown"}`);
-    lines.push("```");
+    lines.push(formatAddedLine("roles", item.roles.join(", ") || "unknown"));
+    lines.push(formatAddedLine("presetIds", item.presetIds.join(", ") || "unknown"));
     lines.push(`[BscScan](https://bscscan.com/address/${item.address})`);
     lines.push("---");
   }
@@ -6157,9 +6198,7 @@ function formatGithubRepoChanges(changes) {
   for (const c of changes.changed || []) {
     const r = c.repo;
     lines.push(`🔄 **仓库更新：** [${r.full_name}](${r.html_url})`);
-    lines.push("```");
-    for (const f of c.fields) lines.push(`${f.key}: ${f.old || "空"} → ${f.new || "空"}`);
-    lines.push("```");
+    for (const f of c.fields) lines.push(formatValueChangeLine(f.key, f.old || "空", f.new || "空"));
     lines.push("---");
   }
   for (const r of changes.removed || []) {
@@ -6187,9 +6226,7 @@ function formatGithubChanges(newCommits) {
       const body = fullMsg.split("\n").slice(1).join("\n").trim();
       if (body) {
         lines.push(`  提交描述：`);
-        lines.push("```");
-        lines.push(body.length > 500 ? body.slice(0, 500) + "..." : body);
-        lines.push("```");
+        lines.push(`  ${diffSnippet(body, 500)}`);
       }
     }
     if (c.files && c.files.length > 0) {
@@ -6203,12 +6240,13 @@ function formatGithubChanges(newCommits) {
       if (removed.length) summary.push(`删除 ${removed.length}`);
       if (renamed.length) summary.push(`重命名 ${renamed.length}`);
       lines.push(`  文件：${summary.join("、")}（共 ${c.files.length} 个）`);
-      lines.push("```");
       for (const f of c.files.slice(0, 10)) {
-        const prefix = f.status === "added" ? "+" : f.status === "removed" ? "-" : f.status === "renamed" ? ">" : "~";
-        lines.push(`${prefix} ${f.filename}  (+${f.additions} -${f.deletions})`);
+        const detail = `${f.filename}  (+${f.additions} -${f.deletions})`;
+        if (f.status === "added") lines.push(formatAddedLine(detail, ""));
+        else if (f.status === "removed") lines.push(formatRemovedLine(detail, ""));
+        else if (f.status === "renamed") lines.push(`- ${changedText(detail)}`);
+        else lines.push(`- ${diffSnippet(detail)}`);
       }
-      lines.push("```");
       if (c.files.length > 10) lines.push(`... 还有 ${c.files.length - 10} 个文件`);
 
       // 输出关键文件的 patch（实际代码变更内容），帮助 AI 理解具体改了什么
@@ -6869,48 +6907,42 @@ function formatContractChanges(changes) {
   const lines = [];
   for (const c of changes) {
     lines.push(`**🔧 ${c.type}：${c.label}**`);
-    lines.push("```");
     if (c.oldAddress) {
-      lines.push(`- address: ${c.oldAddress}`);
-      lines.push(`+ address: ${c.address}`);
+      lines.push(formatValueChangeLine("address", c.oldAddress, c.address));
     } else {
-      lines.push(`  address: ${c.address}`);
+      lines.push(`- address: ${diffSnippet(c.address)}`);
     }
-    if (c.source) lines.push(`  source: ${c.source}`);
-    if (c.discoveredVia) lines.push(`  via: ${c.discoveredVia}`);
+    if (c.source) lines.push(`- source: ${diffSnippet(c.source)}`);
+    if (c.discoveredVia) lines.push(`- via: ${diffSnippet(c.discoveredVia)}`);
     if (c.oldRelation && c.relation) {
-      lines.push(`- ${c.relationField}: ${c.oldRelation}`);
-      lines.push(`+ ${c.relationField}: ${c.relation}`);
+      lines.push(formatValueChangeLine(c.relationField, c.oldRelation, c.relation));
     }
-    if (c.linkedRegistry) lines.push(`  linkedRegistry: ${c.linkedRegistry}`);
-    if (c.linkedCore) lines.push(`  linkedCore: ${c.linkedCore}`);
-    if (c.linkedFeeRouter) lines.push(`  linkedFeeRouter: ${c.linkedFeeRouter}`);
-    if (c.oldHash && c.newHash) { lines.push(`- codeHash: ${c.oldHash}`); lines.push(`+ codeHash: ${c.newHash}`); }
-    if (c.oldImpl && c.newImpl) { lines.push(`- impl: ${c.oldImpl}`); lines.push(`+ impl: ${c.newImpl}`); }
+    if (c.linkedRegistry) lines.push(`- linkedRegistry: ${diffSnippet(c.linkedRegistry)}`);
+    if (c.linkedCore) lines.push(`- linkedCore: ${diffSnippet(c.linkedCore)}`);
+    if (c.linkedFeeRouter) lines.push(`- linkedFeeRouter: ${diffSnippet(c.linkedFeeRouter)}`);
+    if (c.oldHash && c.newHash) lines.push(formatValueChangeLine("codeHash", c.oldHash, c.newHash));
+    if (c.oldImpl && c.newImpl) lines.push(formatValueChangeLine("impl", c.oldImpl, c.newImpl));
     if (c.oldSize !== undefined && c.newSize !== undefined) {
       const delta = c.newSize - c.oldSize;
       const sign = delta > 0 ? "+" : "";
-      lines.push(`  bytecode 大小: ${c.oldSize} → ${c.newSize} bytes (${sign}${delta})`);
+      lines.push(`${formatValueChangeLine("bytecode 大小", `${c.oldSize} bytes`, `${c.newSize} bytes`)} (${sign}${delta})`);
     }
-    lines.push("```");
 
     // 函数选择器 diff — 揭示合约接口的增减
     if (c.selectorDiff) {
       const sd = c.selectorDiff;
       if (sd.added.length > 0 || sd.removed.length > 0) {
         lines.push("**接口变更（函数选择器 diff）：**");
-        lines.push("```");
         for (const s of sd.added.slice(0, 15)) {
           const name = KNOWN_SELECTORS[s.toLowerCase()];
-          lines.push(`+ ${s}${name ? " → " + name : ""}`);
+          lines.push(formatAddedLine(s, name || ""));
         }
         if (sd.added.length > 15) lines.push(`  ... 还有 ${sd.added.length - 15} 个新增`);
         for (const s of sd.removed.slice(0, 15)) {
           const name = KNOWN_SELECTORS[s.toLowerCase()];
-          lines.push(`- ${s}${name ? " → " + name : ""}`);
+          lines.push(formatRemovedLine(s, name || ""));
         }
         if (sd.removed.length > 15) lines.push(`  ... 还有 ${sd.removed.length - 15} 个移除`);
-        lines.push("```");
         // 生成可读摘要供 AI 分析
         const addedNames = sd.added.map(s => KNOWN_SELECTORS[s.toLowerCase()]).filter(Boolean);
         const removedNames = sd.removed.map(s => KNOWN_SELECTORS[s.toLowerCase()]).filter(Boolean);
@@ -6999,20 +7031,15 @@ function formatOnchainChanges(changes) {
       const delta = c.new - c.old;
       const sign = delta > 0 ? "+" : "";
       lines.push(`**🤖 ${c.type}**`);
-      lines.push("```");
-      lines.push(`- nftCount: ${c.old}`);
-      lines.push(`+ nftCount: ${c.new}  (${sign}${delta})`);
-      lines.push("```");
+      lines.push(`${formatValueChangeLine("nftCount", c.old, c.new)} (${sign}${delta})`);
       if (delta > 0) lines.push(`说明：AgentIdentifier 合约中注册的 Agent NFT 合约数量增加了 ${delta} 个，通常意味着有新的 AI Agent 代币创建流程被注册。`);
       else lines.push(`说明：Agent NFT 合约数量减少了 ${Math.abs(delta)} 个，可能有 Agent 被注销或迁移。`);
       lines.push("---");
     } else if (c.type === "新增 Agent NFT 合约") {
       lines.push(`**🤖 ${c.type}（${c.addresses.length} 个）**`);
-      lines.push("```");
       for (const addr of c.addresses) {
-        lines.push(`+ ${addr}`);
+        lines.push(formatAddedLine(addr, ""));
       }
-      lines.push("```");
       lines.push("**BSCscan 链接：**");
       for (const addr of c.addresses.slice(0, 10)) {
         lines.push(`  [${addr.slice(0, 10)}...](https://bscscan.com/address/${addr})`);
@@ -7022,11 +7049,9 @@ function formatOnchainChanges(changes) {
       lines.push("---");
     } else if (c.type === "移除 Agent NFT 合约") {
       lines.push(`**🤖 ${c.type}（${c.addresses.length} 个）**`);
-      lines.push("```");
       for (const addr of c.addresses) {
-        lines.push(`- ${addr}`);
+        lines.push(formatRemovedLine(addr, ""));
       }
-      lines.push("```");
       lines.push("**BSCscan 链接：**");
       for (const addr of c.addresses.slice(0, 10)) {
         lines.push(`  [${addr.slice(0, 10)}...](https://bscscan.com/address/${addr})`);
@@ -7598,18 +7623,16 @@ function formatActorActions(actions) {
   const lines = [];
   for (const a of actions.slice(0, 12)) {
     lines.push(`**${riskIcon[a.risk] || "⚠️"} ${riskLabel[a.risk] || "未知风险"}：${a.method || "已监听地址交易"}**`);
-    lines.push("```");
-    lines.push(`区块: ${a.blockNumber}`);
-    lines.push(`发起地址: ${a.from}`);
-    if (a.fromActor) lines.push(`角色: ${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`);
-    if (a.to) lines.push(`目标地址: ${a.to}${a.toContract ? ` (${a.toContract.labels.join("/")})` : ""}`);
-    if (a.selector) lines.push(`函数选择器: ${a.selector}`);
-    if (a.safeTarget) lines.push(`内部目标: ${a.safeTarget}${a.safeTargetLabel ? ` (${a.safeTargetLabel})` : ""}`);
-    if (a.safeSelector) lines.push(`内部选择器: ${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`);
-    if (a.contractAddress) lines.push(`新合约: ${a.contractAddress}`);
-    if (a.status) lines.push(`状态: ${a.status === "0x1" ? "成功" : a.status}`);
-    lines.push(`原因: ${a.reason}`);
-    lines.push("```");
+    lines.push(`- 区块: ${diffSnippet(a.blockNumber)}`);
+    lines.push(`- 发起地址: ${diffSnippet(a.from)}`);
+    if (a.fromActor) lines.push(`- 角色: ${diffSnippet(`${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`)}`);
+    if (a.to) lines.push(`- 目标地址: ${diffSnippet(`${a.to}${a.toContract ? ` (${a.toContract.labels.join("/")})` : ""}`)}`);
+    if (a.selector) lines.push(`- 函数选择器: ${diffSnippet(a.selector)}`);
+    if (a.safeTarget) lines.push(`- 内部目标: ${diffSnippet(`${a.safeTarget}${a.safeTargetLabel ? ` (${a.safeTargetLabel})` : ""}`)}`);
+    if (a.safeSelector) lines.push(`- 内部选择器: ${diffSnippet(`${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`)}`);
+    if (a.contractAddress) lines.push(formatAddedLine("新合约", a.contractAddress));
+    if (a.status) lines.push(`- 状态: ${diffSnippet(a.status === "0x1" ? "成功" : a.status)}`);
+    lines.push(`- 原因: ${diffSnippet(a.reason)}`);
     lines.push(`[交易链接](https://bscscan.com/tx/${a.hash})`);
     if (a.contractAddress) lines.push(`[新合约](https://bscscan.com/address/${a.contractAddress})`);
     lines.push("---");
@@ -9400,7 +9423,17 @@ export const __testables = {
   buildFrontendNewPageNotification,
   buildFrontendRouteActionButtons,
   buildFrontendNewPageAiInput,
+  formatPoolChanges,
+  formatApiChanges,
+  formatApiValueChanges,
+  formatFrontendSignalChanges,
+  formatOpenFourTemplateChanges,
+  formatGithubRepoChanges,
   formatI18nChangesForFullDiff,
+  formatI18nChanges,
+  formatRouteChanges,
+  formatContractChanges,
+  formatOnchainChanges,
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,
   diffRoutes,
