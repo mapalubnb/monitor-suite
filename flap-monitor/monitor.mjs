@@ -908,38 +908,27 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     : affectedUrls;
   const localSignalLines = hasBusinessResourceDiffs
     ? [
-        ...jsTextDiffs.flatMap(d => [
-          `- ${diffLabel(d.type, d.type === "removed" ? "移除文案" : d.type === "added" ? "新增文案" : "文案变更")}${d.file ? ` (${d.file})` : ""}`,
-          indentCardText(cardValueOrEmpty(d.text), "  ", diffColor(d.type)),
-        ]),
-        ...businessConfigDiffs.flatMap(cd => [
-          `- ${diffLabel("removed", `配置 ${cd.field}`)}${cd.file ? ` (${cd.file})` : ""}`,
-          indentCardText(cardValueOrEmpty(cd.oldVal), "  ", diffColor("removed")),
-          `- ${diffLabel("added", `配置 ${cd.field}`)}${cd.file ? ` (${cd.file})` : ""}`,
-          indentCardText(cardValueOrEmpty(cd.newVal), "  ", diffColor("added")),
-        ]),
+        ...jsTextDiffs.map(d => {
+          const label = d.type === "removed" ? "移除文案" : d.type === "added" ? "新增文案" : "文案变更";
+          const line = d.type === "removed" ? formatRemovedLine(label, d.text) : formatAddedLine(label, d.text);
+          return `${line}${d.file ? `  ← ${cardText(d.file)}` : ""}`;
+        }),
+        ...businessConfigDiffs.map(cd => `${formatValueChangeLine(cd.field, cd.oldVal, cd.newVal)}${cd.file ? `  ← ${cardText(cd.file)}` : ""}`),
         ...vaultDiffs.flatMap(vd => {
           if (vd.type === "modified") {
             return [
-              `- ${diffMarker("modified")} Vault ${vd.name || JSON.stringify(vd)}`,
-              ...(vd.fieldChanges || []).flatMap(fc => [
-                `  ${diffLabel("removed", fc.key)}`,
-                indentCardText(cardValueOrEmpty(fc.oldVal), "    ", diffColor("removed")),
-                `  ${diffLabel("added", fc.key)}`,
-                indentCardText(cardValueOrEmpty(fc.newVal), "    ", diffColor("added")),
-              ]),
+              `- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`,
+              ...(vd.fieldChanges || []).map(fc => `  ${formatValueChangeLine(fc.key, fc.oldVal, fc.newVal)}`),
             ];
           }
           if (vd.type === "added") {
             return [
-              `- ${diffMarker("added")} Vault ${vd.name || JSON.stringify(vd)}`,
-              ...(vd.fields ? Object.entries(vd.fields).flatMap(([key, value]) => [
-                `  ${diffLabel("added", key)}`,
-                indentCardText(cardValueOrEmpty(value), "    ", diffColor("added")),
-              ]) : []),
+              `- ${addedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`,
+              ...(vd.fields ? Object.entries(vd.fields).map(([key, value]) => `  ${formatAddedLine(key, value)}`) : []),
             ];
           }
-          return [`- ${diffMarker(vd.type)} Vault ${vd.name || JSON.stringify(vd)}`];
+          if (vd.type === "removed") return [`- ${removedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
+          return [`- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
         }),
       ]
     : ["- 本地结构化提取未发现业务信号。"];
@@ -1344,30 +1333,31 @@ function cardValueOrEmpty(value) {
   return text === "" ? "(空)" : text;
 }
 
-function escapeCardColorText(value) {
+function escapeCardText(value) {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
 }
 
-function diffColor(type) {
-  if (type === "added") return "green";
-  if (type === "removed") return "red";
-  if (type === "modified" || type === "reordered") return "orange";
-  return "grey";
-}
-
-function diffIcon(type) {
-  if (type === "added") return "🟢";
-  if (type === "removed") return "🔴";
-  if (type === "modified") return "✏️";
-  if (type === "reordered") return "🔀";
-  return "•";
+function cardText(value) {
+  return escapeCardText(cardValueOrEmpty(value));
 }
 
 function colorCardText(value, color) {
-  return `<font color='${color}'>${escapeCardColorText(value)}</font>`;
+  return `<font color="${color}">${escapeCardText(cardValueOrEmpty(value))}</font>`;
+}
+
+function addedText(value) {
+  return colorCardText(value, "green");
+}
+
+function removedText(value) {
+  return colorCardText(value, "red");
+}
+
+function changedText(value) {
+  return colorCardText(value, "orange");
 }
 
 function indentCardText(value, indent = "    ", color = "") {
@@ -1377,12 +1367,18 @@ function indentCardText(value, indent = "    ", color = "") {
     .join("\n");
 }
 
-function diffMarker(type) {
-  return colorCardText(diffIcon(type), diffColor(type));
+function formatAddedLine(label, value = "") {
+  const suffix = value === "" || value === undefined || value === null ? "" : `: ${addedText(value)}`;
+  return `- ${addedText(label)}${suffix}`;
 }
 
-function diffLabel(type, label) {
-  return colorCardText(`${diffIcon(type)} ${label}`, diffColor(type));
+function formatRemovedLine(label, value = "") {
+  const suffix = value === "" || value === undefined || value === null ? "" : `: ${removedText(value)}`;
+  return `- ${removedText(label)}${suffix}`;
+}
+
+function formatValueChangeLine(label, oldValue, newValue) {
+  return `- ${cardText(label)}：${removedText(oldValue)} → ${addedText(newValue)}`;
 }
 
 function buildCardUrlPrefix(url, content) {
@@ -1399,10 +1395,7 @@ function splitDiffPairText(text) {
 }
 
 function pushDiffPairLines(lines, key, oldVal, newVal, indent = "  ") {
-  lines.push(`${indent}${diffLabel("removed", key)}`);
-  lines.push(indentCardText(cardValueOrEmpty(oldVal), `${indent}  `, diffColor("removed")));
-  lines.push(`${indent}${diffLabel("added", key)}`);
-  lines.push(indentCardText(cardValueOrEmpty(newVal), `${indent}  `, diffColor("added")));
+  lines.push(`${indent}${formatValueChangeLine(key, oldVal, newVal)}`);
 }
 
 /**
@@ -1436,18 +1429,11 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       } else if (d.type === "modified") {
         lines.push(`  ✏️ **${label}**`);
         if (d.oldName && d.newName && d.oldName !== d.newName) lines.push(`  名称: ${d.oldName} → ${d.newName}`);
-        lines.push(`  ${diffLabel("removed", "旧文案")}`);
-        lines.push(indentCardText(cardValueOrEmpty(d.oldDescription), "    ", diffColor("removed")));
-        lines.push(`  ${diffLabel("added", "新文案")}`);
-        lines.push(indentCardText(cardValueOrEmpty(d.newDescription), "    ", diffColor("added")));
+        lines.push(`  ${formatValueChangeLine("文案", d.oldDescription, d.newDescription)}`);
       } else if (d.type === "added") {
-        lines.push(`  ${diffLabel("added", `新增金库: ${label}`)}`);
-        lines.push("    文案:");
-        lines.push(indentCardText(cardValueOrEmpty(d.newDescription), "      ", diffColor("added")));
+        lines.push(`  ${formatAddedLine(`新增金库: ${label}`, d.newDescription)}`);
       } else if (d.type === "removed") {
-        lines.push(`  ${diffLabel("removed", `移除金库: ${label}`)}`);
-        lines.push("    原文案:");
-        lines.push(indentCardText(cardValueOrEmpty(d.oldDescription), "      ", diffColor("removed")));
+        lines.push(`  ${formatRemovedLine(`移除金库: ${label}`, d.oldDescription)}`);
       }
     }
     lines.push("");
@@ -1464,10 +1450,9 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
           pushDiffPairLines(lines, fc.key, fc.oldVal, fc.newVal, "    ");
         }
       } else if (vd.type === "added") {
-        lines.push(`  ${diffLabel("added", `新增: ${vd.name}`)}`);
+        lines.push(`  ${formatAddedLine(`新增: ${vd.name}`)}`);
         for (const [key, value] of Object.entries(vd.fields || {})) {
-          lines.push(`    ${diffLabel("added", key)}`);
-          lines.push(indentCardText(cardValueOrEmpty(value), "      ", diffColor("added")));
+          lines.push(`    ${formatAddedLine(key, value)}`);
         }
       }
     }
@@ -1481,31 +1466,29 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     const added = textChanges.filter(c => c.type === "added");
     const removed = textChanges.filter(c => c.type === "removed");
     lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
-    for (const c of modified) {
-      lines.push("  ✏️ 修改");
-      lines.push(`  ${diffLabel("removed", "旧")}`);
-      lines.push(indentCardText(cardValueOrEmpty(c.oldText), "    ", diffColor("removed")));
-      lines.push(`  ${diffLabel("added", "新")}`);
-      lines.push(indentCardText(cardValueOrEmpty(c.newText), "    ", diffColor("added")));
-      if (c.ctxBefore) {
-        lines.push("  上文");
-        lines.push(indentCardText(c.ctxBefore, "    "));
+    if (modified.length > 0) {
+      lines.push("");
+      lines.push("**修改：**");
+      for (const c of modified) {
+        lines.push(`- 原：${removedText(c.oldText)}`);
+        lines.push(`  新：${addedText(c.newText)}`);
+        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
       }
     }
-    for (const c of added) {
-      lines.push(`  ${diffLabel("added", "新增")}`);
-      lines.push(indentCardText(cardValueOrEmpty(c.text), "    ", diffColor("added")));
-      if (c.ctxBefore) {
-        lines.push("  上文");
-        lines.push(indentCardText(c.ctxBefore, "    "));
+    if (added.length > 0) {
+      lines.push("");
+      lines.push("**新增：**");
+      for (const c of added) {
+        lines.push(formatAddedLine(c.text));
+        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
       }
     }
-    for (const c of removed) {
-      lines.push(`  ${diffLabel("removed", "删除")}`);
-      lines.push(indentCardText(cardValueOrEmpty(c.text), "    ", diffColor("removed")));
-      if (c.ctxBefore) {
-        lines.push("  上文");
-        lines.push(indentCardText(c.ctxBefore, "    "));
+    if (removed.length > 0) {
+      lines.push("");
+      lines.push("**移除：**");
+      for (const c of removed) {
+        lines.push(formatRemovedLine(c.text));
+        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
       }
     }
     lines.push("");
@@ -1526,24 +1509,19 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     if (added.length > 0) {
       lines.push(`  **新增 ${added.length} 条：**`);
       for (const d of added) {
-        lines.push(`  ${diffLabel("added", d.key)}`);
-        lines.push(indentCardText(cardValueOrEmpty(d.value), "    ", diffColor("added")));
+        lines.push(`  ${formatAddedLine(d.key, d.value)}`);
       }
     }
     if (modified.length > 0) {
       lines.push(`  **修改 ${modified.length} 条：**`);
       for (const d of modified) {
-        lines.push(`  ${diffLabel("removed", d.key)}`);
-        lines.push(indentCardText(cardValueOrEmpty(d.oldValue), "    ", diffColor("removed")));
-        lines.push(`  ${diffLabel("added", d.key)}`);
-        lines.push(indentCardText(cardValueOrEmpty(d.newValue), "    ", diffColor("added")));
+        lines.push(`  ${formatValueChangeLine(d.key, d.oldValue, d.newValue)}`);
       }
     }
     if (removed.length > 0) {
       lines.push(`  **删除 ${removed.length} 条：**`);
       for (const d of removed) {
-        lines.push(`  ${diffLabel("removed", d.key)}`);
-        lines.push(indentCardText(cardValueOrEmpty(d.value), "    ", diffColor("removed")));
+        lines.push(`  ${formatRemovedLine(d.key, d.value)}`);
       }
     }
     lines.push("");
@@ -1585,19 +1563,23 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     const totalItems = paired.length + unpairedAdded.length + unpairedRemoved.length;
     if (totalItems > 0) {
       lines.push(`**💬 功能文案变更（${totalItems} 处）：**`);
-      for (const p of paired) {
-        lines.push(`  ${diffLabel("removed", "旧")}`);
-        lines.push(indentCardText(cardValueOrEmpty(p.oldText), "    ", diffColor("removed")));
-        lines.push(`  ${diffLabel("added", "新")}`);
-        lines.push(indentCardText(cardValueOrEmpty(p.newText), "    ", diffColor("added")));
+      if (paired.length > 0) {
+        lines.push("");
+        lines.push("**修改：**");
+        for (const p of paired) {
+          lines.push(`- 原：${removedText(p.oldText)}`);
+          lines.push(`  新：${addedText(p.newText)}`);
+        }
       }
-      for (const a of unpairedAdded) {
-        lines.push(`  ${diffLabel("added", "新增")}`);
-        lines.push(indentCardText(cardValueOrEmpty(a.text), "    ", diffColor("added")));
+      if (unpairedAdded.length > 0) {
+        lines.push("");
+        lines.push("**新增：**");
+        for (const a of unpairedAdded) lines.push(formatAddedLine(a.text));
       }
-      for (const r of unpairedRemoved) {
-        lines.push(`  ${diffLabel("removed", "删除")}`);
-        lines.push(indentCardText(cardValueOrEmpty(r.text), "    ", diffColor("removed")));
+      if (unpairedRemoved.length > 0) {
+        lines.push("");
+        lines.push("**移除：**");
+        for (const r of unpairedRemoved) lines.push(formatRemovedLine(r.text));
       }
       lines.push("");
     }
@@ -2154,7 +2136,7 @@ function formatVaultFactoryChanges(changes) {
       if (v.enabled) flags.push("已启用");
       else flags.push("已禁用");
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
-      lines.push(`  ${diffLabel("added", v.name)}`);
+      lines.push(`  ${formatAddedLine(v.name)}`);
       lines.push(`    \`${v.factory}\``);
       lines.push(`    ${flags.join(" | ")}`);
       lines.push(`    🔗 [金库页面](https://flap.sh/launch?vaultfactory=${v.factory})`);
@@ -2164,7 +2146,7 @@ function formatVaultFactoryChanges(changes) {
   if (changes.removed.length > 0) {
     lines.push("**❌ 移除金库工厂:**");
     for (const v of changes.removed) {
-      lines.push(`  ${diffLabel("removed", v.name)}`);
+      lines.push(`  ${formatRemovedLine(v.name)}`);
       lines.push(`    \`${v.factory}\``);
     }
     lines.push("");
@@ -2172,7 +2154,7 @@ function formatVaultFactoryChanges(changes) {
   if (changes.modified.length > 0) {
     lines.push("**✏️ 金库工厂配置变更:**");
     for (const v of changes.modified) {
-      lines.push(`  ${diffLabel("modified", v.name)}`);
+      lines.push(`  ${changedText(v.name)}`);
       lines.push(`    \`${v.factory}\``);
       for (const d of v.diffs) {
         const pair = splitDiffPairText(d);
@@ -2764,7 +2746,11 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
     name,
     "",
     `**变更类型**`,
-    diffLabel(change?.type, typeLabel),
+    change?.type === "removed"
+      ? removedText(typeLabel)
+      : change?.type === "added"
+        ? addedText(typeLabel)
+        : changedText(typeLabel),
     "",
     `**文案**`,
     copy,

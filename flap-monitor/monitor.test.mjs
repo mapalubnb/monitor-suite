@@ -249,10 +249,9 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.equal(grouped[0].url, "https://flap.sh");
   assert.match(grouped[0].content, /功能文案 1 处/);
   assert.match(grouped[0].content, /业务配置 2 项/);
-  assert.match(grouped[0].content, /<font color='green'>🟢 新增文案<\/font>/);
+  assert.match(grouped[0].content, /<font color="green">新增文案<\/font>: <font color="green">Create an account and generate a wallet<\/font>/);
   assert.match(grouped[0].content, /Create an account and generate a wallet/);
-  assert.match(grouped[0].content, /<font color='red'>🔴 配置 fees<\/font>/);
-  assert.match(grouped[0].content, /<font color='green'>🟢 配置 fees<\/font>/);
+  assert.match(grouped[0].content, /fees：<font color="red">\(新增\)<\/font> → <font color="green">void<\/font>/);
   assert.match(grouped[0].content, /\*\*AI 分析\*\*/);
   assert.equal(grouped[0].skipBusinessPriorityTitle, true);
   assert.equal(grouped[0].skipAi, false);
@@ -300,7 +299,7 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   assert.match(notification.content, /金库名字/);
   assert.match(notification.content, /禮物稅收金庫/);
   assert.match(notification.content, /指定一個 X 帳戶/);
-  assert.match(notification.content, /<font color='green'>🟢 新增金库<\/font>/);
+  assert.match(notification.content, /<font color="green">新增金库<\/font>/);
   assert.match(notification.content, /🔗 \[打开金库页面\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\)/);
   assert.match(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
@@ -558,10 +557,8 @@ test("page change card puts summary and important copy before resource details",
   assert(content.indexOf("**重点变更**") < content.indexOf("**资源统计**"));
   assert(content.indexOf("禮物稅收金庫") < content.indexOf("vault-page.js"));
   assert.doesNotMatch(content, /建议动作/);
-  assert.match(content, /<font color='red'>🔴 旧<\/font>/);
-  assert.match(content, /<font color='green'>🟢 新<\/font>/);
-  assert.match(content, /<font color='red'>旧手续费 旧配置说明/);
-  assert.match(content, /<font color='green'>新手续费 新配置说明/);
+  assert.match(content, /- 原：<font color="red">旧手续费 旧配置说明/);
+  assert.match(content, /  新：<font color="green">新手续费 新配置说明/);
   assert.match(content, /旧配置说明 旧配置说明 旧配置说明/);
   assert.match(content, /新配置说明 新配置说明 新配置说明/);
   assert.doesNotMatch(content, /\.\.\.|…/);
@@ -653,8 +650,7 @@ test("vault factory card summarizes counts before details", () => {
   assert(content.startsWith("**结论摘要**"));
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
-  assert.match(content, /<font color='red'>🔴 enabled<\/font>\n      <font color='red'>true<\/font>/);
-  assert.match(content, /<font color='green'>🟢 enabled<\/font>\n      <font color='green'>false<\/font>/);
+  assert.match(content, /enabled：<font color="red">true<\/font> → <font color="green">false<\/font>/);
 });
 
 test("round vault factory aggregation stabilizes conflicting page snapshots", () => {
