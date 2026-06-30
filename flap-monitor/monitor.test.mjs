@@ -249,6 +249,10 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.equal(grouped[0].url, "https://flap.sh");
   assert.match(grouped[0].content, /功能文案 1 处/);
   assert.match(grouped[0].content, /业务配置 2 项/);
+  assert.match(grouped[0].content, /🟢 新增文案/);
+  assert.match(grouped[0].content, /Create an account and generate a wallet/);
+  assert.match(grouped[0].content, /🔴 配置 `fees`/);
+  assert.match(grouped[0].content, /🟢 配置 `fees`/);
   assert.match(grouped[0].content, /\*\*AI 分析\*\*/);
   assert.equal(grouped[0].skipBusinessPriorityTitle, true);
   assert.equal(grouped[0].skipAi, false);
@@ -296,7 +300,8 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   assert.match(notification.content, /金库名字/);
   assert.match(notification.content, /禮物稅收金庫/);
   assert.match(notification.content, /指定一個 X 帳戶/);
-  assert.match(notification.content, /\[https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\]/);
+  assert.match(notification.content, /🟢 新增金库/);
+  assert.match(notification.content, /🔗 \[打开金库页面\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\)/);
   assert.match(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
@@ -522,6 +527,8 @@ test("business priority title can preserve manual check source prefix", () => {
 });
 
 test("page change card puts summary and important copy before resource details", () => {
+  const longOldText = "旧手续费 " + "旧配置说明 ".repeat(40).trim();
+  const longNewText = "新手续费 " + "新配置说明 ".repeat(40).trim();
   const content = __testables.buildCardBriefing(
     "https://flap.sh/bnb/CAstore",
     null,
@@ -543,7 +550,7 @@ test("page change card puts summary and important copy before resource details",
     1,
     1,
     [{ type: "added", key: "castore.giftVault", value: "禮物稅收金庫" }],
-    [{ type: "modified", oldText: "旧手续费", newText: "新手续费", ctxBefore: "CAstore" }],
+    [{ type: "modified", oldText: longOldText, newText: longNewText, ctxBefore: "CAstore" }],
     [{ type: "added", area: "热门金库", name: "禮物稅收金庫", newDescription: "指定账户收取礼物税收" }],
   );
 
@@ -551,6 +558,11 @@ test("page change card puts summary and important copy before resource details",
   assert(content.indexOf("**重点变更**") < content.indexOf("**资源统计**"));
   assert(content.indexOf("禮物稅收金庫") < content.indexOf("vault-page.js"));
   assert.doesNotMatch(content, /建议动作/);
+  assert.match(content, /🔴 旧/);
+  assert.match(content, /🟢 新/);
+  assert.match(content, /旧配置说明 旧配置说明 旧配置说明/);
+  assert.match(content, /新配置说明 新配置说明 新配置说明/);
+  assert.doesNotMatch(content, /\.\.\.|…/);
   assert.match(content, /AI 分析异步生成中，变更已先推送/);
 });
 
@@ -639,6 +651,8 @@ test("vault factory card summarizes counts before details", () => {
   assert(content.startsWith("**结论摘要**"));
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
+  assert.match(content, /🔴 `enabled`\n      true/);
+  assert.match(content, /🟢 `enabled`\n      false/);
 });
 
 test("round vault factory aggregation stabilizes conflicting page snapshots", () => {

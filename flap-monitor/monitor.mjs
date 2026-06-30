@@ -505,21 +505,20 @@ function isTooLongForSingleCard(content) {
  * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
 async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, summarizeFn = aiSummarize) {
-  // 卡片最上方加入监控目标网址
-  const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
-  const messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
+  const initialContent = buildCardUrlPrefix(url, content) + content;
+  const messageId = await sendCardViaApi(title, initialContent, template, diffFilePath);
 
   if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
     const summarize = summarizeFn || aiSummarize;
-    summarize(aiInput || content, moduleContext).then(async (summary) => {
+    summarize(aiInput || initialContent, moduleContext).then(async (summary) => {
       if (!summary) return;
       const enriched = enrichFn
         ? enrichFn(summary)
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
+      const enrichedContent = buildCardUrlPrefix(url, enriched) + enriched;
       if (messageId) {
         try {
-          const enrichedContent = urlLine + enriched;
-          if (isTooLongForSingleCard(urlLine + content) || isTooLongForSingleCard(enrichedContent)) {
+          if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
             log(`[AI 摘要] ${title} 正文较长，保留完整变更卡片，另发 AI 摘要卡片`);
             await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
           } else {
@@ -549,9 +548,9 @@ function shouldUseAiForNotification({ title = "", content = "", moduleContext = 
 
 async function sendNotificationMaybeAi({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, skipAi = false }) {
   if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
-    const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
-    const messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath);
-    if (!messageId) await sendFeishu(title, urlLine + content, template);
+    const cardContent = buildCardUrlPrefix(url, content) + content;
+    const messageId = await sendCardViaApi(title, cardContent, template, diffFilePath);
+    if (!messageId) await sendFeishu(title, cardContent, template);
     else log(`[AI] 已跳过：${title}`);
     return messageId;
   }
@@ -909,9 +908,39 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     : affectedUrls;
   const localSignalLines = hasBusinessResourceDiffs
     ? [
-        ...jsTextDiffs.slice(0, 4).map(d => `- ${d.type === "removed" ? "移除" : "新增"}文案: ${truncateCardText(d.text, 120)}${d.file ? ` (${d.file})` : ""}`),
-        ...businessConfigDiffs.slice(0, 6).map(cd => `- 配置: \`${cd.field}\` ${cd.oldVal} -> ${cd.newVal}${cd.file ? ` (${cd.file})` : ""}`),
-        ...vaultDiffs.slice(0, 4).map(vd => `- Vault: ${vd.type || "changed"} ${vd.name || JSON.stringify(vd)}`),
+        ...jsTextDiffs.flatMap(d => [
+          `- ${diffMarker(d.type)} ${d.type === "removed" ? "移除文案" : d.type === "added" ? "新增文案" : "文案变更"}${d.file ? ` (${d.file})` : ""}`,
+          indentCardText(cardValueOrEmpty(d.text), "  "),
+        ]),
+        ...businessConfigDiffs.flatMap(cd => [
+          `- ${diffMarker("removed")} 配置 \`${cd.field}\`${cd.file ? ` (${cd.file})` : ""}`,
+          indentCardText(cardValueOrEmpty(cd.oldVal), "  "),
+          `- ${diffMarker("added")} 配置 \`${cd.field}\`${cd.file ? ` (${cd.file})` : ""}`,
+          indentCardText(cardValueOrEmpty(cd.newVal), "  "),
+        ]),
+        ...vaultDiffs.flatMap(vd => {
+          if (vd.type === "modified") {
+            return [
+              `- ${diffMarker("modified")} Vault ${vd.name || JSON.stringify(vd)}`,
+              ...(vd.fieldChanges || []).flatMap(fc => [
+                `  ${diffMarker("removed")} \`${fc.key}\``,
+                indentCardText(cardValueOrEmpty(fc.oldVal), "    "),
+                `  ${diffMarker("added")} \`${fc.key}\``,
+                indentCardText(cardValueOrEmpty(fc.newVal), "    "),
+              ]),
+            ];
+          }
+          if (vd.type === "added") {
+            return [
+              `- ${diffMarker("added")} Vault ${vd.name || JSON.stringify(vd)}`,
+              ...(vd.fields ? Object.entries(vd.fields).flatMap(([key, value]) => [
+                `  ${diffMarker("added")} \`${key}\``,
+                indentCardText(cardValueOrEmpty(value), "    "),
+              ]) : []),
+            ];
+          }
+          return [`- ${diffMarker(vd.type)} Vault ${vd.name || JSON.stringify(vd)}`];
+        }),
       ]
     : ["- 本地结构化提取未发现业务信号。"];
 
@@ -1304,9 +1333,50 @@ function buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i
   return summary;
 }
 
-function truncateCardText(value, max = 180) {
-  const s = String(value || "");
-  return s.length > max ? `${s.slice(0, max)}...` : s;
+function normalizeCardText(value) {
+  return String(value ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n+$/, "");
+}
+
+function indentCardText(value, indent = "    ") {
+  return normalizeCardText(value)
+    .split("\n")
+    .map(line => `${indent}${line}`)
+    .join("\n");
+}
+
+function cardValueOrEmpty(value) {
+  const text = normalizeCardText(value);
+  return text === "" ? "(空)" : text;
+}
+
+function diffMarker(type) {
+  if (type === "added") return "🟢";
+  if (type === "removed") return "🔴";
+  if (type === "modified") return "✏️";
+  if (type === "reordered") return "🔀";
+  return "•";
+}
+
+function buildCardUrlPrefix(url, content) {
+  if (!url) return "";
+  const text = String(content || "");
+  if (text.includes(url)) return "";
+  return `🔗 [${url}](${url})\n\n`;
+}
+
+function splitDiffPairText(text) {
+  const m = String(text || "").match(/^(.*?):\s*(.*?)\s*→\s*(.*)$/);
+  if (!m) return null;
+  return { key: m[1].trim(), oldVal: m[2].trim(), newVal: m[3].trim() };
+}
+
+function pushDiffPairLines(lines, key, oldVal, newVal, indent = "  ") {
+  lines.push(`${indent}${diffMarker("removed")} \`${key}\``);
+  lines.push(indentCardText(cardValueOrEmpty(oldVal), `${indent}  `));
+  lines.push(`${indent}${diffMarker("added")} \`${key}\``);
+  lines.push(indentCardText(cardValueOrEmpty(newVal), `${indent}  `));
 }
 
 /**
@@ -1340,14 +1410,18 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       } else if (d.type === "modified") {
         lines.push(`  ✏️ **${label}**`);
         if (d.oldName && d.newName && d.oldName !== d.newName) lines.push(`  名称: ${d.oldName} → ${d.newName}`);
-        lines.push(`  旧文案: ${truncateCardText(d.oldDescription || "(空)")}`);
-        lines.push(`  新文案: ${truncateCardText(d.newDescription || "(空)")}`);
+        lines.push("  🔴 旧文案");
+        lines.push(indentCardText(cardValueOrEmpty(d.oldDescription), "    "));
+        lines.push("  🟢 新文案");
+        lines.push(indentCardText(cardValueOrEmpty(d.newDescription), "    "));
       } else if (d.type === "added") {
         lines.push(`  🟢 新增金库: **${label}**`);
-        lines.push(`  文案: ${truncateCardText(d.newDescription || "(空)")}`);
+        lines.push("    文案:");
+        lines.push(indentCardText(cardValueOrEmpty(d.newDescription), "      "));
       } else if (d.type === "removed") {
         lines.push(`  🔴 移除金库: **${label}**`);
-        lines.push(`  原文案: ${truncateCardText(d.oldDescription || "(空)")}`);
+        lines.push("    原文案:");
+        lines.push(indentCardText(cardValueOrEmpty(d.oldDescription), "      "));
       }
     }
     lines.push("");
@@ -1361,7 +1435,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       if (vd.type === "modified") {
         lines.push(`  ✏️ **${vd.name}**`);
         for (const fc of vd.fieldChanges) {
-          lines.push(`  \`${fc.key}\`: ${fc.oldVal} → ${fc.newVal}`);
+          pushDiffPairLines(lines, fc.key, fc.oldVal, fc.newVal, "    ");
         }
       } else if (vd.type === "added") {
         lines.push(`  🟢 新增: **${vd.name}**`);
@@ -1380,21 +1454,33 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     const added = textChanges.filter(c => c.type === "added");
     const removed = textChanges.filter(c => c.type === "removed");
     lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
-    for (const c of modified.slice(0, 6)) {
+    for (const c of modified) {
       lines.push("  ✏️ 修改");
-      lines.push(`  旧: ${truncateCardText(c.oldText)}`);
-      lines.push(`  新: ${truncateCardText(c.newText)}`);
-      if (c.ctxBefore) lines.push(`  上文: ${truncateCardText(c.ctxBefore, 90)}`);
+      lines.push("  🔴 旧");
+      lines.push(indentCardText(cardValueOrEmpty(c.oldText), "    "));
+      lines.push("  🟢 新");
+      lines.push(indentCardText(cardValueOrEmpty(c.newText), "    "));
+      if (c.ctxBefore) {
+        lines.push("  上文");
+        lines.push(indentCardText(c.ctxBefore, "    "));
+      }
     }
-    for (const c of added.slice(0, 6)) {
-      lines.push(`  🟢 新增: ${truncateCardText(c.text)}`);
-      if (c.ctxBefore) lines.push(`  上文: ${truncateCardText(c.ctxBefore, 90)}`);
+    for (const c of added) {
+      lines.push("  🟢 新增");
+      lines.push(indentCardText(cardValueOrEmpty(c.text), "    "));
+      if (c.ctxBefore) {
+        lines.push("  上文");
+        lines.push(indentCardText(c.ctxBefore, "    "));
+      }
     }
-    for (const c of removed.slice(0, 6)) {
-      lines.push(`  🔴 删除: ${truncateCardText(c.text)}`);
-      if (c.ctxBefore) lines.push(`  上文: ${truncateCardText(c.ctxBefore, 90)}`);
+    for (const c of removed) {
+      lines.push("  🔴 删除");
+      lines.push(indentCardText(cardValueOrEmpty(c.text), "    "));
+      if (c.ctxBefore) {
+        lines.push("  上文");
+        lines.push(indentCardText(c.ctxBefore, "    "));
+      }
     }
-    if (textChanges.length > 18) lines.push(`  ... 还有 ${textChanges.length - 18} 处文案变更`);
     lines.push("");
   } else if (textChangeCount > 0) {
     hasStructuredChange = true;
@@ -1412,24 +1498,26 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     lines.push(`**📝 UI 文案变更（i18n，共 ${i18nDiffs.length} 处）：**`);
     if (added.length > 0) {
       lines.push(`  **新增 ${added.length} 条：**`);
-      for (const d of added.slice(0, 12)) {
-        lines.push(`  🟢 \`${d.key}\`: ${truncateCardText(d.value)}`);
+      for (const d of added) {
+        lines.push(`  ${diffMarker("added")} \`${d.key}\``);
+        lines.push(indentCardText(cardValueOrEmpty(d.value), "    "));
       }
-      if (added.length > 12) lines.push(`  ... 还有 ${added.length - 12} 条新增 i18n`);
     }
     if (modified.length > 0) {
       lines.push(`  **修改 ${modified.length} 条：**`);
-      for (const d of modified.slice(0, 12)) {
-        lines.push(`  ✏️ \`${d.key}\`: "${truncateCardText(d.oldValue, 90)}" → "${truncateCardText(d.newValue, 90)}"`);
+      for (const d of modified) {
+        lines.push(`  ${diffMarker("removed")} \`${d.key}\``);
+        lines.push(indentCardText(cardValueOrEmpty(d.oldValue), "    "));
+        lines.push(`  ${diffMarker("added")} \`${d.key}\``);
+        lines.push(indentCardText(cardValueOrEmpty(d.newValue), "    "));
       }
-      if (modified.length > 12) lines.push(`  ... 还有 ${modified.length - 12} 条修改 i18n`);
     }
     if (removed.length > 0) {
       lines.push(`  **删除 ${removed.length} 条：**`);
-      for (const d of removed.slice(0, 12)) {
-        lines.push(`  🔴 \`${d.key}\`: ${truncateCardText(d.value || "(空)")}`);
+      for (const d of removed) {
+        lines.push(`  ${diffMarker("removed")} \`${d.key}\``);
+        lines.push(indentCardText(cardValueOrEmpty(d.value), "    "));
       }
-      if (removed.length > 12) lines.push(`  ... 还有 ${removed.length - 12} 条删除 i18n`);
     }
     lines.push("");
   } else if (i18nChangeCount > 0) {
@@ -1470,17 +1558,20 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     const totalItems = paired.length + unpairedAdded.length + unpairedRemoved.length;
     if (totalItems > 0) {
       lines.push(`**💬 功能文案变更（${totalItems} 处）：**`);
-      for (const p of paired.slice(0, 8)) {
-        lines.push(`  旧: ${truncateCardText(p.oldText)}`);
-        lines.push(`  新: ${truncateCardText(p.newText)}`);
+      for (const p of paired) {
+        lines.push(`  ${diffMarker("removed")} 旧`);
+        lines.push(indentCardText(cardValueOrEmpty(p.oldText), "    "));
+        lines.push(`  ${diffMarker("added")} 新`);
+        lines.push(indentCardText(cardValueOrEmpty(p.newText), "    "));
       }
-      for (const a of unpairedAdded.slice(0, 8)) {
-        lines.push(`  🟢 ${truncateCardText(a.text)}`);
+      for (const a of unpairedAdded) {
+        lines.push(`  ${diffMarker("added")} 新增`);
+        lines.push(indentCardText(cardValueOrEmpty(a.text), "    "));
       }
-      for (const r of unpairedRemoved.slice(0, 8)) {
-        lines.push(`  🔴 ${truncateCardText(r.text)}`);
+      for (const r of unpairedRemoved) {
+        lines.push(`  ${diffMarker("removed")} 删除`);
+        lines.push(indentCardText(cardValueOrEmpty(r.text), "    "));
       }
-      if (totalItems > 24) lines.push(`  ... 还有 ${totalItems - 24} 处功能文案变更`);
       lines.push("");
     }
   }
@@ -1493,7 +1584,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       hasStructuredChange = true;
       lines.push(`**🔧 配置变更（${businessDiffs.length} 项）：**`);
       for (const cd of businessDiffs) {
-        lines.push(`  \`${cd.field}\`: ${cd.oldVal} → ${cd.newVal}`);
+        pushDiffPairLines(lines, cd.field, cd.oldVal, cd.newVal, "  ");
       }
       lines.push("");
     }
@@ -1523,7 +1614,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     if (assetStats.noiseFiles) statParts.push(`噪音 ${assetStats.noiseFiles} 文件`);
     lines.push(`- 概览: ${statParts.join(" | ") || "无变化"}`);
     if (assetStats.substantiveFileNames?.length > 0) {
-      lines.push(`- 文件: ${assetStats.substantiveFileNames.slice(0, 8).join(", ")}`);
+      lines.push(`- 文件: ${assetStats.substantiveFileNames.join(", ")}`);
     }
   }
 
@@ -1711,7 +1802,11 @@ function diffVaultConfigs(oldConfigs, newConfigs) {
         const oldVal = oldC.fields[key];
         const newVal = newC.fields[key];
         if (oldVal !== newVal) {
-          fieldChanges.push({ key, oldVal: oldVal || "(无)", newVal: newVal || "(已删除)" });
+          fieldChanges.push({
+            key,
+            oldVal: oldVal === undefined ? "(无)" : oldVal,
+            newVal: newVal === undefined ? "(已删除)" : newVal,
+          });
         }
       }
       if (fieldChanges.length > 0) {
@@ -2032,27 +2127,31 @@ function formatVaultFactoryChanges(changes) {
       if (v.enabled) flags.push("已启用");
       else flags.push("已禁用");
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
-      lines.push(`  **${v.name}**`);
-      lines.push(`  \`${v.factory}\``);
-      lines.push(`  [${flags.join(" | ")}]`);
-      // 金库页面直链
-      const vaultUrl = `https://flap.sh/launch?vaultfactory=${v.factory}`;
-      lines.push(`  🔗 [打开金库页面](${vaultUrl})`);
+      lines.push(`  ${diffMarker("added")} **${v.name}**`);
+      lines.push(`    \`${v.factory}\``);
+      lines.push(`    ${flags.join(" | ")}`);
+      lines.push(`    🔗 [金库页面](https://flap.sh/launch?vaultfactory=${v.factory})`);
     }
     lines.push("");
   }
   if (changes.removed.length > 0) {
     lines.push("**❌ 移除金库工厂:**");
     for (const v of changes.removed) {
-      lines.push(`  ~~${v.name}~~ \`${v.factory}\``);
+      lines.push(`  ${diffMarker("removed")} ~~${v.name}~~`);
+      lines.push(`    \`${v.factory}\``);
     }
     lines.push("");
   }
   if (changes.modified.length > 0) {
     lines.push("**✏️ 金库工厂配置变更:**");
     for (const v of changes.modified) {
-      lines.push(`  **${v.name}** \`${v.factory}\``);
-      for (const d of v.diffs) lines.push(`    ${d}`);
+      lines.push(`  ${diffMarker("modified")} **${v.name}**`);
+      lines.push(`    \`${v.factory}\``);
+      for (const d of v.diffs) {
+        const pair = splitDiffPairText(d);
+        if (pair) pushDiffPairLines(lines, pair.key, pair.oldVal, pair.newVal, "    ");
+        else lines.push(`    ${d}`);
+      }
     }
   }
   return lines.filter(Boolean).join("\n");
@@ -2638,13 +2737,13 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
     name,
     "",
     `**变更类型**`,
-    typeLabel,
+    `${diffMarker(change?.type)} ${typeLabel}`,
     "",
     `**文案**`,
-    truncateCardText(copy, 500),
+    copy,
     "",
     `**金库地址**`,
-    launchUrl ? `[${launchUrl}](${launchUrl})` : "未匹配到 vault factory 地址。",
+    launchUrl ? `🔗 [打开金库页面](${launchUrl})` : "未匹配到 vault factory 地址。",
     factory ? `Factory: \`${factory}\`` : "",
     "",
     `**AI 介绍**`,
