@@ -166,15 +166,55 @@ function isCssUtilityFragment(value) {
     || /\b(?:lucide|clip-path|object-cover|ring-offset|pointer-events|cursor-not-allowed|rounded-full|translate-x|opacity-\d+|border-\[|bg-\[|text-\[)\b/.test(s);
 }
 
+function codeSyntaxRatio(value) {
+  const s = String(value || "");
+  if (!s) return 0;
+  const syntaxChars = (s.match(/[{}()[\]=>;?:,&|!]/g) || []).length;
+  return syntaxChars / s.length;
+}
+
+function isMinifiedCodeFragment(value) {
+  const s = String(value || "").trim();
+  if (!s || s.length < 8) return false;
+  if (isSvgPathLikeString(s) || isTailwindClassLikeString(s) || isCssUtilityFragment(s)) return false;
+
+  const syntaxRatio = codeSyntaxRatio(s);
+  const startsLikeCode = /^[),;:\]}]/.test(s);
+  const endsLikeOpenCode = /[({[:,]$/.test(s);
+  const compactMemberAccess = /(?:^|[^A-Za-z])[$A-Za-z_]\w*\.[A-Za-z_$]\w*/.test(s);
+  const compactKeyValue = /(?:^|[,{])[$A-Za-z_]\w{2,}\s*:\s*(?:[$A-Za-z_]\w*|!?[01]|\{|\[|\()/g;
+  const keyValueCount = (s.match(compactKeyValue) || []).length;
+  const codePatternHits = [
+    /\b(?:function|return|throw|async|await|let|const|var)\b/.test(s) && /[{}();=>]/.test(s),
+    /=>|!==|===|&&|\|\||\?\?|\.\.\./.test(s),
+    /\b(?:jsx|jsxs|children|className|props|prototype|Symbol|Object\.assign|filter\(Boolean\)|toLowerCase)\b/.test(s),
+    /\b(?:nonceManager|authorizationList|accessList|maxFeePerGas|maxPriorityFeePerGas|factoryData|generateAbstractMask)\b/.test(s),
+    /(?:^|[,(])0,[A-Za-z_$]\w*|[A-Za-z_$]\w*\([^)]*\)\s*=>/.test(s),
+    keyValueCount >= 2,
+    compactMemberAccess && /[{}()[\];,:]/.test(s),
+  ].filter(Boolean).length;
+
+  if (codePatternHits >= 2) return true;
+  if (codePatternHits >= 1 && syntaxRatio > 0.045) return true;
+  if ((startsLikeCode || endsLikeOpenCode) && syntaxRatio > 0.08) return true;
+  if (!/\s/.test(s) && s.length > 24 && syntaxRatio > 0.08 && /[{}()[\];,:]|[$A-Za-z_]\w*\./.test(s)) return true;
+  if (syntaxRatio > 0.18 && /[{}()[\]=>;]/.test(s)) return true;
+  return false;
+}
+
 function isReadableBusinessText(value) {
   const s = String(value || "").trim();
   if (!s || s.length < 4) return false;
-  if (isSvgPathLikeString(s) || isTailwindClassLikeString(s) || isCssUtilityFragment(s)) return false;
+  if (isSvgPathLikeString(s) || isTailwindClassLikeString(s) || isCssUtilityFragment(s) || isMinifiedCodeFragment(s)) return false;
+  if (codeSyntaxRatio(s) > 0.12 && /[{}()[\]=>;]/.test(s)) return false;
   if (/[\u4e00-\u9fff]/.test(s)) return true;
-  if (BUSINESS_STRING_RE.test(s)) return true;
   const words = s.split(/\s+/).filter(w => /[a-zA-Z]{2,}/.test(w));
-  if (words.length < 3) return false;
   if (/[{}()=>;]/.test(s) || /^[a-z]\.\w/.test(s)) return false;
+  if (BUSINESS_STRING_RE.test(s)) {
+    if (words.length >= 2 && /\s/.test(s)) return true;
+    return false;
+  }
+  if (words.length < 3) return false;
   const utilityWords = words.filter(w => /^(absolute|relative|bottom|left|right|top|rounded|border|object|hover|focus|disabled|opacity|ring|transition|translate|pointer|events|background|foreground)$/i.test(w)).length;
   if (utilityWords / words.length > 0.4) return false;
   return true;
@@ -182,6 +222,7 @@ function isReadableBusinessText(value) {
 
 function isAssetStringDiffNoise(value) {
   return isNoiseString(value)
+    || isMinifiedCodeFragment(value)
     || isSvgPathLikeString(value)
     || isTailwindClassLikeString(value)
     || isCssUtilityFragment(value);
@@ -310,6 +351,73 @@ function collectUiStyleDiffsFromStrings(strings = [], type, file, assetPath) {
   return out;
 }
 
+const CODE_INTENT_RULES = [
+  {
+    key: "tax",
+    label: "税费/税务信息",
+    intent: "可能调整税费读取、税务信息展示或索引期查看逻辑",
+    evidence: /showTaxInfo|taxInfo|buyTaxBps|sellTaxBps|\btax\b/i,
+    evidenceLabel: "showTaxInfo / taxInfo / tax",
+  },
+  {
+    key: "vault",
+    label: "Vault/金库判定",
+    intent: "可能调整 Vault、vaultFactory 判定、链接生成或展示映射逻辑",
+    evidence: /vaultFactory|\bvault\b|Vault/i,
+    evidenceLabel: "vault / vaultFactory",
+  },
+  {
+    key: "dividend",
+    label: "分红参数",
+    intent: "可能调整 dividendBps、分红徽标或分红展示逻辑",
+    evidence: /dividendBps|dividendBadge|Dividend/i,
+    evidenceLabel: "dividendBps / dividendBadge",
+  },
+  {
+    key: "transaction",
+    label: "交易参数",
+    intent: "可能调整账户、gas、nonce 或链上交易参数组装逻辑",
+    evidence: /nonceManager|authorizationList|accessList|maxFeePerGas|maxPriorityFeePerGas|maxFeePerBlobGas|gasPrice|account/i,
+    evidenceLabel: "nonce / gas / account",
+  },
+  {
+    key: "sanitizer",
+    label: "安全/富文本白名单",
+    intent: "可能调整 HTML、ARIA、Data 属性或安全模板过滤策略",
+    evidence: /USE_PROFILES|ALLOW_ARIA_ATTR|ALLOW_DATA_ATTR|ALLOW_UNKNOWN_PROTOCOLS|ALLOW_SELF_CLOSE_IN_ATTR|SAFE_FOR_TEMPLATES|WHOLE_DOCUMENT/i,
+    evidenceLabel: "ALLOW_* / SAFE_FOR_TEMPLATES",
+  },
+  {
+    key: "factory",
+    label: "工厂/部署调用",
+    intent: "可能调整 factoryData、deployless 或工厂调用相关实现",
+    evidence: /factoryData|deployless|\bfactory\b/i,
+    evidenceLabel: "factory / factoryData / deployless",
+  },
+];
+
+function collectCodeIntentDiffsFromStrings(strings = [], type, file, assetPath) {
+  const out = [];
+  for (const value of strings || []) {
+    const s = String(value || "");
+    if (!s || isReadableBusinessText(s)) continue;
+    if (!isMinifiedCodeFragment(s)) continue;
+    for (const rule of CODE_INTENT_RULES) {
+      if (!rule.evidence.test(s)) continue;
+      out.push({
+        type,
+        key: rule.key,
+        label: rule.label,
+        intent: rule.intent,
+        evidence: rule.evidenceLabel,
+        file,
+        assetPath,
+      });
+    }
+  }
+  return out;
+}
+
 const BUSINESS_STRING_RE = /[\u4e00-\u9fff]|Vault|金库|金庫|CAstore|CA Store|fee|rate|tax|税|稅|dividend|staking|质押|質押|燃烧|燃燒|回购|回購|factory|template/i;
 
 function isBusinessAssetString(s) {
@@ -332,6 +440,7 @@ const CONFIG_BUSINESS_KEYS = new Set([
 
 // 排除的框架噪音 key（单字母、React/Next 内部）
 const CONFIG_NOISE_KEYS = /^([a-z]|[A-Z]{1,2}|prototype|constructor|Component|Fragment|Profiler|StrictMode|children|className|ref|displayName|props|isPureReactComponent|enqueue\w+|default|mounted|isMounted)$/;
+const STYLE_CONFIG_FIELD_RE = /(?:^|_|\b)(?:className|style|css|opacity|swapOpacity|color|background|bg|foreground|width|height|size|radius|rounded|border|shadow|ring|outline|layout|position|absolute|relative|fixed|sticky|zIndex|left|right|top|bottom|margin|padding|gap|font|lineHeight|leading|tracking|display|flex|grid|align|justify|translate|rotate|scale|clip|object|pointerEvents|cursor|transition|duration|ease|hover|focus|active)(?:$|_|\b)/i;
 
 /**
  * 判断一个值是否为 minifier 压缩变量（单字母/双字母标识符、X.Y 属性访问）
@@ -357,7 +466,7 @@ function isMinifierValue(val) {
  *   2. 值含引号字符串（"foo"）或 0x 地址 → 通过
  *   3. 值为布尔（!0/!1）→ 仅当 key 名称暗示业务含义时通过
  */
-const BUSINESS_FIELD_HINTS = /fee|permit|swap|enabled|disabled|show|hide|support|stake|vault|dividend|amount|constraint|sugar|subscription/i;
+const BUSINESS_FIELD_HINTS = /fee|permit|enabled|show|hide|support|stake|vault|dividend|amount|constraint|sugar|subscription/i;
 
 function isBusinessConfigDiff(cd) {
   if (isStylePseudoConfigDiff(cd)) return false;
@@ -656,8 +765,9 @@ function isStylePseudoConfigDiff(cd = {}) {
   const field = String(cd.field || "");
   const oldVal = String(cd.oldVal ?? "");
   const newVal = String(cd.newVal ?? "");
+  if (STYLE_CONFIG_FIELD_RE.test(field)) return true;
   if (/^(?:hover|focus|active|disabled|group-hover|aria|data)$/i.test(field)) return true;
-  if (/^(?:pointer|pointer-events|opacity|ring|outline|translate|rounded|border|bg|object|clip|absolute|relative)$/i.test(newVal)) return true;
+  if (/^(?:pointer|pointer-events|opacity|ring|outline|translate|rounded|border|bg|object|clip|absolute|relative|none|auto|hidden|visible)$/i.test(newVal)) return true;
   if (isTailwindClassLikeString(`${field}:${newVal}`) || isCssUtilityFragment(`${field}:${newVal}`)) return true;
   if ((oldVal === "(新增)" || oldVal === "(无)") && /^(?:pointer|none|auto|opacity|ring|outline)$/i.test(newVal)) return true;
   return false;
@@ -795,6 +905,7 @@ function isSharedResourceChangeCandidate(notification) {
   if (hasItems(assetStats.vaultDiffs)) return true;
   if (hasItems(assetStats.jsTextDiffs)) return true;
   if (hasItems(assetStats.uiStyleDiffs)) return true;
+  if (hasItems(assetStats.codeIntentDiffs)) return true;
   if (hasPageSpecificAssetChange(notification)) return false;
   return detectBusinessPriority(notification.changes || []).hit;
 }
@@ -805,6 +916,7 @@ function hasStructuredSharedAssetStats(assetStats) {
   if (hasItems(assetStats.vaultDiffs)) return true;
   if (hasItems(assetStats.jsTextDiffs)) return true;
   if (hasItems(assetStats.uiStyleDiffs)) return true;
+  if (hasItems(assetStats.codeIntentDiffs)) return true;
   return false;
 }
 
@@ -919,21 +1031,64 @@ function summarizeUiStyleDiffs(uiStyleDiffs = []) {
     .sort((a, b) => b.total - a.total || a.contextLabel.localeCompare(b.contextLabel) || a.label.localeCompare(b.label));
 }
 
+function summarizeCodeIntentDiffs(codeIntentDiffs = []) {
+  const grouped = new Map();
+  for (const diff of codeIntentDiffs || []) {
+    const key = diff.key || diff.label || "code";
+    const current = grouped.get(key) || {
+      key,
+      label: diff.label || "实现逻辑信号",
+      intent: diff.intent || "可能调整前端实现逻辑",
+      evidence: diff.evidence || "代码字段",
+      added: 0,
+      removed: 0,
+      files: new Set(),
+      assetPaths: new Set(),
+    };
+    if (diff.type === "removed") current.removed += 1;
+    else current.added += 1;
+    if (diff.file) current.files.add(diff.file);
+    if (diff.assetPath) current.assetPaths.add(diff.assetPath);
+    grouped.set(key, current);
+  }
+  return [...grouped.values()]
+    .map(item => ({
+      ...item,
+      files: uniqueStrings([...item.files]),
+      assetPaths: uniqueStrings([...item.assetPaths]),
+      total: item.added + item.removed,
+    }))
+    .sort((a, b) => b.total - a.total || a.label.localeCompare(b.label));
+}
+
 function buildResourceIntentSummary(assetStats = {}) {
   const configCount = (assetStats.configDiffs || []).filter(isBusinessConfigDiff).length;
   const textCount = assetStats.jsTextDiffs?.length || 0;
   const vaultCount = assetStats.vaultDiffs?.length || 0;
   const uiSignals = summarizeUiStyleDiffs(assetStats.uiStyleDiffs || []);
+  const codeSignals = summarizeCodeIntentDiffs(assetStats.codeIntentDiffs || []);
   if (vaultCount > 0 || configCount > 0 || textCount > 0) {
     const parts = [];
     if (vaultCount > 0) parts.push(`Vault 配置 ${vaultCount} 项`);
     if (configCount > 0) parts.push(`业务配置 ${configCount} 项`);
     if (textCount > 0) parts.push(`功能文案 ${textCount} 处`);
+    if (codeSignals.length > 0) parts.push(`实现意图信号 ${codeSignals.reduce((sum, s) => sum + s.total, 0)} 处`);
     return {
       verdict: "发现业务层信号",
       intent: `可能涉及 ${parts.join("、")} 调整`,
       confidence: "高",
       uiSignals,
+      codeSignals,
+    };
+  }
+  if (codeSignals.length > 0) {
+    const labels = codeSignals.slice(0, 4).map(s => s.label).join("、");
+    return {
+      verdict: "发现实现层业务信号",
+      intent: `代码片段不可直接作为文案展示，但字段透露可能涉及 ${labels} 调整`,
+      confidence: "中",
+      uiSignals,
+      codeSignals,
     };
   }
   if (uiSignals.length > 0) {
@@ -944,6 +1099,7 @@ function buildResourceIntentSummary(assetStats = {}) {
       intent: `主要是 UI/样式层调整，可能意图：${uiSignals.slice(0, 3).map(s => s.intent).join("；")}${contextSuffix}`,
       confidence: "中",
       uiSignals,
+      codeSignals,
     };
   }
   if (assetStats) {
@@ -952,6 +1108,7 @@ function buildResourceIntentSummary(assetStats = {}) {
       intent: "主要是资源构建或运行时代码变化，需结合下载 Diff 追查",
       confidence: "低",
       uiSignals: [],
+      codeSignals: [],
     };
   }
   return {
@@ -959,6 +1116,7 @@ function buildResourceIntentSummary(assetStats = {}) {
     intent: "未提取到资源层意图",
     confidence: "低",
     uiSignals: [],
+    codeSignals: [],
   };
 }
 
@@ -978,9 +1136,20 @@ function buildUiStyleSignalLines(uiSignals = []) {
   return lines;
 }
 
+function buildCodeIntentSignalLines(codeSignals = []) {
+  if (!codeSignals.length) return [];
+  return codeSignals.map(signal => {
+    const countParts = [];
+    if (signal.added) countParts.push(`新增 ${signal.added}`);
+    if (signal.removed) countParts.push(`删除 ${signal.removed}`);
+    const files = signal.files?.length ? `；文件：${signal.files.slice(0, 3).map(cardText).join(", ")}${signal.files.length > 3 ? ` 等 ${signal.files.length} 个` : ""}` : "";
+    return `- ${changedText(signal.label)}：${countParts.join(" / ") || `${signal.total} 处`}；可能意图：${cardText(signal.intent)}；证据：${cardText(signal.evidence)}${files}`;
+  });
+}
+
 function resourceChangeFingerprint(notification) {
   const assetStats = notification.meta?.assetStats || {};
-  const hasStructuredResourceDiff = hasItems(assetStats.configDiffs) || hasItems(assetStats.vaultDiffs) || hasItems(assetStats.jsTextDiffs) || hasItems(assetStats.uiStyleDiffs);
+  const hasStructuredResourceDiff = hasItems(assetStats.configDiffs) || hasItems(assetStats.vaultDiffs) || hasItems(assetStats.jsTextDiffs) || hasItems(assetStats.uiStyleDiffs) || hasItems(assetStats.codeIntentDiffs);
   const detailLines = (notification.changes || [])
     .map(line => String(line || "").trim())
     .filter(line => line && !line.startsWith("📦 前端资源变更") && !line.startsWith("🔇 构建噪音"));
@@ -988,6 +1157,7 @@ function resourceChangeFingerprint(notification) {
     ...(assetStats.configDiffs || []).map(d => d.file),
     ...(assetStats.jsTextDiffs || []).map(d => d.file),
     ...(assetStats.uiStyleDiffs || []).map(d => d.file),
+    ...(assetStats.codeIntentDiffs || []).map(d => d.file),
   ]);
   return stableKey({
     files: hasStructuredResourceDiff ? structuredFiles : (assetStats.substantiveFileNames || []),
@@ -996,6 +1166,7 @@ function resourceChangeFingerprint(notification) {
     vaultDiffs: assetStats.vaultDiffs || [],
     jsTextDiffs: assetStats.jsTextDiffs || [],
     uiStyleSummary: summarizeUiStyleDiffs(assetStats.uiStyleDiffs || []),
+    codeIntentSummary: summarizeCodeIntentDiffs(assetStats.codeIntentDiffs || []),
     fallbackDetails: hasStructuredResourceDiff ? [] : detailLines,
   });
 }
@@ -1093,6 +1264,10 @@ function buildAssetSemanticProfile(assetPaths = [], assetStats = {}) {
 
 function hasPageSpecificAssetChange(notification) {
   const profile = notification?.meta?.assetStats?.semanticProfile;
+  const assetStats = notification?.meta?.assetStats || {};
+  if (hasItems(assetStats.configDiffs) || hasItems(assetStats.vaultDiffs) || hasItems(assetStats.jsTextDiffs) || hasItems(assetStats.uiStyleDiffs) || hasItems(assetStats.codeIntentDiffs)) {
+    return false;
+  }
   return Array.isArray(profile?.pageRoutes) && profile.pageRoutes.length > 0;
 }
 
@@ -1102,6 +1277,8 @@ function summarizeBusinessSignals(assetStats = {}) {
   if ((assetStats.jsTextDiffs || []).length > 0) parts.push(`功能文案 ${assetStats.jsTextDiffs.length} 处`);
   if (configCount > 0) parts.push(`业务配置 ${configCount} 项`);
   if ((assetStats.vaultDiffs || []).length > 0) parts.push(`Vault 配置 ${assetStats.vaultDiffs.length} 项`);
+  const codeSignals = summarizeCodeIntentDiffs(assetStats.codeIntentDiffs || []);
+  if (codeSignals.length > 0) parts.push(`实现意图信号 ${codeSignals.reduce((sum, s) => sum + s.total, 0)} 处`);
   const uiSignals = summarizeUiStyleDiffs(assetStats.uiStyleDiffs || []);
   if (uiSignals.length > 0) parts.push(`UI/样式信号 ${uiSignals.reduce((sum, s) => sum + s.total, 0)} 处`);
   return parts;
@@ -1174,11 +1351,17 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   const vaultDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.vaultDiffs || []));
   const jsTextDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.jsTextDiffs || []));
   const uiStyleDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.uiStyleDiffs || []));
+  const codeIntentDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.codeIntentDiffs || []));
   const businessConfigDiffs = configDiffs.filter(isBusinessConfigDiff);
   const hasBusinessResourceDiffs = businessConfigDiffs.length > 0 || vaultDiffs.length > 0 || jsTextDiffs.length > 0;
-  const intentSummary = buildResourceIntentSummary({ configDiffs, vaultDiffs, jsTextDiffs, uiStyleDiffs });
+  const intentSummary = buildResourceIntentSummary({ configDiffs, vaultDiffs, jsTextDiffs, uiStyleDiffs, codeIntentDiffs });
   const uiSignalLines = buildUiStyleSignalLines(intentSummary.uiSignals);
-  const hasLocalSignals = hasBusinessResourceDiffs || uiSignalLines.length > 0;
+  const codeIntentLines = buildCodeIntentSignalLines(intentSummary.codeSignals);
+  const compactUiSignalLines = uiSignalLines.slice(0, 6);
+  if (uiSignalLines.length > compactUiSignalLines.length) compactUiSignalLines.push(`- 还有 ${uiSignalLines.length - compactUiSignalLines.length} 类 UI/样式信号，见 Diff 详情`);
+  const compactCodeIntentLines = codeIntentLines.slice(0, 6);
+  if (codeIntentLines.length > compactCodeIntentLines.length) compactCodeIntentLines.push(`- 还有 ${codeIntentLines.length - compactCodeIntentLines.length} 类实现意图信号，见 Diff 详情`);
+  const hasLocalSignals = hasBusinessResourceDiffs || compactUiSignalLines.length > 0 || compactCodeIntentLines.length > 0;
   const assetStats = {
     unchanged: maxStat(assetOnlyNotifications, "unchanged"),
     renamed: maxStat(assetOnlyNotifications, "renamed"),
@@ -1194,6 +1377,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     vaultDiffs,
     jsTextDiffs,
     uiStyleDiffs,
+    codeIntentDiffs,
   };
   const semanticFiles = uniqueStrings([
     ...substantiveFileNames,
@@ -1215,10 +1399,14 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
         jsTextDiffs.length > 0 ? `功能文案 ${jsTextDiffs.length} 处` : "",
         businessConfigDiffs.length > 0 ? `业务配置 ${businessConfigDiffs.length} 项` : "",
         vaultDiffs.length > 0 ? `Vault 配置 ${vaultDiffs.length} 项` : "",
+        codeIntentDiffs.length > 0 ? `实现意图信号 ${codeIntentDiffs.length} 处` : "",
         uiStyleDiffs.length > 0 ? `UI/样式信号 ${uiStyleDiffs.length} 处` : "",
       ].filter(Boolean).join("；")
-    : (uiStyleDiffs.length > 0
-        ? `UI/样式信号 ${uiStyleDiffs.length} 处`
+    : (codeIntentDiffs.length > 0 || uiStyleDiffs.length > 0
+        ? [
+            codeIntentDiffs.length > 0 ? `实现意图信号 ${codeIntentDiffs.length} 处` : "",
+            uiStyleDiffs.length > 0 ? `UI/样式信号 ${uiStyleDiffs.length} 处` : "",
+          ].filter(Boolean).join("；")
         : "未提取到 UI 文案、业务配置、Vault/Factory 或合约相关变化");
   const compactAffectedUrls = affectedUrls.length > 6
     ? [...affectedUrls.slice(0, 6), `... 还有 ${affectedUrls.length - 6} 个页面`]
@@ -1247,7 +1435,8 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
           if (vd.type === "removed") return [`- ${removedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
           return [`- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
         }),
-        ...uiSignalLines,
+        ...compactCodeIntentLines,
+        ...compactUiSignalLines,
       ]
     : ["- 本地结构化提取未发现业务信号。"];
 
@@ -1536,6 +1725,15 @@ function buildBriefingInput(url, changes, assetStats, caStoreVaultDiffs = []) {
     }
   }
 
+  const codeSignals = summarizeCodeIntentDiffs(assetStats?.codeIntentDiffs || []);
+  if (codeSignals.length > 0) {
+    lines.push("");
+    lines.push("实现意图信号（不可读代码片段已折叠）:");
+    for (const signal of codeSignals.slice(0, 12)) {
+      lines.push(`  ${signal.label}: ${signal.added} 新增 / ${signal.removed} 删除；可能意图: ${signal.intent}；证据: ${signal.evidence}；文件: ${signal.files.slice(0, 4).join(", ")}`);
+    }
+  }
+
   // 文案变更
   const textChanges = changes.filter(c => c.includes("文案"));
   if (textChanges.length > 0) {
@@ -1721,6 +1919,13 @@ function buildCardUrlPrefix(url, content) {
   return `🔗 [${url}](${url})\n\n`;
 }
 
+function compactTextDiffItems(items = [], max = 12) {
+  const arr = Array.isArray(items) ? items : [];
+  const visible = arr.slice(0, max);
+  const hidden = Math.max(0, arr.length - visible.length);
+  return { visible, hidden };
+}
+
 function splitDiffPairText(text) {
   const m = String(text || "").match(/^(.*?):\s*(.*?)\s*→\s*(.*)$/);
   if (!m) return null;
@@ -1899,22 +2104,28 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     if (totalItems > 0) {
       lines.push(`**💬 功能文案变更（${totalItems} 处）：**`);
       if (paired.length > 0) {
+        const { visible, hidden } = compactTextDiffItems(paired, 8);
         lines.push("");
         lines.push("**修改：**");
-        for (const p of paired) {
+        for (const p of visible) {
           lines.push(`- 原：${removedText(p.oldText)}`);
           lines.push(`  新：${addedText(p.newText)}`);
         }
+        if (hidden) lines.push(`- 还有 ${hidden} 处修改，见 Diff 详情`);
       }
       if (unpairedAdded.length > 0) {
+        const { visible, hidden } = compactTextDiffItems(unpairedAdded, 8);
         lines.push("");
         lines.push("**新增：**");
-        for (const a of unpairedAdded) lines.push(formatAddedLine(a.text));
+        for (const a of visible) lines.push(formatAddedLine(a.text));
+        if (hidden) lines.push(`- 还有 ${hidden} 处新增，见 Diff 详情`);
       }
       if (unpairedRemoved.length > 0) {
+        const { visible, hidden } = compactTextDiffItems(unpairedRemoved, 8);
         lines.push("");
         lines.push("**移除：**");
-        for (const r of unpairedRemoved) lines.push(formatRemovedLine(r.text));
+        for (const r of visible) lines.push(formatRemovedLine(r.text));
+        if (hidden) lines.push(`- 还有 ${hidden} 处移除，见 Diff 详情`);
       }
       lines.push("");
     }
@@ -1937,8 +2148,21 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   const uiSignalLines = buildUiStyleSignalLines(intentSummary.uiSignals);
   if (uiSignalLines.length > 0) {
     hasStructuredChange = true;
+    const compactUiLines = uiSignalLines.slice(0, 12);
     lines.push(`**🎨 UI/样式信号（${assetStats.uiStyleDiffs.length} 处）：**`);
-    lines.push(...uiSignalLines);
+    lines.push(...compactUiLines);
+    if (uiSignalLines.length > compactUiLines.length) lines.push(`- 还有 ${uiSignalLines.length - compactUiLines.length} 类 UI/样式信号，见 Diff 详情`);
+    lines.push("");
+  }
+
+  const codeIntentLines = buildCodeIntentSignalLines(intentSummary.codeSignals);
+  if (codeIntentLines.length > 0) {
+    hasStructuredChange = true;
+    const totalCodeSignals = assetStats.codeIntentDiffs?.length || intentSummary.codeSignals.reduce((sum, s) => sum + s.total, 0);
+    const compactCodeLines = codeIntentLines.slice(0, 8);
+    lines.push(`**🧭 实现意图信号（${totalCodeSignals} 处）：**`);
+    lines.push(...compactCodeLines);
+    if (codeIntentLines.length > compactCodeLines.length) lines.push(`- 还有 ${codeIntentLines.length - compactCodeLines.length} 类实现意图信号，见 Diff 详情`);
     lines.push("");
   }
 
@@ -3538,7 +3762,7 @@ function diffTextContent(oldText, newText) {
   return { changes, reordered: false };
 }
 
-function buildAssetFullDiffLines({ assetDiff, substantiveFiles, noiseOnlyFiles, allConfigDiffs, vaultDiffs, uiStyleDiffs = [] }) {
+function buildAssetFullDiffLines({ assetDiff, substantiveFiles, noiseOnlyFiles, allConfigDiffs, vaultDiffs, uiStyleDiffs = [], codeIntentDiffs = [] }) {
   const lines = ["【前端资源完整 Diff】"];
   const statParts = [];
   if (assetDiff.unchanged) statParts.push(`不变 ${assetDiff.unchanged}`);
@@ -3578,6 +3802,17 @@ function buildAssetFullDiffLines({ assetDiff, substantiveFiles, noiseOnlyFiles, 
       const counts = `${signal.added} 新增 / ${signal.removed} 删除`;
       const files = signal.files.length ? `；文件: ${signal.files.join(", ")}` : "";
       lines.push(`${signal.label}: ${counts}；范围: ${signal.contextLabel}(${signal.contextConfidence})；可能意图: ${signal.intent}；证据: ${signal.evidence}${files}`);
+    }
+  }
+
+  const codeSignals = summarizeCodeIntentDiffs(codeIntentDiffs);
+  if (codeSignals.length > 0) {
+    lines.push("");
+    lines.push("【实现意图信号摘要】");
+    for (const signal of codeSignals) {
+      const counts = `${signal.added} 新增 / ${signal.removed} 删除`;
+      const files = signal.files.length ? `；文件 ${signal.files.join(", ")}` : "";
+      lines.push(`${signal.label}: ${counts}；可能意图: ${signal.intent}；证据: ${signal.evidence}${files}`);
     }
   }
 
@@ -3692,6 +3927,7 @@ function diffFeatures(oldF, newF) {
       const noiseOnlyFiles = [];
       const allConfigDiffs = [];
       const allUiStyleDiffs = [];
+      const allCodeIntentDiffs = [];
 
       for (const m of assetDiff.matched) {
         const realAdded = (m.addedStrings || []).filter(s => !isAssetStringDiffNoise(s));
@@ -3709,6 +3945,11 @@ function diffFeatures(oldF, newF) {
         allUiStyleDiffs.push(
           ...collectUiStyleDiffsFromStrings(m.removedStrings || [], "removed", m.oldFile || m.newFile, m.oldPath || m.newPath),
           ...collectUiStyleDiffsFromStrings(m.addedStrings || [], "added", m.newFile || m.oldFile, m.newPath || m.oldPath),
+        );
+
+        allCodeIntentDiffs.push(
+          ...collectCodeIntentDiffsFromStrings(m.removedStrings || [], "removed", m.oldFile || m.newFile, m.oldPath || m.newPath),
+          ...collectCodeIntentDiffsFromStrings(m.addedStrings || [], "added", m.newFile || m.oldFile, m.newPath || m.oldPath),
         );
 
         if (totalReal === 0 && totalNoise > 0) {
@@ -3758,11 +3999,12 @@ function diffFeatures(oldF, newF) {
         substantiveCount: substantiveFiles.reduce((s, f) => s + f.realAdded.length + f.realRemoved.length, 0),
         substantiveFileNames: substantiveFiles.map(f => f.newFile || f.oldFile),
         substantiveAssetPaths,
-        semanticProfile: buildAssetSemanticProfile(substantiveAssetPaths, { configDiffs: allConfigDiffs, vaultDiffs, jsTextDiffs, uiStyleDiffs: allUiStyleDiffs }),
+        semanticProfile: buildAssetSemanticProfile(substantiveAssetPaths, { configDiffs: allConfigDiffs, vaultDiffs, jsTextDiffs, uiStyleDiffs: allUiStyleDiffs, codeIntentDiffs: allCodeIntentDiffs }),
         configDiffs: allConfigDiffs,
         vaultDiffs,
         jsTextDiffs,
         uiStyleDiffs: allUiStyleDiffs,
+        codeIntentDiffs: allCodeIntentDiffs,
       };
       meta.fullDiffLines.push(...buildAssetFullDiffLines({
         assetDiff,
@@ -3771,6 +4013,7 @@ function diffFeatures(oldF, newF) {
         allConfigDiffs,
         vaultDiffs,
         uiStyleDiffs: allUiStyleDiffs,
+        codeIntentDiffs: allCodeIntentDiffs,
       }));
 
       // ── 详细 diff 输出（存文件用）──
@@ -3783,9 +4026,12 @@ function diffFeatures(oldF, newF) {
       changes.push(`📦 前端资源变更： ${statParts.join(" | ")}`);
 
       if (allConfigDiffs.length > 0) {
-        changes.push("");
-        changes.push("🔧 配置参数变更：");
-        for (const cd of allConfigDiffs) {
+        const businessConfigChanges = allConfigDiffs.filter(isBusinessConfigDiff);
+        if (businessConfigChanges.length > 0) {
+          changes.push("");
+          changes.push("🔧 配置参数变更：");
+        }
+        for (const cd of businessConfigChanges) {
           changes.push(`  ${cd.field}: ${cd.oldVal} → ${cd.newVal}  (${cd.file})`);
         }
       }
@@ -3811,14 +4057,14 @@ function diffFeatures(oldF, newF) {
         const noiseNote = m.totalNoise > 0 ? ` + ${m.totalNoise} 噪音已过滤` : "";
         if (total === 0) continue;
         changes.push(`📝 ${label} (${total} 处实质变更${noiseNote})`);
-        for (const s of m.realRemoved.slice(0, 8)) {
-          changes.push(`  - ${s.length > 120 ? s.slice(0, 120) + "..." : s}`);
-        }
-        if (m.realRemoved.length > 8) changes.push(`  ... 还有 ${m.realRemoved.length - 8} 处移除`);
-        for (const s of m.realAdded.slice(0, 8)) {
-          changes.push(`  + ${s.length > 120 ? s.slice(0, 120) + "..." : s}`);
-        }
-        if (m.realAdded.length > 8) changes.push(`  ... 还有 ${m.realAdded.length - 8} 处新增`);
+        const readableRemoved = m.realRemoved.filter(isReadableBusinessText);
+        const readableAdded = m.realAdded.filter(isReadableBusinessText);
+        for (const s of readableRemoved.slice(0, 4)) changes.push(`  - ${s}`);
+        if (readableRemoved.length > 4) changes.push(`  ... 还有 ${readableRemoved.length - 4} 处可读移除，见 Diff 详情`);
+        for (const s of readableAdded.slice(0, 4)) changes.push(`  + ${s}`);
+        if (readableAdded.length > 4) changes.push(`  ... 还有 ${readableAdded.length - 4} 处可读新增，见 Diff 详情`);
+        const hiddenCount = total - readableRemoved.length - readableAdded.length;
+        if (hiddenCount > 0) changes.push(`  · ${hiddenCount} 处不可读实现片段已折叠到 Diff 详情`);
       }
 
       if (noiseOnlyFiles.length > 0) {
@@ -4598,6 +4844,9 @@ export const __testables = {
   classifyUiStyleString,
   inferUiComponentContext,
   summarizeUiStyleDiffs,
+  collectCodeIntentDiffsFromStrings,
+  summarizeCodeIntentDiffs,
+  isReadableBusinessText,
 };
 
 if (!IS_TEST_MODE) {

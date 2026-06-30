@@ -331,6 +331,70 @@ test("Flap asset extraction explains SVG paths Tailwind utilities and style pseu
   assert.doesNotMatch(content, /disabled:pointer-events-none/);
 });
 
+test("minified code fragments are folded into intent signals instead of readable copy", () => {
+  const oldFeatures = {
+    assetHash: "old-assets",
+    assetContents: {
+      "8625.js": {
+        path: "/_next/static/chunks/8625.js",
+        contentHash: "old",
+        strings: [
+          "stable shared copy for diff matching",
+          "),n}}},provides:function(n){n.generateAbstractMask=function(n){var t,a,e,i,o,s,f,c,l=n.children,u=n.attributes,m=n.main,d=n.mask,b=n.maskId,p=n.transform,v=m.width,g=m.icon",
+          ")&&e.USE_PROFILES,eA=!1!==e.ALLOW_ARIA_ATTR,ex=!1!==e.ALLOW_DATA_ATTR,eS=e.ALLOW_UNKNOWN_PROTOCOLS||!1,eC=!1!==e.ALLOW_SELF_CLOSE_IN_ATTR,eP=e.SAFE_FOR_TEMPLATES||!1",
+          "!==e.toLowerCase(),R=e=>!!(e&&(z(e.vault)||z(e.vaultFactory))),H=e=>e.tax?",
+          ",X(t.change))})]})})(),t.showTaxInfo&&o&&(0,r.jsxs)(",
+          ",label:V(t.dividendBps,Z(e.dividendBadge,",
+          "{swapOpacity:undefined}",
+        ],
+      },
+    },
+  };
+  const newFeatures = {
+    assetHash: "new-assets",
+    assetContents: {
+      "8625.js": {
+        path: "/_next/static/chunks/8625.js",
+        contentHash: "new",
+        strings: [
+          "stable shared copy for diff matching",
+          "),n}}},provides:function(n){n.generateAbstractMask=function(n){var t,a,e,i,o,s,f,c,l=n.children,u=n.attributes,m=n.main,d=n.mask,p=n.maskId,b=n.transform,v=m.width,g=m.icon",
+          ")&&e.USE_PROFILES,eA=!1!==e.ALLOW_ARIA_ATTR,ex=!1!==e.ALLOW_DATA_ATTR,eS=e.ALLOW_UNKNOWN_PROTOCOLS||!1,eP=!1!==e.ALLOW_SELF_CLOSE_IN_ATTR,eC=e.SAFE_FOR_TEMPLATES||!1",
+          "!==e.toLowerCase(),H=e=>!!(e&&(V(e.vault)||V(e.vaultFactory))),R=e=>e.tax?",
+          ",Q(t.change))})]})})(),t.showTaxInfo&&o&&(0,r.jsxs)(",
+          ",label:z(t.dividendBps,Z(e.dividendBadge,",
+          "{swapOpacity:!1}",
+          "you can still view its tax info while indexing.",
+        ],
+      },
+    },
+  };
+
+  const { changes, meta } = __testables.diffFeatures(oldFeatures, newFeatures);
+  const content = __testables.buildCardBriefing(
+    "https://flap.sh/create",
+    null,
+    meta.assetStats,
+    0,
+    0,
+    [],
+    [],
+    [],
+  );
+  const payload = JSON.stringify({ changes, meta, content });
+
+  assert.equal(meta.assetStats.jsTextDiffs.length, 1);
+  assert.equal(meta.assetStats.jsTextDiffs[0].text, "you can still view its tax info while indexing.");
+  assert(meta.assetStats.codeIntentDiffs.length > 0);
+  assert.deepEqual(meta.assetStats.configDiffs.filter(d => d.field === "swapOpacity"), []);
+  assert.match(content, /实现意图信号/);
+  assert.match(content, /税费\/税务信息|Vault\/金库判定|分红参数|安全\/富文本白名单/);
+  assert.match(content, /you can still view its tax info while indexing\./);
+  assert.doesNotMatch(payload, /generateAbstractMask/);
+  assert.doesNotMatch(content, /USE_PROFILES|showTaxInfo&&o|dividendBps,Z|!==e\.toLowerCase|generateAbstractMask/);
+  assert.doesNotMatch(content, /swapOpacity/);
+});
+
 test("structured shared resource diffs coalesce even when semantic page routes differ", () => {
   const configDiffs = [
     { field: "dividendBps", oldVal: "100", newVal: "200", file: "8625-3a0e67b3310b1e9a.js" },
@@ -385,6 +449,65 @@ test("structured shared resource diffs coalesce even when semantic page routes d
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].snapshotUpdates.length, 3);
+});
+
+test("shared minified implementation signals are coalesced without raw code in the card", () => {
+  const codeIntentDiffs = [
+    { type: "removed", key: "tax", label: "税费/税务信息", intent: "可能调整税费读取、税务信息展示或索引期查看逻辑", evidence: "showTaxInfo / taxInfo / tax", file: "8625-old.js" },
+    { type: "added", key: "tax", label: "税费/税务信息", intent: "可能调整税费读取、税务信息展示或索引期查看逻辑", evidence: "showTaxInfo / taxInfo / tax", file: "8625-new.js" },
+    { type: "added", key: "dividend", label: "分红参数", intent: "可能调整 dividendBps、分红徽标或分红展示逻辑", evidence: "dividendBps / dividendBadge", file: "8625-new.js" },
+  ];
+  const makeNotification = (url, key) => ({
+    url,
+    title: "Flap 页面变更",
+    template: "red",
+    changes: [
+      "📦 前端资源变更：修改 1",
+      "📝 8625-old.js → 8625-new.js (3 处实质变更)",
+      "  · 3 处不可读实现片段已折叠到 Diff 详情",
+    ],
+    meta: {
+      assetStats: {
+        unchanged: 20,
+        renamed: 1,
+        modified: 1,
+        added: 0,
+        removed: 0,
+        noiseFiles: 1,
+        noiseCount: 3,
+        substantiveFiles: 0,
+        substantiveCount: 0,
+        substantiveFileNames: ["8625-new.js"],
+        substantiveAssetPaths: ["/_next/static/chunks/8625-new.js"],
+        configDiffs: [],
+        vaultDiffs: [],
+        jsTextDiffs: [],
+        uiStyleDiffs: [],
+        codeIntentDiffs,
+      },
+      textChangeCount: 0,
+      textChanges: [],
+      i18nChangeCount: 0,
+      i18nDiffs: [],
+      caStoreVaultDiffs: [],
+    },
+    snapshotUpdate: { key, features: {} },
+  });
+
+  const grouped = __testables.coalesceFlapNotifications([
+    makeNotification("https://flap.sh/bnb/CAstore", "castore"),
+    makeNotification("https://flap.sh/launch", "launch"),
+    makeNotification("https://flap.sh/create", "create"),
+  ]);
+
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].title, "Flap 全站前端资源变更");
+  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.match(grouped[0].content, /实现意图信号/);
+  assert.match(grouped[0].content, /税费\/税务信息/);
+  assert.match(grouped[0].content, /分红参数/);
+  assert.doesNotMatch(grouped[0].content, /showTaxInfo&&o|dividendBps,Z|function\(|generateAbstractMask/);
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
 
