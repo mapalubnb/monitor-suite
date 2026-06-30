@@ -259,7 +259,7 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
 
-test("Flap asset extraction filters SVG paths Tailwind utilities and style pseudo configs", () => {
+test("Flap asset extraction explains SVG paths Tailwind utilities and style pseudo configs as UI signals", () => {
   const oldFeatures = {
     assetHash: "old-assets",
     assetContents: {
@@ -282,6 +282,10 @@ test("Flap asset extraction filters SVG paths Tailwind utilities and style pseud
           "absolute bottom-2 left-1/2 -translate-x-1/2",
           "absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none",
           "disabled:pointer-events-none",
+          "peer-disabled:cursor-not-allowed peer-disabled:opacity-70 text-[12px] font-medium leading-[18px] text-white/80",
+          "group-hover/nav-dropdown:visible group-focus-within/nav-dropdown:opacity-100 max-[375px]:hidden min-[1400px]:flex",
+          "[--ui20-chamfer-bg:#000000] hover:[--ui20-chamfer-bg:#D0FF00]",
+          "[&_[data-radix-scroll-area-viewport]>div]:!block [&_[data-radix-scroll-area-viewport]>div]:!min-w-0",
         ],
       },
     },
@@ -294,9 +298,37 @@ test("Flap asset extraction filters SVG paths Tailwind utilities and style pseud
   assert.deepEqual(meta.assetStats.jsTextDiffs, []);
   assert.equal(meta.assetStats.substantiveFiles, 0);
   assert.equal(meta.assetStats.noiseFiles, 1);
-  assert.doesNotMatch(payload, /M7 0\.583984/);
-  assert.doesNotMatch(payload, /absolute bottom-2/);
-  assert.doesNotMatch(payload, /disabled.*pointer/);
+  assert(meta.assetStats.uiStyleDiffs.length > 0);
+  assert(meta.assetStats.uiStyleDiffs.some(d => d.category === "icon"));
+  assert(meta.assetStats.uiStyleDiffs.some(d => d.category === "disabled"));
+  assert(meta.assetStats.uiStyleDiffs.some(d => d.category === "responsive"));
+  assert(meta.assetStats.uiStyleDiffs.some(d => d.category === "component"));
+  assert(meta.assetStats.uiStyleDiffs.some(d => d.contextLabel === "顶部导航/下拉菜单"));
+  assert(meta.assetStats.uiStyleDiffs.some(d => d.contextLabel === "代币创建表单控件"));
+  assert(meta.assetStats.uiStyleDiffs.some(d => d.contextLabel === "弹窗/下拉层/滚动区"));
+
+  const content = __testables.buildCardBriefing(
+    "https://flap.sh/create",
+    null,
+    meta.assetStats,
+    0,
+    0,
+    [],
+    [],
+    [],
+  );
+
+  assert.match(content, /UI\/样式信号/);
+  assert.match(content, /禁用态交互/);
+  assert.match(content, /图标\/矢量/);
+  assert.match(content, /响应式布局/);
+  assert.match(content, /组件样式变量/);
+  assert.match(content, /范围：/);
+  assert.match(content, /顶部导航\/下拉菜单|代币创建表单控件|弹窗\/下拉层\/滚动区/);
+  assert.match(content, /意图判断/);
+  assert.doesNotMatch(content, /M7 0\.583984/);
+  assert.doesNotMatch(content, /absolute bottom-2/);
+  assert.doesNotMatch(content, /disabled:pointer-events-none/);
 });
 
 test("structured shared resource diffs coalesce even when semantic page routes differ", () => {
@@ -354,6 +386,89 @@ test("structured shared resource diffs coalesce even when semantic page routes d
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.equal(grouped[0].url, "https://flap.sh");
   assert.equal(grouped[0].snapshotUpdates.length, 3);
+});
+
+test("shared UI style signals coalesce into one explanatory site-wide notification", () => {
+  const uiStyleDiffs = [
+    { type: "added", category: "disabled", label: "禁用态交互", intent: "调整禁用状态下的点击或交互反馈", evidence: "disabled / pointer-events", contextKey: "wallet-connect", contextLabel: "钱包连接控件", contextConfidence: "高", file: "8625-3a0e67b3310b1e9a.js" },
+    { type: "added", category: "interaction", label: "交互反馈", intent: "调整 hover/focus/active 或过渡反馈", evidence: "hover / focus / transition / ring", contextKey: "navigation-menu", contextLabel: "顶部导航/下拉菜单", contextConfidence: "高", file: "8625-3a0e67b3310b1e9a.js" },
+  ];
+  const makeNotification = (url, key) => ({
+    url,
+    title: "Flap 页面变更",
+    template: "red",
+    changes: ["📦 前端资源变更：修改 1"],
+    meta: {
+      assetStats: {
+        unchanged: 20,
+        renamed: 0,
+        modified: 1,
+        added: 0,
+        removed: 0,
+        noiseFiles: 1,
+        noiseCount: 2,
+        substantiveFiles: 0,
+        substantiveCount: 0,
+        substantiveFileNames: [],
+        substantiveAssetPaths: [],
+        configDiffs: [],
+        vaultDiffs: [],
+        jsTextDiffs: [],
+        uiStyleDiffs,
+      },
+      textChangeCount: 0,
+      textChanges: [],
+      i18nChangeCount: 0,
+      i18nDiffs: [],
+      caStoreVaultDiffs: [],
+    },
+    snapshotUpdate: { key, features: {} },
+  });
+
+  const grouped = __testables.coalesceFlapNotifications([
+    makeNotification("https://flap.sh/launch", "launch"),
+    makeNotification("https://flap.sh/create", "create"),
+  ]);
+
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].title, "Flap 全站前端资源变更");
+  assert.match(grouped[0].content, /UI\/样式信号 2 处/);
+  assert.match(grouped[0].content, /未发现明确业务配置变化/);
+  assert.match(grouped[0].content, /禁用态交互/);
+  assert.match(grouped[0].content, /钱包连接控件/);
+  assert.match(grouped[0].content, /顶部导航\/下拉菜单/);
+  assert.match(grouped[0].content, /调整禁用状态下的点击或交互反馈/);
+  assert.equal(grouped[0].snapshotUpdates.length, 2);
+});
+
+test("Flap UI style context inference maps real Tailwind patterns to concrete components", () => {
+  const cases = [
+    {
+      text: "group-hover/nav-dropdown:visible group-focus-within/nav-dropdown:opacity-100",
+      context: "顶部导航/下拉菜单",
+    },
+    {
+      text: "ui20-connect-chamfer [--ui20-chamfer-bg:#000000] hover:[--ui20-chamfer-bg:#D0FF00]",
+      context: "钱包连接控件",
+    },
+    {
+      text: "peer-disabled:cursor-not-allowed peer-disabled:opacity-70 text-[12px] font-medium",
+      context: "代币创建表单控件",
+    },
+    {
+      text: "[&_[data-radix-scroll-area-viewport]>div]:!block [&_[data-radix-scroll-area-viewport]>div]:!min-w-0",
+      context: "弹窗/下拉层/滚动区",
+    },
+  ];
+
+  for (const item of cases) {
+    assert.equal(__testables.inferUiComponentContext(item.text).label, item.context);
+  }
+
+  assert.equal(
+    __testables.inferUiComponentContext("rounded-[4px] border object-cover", "page-59769a4a66f32125.js", "/_next/static/chunks/app/[chain]/CAstore/page-59769a4a66f32125.js").label,
+    "CAstore 金库卡片/模板列表",
+  );
 });
 
 test("CAstore Chinese vault headings are extracted as structured vault sections", () => {

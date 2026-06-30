@@ -131,9 +131,22 @@ function isNoiseString(s) {
 function isSvgPathLikeString(value) {
   const s = String(value || "").trim();
   if (!s || !/^[Mm][\d\s.,+\-A-Za-z]+$/.test(s)) return false;
+  const nonPathLetters = s.replace(/[MmLlHhVvCcSsQqTtAaZz]/g, "").match(/[A-Za-z]/);
+  if (nonPathLetters) return false;
   const commandCount = (s.match(/[MmLlHhVvCcSsQqTtAaZz]/g) || []).length;
   const numberCount = (s.match(/-?\d+(?:\.\d+)?/g) || []).length;
-  return commandCount >= 3 && numberCount >= 6;
+  return commandCount >= 1 && numberCount >= 2;
+}
+
+function isTailwindUtilityToken(token) {
+  let t = String(token || "").trim();
+  if (!t) return false;
+  t = t.replace(/^!/, "");
+  if (/^\[[^\]]+\]$/.test(t)) return true;
+  t = t.replace(/^(?:(?:[a-z0-9-]+(?:\/[a-z0-9_-]+)?|\[[^\]]+\]):)+/i, "").replace(/^!/, "");
+  if (/^\[[^\]]+\]$/.test(t)) return true;
+  if (/^lucide(?:-[\w-]+)?$/i.test(t)) return true;
+  return /^-?(?:absolute|relative|fixed|sticky|inset|top|right|bottom|left|z|m|mx|my|mt|mr|mb|ml|p|px|py|pt|pr|pb|pl|w|h|min|max|size|flex|grid|block|inline|hidden|visible|invisible|items|justify|gap|space|shrink|grow|basis|rounded|border|bg|text|font|leading|tracking|opacity|shadow|ring|outline|focus|hover|active|disabled|transition|duration|ease|object|overflow|translate|rotate|scale|clip|cursor|pointer|select|container|aspect|origin|transform|backdrop|fill|stroke|sr-only|file|placeholder|peer|group|mask|notranslate|lucide|ui20)(?:[-:/\[\]#%.!_a-zA-Z0-9]+)?$/.test(t);
 }
 
 function isTailwindClassLikeString(value) {
@@ -141,16 +154,16 @@ function isTailwindClassLikeString(value) {
   if (!s || s.length < 8) return false;
   const tokens = s.split(/\s+/).filter(Boolean);
   if (tokens.length < 2) return false;
-  const classTokenRe = /^(?:[a-z]+:)*-?(?:absolute|relative|fixed|sticky|inset|top|right|bottom|left|z|m|mx|my|mt|mr|mb|ml|p|px|py|pt|pr|pb|pl|w|h|min|max|size|flex|grid|block|inline|hidden|items|justify|gap|space|rounded|border|bg|text|font|leading|tracking|opacity|shadow|ring|outline|focus|hover|active|disabled|transition|duration|ease|object|overflow|translate|rotate|scale|clip|cursor|pointer|select|container|aspect|origin|transform|backdrop|fill|stroke|sr-only)(?:[-:/\[\]#%.!_a-zA-Z0-9]+)?$/;
-  const classLike = tokens.filter(t => classTokenRe.test(t) || /^\[[^\]]+\]$/.test(t)).length;
+  const classLike = tokens.filter(isTailwindUtilityToken).length;
   return classLike / tokens.length >= 0.75;
 }
 
 function isCssUtilityFragment(value) {
   const s = String(value || "").trim();
   if (!s) return false;
-  return /(?:^|\s)(?:hover|focus|active|disabled|group-hover|aria-\w+|data-\[[^\]]+\]):[^\s]+/.test(s)
-    || /\b(?:clip-path|object-cover|ring-offset|pointer-events|rounded-full|translate-x|opacity-\d+|border-\[|bg-\[|text-\[)\b/.test(s);
+  return /(?:^|\s)(?:hover|focus|focus-visible|focus-within|active|disabled|peer-disabled|group-hover(?:\/[\w-]+)?|group-focus(?:-visible|-within)?(?:\/[\w-]+)?|group-focus-within(?:\/[\w-]+)?|aria-\w+|data-\[[^\]]+\]|sm|md|lg|xl|2xl|min-\[[^\]]+\]|max-\[[^\]]+\]):[^\s]+/.test(s)
+    || /\[[^\]]*(?:--|data-|mask|clip-path|&_|webkit)[^\]]*\]/.test(s)
+    || /\b(?:lucide|clip-path|object-cover|ring-offset|pointer-events|cursor-not-allowed|rounded-full|translate-x|opacity-\d+|border-\[|bg-\[|text-\[)\b/.test(s);
 }
 
 function isReadableBusinessText(value) {
@@ -172,6 +185,129 @@ function isAssetStringDiffNoise(value) {
     || isSvgPathLikeString(value)
     || isTailwindClassLikeString(value)
     || isCssUtilityFragment(value);
+}
+
+const UI_STYLE_CATEGORY_META = {
+  icon: {
+    label: "图标/矢量",
+    intent: "更新图标或矢量绘制资源",
+    evidence: "SVG path",
+  },
+  disabled: {
+    label: "禁用态交互",
+    intent: "调整禁用状态下的点击或交互反馈",
+    evidence: "disabled / pointer-events",
+  },
+  interaction: {
+    label: "交互反馈",
+    intent: "调整 hover/focus/active 或过渡反馈",
+    evidence: "hover / focus / transition / ring",
+  },
+  layout: {
+    label: "布局定位",
+    intent: "调整组件位置、对齐或层级",
+    evidence: "absolute / top / right / bottom / translate",
+  },
+  visual: {
+    label: "视觉样式",
+    intent: "调整圆角、边框、透明度、背景或图片裁切",
+    evidence: "rounded / border / opacity / bg / object",
+  },
+  responsive: {
+    label: "响应式布局",
+    intent: "调整不同屏幕尺寸下的布局或显示规则",
+    evidence: "sm / md / min-[...] / max-[...]",
+  },
+  component: {
+    label: "组件样式变量",
+    intent: "调整组件内部选择器、遮罩或主题变量",
+    evidence: "arbitrary selector / CSS variable / mask",
+  },
+  utility: {
+    label: "样式工具类",
+    intent: "调整 CSS utility 样式组合",
+    evidence: "CSS utility",
+  },
+};
+
+function classifyUiStyleString(value) {
+  const s = String(value || "").trim();
+  if (!s) return [];
+  const categories = new Set();
+  const lower = s.toLowerCase();
+
+  if (isSvgPathLikeString(s) || /\blucide(?:\s|[-_])/.test(lower)) categories.add("icon");
+  if (/(?:^|\s)(?:disabled|peer-disabled):/.test(s) || /pointer-events|cursor-not-allowed/.test(lower)) categories.add("disabled");
+  if (/(?:^|\s)(?:hover|focus|focus-visible|focus-within|active|group-hover(?:\/[\w-]+)?|group-focus(?:-visible|-within)?(?:\/[\w-]+)?|group-focus-within(?:\/[\w-]+)?|peer-disabled|aria-\w+|data-\[[^\]]+\]):/.test(s)
+    || /\b(?:transition|duration|ease|ring|outline|opacity-\d+)\b/.test(lower)) {
+    categories.add("interaction");
+  }
+  if (/(?:^|\s)(?:sm|md|lg|xl|2xl|min-\[[^\]]+\]|max-\[[^\]]+\]):/.test(s)) categories.add("responsive");
+  if (/\[[^\]]*(?:--|data-|mask|clip-path|&_|webkit)[^\]]*\]|ui20-/.test(s)) categories.add("component");
+  if (/\b(?:absolute|relative|fixed|sticky|inset|top|right|bottom|left|z-|translate|rotate|scale|origin|transform)\b/.test(lower)) {
+    categories.add("layout");
+  }
+  if (/\b(?:rounded|border|bg-|text-|shadow|opacity|object-|clip-path|fill-|stroke-|backdrop)\b/.test(lower)) {
+    categories.add("visual");
+  }
+  if (categories.size === 0 && (isTailwindClassLikeString(s) || isCssUtilityFragment(s))) categories.add("utility");
+
+  return [...categories].map(category => ({
+    category,
+    label: UI_STYLE_CATEGORY_META[category]?.label || "样式信号",
+    intent: UI_STYLE_CATEGORY_META[category]?.intent || "调整前端样式",
+    evidence: UI_STYLE_CATEGORY_META[category]?.evidence || "CSS utility",
+  }));
+}
+
+function inferUiComponentContext(value, file = "", assetPath = "") {
+  const text = `${value || ""} ${file || ""} ${assetPath || ""}`;
+  const lower = text.toLowerCase();
+  const route = getPageRouteFromAssetPath(assetPath || file);
+
+  if (/castore|vault|gift|reserve|staking|lista|stock|burn|buyback|snow|lucky|buffet|flapixel/.test(lower) || route === "CAstore") {
+    return { key: "castore-vault-card", label: "CAstore 金库卡片/模板列表", confidence: route === "CAstore" ? "高" : "中" };
+  }
+  if (/group\/nav-dropdown|nav-dropdown|group-hover\/item|group-focus-visible\/item|border-b border-\[#303236\]|\/bnb\/board|docs\.flap|token-social|lucide-arrow-up-right/.test(lower)) {
+    return { key: "navigation-menu", label: "顶部导航/下拉菜单", confidence: "高" };
+  }
+  if (/connect|wallet|ui20-connect|chamfer|连接钱包|connect wallet/.test(lower)) {
+    return { key: "wallet-connect", label: "钱包连接控件", confidence: "高" };
+  }
+  if (/lucide-search|搜索|search/.test(lower)) {
+    return { key: "search-control", label: "搜索控件", confidence: "高" };
+  }
+  if (/lucide-globe|language|语言|zh|locale/.test(lower)) {
+    return { key: "language-control", label: "语言选择控件", confidence: "高" };
+  }
+  if (/\bbsc\b|chain|network|區塊鏈|区块链|chevron-down/.test(lower)) {
+    return { key: "network-selector", label: "链/网络选择控件", confidence: "中" };
+  }
+  if (/peer-disabled|placeholder|file:border|file:bg|border-input|ring-offset-background|input|textarea|select|form|label|radix-select|token|代幣|税收|稅收/.test(lower) || route === "launch" || route === "create") {
+    return { key: "token-form", label: "代币创建表单控件", confidence: route === "launch" || route === "create" ? "高" : "中" };
+  }
+  if (/lucide-menu|lucide-x|max-\[\d+px\]|min-\[\d+px\]|mobile|drawer|sheet|translate-x-full/.test(lower)) {
+    return { key: "mobile-navigation", label: "移动端导航/响应式布局", confidence: "中" };
+  }
+  if (/radix|data-radix|scroll-area|dialog|popover|dropdown|modal|absolute right-4 top-4/.test(lower)) {
+    return { key: "overlay-popover", label: "弹窗/下拉层/滚动区", confidence: "中" };
+  }
+  if (/lucide|svg|path|mask|icon/.test(lower) || isSvgPathLikeString(value)) {
+    return { key: "iconography", label: "图标资源", confidence: "中" };
+  }
+  return { key: "unknown", label: "未定位具体组件", confidence: "低" };
+}
+
+function collectUiStyleDiffsFromStrings(strings = [], type, file, assetPath) {
+  const out = [];
+  for (const value of strings || []) {
+    const classified = classifyUiStyleString(value);
+    const context = inferUiComponentContext(value, file, assetPath);
+    for (const item of classified) {
+      out.push({ type, ...item, contextKey: context.key, contextLabel: context.label, contextConfidence: context.confidence, file, assetPath });
+    }
+  }
+  return out;
 }
 
 const BUSINESS_STRING_RE = /[\u4e00-\u9fff]|Vault|金库|金庫|CAstore|CA Store|fee|rate|tax|税|稅|dividend|staking|质押|質押|燃烧|燃燒|回购|回購|factory|template/i;
@@ -638,6 +774,7 @@ function isFlapAssetOnlyNotification(notification) {
   if (hasItems(assetStats.configDiffs)) return false;
   if (hasItems(assetStats.vaultDiffs)) return false;
   if (hasItems(assetStats.jsTextDiffs)) return false;
+  if (hasItems(assetStats.uiStyleDiffs)) return false;
   if (detectBusinessPriority(notification.changes || []).hit) return false;
   return true;
 }
@@ -657,6 +794,7 @@ function isSharedResourceChangeCandidate(notification) {
   if (hasItems(assetStats.configDiffs)) return true;
   if (hasItems(assetStats.vaultDiffs)) return true;
   if (hasItems(assetStats.jsTextDiffs)) return true;
+  if (hasItems(assetStats.uiStyleDiffs)) return true;
   if (hasPageSpecificAssetChange(notification)) return false;
   return detectBusinessPriority(notification.changes || []).hit;
 }
@@ -666,6 +804,7 @@ function hasStructuredSharedAssetStats(assetStats) {
   if (hasItems(assetStats.configDiffs)) return true;
   if (hasItems(assetStats.vaultDiffs)) return true;
   if (hasItems(assetStats.jsTextDiffs)) return true;
+  if (hasItems(assetStats.uiStyleDiffs)) return true;
   return false;
 }
 
@@ -745,15 +884,110 @@ function uniqueRecords(records = []) {
   return out;
 }
 
+function summarizeUiStyleDiffs(uiStyleDiffs = []) {
+  const grouped = new Map();
+  for (const diff of uiStyleDiffs || []) {
+    const category = diff.category || "utility";
+    const contextKey = diff.contextKey || "unknown";
+    const key = `${category}:${contextKey}`;
+    const current = grouped.get(key) || {
+      category,
+      contextKey,
+      label: diff.label || UI_STYLE_CATEGORY_META[category]?.label || "样式信号",
+      intent: diff.intent || UI_STYLE_CATEGORY_META[category]?.intent || "调整前端样式",
+      evidence: diff.evidence || UI_STYLE_CATEGORY_META[category]?.evidence || "CSS utility",
+      contextLabel: diff.contextLabel || "未定位具体组件",
+      contextConfidence: diff.contextConfidence || "低",
+      added: 0,
+      removed: 0,
+      files: new Set(),
+      assetPaths: new Set(),
+    };
+    if (diff.type === "removed") current.removed += 1;
+    else current.added += 1;
+    if (diff.file) current.files.add(diff.file);
+    if (diff.assetPath) current.assetPaths.add(diff.assetPath);
+    grouped.set(key, current);
+  }
+  return [...grouped.values()]
+    .map(item => ({
+      ...item,
+      files: uniqueStrings([...item.files]),
+      assetPaths: uniqueStrings([...item.assetPaths]),
+      total: item.added + item.removed,
+    }))
+    .sort((a, b) => b.total - a.total || a.contextLabel.localeCompare(b.contextLabel) || a.label.localeCompare(b.label));
+}
+
+function buildResourceIntentSummary(assetStats = {}) {
+  const configCount = (assetStats.configDiffs || []).filter(isBusinessConfigDiff).length;
+  const textCount = assetStats.jsTextDiffs?.length || 0;
+  const vaultCount = assetStats.vaultDiffs?.length || 0;
+  const uiSignals = summarizeUiStyleDiffs(assetStats.uiStyleDiffs || []);
+  if (vaultCount > 0 || configCount > 0 || textCount > 0) {
+    const parts = [];
+    if (vaultCount > 0) parts.push(`Vault 配置 ${vaultCount} 项`);
+    if (configCount > 0) parts.push(`业务配置 ${configCount} 项`);
+    if (textCount > 0) parts.push(`功能文案 ${textCount} 处`);
+    return {
+      verdict: "发现业务层信号",
+      intent: `可能涉及 ${parts.join("、")} 调整`,
+      confidence: "高",
+      uiSignals,
+    };
+  }
+  if (uiSignals.length > 0) {
+    const contexts = uniqueStrings(uiSignals.map(s => s.contextLabel).filter(label => label && label !== "未定位具体组件")).slice(0, 3);
+    const contextSuffix = contexts.length > 0 ? `；影响范围：${contexts.join("、")}` : "";
+    return {
+      verdict: "未发现明确业务配置变化",
+      intent: `主要是 UI/样式层调整，可能意图：${uiSignals.slice(0, 3).map(s => s.intent).join("；")}${contextSuffix}`,
+      confidence: "中",
+      uiSignals,
+    };
+  }
+  if (assetStats) {
+    return {
+      verdict: "未发现明确业务信号",
+      intent: "主要是资源构建或运行时代码变化，需结合下载 Diff 追查",
+      confidence: "低",
+      uiSignals: [],
+    };
+  }
+  return {
+    verdict: "检测到页面变化",
+    intent: "未提取到资源层意图",
+    confidence: "低",
+    uiSignals: [],
+  };
+}
+
+function buildUiStyleSignalLines(uiSignals = []) {
+  if (!uiSignals.length) return [];
+  const lines = [];
+  for (const signal of uiSignals) {
+    const countParts = [];
+    if (signal.added) countParts.push(`新增 ${signal.added}`);
+    if (signal.removed) countParts.push(`删除 ${signal.removed}`);
+    const files = signal.files?.length ? `；文件：${signal.files.slice(0, 3).map(cardText).join(", ")}${signal.files.length > 3 ? ` 等 ${signal.files.length} 个` : ""}` : "";
+    const context = signal.contextLabel && signal.contextLabel !== "未定位具体组件"
+      ? `；范围：${cardText(signal.contextLabel)}（${cardText(signal.contextConfidence)}）`
+      : "";
+    lines.push(`- ${changedText(signal.label)}：${countParts.join(" / ") || `${signal.total} 处`}${context}；可能意图：${cardText(signal.intent)}；证据：${cardText(signal.evidence)}${files}`);
+  }
+  return lines;
+}
+
 function resourceChangeFingerprint(notification) {
   const assetStats = notification.meta?.assetStats || {};
-  const hasStructuredResourceDiff = hasItems(assetStats.configDiffs) || hasItems(assetStats.vaultDiffs) || hasItems(assetStats.jsTextDiffs);
+  const hasStructuredResourceDiff = hasItems(assetStats.configDiffs) || hasItems(assetStats.vaultDiffs) || hasItems(assetStats.jsTextDiffs) || hasItems(assetStats.uiStyleDiffs);
   const detailLines = (notification.changes || [])
     .map(line => String(line || "").trim())
     .filter(line => line && !line.startsWith("📦 前端资源变更") && !line.startsWith("🔇 构建噪音"));
   const structuredFiles = uniqueStrings([
     ...(assetStats.configDiffs || []).map(d => d.file),
     ...(assetStats.jsTextDiffs || []).map(d => d.file),
+    ...(assetStats.uiStyleDiffs || []).map(d => d.file),
   ]);
   return stableKey({
     files: hasStructuredResourceDiff ? structuredFiles : (assetStats.substantiveFileNames || []),
@@ -761,6 +995,7 @@ function resourceChangeFingerprint(notification) {
     configDiffs: assetStats.configDiffs || [],
     vaultDiffs: assetStats.vaultDiffs || [],
     jsTextDiffs: assetStats.jsTextDiffs || [],
+    uiStyleSummary: summarizeUiStyleDiffs(assetStats.uiStyleDiffs || []),
     fallbackDetails: hasStructuredResourceDiff ? [] : detailLines,
   });
 }
@@ -867,6 +1102,8 @@ function summarizeBusinessSignals(assetStats = {}) {
   if ((assetStats.jsTextDiffs || []).length > 0) parts.push(`功能文案 ${assetStats.jsTextDiffs.length} 处`);
   if (configCount > 0) parts.push(`业务配置 ${configCount} 项`);
   if ((assetStats.vaultDiffs || []).length > 0) parts.push(`Vault 配置 ${assetStats.vaultDiffs.length} 项`);
+  const uiSignals = summarizeUiStyleDiffs(assetStats.uiStyleDiffs || []);
+  if (uiSignals.length > 0) parts.push(`UI/样式信号 ${uiSignals.reduce((sum, s) => sum + s.total, 0)} 处`);
   return parts;
 }
 
@@ -898,6 +1135,8 @@ function buildResourceSemanticSummary(assetStats, notifications = []) {
   if (profile.style.length > 0) {
     lines.push(`- 样式资源: ${profile.style.length} 文件。`);
   }
+  const intent = buildResourceIntentSummary(assetStats);
+  lines.push(`- 意图判断: ${intent.verdict}；${intent.intent}；置信度 ${intent.confidence}。`);
   lines.push(businessSignals.length > 0
     ? `- 结构化业务信号: ${businessSignals.join("、")}。`
     : "- 结构化业务信号: 当前提取未发现 UI 文案、业务配置、Vault/Factory 或合约相关变化。");
@@ -920,7 +1159,9 @@ function summarizePageAssetChange(notification) {
   if (profile.script.length > 0) parts.push(`页面/业务脚本 ${profile.script.map(i => assetPathToFilename(i.file)).join(", ")}：已做结构化信号提取`);
   if (profile.style.length > 0) parts.push(`样式资源 ${profile.style.map(i => assetPathToFilename(i.file)).join(", ")}`);
   const signals = summarizeBusinessSignals(assetStats);
+  const intent = buildResourceIntentSummary(assetStats);
   parts.push(signals.length > 0 ? `业务信号 ${signals.join("、")}` : "未发现结构化业务信号");
+  parts.push(`意图判断 ${intent.verdict}，置信度 ${intent.confidence}`);
   return `${notification.url}: ${parts.join("；")}`;
 }
 
@@ -932,8 +1173,12 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   const configDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.configDiffs || []));
   const vaultDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.vaultDiffs || []));
   const jsTextDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.jsTextDiffs || []));
+  const uiStyleDiffs = uniqueRecords(assetOnlyNotifications.flatMap(n => n.meta?.assetStats?.uiStyleDiffs || []));
   const businessConfigDiffs = configDiffs.filter(isBusinessConfigDiff);
   const hasBusinessResourceDiffs = businessConfigDiffs.length > 0 || vaultDiffs.length > 0 || jsTextDiffs.length > 0;
+  const intentSummary = buildResourceIntentSummary({ configDiffs, vaultDiffs, jsTextDiffs, uiStyleDiffs });
+  const uiSignalLines = buildUiStyleSignalLines(intentSummary.uiSignals);
+  const hasLocalSignals = hasBusinessResourceDiffs || uiSignalLines.length > 0;
   const assetStats = {
     unchanged: maxStat(assetOnlyNotifications, "unchanged"),
     renamed: maxStat(assetOnlyNotifications, "renamed"),
@@ -948,6 +1193,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     configDiffs,
     vaultDiffs,
     jsTextDiffs,
+    uiStyleDiffs,
   };
   const semanticFiles = uniqueStrings([
     ...substantiveFileNames,
@@ -969,12 +1215,15 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
         jsTextDiffs.length > 0 ? `功能文案 ${jsTextDiffs.length} 处` : "",
         businessConfigDiffs.length > 0 ? `业务配置 ${businessConfigDiffs.length} 项` : "",
         vaultDiffs.length > 0 ? `Vault 配置 ${vaultDiffs.length} 项` : "",
+        uiStyleDiffs.length > 0 ? `UI/样式信号 ${uiStyleDiffs.length} 处` : "",
       ].filter(Boolean).join("；")
-    : "未提取到 UI 文案、业务配置、Vault/Factory 或合约相关变化";
+    : (uiStyleDiffs.length > 0
+        ? `UI/样式信号 ${uiStyleDiffs.length} 处`
+        : "未提取到 UI 文案、业务配置、Vault/Factory 或合约相关变化");
   const compactAffectedUrls = affectedUrls.length > 6
     ? [...affectedUrls.slice(0, 6), `... 还有 ${affectedUrls.length - 6} 个页面`]
     : affectedUrls;
-  const localSignalLines = hasBusinessResourceDiffs
+  const localSignalLines = hasLocalSignals
     ? [
         ...jsTextDiffs.map(d => {
           const label = d.type === "removed" ? "移除文案" : d.type === "added" ? "新增文案" : "文案变更";
@@ -998,26 +1247,29 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
           if (vd.type === "removed") return [`- ${removedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
           return [`- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
         }),
+        ...uiSignalLines,
       ]
     : ["- 本地结构化提取未发现业务信号。"];
 
   const changes = [
     `📦 Flap 全站前端资源变更：影响页面 ${affectedUrls.length} 个，修改资源 ${assetStats.modified} 个`,
     `本地初筛：${localSignalSummary}`,
+    `意图判断：${intentSummary.verdict}；${intentSummary.intent}；置信度 ${intentSummary.confidence}`,
     `资源范围：${resourceScope}`,
     "",
     "受影响页面：",
     ...affectedUrls.map(url => `- ${url}`),
-    hasBusinessResourceDiffs ? "" : "",
-    hasBusinessResourceDiffs ? "本地业务信号：" : "",
+    hasLocalSignals ? "" : "",
+    hasLocalSignals ? "本地信号：" : "",
     ...localSignalLines,
   ].filter(Boolean);
 
   const contentLines = [
     "**结论摘要**",
-    hasBusinessResourceDiffs
+    hasLocalSignals
       ? `- 本地初筛: 检测到 ${localSignalSummary}。`
       : "- 本地初筛: 未发现结构化业务变更。",
+    `- 意图判断: ${intentSummary.verdict}；${intentSummary.intent}；置信度 ${intentSummary.confidence}`,
     `- 影响页面: ${affectedUrls.length} 个`,
     `- 资源范围: ${resourceScope}`,
     `- 资源统计: 修改 ${assetStats.modified} 个，新增 ${assetStats.added} 个，移除 ${assetStats.removed} 个，重命名 ${assetStats.renamed} 个`,
@@ -1225,6 +1477,8 @@ function buildBriefingInput(url, changes, assetStats, caStoreVaultDiffs = []) {
     lines.push(`资源变更: 不变 ${assetStats.unchanged} | 重命名 ${assetStats.renamed} | 修改 ${assetStats.modified} | 新增 ${assetStats.added} | 移除 ${assetStats.removed}`);
     lines.push(`噪音文件: ${assetStats.noiseFiles} 个 (${assetStats.noiseCount} 处变量重命名/部署ID轮换)`);
     lines.push(`实质变更文件: ${assetStats.substantiveFiles} 个 (${assetStats.substantiveCount} 处)`);
+    const intent = buildResourceIntentSummary(assetStats);
+    lines.push(`意图判断: ${intent.verdict}；${intent.intent}；置信度 ${intent.confidence}`);
   }
 
   if (caStoreVaultDiffs.length > 0) {
@@ -1270,6 +1524,15 @@ function buildBriefingInput(url, changes, assetStats, caStoreVaultDiffs = []) {
       } else {
         lines.push(`  新增: ${vd.name}`);
       }
+    }
+  }
+
+  const uiSignals = summarizeUiStyleDiffs(assetStats?.uiStyleDiffs || []);
+  if (uiSignals.length > 0) {
+    lines.push("");
+    lines.push("UI/样式信号:");
+    for (const signal of uiSignals.slice(0, 12)) {
+      lines.push(`  ${signal.label}: ${signal.added} 新增 / ${signal.removed} 删除；范围: ${signal.contextLabel}(${signal.contextConfidence})；可能意图: ${signal.intent}；证据: ${signal.evidence}；文件: ${signal.files.slice(0, 4).join(", ")}`);
     }
   }
 
@@ -1385,6 +1648,8 @@ function buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i
   if (assetStats?.jsTextDiffs?.length > 0) summary.push(`功能文案 ${assetStats.jsTextDiffs.length} 处`);
   const configCount = countBusinessConfigDiffs(assetStats);
   if (configCount > 0) summary.push(`业务配置 ${configCount} 项`);
+  const uiSignalCount = (assetStats?.uiStyleDiffs || []).length;
+  if (uiSignalCount > 0) summary.push(`UI/样式信号 ${uiSignalCount} 处`);
   if (summary.length === 0 && assetStats) summary.push("未提取到结构化业务变更，仅有资源层变化");
   if (summary.length === 0) summary.push("检测到页面变化");
   return summary;
@@ -1475,10 +1740,12 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
 
   const summary = buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs);
   const hasBusinessChange = summary.some(s => !s.includes("未提取到结构化业务变更"));
+  const intentSummary = buildResourceIntentSummary(assetStats || {});
 
   lines.push("**结论摘要**");
   lines.push(`- 监控页面: [${url}](${url})`);
   lines.push(`- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`);
+  if (assetStats) lines.push(`- 意图判断: ${intentSummary.verdict}；${intentSummary.intent}；置信度 ${intentSummary.confidence}`);
   lines.push("");
   lines.push("**重点变更**");
   lines.push("");
@@ -1665,6 +1932,14 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
       }
       lines.push("");
     }
+  }
+
+  const uiSignalLines = buildUiStyleSignalLines(intentSummary.uiSignals);
+  if (uiSignalLines.length > 0) {
+    hasStructuredChange = true;
+    lines.push(`**🎨 UI/样式信号（${assetStats.uiStyleDiffs.length} 处）：**`);
+    lines.push(...uiSignalLines);
+    lines.push("");
   }
 
   if (!hasStructuredChange) {
@@ -3263,7 +3538,7 @@ function diffTextContent(oldText, newText) {
   return { changes, reordered: false };
 }
 
-function buildAssetFullDiffLines({ assetDiff, substantiveFiles, noiseOnlyFiles, allConfigDiffs, vaultDiffs }) {
+function buildAssetFullDiffLines({ assetDiff, substantiveFiles, noiseOnlyFiles, allConfigDiffs, vaultDiffs, uiStyleDiffs = [] }) {
   const lines = ["【前端资源完整 Diff】"];
   const statParts = [];
   if (assetDiff.unchanged) statParts.push(`不变 ${assetDiff.unchanged}`);
@@ -3292,6 +3567,17 @@ function buildAssetFullDiffLines({ assetDiff, substantiveFiles, noiseOnlyFiles, 
       } else {
         lines.push(`${vd.type || "changed"}: ${vd.name || JSON.stringify(vd)}`);
       }
+    }
+  }
+
+  const uiSignals = summarizeUiStyleDiffs(uiStyleDiffs);
+  if (uiSignals.length > 0) {
+    lines.push("");
+    lines.push("【UI/样式信号摘要】");
+    for (const signal of uiSignals) {
+      const counts = `${signal.added} 新增 / ${signal.removed} 删除`;
+      const files = signal.files.length ? `；文件: ${signal.files.join(", ")}` : "";
+      lines.push(`${signal.label}: ${counts}；范围: ${signal.contextLabel}(${signal.contextConfidence})；可能意图: ${signal.intent}；证据: ${signal.evidence}${files}`);
     }
   }
 
@@ -3405,6 +3691,7 @@ function diffFeatures(oldF, newF) {
       const substantiveFiles = [];
       const noiseOnlyFiles = [];
       const allConfigDiffs = [];
+      const allUiStyleDiffs = [];
 
       for (const m of assetDiff.matched) {
         const realAdded = (m.addedStrings || []).filter(s => !isAssetStringDiffNoise(s));
@@ -3418,6 +3705,11 @@ function diffFeatures(oldF, newF) {
             allConfigDiffs.push({ ...cd, file: m.newFile || m.oldFile });
           }
         }
+
+        allUiStyleDiffs.push(
+          ...collectUiStyleDiffsFromStrings(m.removedStrings || [], "removed", m.oldFile || m.newFile, m.oldPath || m.newPath),
+          ...collectUiStyleDiffsFromStrings(m.addedStrings || [], "added", m.newFile || m.oldFile, m.newPath || m.oldPath),
+        );
 
         if (totalReal === 0 && totalNoise > 0) {
           noiseOnlyFiles.push({ label: m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`, noise: totalNoise });
@@ -3466,10 +3758,11 @@ function diffFeatures(oldF, newF) {
         substantiveCount: substantiveFiles.reduce((s, f) => s + f.realAdded.length + f.realRemoved.length, 0),
         substantiveFileNames: substantiveFiles.map(f => f.newFile || f.oldFile),
         substantiveAssetPaths,
-        semanticProfile: buildAssetSemanticProfile(substantiveAssetPaths, { configDiffs: allConfigDiffs, vaultDiffs, jsTextDiffs }),
+        semanticProfile: buildAssetSemanticProfile(substantiveAssetPaths, { configDiffs: allConfigDiffs, vaultDiffs, jsTextDiffs, uiStyleDiffs: allUiStyleDiffs }),
         configDiffs: allConfigDiffs,
         vaultDiffs,
         jsTextDiffs,
+        uiStyleDiffs: allUiStyleDiffs,
       };
       meta.fullDiffLines.push(...buildAssetFullDiffLines({
         assetDiff,
@@ -3477,6 +3770,7 @@ function diffFeatures(oldF, newF) {
         noiseOnlyFiles,
         allConfigDiffs,
         vaultDiffs,
+        uiStyleDiffs: allUiStyleDiffs,
       }));
 
       // ── 详细 diff 输出（存文件用）──
@@ -4301,6 +4595,9 @@ export const __testables = {
   mergeRoundVaultFactoryMaps,
   diffVaultFactories,
   buildFlapFullDiff,
+  classifyUiStyleString,
+  inferUiComponentContext,
+  summarizeUiStyleDiffs,
 };
 
 if (!IS_TEST_MODE) {
