@@ -128,6 +128,52 @@ function isNoiseString(s) {
   return NOISE_PATTERNS.some(p => p.test(s));
 }
 
+function isSvgPathLikeString(value) {
+  const s = String(value || "").trim();
+  if (!s || !/^[Mm][\d\s.,+\-A-Za-z]+$/.test(s)) return false;
+  const commandCount = (s.match(/[MmLlHhVvCcSsQqTtAaZz]/g) || []).length;
+  const numberCount = (s.match(/-?\d+(?:\.\d+)?/g) || []).length;
+  return commandCount >= 3 && numberCount >= 6;
+}
+
+function isTailwindClassLikeString(value) {
+  const s = String(value || "").trim();
+  if (!s || s.length < 8) return false;
+  const tokens = s.split(/\s+/).filter(Boolean);
+  if (tokens.length < 2) return false;
+  const classTokenRe = /^(?:[a-z]+:)*-?(?:absolute|relative|fixed|sticky|inset|top|right|bottom|left|z|m|mx|my|mt|mr|mb|ml|p|px|py|pt|pr|pb|pl|w|h|min|max|size|flex|grid|block|inline|hidden|items|justify|gap|space|rounded|border|bg|text|font|leading|tracking|opacity|shadow|ring|outline|focus|hover|active|disabled|transition|duration|ease|object|overflow|translate|rotate|scale|clip|cursor|pointer|select|container|aspect|origin|transform|backdrop|fill|stroke|sr-only)(?:[-:/\[\]#%.!_a-zA-Z0-9]+)?$/;
+  const classLike = tokens.filter(t => classTokenRe.test(t) || /^\[[^\]]+\]$/.test(t)).length;
+  return classLike / tokens.length >= 0.75;
+}
+
+function isCssUtilityFragment(value) {
+  const s = String(value || "").trim();
+  if (!s) return false;
+  return /(?:^|\s)(?:hover|focus|active|disabled|group-hover|aria-\w+|data-\[[^\]]+\]):[^\s]+/.test(s)
+    || /\b(?:clip-path|object-cover|ring-offset|pointer-events|rounded-full|translate-x|opacity-\d+|border-\[|bg-\[|text-\[)\b/.test(s);
+}
+
+function isReadableBusinessText(value) {
+  const s = String(value || "").trim();
+  if (!s || s.length < 4) return false;
+  if (isSvgPathLikeString(s) || isTailwindClassLikeString(s) || isCssUtilityFragment(s)) return false;
+  if (/[\u4e00-\u9fff]/.test(s)) return true;
+  if (BUSINESS_STRING_RE.test(s)) return true;
+  const words = s.split(/\s+/).filter(w => /[a-zA-Z]{2,}/.test(w));
+  if (words.length < 3) return false;
+  if (/[{}()=>;]/.test(s) || /^[a-z]\.\w/.test(s)) return false;
+  const utilityWords = words.filter(w => /^(absolute|relative|bottom|left|right|top|rounded|border|object|hover|focus|disabled|opacity|ring|transition|translate|pointer|events|background|foreground)$/i.test(w)).length;
+  if (utilityWords / words.length > 0.4) return false;
+  return true;
+}
+
+function isAssetStringDiffNoise(value) {
+  return isNoiseString(value)
+    || isSvgPathLikeString(value)
+    || isTailwindClassLikeString(value)
+    || isCssUtilityFragment(value);
+}
+
 const BUSINESS_STRING_RE = /[\u4e00-\u9fff]|Vault|金库|金庫|CAstore|CA Store|fee|rate|tax|税|稅|dividend|staking|质押|質押|燃烧|燃燒|回购|回購|factory|template/i;
 
 function isBusinessAssetString(s) {
@@ -178,6 +224,7 @@ function isMinifierValue(val) {
 const BUSINESS_FIELD_HINTS = /fee|permit|swap|enabled|disabled|show|hide|support|stake|vault|dividend|amount|constraint|sugar|subscription/i;
 
 function isBusinessConfigDiff(cd) {
+  if (isStylePseudoConfigDiff(cd)) return false;
   // 前置过滤：如果新旧值都是 minifier 变量，直接拒绝（无论 key 是什么）
   if (isMinifierValue(cd.oldVal) && isMinifierValue(cd.newVal)) return false;
   // 如果任一值是 minifier 变量，另一方也不是具体业务值，拒绝
@@ -207,6 +254,12 @@ function isBusinessConfigDiff(cd) {
 function extractConfigDiffs(removedStrings, addedStrings) {
   const configDiffs = [];
   const configRe = /(\w+)\s*:\s*(\{[^}]+\}|![01]|"[^"]*"|'[^']*'|[\w.]+)/g;
+
+  function pushConfigDiff(item) {
+    if (!isBusinessConfigDiff(item)) return false;
+    configDiffs.push(item);
+    return true;
+  }
 
   function parseConfigTokens(str) {
     const map = new Map();
@@ -243,7 +296,7 @@ function extractConfigDiffs(removedStrings, addedStrings) {
             const isConcrete = /^["']/.test(otherVal) || /^0x[0-9a-fA-F]{4,}/.test(otherVal) || /^\d+(\.\d+)?$/.test(otherVal) || /^!?[01]$/.test(otherVal) || /^null$/.test(otherVal) || /^(true|false)$/.test(otherVal);
             if (!isConcrete) continue;
           }
-          configDiffs.push({ field: key, oldVal, newVal });
+          pushConfigDiff({ field: key, oldVal, newVal });
         }
       }
       for (const [key, val] of newTokens) {
@@ -251,7 +304,7 @@ function extractConfigDiffs(removedStrings, addedStrings) {
           // 新出现的 key：白名单内直接通过，或匹配业务关键词模式也通过
           const isBusinessKey = CONFIG_BUSINESS_KEYS.has(key) || BUSINESS_FIELD_HINTS.test(key);
           if (isBusinessKey && !isMinifierValue(val)) {
-            configDiffs.push({ field: key, oldVal: "(无)", newVal: val });
+            pushConfigDiff({ field: key, oldVal: "(无)", newVal: val });
           }
         }
       }
@@ -278,8 +331,9 @@ function extractConfigDiffs(removedStrings, addedStrings) {
         }
       }
       if (!existsInOld) {
-        configDiffs.push({ field: key, oldVal: "(新增)", newVal: val });
-        seenFields.add(key);
+        if (pushConfigDiff({ field: key, oldVal: "(新增)", newVal: val })) {
+          seenFields.add(key);
+        }
       }
     }
   }
@@ -462,6 +516,17 @@ async function sendFeishu(title, content, template = "red", _retries = 2) {
   return false;
 }
 
+function isStylePseudoConfigDiff(cd = {}) {
+  const field = String(cd.field || "");
+  const oldVal = String(cd.oldVal ?? "");
+  const newVal = String(cd.newVal ?? "");
+  if (/^(?:hover|focus|active|disabled|group-hover|aria|data)$/i.test(field)) return true;
+  if (/^(?:pointer|pointer-events|opacity|ring|outline|translate|rounded|border|bg|object|clip|absolute|relative)$/i.test(newVal)) return true;
+  if (isTailwindClassLikeString(`${field}:${newVal}`) || isCssUtilityFragment(`${field}:${newVal}`)) return true;
+  if ((oldVal === "(新增)" || oldVal === "(无)") && /^(?:pointer|none|auto|opacity|ring|outline)$/i.test(newVal)) return true;
+  return false;
+}
+
 /**
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
@@ -589,10 +654,10 @@ function isSharedResourceChangeCandidate(notification) {
   if (!notification || notification.isRecoveryNotice || notification.content) return false;
   const assetStats = notification.meta?.assetStats;
   if (!assetStats || hasFlapPageLevelChange(notification)) return false;
-  if (hasPageSpecificAssetChange(notification)) return false;
   if (hasItems(assetStats.configDiffs)) return true;
   if (hasItems(assetStats.vaultDiffs)) return true;
   if (hasItems(assetStats.jsTextDiffs)) return true;
+  if (hasPageSpecificAssetChange(notification)) return false;
   return detectBusinessPriority(notification.changes || []).hit;
 }
 
@@ -608,7 +673,6 @@ function hasExtractableSharedResourceChange(notification) {
   if (!notification || notification.isRecoveryNotice || notification.content) return false;
   const assetStats = notification.meta?.assetStats;
   if (!assetStats || !hasFlapPageLevelChange(notification)) return false;
-  if (hasPageSpecificAssetChange(notification)) return false;
   return hasStructuredSharedAssetStats(assetStats);
 }
 
@@ -638,14 +702,14 @@ function stripSharedResourceNotification(notification) {
     const text = String(line || "");
     return !/前端资源变更|配置参数变更|Vault 配置变更/.test(text);
   });
-  return { ...notification, changes, meta };
+  return { ...notification, changes, meta, sharedResourceStripped: true };
 }
 
 function hasNotificationPayload(notification) {
   if (!notification) return false;
   if (notification.content) return true;
   const meta = notification.meta || {};
-  if ((notification.changes || []).length > 0) return true;
+  if (!notification.sharedResourceStripped && (notification.changes || []).length > 0) return true;
   if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return true;
   if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return true;
   if (hasItems(meta.caStoreVaultDiffs)) return true;
@@ -687,9 +751,13 @@ function resourceChangeFingerprint(notification) {
   const detailLines = (notification.changes || [])
     .map(line => String(line || "").trim())
     .filter(line => line && !line.startsWith("📦 前端资源变更") && !line.startsWith("🔇 构建噪音"));
+  const structuredFiles = uniqueStrings([
+    ...(assetStats.configDiffs || []).map(d => d.file),
+    ...(assetStats.jsTextDiffs || []).map(d => d.file),
+  ]);
   return stableKey({
-    files: hasStructuredResourceDiff ? [] : (assetStats.substantiveFileNames || []),
-    semanticProfile: assetStats.semanticProfile || null,
+    files: hasStructuredResourceDiff ? structuredFiles : (assetStats.substantiveFileNames || []),
+    semanticProfile: hasStructuredResourceDiff ? null : (assetStats.semanticProfile || null),
     configDiffs: assetStats.configDiffs || [],
     vaultDiffs: assetStats.vaultDiffs || [],
     jsTextDiffs: assetStats.jsTextDiffs || [],
@@ -3339,8 +3407,8 @@ function diffFeatures(oldF, newF) {
       const allConfigDiffs = [];
 
       for (const m of assetDiff.matched) {
-        const realAdded = (m.addedStrings || []).filter(s => !isNoiseString(s));
-        const realRemoved = (m.removedStrings || []).filter(s => !isNoiseString(s));
+        const realAdded = (m.addedStrings || []).filter(s => !isAssetStringDiffNoise(s));
+        const realRemoved = (m.removedStrings || []).filter(s => !isAssetStringDiffNoise(s));
         const totalNoise = (m.addedStrings.length - realAdded.length) + (m.removedStrings.length - realRemoved.length);
         const totalReal = realAdded.length + realRemoved.length;
 
@@ -3361,25 +3429,15 @@ function diffFeatures(oldF, newF) {
 
       // ── 提取 JS 字符串 diff 中的业务文案（中文文案、Vault 描述等）──
       const jsTextDiffs = [];
-      // 判断一条字符串是否为有意义的业务文案（非代码、非 minifier、含中文或有意义的英文）
-      const isBusinessText = (s) => {
-        if (!s || s.length < 4) return false;
-        // 含中文字符 → 业务文案
-        if (/[\u4e00-\u9fff]/.test(s)) return true;
-        // 含有意义的英文短语（至少 3 个单词，且不像代码）
-        const words = s.split(/\s+/).filter(w => w.length > 1);
-        if (words.length >= 3 && !/[{}()=>;]/.test(s) && !/^[a-z]\.\w/.test(s)) return true;
-        return false;
-      };
 
       for (const sf of substantiveFiles) {
         for (const s of sf.realRemoved) {
-          if (isBusinessText(s)) {
+          if (isReadableBusinessText(s)) {
             jsTextDiffs.push({ type: "removed", text: s, file: sf.oldFile || sf.newFile });
           }
         }
         for (const s of sf.realAdded) {
-          if (isBusinessText(s)) {
+          if (isReadableBusinessText(s)) {
             jsTextDiffs.push({ type: "added", text: s, file: sf.newFile || sf.oldFile });
           }
         }

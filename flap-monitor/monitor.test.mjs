@@ -259,6 +259,103 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
 
+test("Flap asset extraction filters SVG paths Tailwind utilities and style pseudo configs", () => {
+  const oldFeatures = {
+    assetHash: "old-assets",
+    assetContents: {
+      "8625-aaa.js": {
+        path: "/_next/static/chunks/8625-aaa.js",
+        contentHash: "old",
+        strings: ["stable shared copy for diff matching"],
+      },
+    },
+  };
+  const newFeatures = {
+    assetHash: "new-assets",
+    assetContents: {
+      "8625-aaa.js": {
+        path: "/_next/static/chunks/8625-aaa.js",
+        contentHash: "new",
+        strings: [
+          "stable shared copy for diff matching",
+          "M7 0.583984L11.9587 2.28634C12.2356 2.38143 12.4212 2.64208 12.4212 2.93497V6.99935C12.4212 9.18164 11.2444 11.1949 9.3413 12.2654L7 13.583Z",
+          "absolute bottom-2 left-1/2 -translate-x-1/2",
+          "absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none",
+          "disabled:pointer-events-none",
+        ],
+      },
+    },
+  };
+
+  const { changes, meta } = __testables.diffFeatures(oldFeatures, newFeatures);
+  const payload = JSON.stringify({ changes, meta });
+
+  assert.deepEqual(meta.assetStats.configDiffs, []);
+  assert.deepEqual(meta.assetStats.jsTextDiffs, []);
+  assert.equal(meta.assetStats.substantiveFiles, 0);
+  assert.equal(meta.assetStats.noiseFiles, 1);
+  assert.doesNotMatch(payload, /M7 0\.583984/);
+  assert.doesNotMatch(payload, /absolute bottom-2/);
+  assert.doesNotMatch(payload, /disabled.*pointer/);
+});
+
+test("structured shared resource diffs coalesce even when semantic page routes differ", () => {
+  const configDiffs = [
+    { field: "dividendBps", oldVal: "100", newVal: "200", file: "8625-3a0e67b3310b1e9a.js" },
+  ];
+  const jsTextDiffs = [
+    { type: "added", text: "you can still view its tax info while indexing.", file: "8625-3a0e67b3310b1e9a.js" },
+  ];
+  const makeNotification = (url, route, key) => {
+    const paths = [
+      "/_next/static/chunks/8625-3a0e67b3310b1e9a.js",
+      `/_next/static/chunks/app/${route}/page-${key}.js`,
+    ];
+    return {
+      url,
+      title: "Flap 页面变更",
+      template: "red",
+      changes: ["📦 前端资源变更：修改 2", "🔧 配置参数变更：1"],
+      meta: {
+        assetStats: {
+          unchanged: 20,
+          renamed: 0,
+          modified: 2,
+          added: 0,
+          removed: 0,
+          noiseFiles: 0,
+          noiseCount: 0,
+          substantiveFiles: 2,
+          substantiveCount: 2,
+          substantiveFileNames: ["8625-3a0e67b3310b1e9a.js", `page-${key}.js`],
+          substantiveAssetPaths: paths,
+          semanticProfile: __testables.buildAssetSemanticProfile(paths, { configDiffs, jsTextDiffs, vaultDiffs: [] }),
+          configDiffs,
+          vaultDiffs: [],
+          jsTextDiffs,
+        },
+        textChangeCount: 0,
+        textChanges: [],
+        i18nChangeCount: 0,
+        i18nDiffs: [],
+        caStoreVaultDiffs: [],
+      },
+      snapshotUpdate: { key, features: {} },
+    };
+  };
+
+  const grouped = __testables.coalesceFlapNotifications([
+    makeNotification("https://flap.sh/bnb/CAstore", "[chain]/CAstore", "castore"),
+    makeNotification("https://flap.sh/launch", "launch", "launch"),
+    makeNotification("https://flap.sh/create", "create", "create"),
+  ]);
+
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].title, "Flap 全站前端资源变更");
+  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].snapshotUpdates.length, 3);
+});
+
 test("CAstore Chinese vault headings are extracted as structured vault sections", () => {
   const html = `
     <main>
