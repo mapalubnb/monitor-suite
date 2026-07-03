@@ -2479,10 +2479,95 @@ function diffVaultConfigs(oldConfigs, newConfigs) {
  * 匹配 taxVaults:{vaultPortal:"0x...",vaultTypes:[...]} 结构
  * 返回 { vaultPortal: string, factories: [{ name, factory, enabled, showInCAStore, ai, constraints }] }
  */
+function findMatchingBracket(content, start, openChar, closeChar) {
+  let depth = 0;
+  let quote = null;
+  let escaped = false;
+  for (let i = start; i < content.length; i++) {
+    const ch = content[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === openChar) depth++;
+    else if (ch === closeChar) depth--;
+    if (depth === 0) return i;
+  }
+  return -1;
+}
+
+function parseWebpackExportAliases(jsContent) {
+  const aliases = new Map();
+  const moduleRe = /(\d+):function\([^)]*\)\{/g;
+  let moduleMatch;
+  while ((moduleMatch = moduleRe.exec(jsContent)) !== null) {
+    const bodyStart = jsContent.indexOf("{", moduleMatch.index);
+    const bodyEnd = findMatchingBracket(jsContent, bodyStart, "{", "}");
+    if (bodyEnd === -1) continue;
+    const body = jsContent.slice(bodyStart + 1, bodyEnd);
+    moduleRe.lastIndex = bodyEnd + 1;
+
+    const exportMatch = body.match(/\.d\([^,]+,\s*\{([\s\S]*?)\}\)/);
+    if (!exportMatch) continue;
+    const exportToLocal = new Map();
+    const exportRe = /(\w+)\s*:\s*function\(\)\s*\{\s*return\s+(\w+)\s*\}/g;
+    let exportItem;
+    while ((exportItem = exportRe.exec(exportMatch[1])) !== null) {
+      exportToLocal.set(exportItem[1], exportItem[2]);
+    }
+    if (exportToLocal.size === 0) continue;
+
+    const localValues = new Map();
+    const letRe = /\blet\s+([\s\S]*?);/g;
+    let letMatch;
+    while ((letMatch = letRe.exec(body)) !== null) {
+      const assignRe = /(\w+)\s*=\s*(["'])(.*?)\2/g;
+      let assign;
+      while ((assign = assignRe.exec(letMatch[1])) !== null) {
+        localValues.set(assign[1], assign[3]);
+      }
+      const arrayAssignRe = /(\w+)\s*=\s*\[((?:(["'])[^"']*\3\s*,?\s*)+)\]/g;
+      let arrayAssign;
+      while ((arrayAssign = arrayAssignRe.exec(letMatch[1])) !== null) {
+        const values = [];
+        const stringRe = /(["'])(.*?)\1/g;
+        let stringItem;
+        while ((stringItem = stringRe.exec(arrayAssign[2])) !== null) values.push(stringItem[2]);
+        if (values.length > 0) localValues.set(arrayAssign[1], values.join(","));
+      }
+    }
+
+    for (const [exportName, localName] of exportToLocal) {
+      if (localValues.has(localName)) {
+        aliases.set(`${moduleMatch[1]}.${exportName}`, localValues.get(localName));
+      }
+    }
+  }
+  return aliases;
+}
+
 function extractVaultFactories(jsContent) {
   const marker = /vaultTypes\s*:\s*\[/g;
   const markerMatch = marker.exec(jsContent);
   if (!markerMatch) return null;
+  const exportAliases = parseWebpackExportAliases(jsContent);
+  const importAliases = new Map();
+  const varDeclStart = jsContent.lastIndexOf("var ", markerMatch.index);
+  const varDeclEnd = jsContent.indexOf(";", varDeclStart);
+  if (varDeclStart !== -1 && varDeclEnd !== -1 && varDeclEnd < markerMatch.index) {
+    const decl = jsContent.slice(varDeclStart, varDeclEnd);
+    const importRe = /(\w+)\s*=\s*a\((\d+)\)/g;
+    let importMatch;
+    while ((importMatch = importRe.exec(decl)) !== null) {
+      importAliases.set(importMatch[1], importMatch[2]);
+    }
+  }
 
   // 找到匹配的 ] 闭合
   let depth = 0;
@@ -2515,9 +2600,24 @@ function extractVaultFactories(jsContent) {
     .match(/vaultPortal\s*:\s*["'](0x[a-fA-F0-9]{40})["']/);
   if (vpMatch) vaultPortal = vpMatch[1];
 
+  const resolveExpression = (expr) => {
+    if (!expr) return null;
+    const trimmed = expr.trim();
+    const quoted = trimmed.match(/^["']([^"']*)["']$/);
+    if (quoted) return quoted[1];
+    const alias = trimmed.match(/^(\w+)\.(\w+)$/);
+    if (alias) {
+      const moduleId = importAliases.get(alias[1]);
+      if (moduleId) return exportAliases.get(`${moduleId}.${alias[2]}`) || null;
+    }
+    return null;
+  };
+  const readFieldExpression = (block, field) => {
+    const re = new RegExp(`${field}\\s*:\\s*([^,}]+)`);
+    return block.match(re)?.[1]?.trim() || null;
+  };
   const readStringField = (block, field) => {
-    const re = new RegExp(`${field}\\s*:\\s*["']([^"']+)["']`);
-    return block.match(re)?.[1] || null;
+    return resolveExpression(readFieldExpression(block, field));
   };
   const readBoolField = (block, field) => {
     const re = new RegExp(`${field}\\s*:\\s*(!0|!1|true|false)`);
@@ -2542,6 +2642,23 @@ function extractVaultFactories(jsContent) {
     let kv;
     while ((kv = kvRe.exec(objText)) !== null) obj[kv[1]] = parseInt(kv[2], 10);
     return Object.keys(obj).length > 0 ? obj : null;
+  };
+  const readExtraLegacyFactories = (block) => {
+    const extraIdx = block.search(/extra\s*:\s*\{/);
+    if (extraIdx === -1) return "";
+    const start = block.indexOf("{", extraIdx);
+    const end = findMatchingBracket(block, start, "{", "}");
+    if (end === -1) return "";
+    const extra = block.slice(start + 1, end);
+    const literal = extra.match(/legacyFactories\s*:\s*["']([^"']+)["']/);
+    if (literal) return literal[1];
+    const joined = extra.match(/legacyFactories\s*:\s*(\w+)\.(\w+)\.join\(["']([^"']*)["']\)/);
+    if (joined) {
+      const moduleId = importAliases.get(joined[1]);
+      const value = moduleId ? exportAliases.get(`${moduleId}.${joined[2]}`) : null;
+      return value || "";
+    }
+    return "";
   };
 
   const objectBlocks = [];
@@ -2577,13 +2694,22 @@ function extractVaultFactories(jsContent) {
   for (const block of objectBlocks) {
     const factory = readStringField(block, "factory");
     if (!factory || !/^0x[a-fA-F0-9]{40}$/.test(factory)) continue;
+    const name = readStringField(block, "name") || readStringField(block, "title") || readStringField(block, "label") || "(未知金库工厂)";
+    const descriptionI18nKey = readStringField(block, "descriptionI18nKey");
+    const shortDescriptionI18nKey = readStringField(block, "shortDescriptionI18nKey");
+    const logo = readStringField(block, "logo");
+    const legacyFactories = readExtraLegacyFactories(block);
     factories.push({
-      name: readStringField(block, "name") || readStringField(block, "title") || readStringField(block, "label") || "(未知金库工厂)",
+      name,
       factory,
       enabled: readBoolField(block, "enabled"),
       showInCAStore: readBoolField(block, "showInCAStore"),
       ai: readBoolField(block, "ai"),
       constraints: readConstraints(block),
+      descriptionI18nKey,
+      shortDescriptionI18nKey,
+      logo,
+      legacyFactories,
     });
   }
 
@@ -2608,6 +2734,9 @@ function diffVaultFactories(oldMap, newMap) {
       if (ov.enabled !== nv.enabled) diffs.push(`enabled: ${ov.enabled} → ${nv.enabled}`);
       if (ov.showInCAStore !== nv.showInCAStore) diffs.push(`showInCAStore: ${ov.showInCAStore} → ${nv.showInCAStore}`);
       if (ov.ai !== nv.ai) diffs.push(`ai: ${ov.ai} → ${nv.ai}`);
+      if (ov.descriptionI18nKey !== nv.descriptionI18nKey) diffs.push(`descriptionI18nKey: ${ov.descriptionI18nKey || ""} → ${nv.descriptionI18nKey || ""}`);
+      if (ov.logo !== nv.logo) diffs.push(`logo: ${ov.logo || ""} → ${nv.logo || ""}`);
+      if (ov.legacyFactories !== nv.legacyFactories) diffs.push(`legacyFactories: ${ov.legacyFactories || ""} → ${nv.legacyFactories || ""}`);
       if (JSON.stringify(ov.constraints) !== JSON.stringify(nv.constraints)) {
         diffs.push(`constraints: ${JSON.stringify(ov.constraints)} → ${JSON.stringify(nv.constraints)}`);
       }
@@ -2631,7 +2760,7 @@ function factoryListToMap(factories) {
   const map = {};
   for (const f of factories) {
     if (f.factory === "0x0000000000000000000000000000000000000000") continue;
-    map[f.factory] = f;
+    map[f.factory] = { ...f, key: f.factory };
   }
   return map;
 }
@@ -2755,25 +2884,48 @@ function buildOperationalNoticeContent({ status, url, severity = "orange", reaso
  * 格式化 vault factory 变更为飞书卡片内容
  */
 function formatVaultFactoryChanges(changes) {
+  const visibleAdded = changes.added.filter(v => v.showInCAStore);
+  const hiddenAdded = changes.added.filter(v => !v.showInCAStore);
+  const hiddenModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*true\s*→\s*false/.test(d)));
+  const visibleModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*false\s*→\s*true/.test(d)));
   const lines = [
     "**结论摘要**",
     `- 新增 ${changes.added.length} 个 / 移除 ${changes.removed.length} 个 / 修改 ${changes.modified.length} 个`,
+    visibleAdded.length ? `- 新增可见金库 ${visibleAdded.length} 个：${visibleAdded.map(v => v.name).join(", ")}` : "",
+    hiddenModified.length ? `- CAStore 下架/隐藏 ${hiddenModified.length} 个：${hiddenModified.map(v => v.name).join(", ")}` : "",
+    visibleModified.length ? `- CAStore 上架/可见 ${visibleModified.length} 个：${visibleModified.map(v => v.name).join(", ")}` : "",
     "",
   ];
-  if (changes.added.length > 0) {
-    lines.push("**🆕 新增金库工厂:**");
-    for (const v of changes.added) {
+  if (visibleAdded.length > 0) {
+    lines.push("**🆕 新玩法/可见金库上线:**");
+    for (const v of visibleAdded) {
       const flags = [];
-      if (v.showInCAStore) flags.push("前端可见");
-      else flags.push("隐藏");
+      flags.push("前端可见");
       if (v.ai) flags.push("AI");
       if (v.enabled) flags.push("已启用");
       else flags.push("已禁用");
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
       lines.push(`  ${formatAddedLine(v.name)}`);
       lines.push(`    \`${v.factory}\``);
+      if (v.descriptionI18nKey) lines.push(`    ${v.descriptionI18nKey}`);
       lines.push(`    ${flags.join(" | ")}`);
       lines.push(`    🔗 [金库页面](https://flap.sh/launch?vaultfactory=${v.factory})`);
+    }
+    lines.push("");
+  }
+  if (hiddenAdded.length > 0) {
+    lines.push("**🆕 新增隐藏金库工厂:**");
+    for (const v of hiddenAdded) {
+      const flags = [];
+      flags.push("隐藏");
+      if (v.ai) flags.push("AI");
+      if (v.enabled) flags.push("已启用");
+      else flags.push("已禁用");
+      if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
+      lines.push(`  ${formatAddedLine(v.name)}`);
+      lines.push(`    \`${v.factory}\``);
+      if (v.descriptionI18nKey) lines.push(`    ${v.descriptionI18nKey}`);
+      lines.push(`    ${flags.join(" | ")}`);
     }
     lines.push("");
   }
@@ -2790,11 +2942,13 @@ function formatVaultFactoryChanges(changes) {
     for (const v of changes.modified) {
       lines.push(`  ${changedText(v.name)}`);
       lines.push(`    \`${v.factory}\``);
+      if (v.descriptionI18nKey) lines.push(`    ${v.descriptionI18nKey}`);
       for (const d of v.diffs) {
         const pair = splitDiffPairText(d);
         if (pair) pushDiffPairLines(lines, pair.key, pair.oldVal, pair.newVal, "    ");
         else lines.push(`    ${d}`);
       }
+      if (v.legacyFactories) lines.push(`    legacy: ${v.legacyFactories}`);
     }
   }
   return lines.filter(Boolean).join("\n");
@@ -2803,7 +2957,21 @@ function formatVaultFactoryChanges(changes) {
 function buildVaultFactoryChangeTitle(changes, prefix = "") {
   const visibleAdded = changes.added.filter(v => v.showInCAStore);
   const hiddenAdded = changes.added.filter(v => !v.showInCAStore);
+  const hiddenModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*true\s*→\s*false/.test(d)));
+  const visibleModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*false\s*→\s*true/.test(d)));
   const names = changes.added.map(v => v.name).join(", ");
+  if (visibleAdded.length > 0 && hiddenModified.length > 0) {
+    return `${prefix}CAStore 金库变更：新增可见 ${visibleAdded.length} / 下架 ${hiddenModified.length} (${visibleAdded.map(v => v.name).join(", ")})`;
+  }
+  if (visibleAdded.length > 0) {
+    return `${prefix}新增可见金库 (${visibleAdded.map(v => v.name).join(", ")})`;
+  }
+  if (hiddenModified.length > 0) {
+    return `${prefix}CAStore 金库下架 (${hiddenModified.map(v => v.name).join(", ")})`;
+  }
+  if (visibleModified.length > 0) {
+    return `${prefix}CAStore 金库上架 (${visibleModified.map(v => v.name).join(", ")})`;
+  }
   if (visibleAdded.length > 0 && hiddenAdded.length > 0) {
     return `${prefix}新增金库工厂：可见 ${visibleAdded.length} 个 / 隐藏 ${hiddenAdded.length} 个 (${names})`;
   }
@@ -4904,7 +5072,11 @@ export const __testables = {
   getStandaloneCaStoreVaultDiffs,
   shouldSuppressCaStoreOnlyPageNotification,
   omitStandaloneCaStoreVaultDiffs,
+  parseWebpackExportAliases,
+  extractVaultFactories,
+  factoryListToMap,
   formatVaultFactoryChanges,
+  buildVaultFactoryChangeTitle,
   mergeRoundVaultFactoryMaps,
   diffVaultFactories,
   buildFlapFullDiff,

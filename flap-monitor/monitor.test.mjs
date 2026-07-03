@@ -1107,6 +1107,46 @@ test("round vault factory aggregation stabilizes conflicting page snapshots", ()
   assert.deepEqual(diff.modified[0].diffs, ["showInCAStore: true → false"]);
 });
 
+test("vault factory extraction resolves webpack aliases for visible CAStore vault changes", () => {
+  const chunk = `
+  (self.webpackChunk_N_E=self.webpackChunk_N_E||[]).push([[1],{
+    78770:function(e,t,a){"use strict";a.d(t,{JY:function(){return d},ON:function(){return l}});let l="IndexVault",d="0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5";},
+    56704:function(e,t,a){"use strict";a.d(t,{KB:function(){return s},Fn:function(){return d},vg:function(){return r}});let r="StocksVault",s="0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb",d=["0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a"];}
+  }]);
+  var r=a(78770),i=a(56704);
+  const config={taxVaults:{vaultTypes:[
+    {name:r.ON,factory:r.JY,enabled:!0,showInCAStore:!0,constraints:{minDividendBps:0,maxDividendBps:0},descriptionI18nKey:"vaults.IndexVault.description",shortDescriptionI18nKey:"vaults.IndexVault.shortDescription",logo:"/stocks-vault-logo.svg"},
+    {name:i.vg,factory:i.KB,enabled:!0,showInCAStore:!1,constraints:{minDividendBps:0,maxDividendBps:0},extra:{legacyFactories:i.Fn.join(",")},descriptionI18nKey:"vaults.StocksVault.description",shortDescriptionI18nKey:"vaults.StocksVault.shortDescription",logo:"/stocks-vault-logo.svg"}
+  ]}};
+  `;
+
+  const vf = __testables.extractVaultFactories(chunk);
+  const map = Object.fromEntries(vf.factories.map(v => [v.factory.toLowerCase(), v]));
+  const index = map["0x5418f7e8ff90354db0ecd48c8b710219244eb3c5"];
+  const stocks = map["0x40a9a2fda017e0923ea0b403f2f063f9e51168fb"];
+
+  assert.equal(index.name, "IndexVault");
+  assert.equal(index.showInCAStore, true);
+  assert.equal(index.descriptionI18nKey, "vaults.IndexVault.description");
+  assert.equal(stocks.name, "StocksVault");
+  assert.equal(stocks.showInCAStore, false);
+  assert.equal(stocks.legacyFactories, "0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a");
+
+  const diff = __testables.diffVaultFactories({
+    "0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb": { ...stocks, showInCAStore: true },
+  }, __testables.mergeRoundVaultFactoryMaps([{ url: "https://flap.sh/bnb/CAstore", map: __testables.factoryListToMap(vf.factories) }]).map);
+  const content = __testables.formatVaultFactoryChanges(diff);
+  const title = __testables.buildVaultFactoryChangeTitle(diff, "🏦 ");
+
+  assert.equal(diff.added.length, 1);
+  assert.equal(diff.modified.length, 1);
+  assert.match(title, /新增可见 1 \/ 下架 1/);
+  assert.match(content, /IndexVault/);
+  assert.match(content, /0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5/);
+  assert.match(content, /StocksVault/);
+  assert.match(content, /showInCAStore/);
+});
+
 test("operational notice card is readable and action oriented", () => {
   const content = __testables.buildOperationalNoticeContent({
     status: "页面请求失败",
