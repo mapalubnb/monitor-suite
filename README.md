@@ -100,7 +100,7 @@ pm2 restart all
 | `fm-status` | 查看 Four.meme 监控摘要 |
 | `fm-log [N]` | 查看 Four.meme 日志 |
 | `fm-check` | 立即触发 Four.meme 全量检测 |
-| `fl-status` | 查看 Flap.sh 监控摘要 |
+| `fl-status` | 查看 Flap.sh 页面、金库工厂和链上注册中心摘要 |
 | `fl-log [N]` | 查看 Flap.sh 日志 |
 | `bot-status` | 查看飞书 Bot 状态 |
 | `bot-log [N]` | 查看飞书 Bot 日志 |

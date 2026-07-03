@@ -652,11 +652,36 @@ if [ -f "$SNAP" ]; then
   echo ""
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
+    const mdLink=(label,url)=>'['+label+']('+url+')';
+    const short=(v,n=10)=>{const x=String(v||'');return x?x.length>n?x.slice(0,n)+'...':x:'-'};
     const pages=s.pages||{};
     const keys=Object.keys(pages);
-    console.log('[ 页面监控 ]');
-    console.log('  页面: '+keys.length+' 个');
+    const factories=s.vaultFactories||{};
+    const factoryItems=Object.values(factories);
+    const visibleFactories=factoryItems.filter(v=>v&&v.showInCAStore).length;
+    const enabledFactories=factoryItems.filter(v=>v&&v.enabled).length;
+    const registry=s.registryMonitor||{};
+    const registryAddress=registry.address||'0x90497450f2a706f1951b5bdda52b4e5d16f34c06';
+    const knownVaults=Object.keys(registry.knownVaults||{});
+    const safeLatest=registry.safeLatestBlock??'-';
+    const lastBlock=registry.lastBlock??'-';
+    const latest=registry.latestBlock??'-';
+    const lag=registry.lagBlocks??(
+      Number.isFinite(Number(safeLatest))&&Number.isFinite(Number(lastBlock))
+        ? Math.max(0,Number(safeLatest)-Number(lastBlock))
+        : '-'
+    );
+
+    console.log('**结论摘要**');
+    console.log('- 状态: 快照已读取');
+    console.log('- 页面: '+keys.length+' 个');
+    console.log('- 金库工厂: '+factoryItems.length+' 个（CAStore可见 '+visibleFactories+' / 已启用 '+enabledFactories+'）');
+    console.log('- 链上注册中心: '+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
+    console.log('- 链上扫描: 已扫 '+lastBlock+' / 确认 '+safeLatest+' / 最新 '+latest+' / 延迟 '+lag+' 块');
+    console.log('- 链上已知金库: '+knownVaults.length+' 个');
     console.log('');
+
+    console.log('**页面监控**');
     for(const k of keys){
       const f=pages[k];
       const url=f.originalUrl||k;
@@ -666,29 +691,52 @@ if [ -f "$SNAP" ]; then
       const nextData=f.nextDataHash?'有 ('+f.nextDataHash.slice(0,8)+')':'无';
       const contentHash=(f.contentHash||'').slice(0,8)||'-';
       const textLen=(f.textContent||'').length;
-      console.log('  '+url);
-      console.log('    资源: '+assets.length+' 个 (JS:'+jsCount+' CSS:'+cssCount+')  |  文案: '+textLen+' 字  |  hash: '+contentHash);
-      console.log('    __NEXT_DATA__: '+nextData);
+      console.log('- '+mdLink(url,url));
+      console.log('  资源: '+assets.length+' 个 (JS:'+jsCount+' CSS:'+cssCount+') | 文案: '+textLen+' 字 | hash: '+contentHash);
+      console.log('  __NEXT_DATA__: '+nextData);
       const i18nHash=(f.i18nHash||'').slice(0,8);
       if(i18nHash){
-        console.log('    i18n: hash='+i18nHash+(f.i18nChunk?' chunk='+f.i18nChunk.split('/').pop():''));
+        console.log('  i18n: hash='+i18nHash+(f.i18nChunk?' chunk='+f.i18nChunk.split('/').pop():''));
       }
-      console.log('');
     }
 
-    // 检测配置
-    console.log('[ 检测配置 ]');
-    console.log('  心跳推送: 默认关闭（使用 fm-heartbeat on/数字 可开启）');
+    console.log('');
+    console.log('**金库工厂**');
+    console.log('- 总数: '+factoryItems.length+' 个');
+    console.log('- CAStore可见: '+visibleFactories+' 个');
+    console.log('- 已启用: '+enabledFactories+' 个');
+    for(const v of factoryItems.slice(0,10)){
+      const name=v.name||v.id||v.factory||'未知金库';
+      const factory=v.factory||'-';
+      const flags=[];
+      flags.push(v.showInCAStore?'CAStore可见':'CAStore隐藏');
+      flags.push(v.enabled?'已启用':'已禁用');
+      console.log('- '+name+' | '+flags.join(' / ')+' | '+(factory!=='-'?mdLink(short(factory,12),'https://flap.sh/launch?vaultfactory='+factory):'-'));
+    }
+    if(factoryItems.length>10) console.log('- 其余 '+(factoryItems.length-10)+' 个已省略');
+
+    console.log('');
+    console.log('**链上注册中心**');
+    console.log('- 注册中心: '+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
+    console.log('- 扫描进度: 已扫 '+lastBlock+' / 确认 '+safeLatest+' / 最新 '+latest+' / 延迟 '+lag+' 块');
+    console.log('- 已知链上金库: '+knownVaults.length+' 个');
+    for(const addr of knownVaults.slice(-5)){
+      const item=registry.knownVaults[addr]||{};
+      const tx=item.txHash?mdLink(short(item.txHash,12),'https://bscscan.com/tx/'+item.txHash):'-';
+      const block=item.blockNumber?mdLink(String(item.blockNumber),'https://bscscan.com/block/'+item.blockNumber):'-';
+      console.log('- '+mdLink(addr,'https://bscscan.com/address/'+addr)+' | 区块 '+block+' | 交易 '+tx);
+    }
+
+    console.log('');
+    console.log('**运行信息**');
+    console.log('- 最后检测: '+(s.lastCheck||'未知'));
+    console.log('- 心跳推送: 默认关闭（使用 fm-heartbeat on/数字 可开启）');
   " 2>/dev/null
   echo ""
   echo "------"
   LASTPOLL="/root/monitor-suite/flap-monitor/lastpoll.txt"
   [ -f "$LASTPOLL" ] || LASTPOLL="/root/flap-monitor/lastpoll.txt"
-  if [ -f "$LASTPOLL" ]; then
-    echo "最后检测: $(cat "$LASTPOLL")"
-  else
-    echo "最后检测: 未知"
-  fi
+  [ -f "$LASTPOLL" ] && echo "lastpoll: $(cat "$LASTPOLL")"
   echo "快照更新: $(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
 fi
 echo "========================================="
