@@ -288,6 +288,8 @@ if [ -f "$SNAP" ]; then
     const pageLabel=(url)=>{try{const u=new URL(url);return u.pathname+(u.search?u.search:'')||'/'}catch{return short(url,32)}};
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
     const value=(v)=>v===undefined||v===null||v===''?'-':String(v);
+    const quote=String.fromCharCode(34);
+    const colorStatus=(status)=>{const text=value(status);if(text==='PUBLISH')return '<font color='+quote+'green'+quote+'>PUBLISH</font>';if(text==='INIT')return '<font color='+quote+'red'+quote+'>INIT</font>';return text};
     const apiLinks={
       public_config:['/v1/public/config','https://four.meme/meme-api/v1/public/config'],
       public_address:['/v1/public/address','https://four.meme/meme-api/v1/public/address'],
@@ -366,12 +368,9 @@ if [ -f "$SNAP" ]; then
     if(allPools.length){
       for(const p of allPools){
         const sym=p.symbol||p.nativeSymbol||'?';
-        const net=p.networkCode||'?';
         const st=p.status||'?';
         const addr=p.symbolAddress||p.address||p.contractAddress||'';
-        const fees=(p.buyFee!==undefined||p.sellFee!==undefined)?'｜费率 '+value(p.buyFee)+'/'+value(p.sellFee):'';
-        const amounts=(p.b0Amount!==undefined||p.totalBAmount!==undefined)?'｜余额 '+value(p.b0Amount)+'｜总量 '+value(p.totalBAmount):'';
-        console.log('- '+net+' '+sym+'｜'+st+'｜'+bscAddress(addr)+fees+amounts);
+        console.log('- '+sym+'｜'+colorStatus(st)+'｜'+bscAddress(addr));
       }
     } else {
       console.log('- 暂无底池快照');
@@ -430,7 +429,6 @@ if [ -f "$SNAP" ]; then
         if(t.tag) parts.push('tag '+t.tag);
         if(t.codeType) parts.push('codeType '+t.codeType);
         if(t.userAddress) parts.push('作者 '+bscAddress(t.userAddress));
-        if(t.time) parts.push('时间 '+value(t.time));
         console.log(parts.join('｜'));
       }
     } else {
@@ -500,7 +498,6 @@ if [ -f "$SNAP" ]; then
 
     console.log('**14｜待处理**');
     console.log('新路由：待确认 '+pendingRoutes+' 个｜已纳管 '+approvedRoutes+' 个｜已忽略 '+ignoredRoutes+' 个');
-    if(s.openFourTemplatesLastPollAt||ofm.lastPollAt) console.log('OpenFour：模板 '+fmtTime(s.openFourTemplatesLastPollAt)+'｜模块 '+fmtTime(ofm.lastPollAt));
     console.log('');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null
