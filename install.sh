@@ -245,40 +245,54 @@ chmod +x "$BIN_DIR/_pm2-proc-info"
 # fourmeme-monitor
 cat > "$BIN_DIR/fm-status" << 'EOF'
 #!/bin/sh
-echo "====== fourmeme-monitor (four.meme) ======"
-echo ""
-# 进程信息
-echo "[ 进程 ]"
-pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor
-# 快照摘要（兼容两种部署路径）
 SNAP="/root/monitor-suite/fourmeme-monitor/snapshot.json"
 [ -f "$SNAP" ] || SNAP="/root/fourmeme-monitor/snapshot.json"
+PM2_JSON="$(pm2 jlist 2>/dev/null)"
+
+echo "✅ **Four.meme 状态正常**"
+echo ""
+
+echo "$PM2_JSON" | node -e "
+  let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
+    const statusText=(status)=>({online:'在线',stopped:'已停止',errored:'异常',launching:'启动中',stopping:'停止中',waiting:'等待中'}[status]||'未知');
+    const fmtUp=(ms)=>{if(!ms)return '未知';const sec=Math.max(0,Math.floor((Date.now()-ms)/1000));const day=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60);return day>0?day+' 天 '+h+' 小时':h+' 小时 '+m+' 分钟'};
+    try{
+      const list=JSON.parse(d||'[]');
+      const p=list.find(x=>x.name==='fourmeme-monitor');
+      console.log('**运行状态**');
+      if(!p){
+        console.log('进程：未运行');
+        return;
+      }
+      const env=p.pm2_env||{};
+      const mem=p.monit?.memory?(p.monit.memory/1024/1024).toFixed(1)+' MB':'未知';
+      const cpu=(p.monit?.cpu??0)+'%';
+      console.log('进程：'+statusText(env.status)+'｜PID '+(p.pid||'-')+'｜重启 '+(env.restart_time??0)+' 次');
+      console.log('资源：内存 '+mem+'｜CPU '+cpu+'｜运行 '+fmtUp(env.pm_uptime));
+    }catch(e){
+      console.log('**运行状态**');
+      console.log('进程：状态解析失败');
+    }
+  })
+"
+
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
-    const short=(v,n=10)=>{const s=String(v||'');return s?s.length>n?s.slice(0,n)+'...':s:'-'};
-    const joinSample=(arr,n=5)=>arr.slice(0,n).join(', ')+(arr.length>n?' ... +'+(arr.length-n):'');
+    const short=(v,n=10)=>{const x=String(v||'');return x?x.length>n?x.slice(0,n)+'...':x:'-'};
+    const joinSample=(arr,n=5)=>arr.slice(0,n).join('、')+(arr.length>n?'｜+'+(arr.length-n):'');
     const mdLink=(label,url)=>'['+label+']('+url+')';
-    const bscAddress=(addr)=>addr?mdLink(addr,'https://bscscan.com/address/'+addr):'-';
+    const isAddr=(v)=>/^0x[a-fA-F0-9]{40}$/.test(String(v||''));
+    const shortAddr=(addr)=>isAddr(addr)?addr.slice(0,6)+'...'+addr.slice(-4):short(addr,16);
+    const bscAddress=(addr,label)=>addr?mdLink(label||shortAddr(addr),'https://bscscan.com/address/'+addr):'-';
+    const pageLabel=(url)=>{try{const u=new URL(url);return u.pathname+(u.search?u.search:'')||'/'}catch{return short(url,32)}};
+    const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
 
-    // 模块 1：底池
     const allPools=s.poolConfig||[];
     const networks={};
     for(const p of allPools){const n=p.networkCode||'?';networks[n]=(networks[n]||0)+1}
-    const total=allPools.length;
-    const netStr=Object.entries(networks).map(([k,v])=>k+' '+v).join(', ');
-    console.log('[ 模块1: 底池配置 ]');
-    console.log('  总计: '+total+' 个 ('+netStr+')');
-    for(const p of allPools){
-      const sym=p.symbol||p.nativeSymbol||'?';
-      const st=p.status||'?';
-      const net=p.networkCode||'?';
-      const addr=p.address||p.contractAddress||'';
-      console.log('  '+net+' '+sym+' ['+st+']'+(addr?' '+bscAddress(addr):''));
-    }
-
-    // 模块 2：前端
+    const netStr=Object.entries(networks).map(([k,v])=>k+' '+v).join('、')||'-';
     const canonicalFrontendUrl=(url)=>{try{const u=new URL(url,'https://four.meme');u.hash='';if(u.pathname!=='/'&&u.pathname.endsWith('/'))u.pathname=u.pathname.replace(/\/+$/,'');return u.origin+(u.pathname==='/'?'':u.pathname)+u.search}catch{return url}};
     const removedFrontendUrls=new Set([
       'https://four.meme/zh-TW/create-token?entry=X-mode',
@@ -289,136 +303,99 @@ if [ -f "$SNAP" ]; then
       const url=p&&p.originalUrl?canonicalFrontendUrl(p.originalUrl):'';
       return url&&!removedFrontendUrls.has(url);
     });
-    console.log('');
-    console.log('[ 模块2: 前端监控 ]');
-    console.log('  页面: '+pageEntries.length+' 个（统一监控池）');
     const assetFiles=pageEntries.reduce((sum,[,p])=>sum+(p.assetFiles||[]).length,0);
     const downloaded=pageEntries.reduce((sum,[,p])=>sum+Object.keys(p.assetContents||{}).length,0);
     const i18nTotal=pageEntries.reduce((sum,[,p])=>sum+Object.keys(p.i18nStrings||{}).length,0);
-    console.log('  资源: '+assetFiles+' 个（已下载 '+downloaded+'） | i18n: '+i18nTotal+' 键');
-    for(const [k,p] of pageEntries){
-      const url=p.originalUrl||k;
-      const files=(p.assetFiles||[]).length;
-      const dlCount=Object.keys(p.assetContents||{}).length;
-      const text=(p.textContent||'').length;
-      const i18n=p.i18nStrings?Object.keys(p.i18nStrings).length:0;
-      console.log('  '+mdLink(url,url)+' | JS/CSS '+files+'/'+dlCount+' | 文案 '+text+' | i18n '+i18n);
-    }
-
-    // 模块 3：API
     const api=s.apiStructure||{};
     const apiKeys=Object.keys(api);
-    const apiLinks={
-      public_config:['/v1/public/config','https://four.meme/meme-api/v1/public/config'],
-      public_address:['/v1/public/address','https://four.meme/meme-api/v1/public/address'],
-      public_file_host:['/v1/public/file/host','https://four.meme/meme-api/v1/public/file/host'],
-      kol_teams:['/v1/public/kol/teams','https://four.meme/meme-api/v1/public/kol/teams?tcs=fm25'],
-      kol_traders:['/v1/public/kol/traders','https://four.meme/meme-api/v1/public/kol/traders?tcs=fm25'],
-      token_ranking_cap:['/v1/public/token/ranking CAP','https://four.meme/meme-api/v1/public/token/ranking'],
-      token_ranking_binance:['/v1/public/token/ranking BINANCE','https://four.meme/meme-api/v1/public/token/ranking'],
-      token_search_new:['/v1/public/token/search NEW','https://four.meme/meme-api/v1/public/token/search'],
-      token_search_cap:['/v1/public/token/search CAP','https://four.meme/meme-api/v1/public/token/search']
-    };
-    console.log('');
-    console.log('[ 模块3: API结构 ]');
-    console.log('  端点: '+apiKeys.length+' 个');
-    for(const k of apiKeys){
-      const a=api[k];
-      const fields=typeof a==='object'?Object.keys(a).length:'?';
-      const label=apiLinks[k]?apiLinks[k][0]:k;
-      const url=apiLinks[k]?apiLinks[k][1]:'';
-      console.log('  '+(url?mdLink(label,url):label)+' ('+fields+' 个顶层字段)');
-    }
-
-    // 模块 4：OpenFour
     const templates=s.openFourTemplates||{};
     const templateKeys=Object.keys(templates);
-    console.log('');
-    console.log('[ 模块4: OpenFour ]');
     const published=templateKeys.filter(id=>String((templates[id]||{}).status||'').toUpperCase()==='PUBLISHED').length;
-    console.log('  业务模板: '+templateKeys.length+' 个（PUBLISHED '+published+'）'+(s.openFourTemplatesLastPollAt?' | 检查 '+s.openFourTemplatesLastPollAt:''));
-    const templateSample=templateKeys.slice(0,5).map(id=>{
-      const t=templates[id]||{};
-      return id+' '+(t.name||'未知')+'['+(t.status||'?')+']';
-    });
-    if(templateSample.length) console.log('  模板: '+joinSample(templateSample,5));
     const ofm=s.openFourModules||{};
     const moduleItems=Object.values(ofm.byAddress||{});
     const roleCounts={};
     for(const m of moduleItems) for(const r of m.roles||[]) roleCounts[r]=(roleCounts[r]||0)+1;
     const roleNames=Object.keys(roleCounts).sort();
-    console.log('  Registry: '+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94')+' | Preset '+((ofm.presetIds||[]).length)+' | 实现 '+moduleItems.length);
-    if(roleNames.length) console.log('  模块名称: '+roleNames.join(', '));
-    if(ofm.lastPollAt) console.log('  模块发现检查: '+ofm.lastPollAt);
-
-    // 模块 5：GitHub
     const sha=(s.githubSha||'')||'未知';
     const repos=Object.keys(s.githubRepos||{}).length;
-    console.log('');
-    console.log('[ 模块5: GitHub ]');
-    console.log('  账号: '+mdLink('four-meme-community','https://github.com/four-meme-community')+'（仓库 '+repos+' 个）');
-    console.log('  主仓库: '+mdLink('four-meme-community/four-meme-ai','https://github.com/four-meme-community/four-meme-ai'));
-    console.log('  最新 SHA: '+(sha&&sha!=='未知'?mdLink(sha,'https://github.com/four-meme-community/four-meme-ai/commit/'+sha):sha));
-
-    // 模块 6：合约
     const fp=s.contractFingerprints||{};
     const fpKeys=Object.keys(fp);
-    console.log('');
-    console.log('[ 模块6: 智能合约 ]');
-    console.log('  合约: '+fpKeys.length+' 个');
-    for(const k of fpKeys){
-      const c=fp[k];
-      const addr=(c.address||'-');
-      console.log('  '+k+': '+bscAddress(addr));
-    }
-
-    // 模块 7：链上参数
     const op=s.onchainParams||{};
-    console.log('');
-    console.log('[ 模块7: 链上参数 ]');
-    console.log('  Agent NFT 数量: '+(op.agentNftCount??'未知'));
     const nfts=op.agentNfts||[];
-    if(nfts.length) console.log('  样例: '+joinSample(nfts.map(a=>short(a,12)),5));
-
-    // 模块 8：创建者动作
     const am=s.chainActorMonitor||{};
     const allActors=am.actors||{};
     const actors=Object.keys(allActors).filter(a=>allActors[a]?.actionWatched);
-    console.log('');
-    console.log('[ 模块8: 创建者动作 ]');
-    console.log('  监听地址: '+actors.length+' 个');
     const cachedCreators=Object.values(am.creators||{}).filter(x=>x&&x.creator).length;
     const modes=[];
     if(am.creatorChainLookupEnabled) modes.push('RPC近期反查');
     if(am.creatorPageLookupEnabled) modes.push('BscScan页面自动抓取');
     if(am.creatorApiLookupEnabled) modes.push('Etherscan API备用');
     if(modes.length===0) modes.push('仅缓存/手动配置');
-    console.log('  创建者来源: '+modes.join(' + ')+' | 缓存 '+cachedCreators+' 个');
     const feed=am.blockFeed||{};
-    if(feed.enabled!==undefined) console.log('  新区块触发: '+(feed.mode||'未知')+' | WS连接: '+(feed.connected?'正常':'未连接')+(feed.latestHeadBlock?' | 最新头块: '+feed.latestHeadBlock:''));
+    const pendingRoutes=Object.values(s._frontendPendingRoutes||{}).filter(r=>r&&r.status==='pending').length;
+    const ignoredRoutes=Object.values(s._frontendIgnoredRoutes||{}).filter(r=>r&&r.status==='ignored').length;
+    const approvedRoutes=Object.values(s._frontendRouteApprovals||{}).filter(r=>r&&r.status==='approved').length;
+
+    console.log('**监控概览**');
+    console.log('底池：'+allPools.length+' 个｜'+netStr);
+    console.log('前端：'+pageEntries.length+' 个页面｜API '+apiKeys.length+' 个端点');
+    console.log('OpenFour：模板 '+templateKeys.length+' 个（PUBLISHED '+published+'）｜模块 '+moduleItems.length+' 个｜Preset '+((ofm.presetIds||[]).length));
+    console.log('GitHub：仓库 '+repos+' 个｜最新 '+(sha&&sha!=='未知'?mdLink(short(sha,8),'https://github.com/four-meme-community/four-meme-ai/commit/'+sha):sha));
+    console.log('合约：'+fpKeys.length+' 个｜AgentNFT '+(op.agentNftCount??'未知')+' 个｜创建者动作 '+actors.length+' 个地址');
+    console.log('');
+
+    console.log('**前端能力**');
+    console.log('NEXT_DATA · i18n · 路由发现 · 端点发现 · 新页面自动纳管');
+    console.log('资源：JS/CSS '+assetFiles+' 个｜已下载 '+downloaded+' 个｜i18n '+i18nTotal+' 键');
+    if(pageEntries.length){
+      const pageSamples=pageEntries.slice(0,5).map(([k,p])=>mdLink(pageLabel(p.originalUrl||k),p.originalUrl||k));
+      console.log('页面样例：'+joinSample(pageSamples,5));
+    }
+    console.log('');
+
+    console.log('**OpenFour / 链上**');
+    console.log('Registry：'+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
+    if(roleNames.length) console.log('模块角色：'+joinSample(roleNames,8));
+    if(nfts.length) console.log('AgentNFT 样例：'+joinSample(nfts.map(a=>bscAddress(a)),5));
+    console.log('创建者来源：'+modes.join(' + ')+'｜缓存 '+cachedCreators+' 个');
+    if(feed.enabled!==undefined) console.log('新区块：'+(feed.connected?'WebSocket 已连接':'WebSocket 未连接')+'｜'+(feed.mode||'未知')+(feed.latestHeadBlock?'｜头块 '+feed.latestHeadBlock:''));
     if(am.lastBlock) {
       const lag=am.actorLagBlocks??(am.safeLatestBlock?Math.max(0,am.safeLatestBlock-am.lastBlock):'-');
       const lagSec=am.actorLagSecondsApprox??(typeof lag==='number'?lag*3:'-');
-      console.log('  已扫描至确认块: '+am.lastBlock+' / 最新确认块: '+(am.safeLatestBlock||'未知')+' / 链最新块: '+(am.latestBlock||'未知'));
-      console.log('  扫链延迟: '+lag+' 块（约 '+lagSec+' 秒） | 上轮: '+(am.lastRunScannedBlocks||0)+' 块 / '+(am.lastRunBatches||0)+' 批');
+      console.log('扫链：已扫 '+am.lastBlock+'｜确认 '+(am.safeLatestBlock||'未知')+'｜最新 '+(am.latestBlock||'未知')+'｜延迟 '+lag+' 块（约 '+lagSec+' 秒）');
+      console.log('上轮：'+(am.lastRunScannedBlocks||0)+' 块｜'+(am.lastRunBatches||0)+' 批');
     }
-    for(const a of actors){
-      const item=allActors[a]||{};
-      console.log('  '+bscAddress(a)+'  '+((item.roles||[]).join(',')||'创建者'));
+    if(actors.length){
+      const actorSamples=actors.slice(0,5).map(a=>{
+        const item=allActors[a]||{};
+        const role=((item.roles||[]).join(',')||'创建者');
+        return bscAddress(a)+' '+role;
+      });
+      console.log('监听样例：'+joinSample(actorSamples,5));
     }
+    console.log('');
+
+    console.log('**待处理**');
+    console.log('新路由：待确认 '+pendingRoutes+' 个｜已纳管 '+approvedRoutes+' 个｜已忽略 '+ignoredRoutes+' 个');
+    if(s.openFourTemplatesLastPollAt||ofm.lastPollAt) console.log('OpenFour：模板 '+fmtTime(s.openFourTemplatesLastPollAt)+'｜模块 '+fmtTime(ofm.lastPollAt));
+    console.log('');
+    console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null
   echo ""
-  echo "------"
   LASTPOLL="/root/monitor-suite/fourmeme-monitor/lastpoll.txt"
   [ -f "$LASTPOLL" ] || LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
   if [ -f "$LASTPOLL" ]; then
-    echo "最后检测: $(cat "$LASTPOLL")"
+    echo "最后检测：$(cat "$LASTPOLL")"
   else
-    echo "最后检测: 未知"
+    echo "最后检测：未知"
   fi
-  echo "快照更新: $(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
+  echo "快照更新：$(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
+else
+  echo "**数据状态**"
+  echo "快照：未找到"
+  echo ""
+  echo "更新时间：$(date '+%Y-%m-%d %H:%M:%S')"
 fi
-echo "========================================="
 EOF
 
 cat > "$BIN_DIR/fm-log" << 'EOF'

@@ -1025,7 +1025,8 @@ async function sendLogFile(messageId, command) {
 
 // 根据命令名推断卡片标题和颜色
 const CMD_CARD_MAP = [
-  { re: /^(fm-status|mon-status)$/,  title: "状态总览",   color: "green",  markdown: true },
+  { re: /^fm-status$/,               title: "Four.meme 状态", color: "green",  markdown: true },
+  { re: /^mon-status$/,              title: "状态总览",   color: "green",  markdown: true },
   { re: /^fl-status$/,               title: "Flap 状态",  color: "green",  markdown: true },
   { re: /^bot-status$/,              title: "Bot 状态",   color: "green",  markdown: true },
   { re: /^(fm|fl|bot|mon)-log$/,     title: "日志",       color: "indigo", markdown: false },

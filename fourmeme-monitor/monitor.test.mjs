@@ -15,12 +15,17 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
 test("startup card copy reflects active frontend and api cadences", () => {
   const progress = __testables.buildStartupProgressContent();
   const ready = __testables.buildStartupReadyContent();
-  assert.match(progress, /前端监控:[\s\S]*每 10s/);
-  assert.match(progress, /API监控:[\s\S]*每 15s/);
-  assert.match(ready, /前端监控:[\s\S]*每 10s/);
-  assert.match(ready, /API监控:[\s\S]*每 15s/);
+  assert.match(progress, /前端：当前快照 [\s\S]*每 10 秒/);
+  assert.match(progress, /API：每 15 秒/);
+  assert.match(ready, /✅ \*\*监控运行中\*\*/);
+  assert.match(ready, /\*\*运行状态\*\*[\s\S]*\*\*监控概览\*\*[\s\S]*\*\*前端能力\*\*[\s\S]*\*\*运行策略\*\*[\s\S]*\*\*通知状态\*\*/);
+  assert.match(ready, /前端：[\s\S]*每 10 秒/);
+  assert.match(ready, /API：[\s\S]*每 15 秒/);
+  assert.match(ready, /NEXT_DATA · i18n · 路由发现 · 端点发现 · 新页面自动纳管/);
+  assert.match(ready, /固定入口 \d+ 个｜当前监控池 \d+ 个｜详情：fm-status/);
+  assert.match(ready, /更新时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+  assert.doesNotMatch(ready, /每 \d+s/);
   assert.doesNotMatch(ready, /- https:\/\/four\.meme/);
-  assert.match(ready, /完整列表可通过 fm-status 查看/);
 });
 
 test("canonicalFrontendUrl normalizes tracking params, hash, query order, and trailing slash", () => {

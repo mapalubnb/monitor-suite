@@ -532,6 +532,40 @@ function recordCurrentModuleRequest() {
    工具函数
    ══════════════════════════════════════════ */
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
+
+function formatDateTime(value = new Date()) {
+  const d = value instanceof Date ? value : new Date(value);
+  const pad = (n) => String(n).padStart(2, "0");
+  return [
+    d.getFullYear(),
+    "-",
+    pad(d.getMonth() + 1),
+    "-",
+    pad(d.getDate()),
+    " ",
+    pad(d.getHours()),
+    ":",
+    pad(d.getMinutes()),
+    ":",
+    pad(d.getSeconds()),
+  ].join("");
+}
+
+function formatInterval(ms) {
+  const value = Number(ms || 0);
+  if (!Number.isFinite(value) || value <= 0) return "未知";
+  if (value % 60000 === 0) return `每 ${value / 60000} 分钟`;
+  if (value % 1000 === 0) return `每 ${value / 1000} 秒`;
+  return `每 ${(value / 1000).toFixed(1).replace(/\.0$/, "")} 秒`;
+}
+
+function formatDuration(ms) {
+  const value = Number(ms || 0);
+  if (!Number.isFinite(value) || value <= 0) return "未知";
+  if (value % 60000 === 0) return `${value / 60000} 分钟`;
+  if (value % 1000 === 0) return `${value / 1000} 秒`;
+  return `${(value / 1000).toFixed(1).replace(/\.0$/, "")} 秒`;
+}
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
@@ -9146,10 +9180,17 @@ async function sendDailyReport() {
 function buildStartupProgressContent() {
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
   return [
-    `**状态:** 进程已启动，正在建立/刷新首轮基线`,
-    `**前端监控:** 当前快照 ${pageCount} 个页面 — 每 ${CONFIG.intervals.frontend / 1000}s`,
-    `**API监控:** 每 ${CONFIG.intervals.api / 1000}s`,
-    `**提示:** 首轮检查完成后会更新本卡片为已启动状态`,
+    `⏳ **监控启动中**`,
+    ``,
+    `**运行状态**`,
+    `进程已启动，正在建立/刷新首轮基线`,
+    `首轮完成后会自动更新为运行中状态`,
+    ``,
+    `**监控概览**`,
+    `前端：当前快照 ${pageCount} 个页面｜${formatInterval(CONFIG.intervals.frontend)}`,
+    `API：${formatInterval(CONFIG.intervals.api)}`,
+    ``,
+    `更新时间：${formatDateTime()}`,
   ].join("\n");
 }
 
@@ -9161,25 +9202,47 @@ function buildStartupReadyContent() {
   const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
   const openFourTemplateCount = Object.keys(snapshot?.openFourTemplates || {}).length;
   const openFourModuleCount = Object.keys(snapshot?.openFourModules?.byAddress || {}).length;
+  const apiCount = Object.keys(snapshot?.apiStructure || {}).length;
+  const githubSha = (snapshot?.githubSha || "").slice(0, 8) || "未知";
   const actorCount = snapshot?.chainActorMonitor?.actionActorCount
     ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
+  const heartbeatText = CONFIG.heartbeatEnabled
+    ? `${formatInterval(CONFIG.heartbeatMs)}（低优先级，队列空闲时推送）`
+    : "关闭";
+  const dailyReportText = CONFIG.dailyReport.enabled
+    ? `开启（每日 ${CONFIG.dailyReport.hour}:00）`
+    : "关闭";
+  const registryTrigger = CONFIG.openFourRegistryLogMonitor.enabled ? "**Registry Logs 实时触发**" : "Registry Logs 关闭";
   return [
-    `**状态:** 首轮基线检查完成，定时器已启动`,
-    `**架构:** 独立定时器 + RPC Batch + 并行抓取`,
-    `**底池监控:** BSC ${poolCount} 个 — 每 ${CONFIG.intervals.pool / 1000}s`,
-    `**前端监控:** ${pageCount} 个页面（固定入口 ${entryPageCount}，路由发现页面纳入同一监控池）— 每 ${CONFIG.intervals.frontend / 1000}s`,
-    `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面同层纳入`,
-    `  HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)} / 资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)} / 资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
-    `  固定入口 ${entryPageCount} 个，当前监控池 ${pageCount} 个；完整列表可通过 fm-status 查看`,
-    `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
-    `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
-    `**OpenFour模块:** ${openFourModuleCount} 个实现地址 — Registry logs ${CONFIG.openFourRegistryLogMonitor.enabled ? "实时触发" : "关闭"}`,
-    `**GitHub:** ${CONFIG.githubOwner} 账号 ${githubRepoCount} 个仓库，主仓库 ${CONFIG.githubRepo} (${(snapshot?.githubSha || "").slice(0, 8) || "未知"}) — 每 ${CONFIG.intervals.github / 1000}s`,
-    `**合约监控:** ${contractCount} 个 — 每 ${CONFIG.intervals.contract / 1000}s（RPC 批量 + OpenFour 链上发现）`,
-    `**链上参数:** AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个 — 每 ${CONFIG.intervals.onchain / 1000}s（RPC 批量）`,
-    `**创建者动作:** ${actorCount} 个地址 — WebSocket 新区块驱动 + 每 ${actorRunner?.intervalMs / 1000}s HTTP 兜底（只过滤交易发起地址 tx.from，命中后合约复查）`,
-    `**反风控:** UA轮换 + 按域名自适应退避 + 请求抖动`,
-    `**心跳:** ${CONFIG.heartbeatEnabled ? `每 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟（低优先级，队列空闲时推送）` : "关闭"} | **日报:** ${CONFIG.dailyReport.enabled ? `开启（每日 ${CONFIG.dailyReport.hour}:00）` : "关闭"}`,
+    `✅ **监控运行中**`,
+    ``,
+    `**运行状态**`,
+    `首轮基线检查完成，定时器已启动`,
+    `独立定时器 · RPC Batch · 并行抓取`,
+    ``,
+    `**监控概览**`,
+    `底池：BSC ${poolCount} 个｜${formatInterval(CONFIG.intervals.pool)}`,
+    `前端：${pageCount} 个页面｜${formatInterval(CONFIG.intervals.frontend)}`,
+    `API：${apiCount} 个端点｜${formatInterval(CONFIG.intervals.api)}`,
+    `OpenFour 模板：${openFourTemplateCount} 个｜${formatInterval(CONFIG.intervals.openfourTemplates)}`,
+    `OpenFour 模块：${openFourModuleCount} 个｜${registryTrigger}`,
+    `GitHub：${CONFIG.githubOwner} ${githubRepoCount} 个仓库｜${CONFIG.githubRepo} ${githubSha}｜${formatInterval(CONFIG.intervals.github)}`,
+    `合约：${contractCount} 个｜${formatInterval(CONFIG.intervals.contract)}｜RPC 批量 + OpenFour 链上发现`,
+    `链上参数：AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个｜${formatInterval(CONFIG.intervals.onchain)}｜RPC 批量`,
+    `创建者动作：${actorCount} 个地址｜**WebSocket 实时监听** + **HTTP ${formatInterval(actorRunner?.intervalMs)}兜底**`,
+    ``,
+    `**前端能力**`,
+    `NEXT_DATA · i18n · 路由发现 · 端点发现 · 新页面自动纳管`,
+    `固定入口 ${entryPageCount} 个｜当前监控池 ${pageCount} 个｜详情：fm-status`,
+    ``,
+    `**运行策略**`,
+    `HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)}｜资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)}｜异常资源 ${formatDuration(CONFIG.frontendAssetJitter.quickConfirmDelayMs)}快速复查`,
+    `UA 轮换｜请求抖动｜按域名自适应退避｜tx.from 过滤｜命中后合约复查`,
+    ``,
+    `**通知状态**`,
+    `心跳：${heartbeatText}｜日报：${dailyReportText}`,
+    ``,
+    `更新时间：${formatDateTime()}`,
   ].join("\n");
 }
 
