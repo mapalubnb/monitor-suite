@@ -658,8 +658,9 @@ if [ -f "$SNAP" ]; then
     const keys=Object.keys(pages);
     const factories=s.vaultFactories||{};
     const factoryItems=Object.values(factories);
-    const visibleFactories=factoryItems.filter(v=>v&&v.showInCAStore).length;
-    const enabledFactories=factoryItems.filter(v=>v&&v.enabled).length;
+    const visibleFactoryItems=factoryItems.filter(v=>v&&v.showInCAStore);
+    const visibleFactories=visibleFactoryItems.length;
+    const enabledVisibleFactories=visibleFactoryItems.filter(v=>v&&v.enabled).length;
     const registry=s.registryMonitor||{};
     const registryAddress=registry.address||'0x90497450f2a706f1951b5bdda52b4e5d16f34c06';
     const knownVaults=Object.keys(registry.knownVaults||{});
@@ -675,7 +676,7 @@ if [ -f "$SNAP" ]; then
     console.log('**结论摘要**');
     console.log('- 状态: 快照已读取');
     console.log('- 页面: '+keys.length+' 个');
-    console.log('- 金库工厂: '+factoryItems.length+' 个（CAStore可见 '+visibleFactories+' / 已启用 '+enabledFactories+'）');
+    console.log('- CAStore可见金库工厂: '+visibleFactories+' 个（已启用 '+enabledVisibleFactories+'）');
     console.log('- 链上注册中心: '+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
     console.log('- 链上扫描: 已扫 '+lastBlock+' / 确认 '+safeLatest+' / 最新 '+latest+' / 延迟 '+lag+' 块');
     console.log('- 链上已知金库: '+knownVaults.length+' 个');
@@ -702,18 +703,17 @@ if [ -f "$SNAP" ]; then
 
     console.log('');
     console.log('**金库工厂**');
-    console.log('- 总数: '+factoryItems.length+' 个');
     console.log('- CAStore可见: '+visibleFactories+' 个');
-    console.log('- 已启用: '+enabledFactories+' 个');
-    for(const v of factoryItems.slice(0,10)){
+    console.log('- 已启用: '+enabledVisibleFactories+' 个');
+    for(const v of visibleFactoryItems.slice(0,10)){
       const name=v.name||v.id||v.factory||'未知金库';
       const factory=v.factory||'-';
       const flags=[];
-      flags.push(v.showInCAStore?'CAStore可见':'CAStore隐藏');
+      flags.push('CAStore可见');
       flags.push(v.enabled?'已启用':'已禁用');
       console.log('- '+name+' | '+flags.join(' / ')+' | '+(factory!=='-'?mdLink(short(factory,12),'https://flap.sh/launch?vaultfactory='+factory):'-'));
     }
-    if(factoryItems.length>10) console.log('- 其余 '+(factoryItems.length-10)+' 个已省略');
+    if(visibleFactoryItems.length>10) console.log('- 其余 '+(visibleFactoryItems.length-10)+' 个已省略');
 
     console.log('');
     console.log('**链上注册中心**');
