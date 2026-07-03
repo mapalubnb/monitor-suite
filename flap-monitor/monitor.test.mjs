@@ -452,6 +452,95 @@ test("structured shared resource diffs coalesce even when semantic page routes d
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
 
+test("same Flap business change coalesces even when page chunks and UI impact differ", () => {
+  const jsTextDiffs = [
+    { type: "added", text: ", you can still view its fee info while indexing.", file: "page-placeholder.js" },
+    { type: "removed", text: "DiamondPulse Tail-Cut Vault", file: "page-placeholder.js" },
+  ];
+  const codeIntentDiffs = [
+    { type: "added", key: "dividend", label: "分红参数", intent: "可能调整 dividendBps、分红徽标或分红展示逻辑", evidence: "dividendBps / dividendBadge", file: "main-app-c72dc75351f84185.js" },
+    { type: "added", key: "dividend", label: "分红参数", intent: "可能调整 dividendBps、分红徽标或分红展示逻辑", evidence: "dividendBps / dividendBadge", file: "main-app-c72dc75351f84185.js" },
+    { type: "removed", key: "dividend", label: "分红参数", intent: "可能调整 dividendBps、分红徽标或分红展示逻辑", evidence: "dividendBps / dividendBadge", file: "main-app-4a134b52bf8b81e0.js" },
+    { type: "removed", key: "dividend", label: "分红参数", intent: "可能调整 dividendBps、分红徽标或分红展示逻辑", evidence: "dividendBps / dividendBadge", file: "main-app-4a134b52bf8b81e0.js" },
+  ];
+  const makeUiDiffs = (count, files) => Array.from({ length: count }, (_, i) => ({
+    type: i % 2 ? "removed" : "added",
+    category: "layout",
+    label: "布局定位",
+    intent: "调整组件位置、对齐或层级",
+    evidence: "absolute / top / right / bottom / translate",
+    contextKey: i >= 2 ? "wallet-connect" : "unknown",
+    contextLabel: i >= 2 ? "钱包连接控件" : "未定位具体组件",
+    contextConfidence: i >= 2 ? "高" : "低",
+    file: files[i % files.length],
+  }));
+  const makeNotification = ({ url, key, pageRoute, pageFile, uiCount, uiFiles }) => {
+    const assetPaths = [
+      "/_next/static/chunks/3092-8887ce94f4aa5d3e.js",
+      "/_next/static/chunks/5437-ad8495d6a7676030.js",
+      `/_next/static/chunks/app/${pageRoute}/${pageFile}`,
+      "/_next/static/css/2dfb716651435e0a.css",
+      "/_next/static/chunks/main-app-4a134b52bf8b81e0.js",
+      "/_next/static/chunks/webpack-597e0b49301a2e1a.js",
+    ];
+    const pageJsTextDiffs = jsTextDiffs.map(d => ({ ...d, file: pageFile }));
+    const uiStyleDiffs = makeUiDiffs(uiCount, uiFiles);
+    const assetStats = {
+      unchanged: 28,
+      renamed: 1,
+      modified: 8,
+      added: 0,
+      removed: 0,
+      noiseFiles: 2,
+      noiseCount: 6,
+      substantiveFiles: 6,
+      substantiveCount: 8,
+      substantiveFileNames: ["3092-8887ce94f4aa5d3e.js", "5437-ad8495d6a7676030.js", pageFile, "2dfb716651435e0a.css", "main-app-4a134b52bf8b81e0.js", "webpack-597e0b49301a2e1a.js"],
+      substantiveAssetPaths: assetPaths,
+      semanticProfile: __testables.buildAssetSemanticProfile(assetPaths, { configDiffs: [], vaultDiffs: [], jsTextDiffs: pageJsTextDiffs, uiStyleDiffs, codeIntentDiffs }),
+      configDiffs: [],
+      vaultDiffs: [],
+      jsTextDiffs: pageJsTextDiffs,
+      uiStyleDiffs,
+      codeIntentDiffs,
+    };
+    return {
+      url,
+      title: "Flap 页面变更",
+      template: "red",
+      changes: ["📦 前端资源变更：修改 8 | 重命名 1"],
+      meta: {
+        assetStats,
+        textChangeCount: 0,
+        textChanges: [],
+        i18nChangeCount: 0,
+        i18nDiffs: [],
+        caStoreVaultDiffs: [],
+      },
+      snapshotUpdate: { key, features: {} },
+    };
+  };
+
+  const grouped = __testables.coalesceFlapNotifications([
+    makeNotification({ url: "https://flap.sh/create", key: "create", pageRoute: "create", pageFile: "page-62ecac793de5f41d.js", uiCount: 2, uiFiles: ["407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
+    makeNotification({ url: "https://flap.sh/bnb/CAstore", key: "castore", pageRoute: "[chain]/CAstore", pageFile: "page-50dce0de0e0c111a.js", uiCount: 8, uiFiles: ["6055-d674eedd435ff478.js", "1946-b696c7945cec7add.js", "407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
+    makeNotification({ url: "https://flap.sh/launch", key: "launch", pageRoute: "launch", pageFile: "page-d53a27e3a7a1ff1e.js", uiCount: 2, uiFiles: ["407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
+  ]);
+
+  assert.equal(grouped.length, 1);
+  assert.equal(grouped[0].title, "Flap 全站前端资源变更");
+  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].snapshotUpdates.length, 3);
+  assert.match(grouped[0].content, /影响页面: 3 个/);
+  assert.match(grouped[0].content, /功能文案 2 处/);
+  assert.match(grouped[0].content, /实现意图信号 2 处/);
+  assert.match(grouped[0].content, /UI\/样式信号 8 处/);
+  assert.match(grouped[0].content, /DiamondPulse Tail-Cut Vault/);
+  assert.match(grouped[0].content, /you can still view its fee info while indexing/);
+  assert.match(grouped[0].content, /钱包连接控件/);
+  assert.doesNotMatch(grouped[0].title, /重点变更/);
+});
+
 test("shared minified implementation signals are coalesced without raw code in the card", () => {
   const codeIntentDiffs = [
     { type: "removed", key: "tax", label: "税费/税务信息", intent: "可能调整税费读取、税务信息展示或索引期查看逻辑", evidence: "showTaxInfo / taxInfo / tax", file: "8625-old.js" },
@@ -860,7 +949,7 @@ test("business priority title can preserve manual check source prefix", () => {
   assert.equal(notification.template, "red");
 });
 
-test("page change card puts summary and important copy before resource details", () => {
+test("page change card puts summary and important copy before ai analysis", () => {
   const longOldText = "旧手续费 " + "旧配置说明 ".repeat(40).trim();
   const longNewText = "新手续费 " + "新配置说明 ".repeat(40).trim();
   const content = __testables.buildCardBriefing(
@@ -889,8 +978,9 @@ test("page change card puts summary and important copy before resource details",
   );
 
   assert(content.startsWith("**结论摘要**"));
-  assert(content.indexOf("**重点变更**") < content.indexOf("**资源统计**"));
-  assert(content.indexOf("禮物稅收金庫") < content.indexOf("vault-page.js"));
+  assert(content.indexOf("**重点变更**") < content.indexOf("**AI 分析:**"));
+  assert.doesNotMatch(content, /\*\*资源统计\*\*/);
+  assert.doesNotMatch(content, /- 概览: 修改/);
   assert.doesNotMatch(content, /建议动作/);
   assert.match(content, /- 原：<font color="red">旧手续费 旧配置说明/);
   assert.match(content, /  新：<font color="green">新手续费 新配置说明/);
@@ -915,6 +1005,7 @@ test("site-wide asset card leads with no business-change conclusion", () => {
   assert(notification.content.startsWith("**结论摘要**"));
   assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**AI 分析**"));
   assert(notification.content.indexOf("**AI 分析**") < notification.content.indexOf("**影响页面**"));
+  assert.doesNotMatch(notification.content, /资源统计/);
   assert.doesNotMatch(notification.content, /完整资源 Diff/);
   assert.equal(notification.skipAi, false);
   assert.equal(notification.useFullDiffForAi, true);
