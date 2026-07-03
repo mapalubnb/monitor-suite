@@ -1166,6 +1166,8 @@ test("registry log extraction detects on-chain registered vault address", () => 
 
   assert.deepEqual(addresses, ["0x5418f7e8ff90354db0ecd48c8b710219244eb3c5"]);
   assert.match(content, /链上注册中心发现新金库 1 个/);
+  assert.match(content, /注册中心:/);
+  assert.match(content, /后续确认/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
   assert.match(content, /0x9e239cd0/);
 });
@@ -1179,7 +1181,9 @@ test("operational notice card is readable and action oriented", () => {
     consecutiveFailures: 3,
   });
 
-  assert(content.startsWith("**状态:** 页面请求失败"));
+  assert(content.startsWith("**结论摘要**"));
+  assert.match(content, /- 状态: 页面请求失败/);
+  assert.match(content, /- 连续失败: 3 次/);
   assert.doesNotMatch(content, /建议动作/);
   assert.match(content, /HTTP 403/);
 });

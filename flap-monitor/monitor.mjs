@@ -2456,18 +2456,47 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
   const lines = [
     "**结论摘要**",
     `- 链上注册中心发现新金库 ${events.length} 个`,
+    `- 注册中心: [${CONFIG.registryMonitor.address}](https://bscscan.com/address/${CONFIG.registryMonitor.address})`,
     `- 扫描区块: ${fromBlock} → ${toBlock}`,
     "",
-    "**🆕 链上新金库注册:**",
+    "**🆕 链上新金库注册**",
   ];
   for (const event of events) {
     lines.push(`- \`${event.vault}\``);
     lines.push(`  交易: [${event.txHash.slice(0, 10)}...](https://bscscan.com/tx/${event.txHash})`);
     lines.push(`  区块: [${event.blockNumber}](https://bscscan.com/block/${event.blockNumber})`);
-    lines.push(`  注册中心: [${CONFIG.registryMonitor.address}](https://bscscan.com/address/${CONFIG.registryMonitor.address})`);
-    lines.push("  状态: 链上已注册，等待/对照前端 vaultTypes 与 CAStore 展示确认");
+    lines.push("  状态: 链上已注册");
   }
+  lines.push("");
+  lines.push("**后续确认**");
+  lines.push("- 对照前端 vaultTypes、CAStore 展示和 launch 链接，确认是否已开放给用户");
   return lines.join("\n");
+}
+
+function formatRegistryMonitorStatus(snapshot = {}, { includeRpc = false } = {}) {
+  if (!CONFIG.registryMonitor.enabled) return ["- 链上注册中心: 未启用"];
+  const state = snapshot.registryMonitor || {};
+  const knownCount = Object.keys(state.knownVaults || {}).length;
+  const lastBlock = state.lastBlock ?? "-";
+  const safeLatest = state.safeLatestBlock ?? "-";
+  const latest = state.latestBlock ?? "-";
+  const lagBlocks = state.lagBlocks ?? (
+    Number.isFinite(Number(safeLatest)) && Number.isFinite(Number(lastBlock))
+      ? Math.max(0, Number(safeLatest) - Number(lastBlock))
+      : "-"
+  );
+  const lines = [
+    `- 链上注册中心: \`${CONFIG.registryMonitor.address}\``,
+    `- 链上扫描: 已扫 ${lastBlock} / 确认 ${safeLatest} / 最新 ${latest} / 延迟 ${lagBlocks} 块`,
+    `- 链上已知金库: ${knownCount} 个`,
+  ];
+  if (includeRpc) {
+    const rpcPreview = CONFIG.bscRpcUrls.slice(0, 2).join(" / ");
+    const more = CONFIG.bscRpcUrls.length > 2 ? ` 等 ${CONFIG.bscRpcUrls.length} 个` : "";
+    lines.push(`- RPC: ${rpcPreview}${more}`);
+    lines.push(`- 确认块: ${CONFIG.registryMonitor.confirmations} / 单轮最多 ${CONFIG.registryMonitor.maxBlocksPerRun} 块`);
+  }
+  return lines;
 }
 
 async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, titlePrefix = "" } = {}) {
@@ -3049,13 +3078,14 @@ async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries,
 
 function buildOperationalNoticeContent({ status, url, severity = "orange", reason = "", consecutiveFailures = 0, skipped = 0, detail = "" } = {}) {
   const lines = [
-    `**状态:** ${status || "Flap 监控状态变化"}`,
-    url ? `**影响页面:** [${url}](${url})` : "",
-    consecutiveFailures ? `**连续失败:** ${consecutiveFailures} 次` : "",
-    skipped ? `**跳过检测:** ${skipped} 次` : "",
-    reason ? `**原因:** ${reason}` : "",
-    severity ? `**级别:** ${severity}` : "",
-    detail ? "" : "",
+    "**结论摘要**",
+    `- 状态: ${status || "Flap 监控状态变化"}`,
+    severity ? `- 级别: ${severity}` : "",
+    url ? `- 影响页面: [${url}](${url})` : "",
+    consecutiveFailures ? `- 连续失败: ${consecutiveFailures} 次` : "",
+    skipped ? `- 跳过检测: ${skipped} 次` : "",
+    reason ? `- 原因: ${reason}` : "",
+    detail ? "\n**状态详情**" : "",
     detail || "",
   ];
   return lines.filter(line => line !== "").join("\n");
@@ -4836,7 +4866,23 @@ async function startMonitor() {
 
   await sendFeishu(
     "Flap 监控 v2 已启动",
-    `**监控目标:**\n${CONFIG.urls.map(u => `- ${u}`).join("\n")}\n\n**轮询间隔:** ${CONFIG.pollIntervalMs}ms\n**反风控:** UA 轮换 + 按页面/资源路径自适应退避 + 请求抖动\n**服务器:** ${(await import("node:os")).hostname()}`,
+    [
+      "**结论摘要**",
+      "- 状态: 已启动",
+      `- 监控页面: ${CONFIG.urls.length} 个`,
+      `- 金库工厂基线: ${Object.keys(snapshot.vaultFactories || {}).length} 个`,
+      `- 轮询间隔: ${CONFIG.pollIntervalMs}ms`,
+      "",
+      "**监控范围**",
+      ...CONFIG.urls.map(u => `- ${u}`),
+      "",
+      "**链上注册中心**",
+      ...formatRegistryMonitorStatus(snapshot, { includeRpc: true }),
+      "",
+      "**运行参数**",
+      "- 反风控: UA 轮换 + 按页面/资源路径自适应退避 + 请求抖动",
+      `- 服务器: ${(await import("node:os")).hostname()}`,
+    ].join("\n"),
     "blue"
   );
 
@@ -5130,7 +5176,16 @@ async function startMonitor() {
     log(`运行正常，已轮询 ${pollCount} 次`);
     cleanOldSnapshots();
 
-    const lines = [`已轮询 **${pollCount}** 次`];
+    const pageCount = Object.keys(snapshot.pages || {}).length;
+    const vaultFactoryCount = Object.keys(snapshot.vaultFactories || {}).length;
+    const lines = [
+      "**结论摘要**",
+      "- 状态: 运行中",
+      `- 已轮询: ${pollCount} 次`,
+      `- 页面: ${pageCount} 个`,
+      `- 金库工厂: ${vaultFactoryCount} 个`,
+      ...formatRegistryMonitorStatus(snapshot),
+    ];
 
     // 汇总近一个心跳周期内的页面错误
     const twoHoursAgo = Date.now() - CONFIG.heartbeatMs;
@@ -5169,19 +5224,20 @@ async function startMonitor() {
     let color = "green";
     if (errorLines.length > 0) {
       lines.push("");
-      lines.push(`**⚠ 近 ${Math.round(CONFIG.heartbeatMs / 3_600_000)}h 异常:**`);
+      lines.push(`**异常状态（近 ${Math.round(CONFIG.heartbeatMs / 3_600_000)}h）**`);
       lines.push(errorLines.join("\n"));
       color = "yellow";
     }
     if (backoffLines.length > 0) {
       lines.push("");
-      lines.push("**退避中:**");
+      lines.push("**退避状态**");
       lines.push(backoffLines.join("\n"));
       if (color === "green") color = "yellow";
     }
     if (errorLines.length === 0 && backoffLines.length === 0) {
       lines.push("");
-      lines.push("✅ 全部页面监控正常");
+      lines.push("**运行状态**");
+      lines.push("- 全部页面监控正常");
     }
 
     // 写入共享心跳文件，供 fourmeme-monitor 合并推送

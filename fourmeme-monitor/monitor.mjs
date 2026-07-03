@@ -9202,10 +9202,20 @@ async function startAllModules() {
 
       const lines = [
         `**── Four.meme ──**`,
-        `运行 **${h}h${m}m**，总检测 **${total}** 次`,
-        Object.entries(modulePollCounts).map(([k, v]) => `  ${k}: ${v}`).join("\n"),
-        `当前底池：**${poolCount}** 个`,
-        `前端页面池：**${Object.keys(snapshot?.frontendPages || {}).length}** 个，待确认新路由 **${Object.values(snapshot?._frontendPendingRoutes || {}).filter(r => r?.status === "pending").length}** 个，最近一轮成功 ${frontendMetrics.success} / 失败 ${frontendMetrics.failed}，累计推送 ${frontendMetrics.notifications}，抑制 ${frontendMetrics.suppressed}`,
+        "**结论摘要**",
+        "- 状态: 运行中",
+        `- 运行时长: ${h}h${m}m`,
+        `- 总检测: ${total} 次`,
+        `- 当前底池: ${poolCount} 个`,
+        `- 前端页面: ${Object.keys(snapshot?.frontendPages || {}).length} 个`,
+        `- 待确认新路由: ${Object.values(snapshot?._frontendPendingRoutes || {}).filter(r => r?.status === "pending").length} 个`,
+        "",
+        "**模块轮询**",
+        Object.entries(modulePollCounts).map(([k, v]) => `- ${k}: ${v}`).join("\n"),
+        "",
+        "**前端状态**",
+        `- 最近一轮: 成功 ${frontendMetrics.success} / 失败 ${frontendMetrics.failed}`,
+        `- 累计推送: ${frontendMetrics.notifications} / 抑制 ${frontendMetrics.suppressed}`,
       ];
 
       // 汇总近 2 小时内的模块错误
@@ -9240,19 +9250,20 @@ async function startAllModules() {
       let color = "green";
       if (errorLines.length > 0) {
         lines.push("");
-        lines.push("**⚠ 近 2h 异常:**");
+        lines.push("**异常状态（近 2h）**");
         lines.push(errorLines.join("\n"));
         color = "yellow";
       }
       if (backoffLines.length > 0) {
         lines.push("");
-        lines.push("**退避中:**");
+        lines.push("**退避状态**");
         lines.push(backoffLines.join("\n"));
         if (color === "green") color = "yellow";
       }
       if (errorLines.length === 0 && backoffLines.length === 0) {
         lines.push("");
-        lines.push("✅ 全部模块运行正常");
+        lines.push("**运行状态**");
+        lines.push("- 全部模块运行正常");
       }
 
       // ── 读取 Flap 心跳数据，合并到同一张卡片 ──

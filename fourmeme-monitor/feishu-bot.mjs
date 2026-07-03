@@ -64,6 +64,7 @@ const CONFIG = {
    ══════════════════════════════════════════ */
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
+const FLAP_REGISTRY_ADDRESS = "0x90497450f2a706f1951b5bdda52b4e5d16f34c06";
 
 const API_ENDPOINT_LINKS = {
   public_config: { label: "/v1/public/config", url: "https://four.meme/meme-api/v1/public/config" },
@@ -400,8 +401,13 @@ function buildMonitorContext() {
       const snap = JSON.parse(readFileSync(flSnapPath, "utf-8"));
       parts.push("\n=== Flap.sh 监控快照 ===");
       parts.push(`最后检测: ${snap.lastCheck || "未知"}`);
+      const flapSummary = summarizeFlapSnapshot(snap);
       const pages = snap.pages || {};
-      parts.push(`页面: ${Object.keys(pages).length} 个`);
+      parts.push(`页面: ${flapSummary.pageCount} 个`);
+      parts.push(`金库工厂: ${flapSummary.vaultFactoryCount} 个`);
+      parts.push(`链上注册中心: ${flapSummary.registryAddress}`);
+      parts.push(`链上扫描: 已扫 ${flapSummary.lastBlock} / 确认 ${flapSummary.safeLatest} / 最新 ${flapSummary.latest} / 延迟 ${flapSummary.lag} 块`);
+      parts.push(`链上已知金库: ${flapSummary.knownVaults} 个`);
       for (const [key, data] of Object.entries(pages)) {
         const url = data.originalUrl || key;
         const assets = data.assetFiles?.length || Object.keys(data.assetContents || {}).length || 0;
@@ -426,6 +432,30 @@ function buildMonitorContext() {
     context = context.slice(0, AI_CONFIG.maxSnapshotLen) + "\n... (数据已截断)";
   }
   return context;
+}
+
+function summarizeFlapSnapshot(snap = {}) {
+  const pages = snap.pages || {};
+  const registry = snap.registryMonitor || {};
+  const knownVaults = Object.keys(registry.knownVaults || {}).length;
+  const safeLatest = registry.safeLatestBlock ?? "-";
+  const lastBlock = registry.lastBlock ?? "-";
+  const latest = registry.latestBlock ?? "-";
+  const lag = registry.lagBlocks ?? (
+    Number.isFinite(Number(safeLatest)) && Number.isFinite(Number(lastBlock))
+      ? Math.max(0, Number(safeLatest) - Number(lastBlock))
+      : "-"
+  );
+  return {
+    pageCount: Object.keys(pages).length,
+    vaultFactoryCount: Object.keys(snap.vaultFactories || {}).length,
+    knownVaults,
+    lastBlock,
+    safeLatest,
+    latest,
+    lag,
+    registryAddress: registry.address || FLAP_REGISTRY_ADDRESS,
+  };
 }
 
 /**
@@ -617,6 +647,14 @@ async function buildDailyReport() {
         const actors = snap.chainActorMonitor?.actionActorCount
           ?? Object.values(snap.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
         parts.push(`Four.meme：底池${pools} | 合约${contracts} | 创建者${actors} | NFT${nfts} | GitHub仓库${repos} | SHA:\`${sha}\``);
+      } catch { /* ignore */ }
+    }
+    const flSnapPath = "/root/flap-monitor/snapshot.json";
+    if (existsSync(flSnapPath)) {
+      try {
+        const snap = JSON.parse(readFileSync(flSnapPath, "utf-8"));
+        const flap = summarizeFlapSnapshot(snap);
+        parts.push(`Flap.sh：页面${flap.pageCount} | 金库工厂${flap.vaultFactoryCount} | 链上金库${flap.knownVaults} | 注册中心已扫 ${flap.lastBlock}/${flap.safeLatest} | 延迟${flap.lag}块`);
       } catch { /* ignore */ }
     }
 
