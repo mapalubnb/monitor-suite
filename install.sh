@@ -281,13 +281,24 @@ if [ -f "$SNAP" ]; then
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
     const short=(v,n=10)=>{const x=String(v||'');return x?x.length>n?x.slice(0,n)+'...':x:'-'};
-    const joinSample=(arr,n=5)=>arr.slice(0,n).join('、')+(arr.length>n?'｜+'+(arr.length-n):'');
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const isAddr=(v)=>/^0x[a-fA-F0-9]{40}$/.test(String(v||''));
     const shortAddr=(addr)=>isAddr(addr)?addr.slice(0,6)+'...'+addr.slice(-4):short(addr,16);
     const bscAddress=(addr,label)=>addr?mdLink(label||shortAddr(addr),'https://bscscan.com/address/'+addr):'-';
     const pageLabel=(url)=>{try{const u=new URL(url);return u.pathname+(u.search?u.search:'')||'/'}catch{return short(url,32)}};
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
+    const value=(v)=>v===undefined||v===null||v===''?'-':String(v);
+    const apiLinks={
+      public_config:['/v1/public/config','https://four.meme/meme-api/v1/public/config'],
+      public_address:['/v1/public/address','https://four.meme/meme-api/v1/public/address'],
+      public_file_host:['/v1/public/file/host','https://four.meme/meme-api/v1/public/file/host'],
+      kol_teams:['/v1/public/kol/teams','https://four.meme/meme-api/v1/public/kol/teams?tcs=fm25'],
+      kol_traders:['/v1/public/kol/traders','https://four.meme/meme-api/v1/public/kol/traders?tcs=fm25'],
+      token_ranking_cap:['/v1/public/token/ranking CAP','https://four.meme/meme-api/v1/public/token/ranking'],
+      token_ranking_binance:['/v1/public/token/ranking BINANCE','https://four.meme/meme-api/v1/public/token/ranking'],
+      token_search_new:['/v1/public/token/search NEW','https://four.meme/meme-api/v1/public/token/search'],
+      token_search_cap:['/v1/public/token/search CAP','https://four.meme/meme-api/v1/public/token/search']
+    };
 
     const allPools=s.poolConfig||[];
     const networks={};
@@ -312,12 +323,14 @@ if [ -f "$SNAP" ]; then
     const templateKeys=Object.keys(templates);
     const published=templateKeys.filter(id=>String((templates[id]||{}).status||'').toUpperCase()==='PUBLISHED').length;
     const ofm=s.openFourModules||{};
-    const moduleItems=Object.values(ofm.byAddress||{});
+    const moduleEntries=Object.entries(ofm.byAddress||{}).sort(([a],[b])=>a.localeCompare(b));
+    const moduleItems=moduleEntries.map(([,m])=>m);
     const roleCounts={};
     for(const m of moduleItems) for(const r of m.roles||[]) roleCounts[r]=(roleCounts[r]||0)+1;
     const roleNames=Object.keys(roleCounts).sort();
     const sha=(s.githubSha||'')||'未知';
-    const repos=Object.keys(s.githubRepos||{}).length;
+    const repoEntries=Object.values(s.githubRepos||{}).sort((a,b)=>String(a.full_name||'').localeCompare(String(b.full_name||'')));
+    const repos=repoEntries.length;
     const fp=s.contractFingerprints||{};
     const fpKeys=Object.keys(fp);
     const op=s.onchainParams||{};
@@ -347,16 +360,58 @@ if [ -f "$SNAP" ]; then
     console.log('**前端能力**');
     console.log('NEXT_DATA · i18n · 路由发现 · 端点发现 · 新页面自动纳管');
     console.log('资源：JS/CSS '+assetFiles+' 个｜已下载 '+downloaded+' 个｜i18n '+i18nTotal+' 键');
+    console.log('');
+
+    console.log('**底池列表（'+allPools.length+'）**');
+    if(allPools.length){
+      for(const p of allPools){
+        const sym=p.symbol||p.nativeSymbol||'?';
+        const net=p.networkCode||'?';
+        const st=p.status||'?';
+        const addr=p.symbolAddress||p.address||p.contractAddress||'';
+        const fees=(p.buyFee!==undefined||p.sellFee!==undefined)?'｜费率 '+value(p.buyFee)+'/'+value(p.sellFee):'';
+        const amounts=(p.b0Amount!==undefined||p.totalBAmount!==undefined)?'｜余额 '+value(p.b0Amount)+'｜总量 '+value(p.totalBAmount):'';
+        console.log('- '+net+' '+sym+'｜'+st+'｜'+bscAddress(addr)+fees+amounts);
+      }
+    } else {
+      console.log('- 暂无底池快照');
+    }
+    console.log('');
+
+    console.log('**前端页面（'+pageEntries.length+'）**');
     if(pageEntries.length){
-      const pageSamples=pageEntries.slice(0,5).map(([k,p])=>mdLink(pageLabel(p.originalUrl||k),p.originalUrl||k));
-      console.log('页面样例：'+joinSample(pageSamples,5));
+      for(const [k,p] of pageEntries){
+        const url=p.originalUrl||k;
+        const files=(p.assetFiles||[]).length;
+        const dlCount=Object.keys(p.assetContents||{}).length;
+        const text=(p.textContent||'').length;
+        const i18n=p.i18nStrings?Object.keys(p.i18nStrings).length:0;
+        const routes=(p.routes||[]).length;
+        console.log('- '+mdLink(pageLabel(url),url)+'｜JS/CSS '+files+'/'+dlCount+'｜文案 '+text+'｜i18n '+i18n+'｜路由 '+routes);
+      }
+    } else {
+      console.log('- 暂无前端页面快照');
+    }
+    console.log('');
+
+    console.log('**API 端点（'+apiKeys.length+'）**');
+    if(apiKeys.length){
+      for(const k of apiKeys){
+        const a=api[k];
+        const fields=typeof a==='object'&&a?Object.keys(a).length:'?';
+        const meta=apiLinks[k];
+        const label=meta?meta[0]:k;
+        const link=meta?mdLink(label,meta[1]):label;
+        console.log('- '+link+'｜顶层字段 '+fields+' 个｜key '+k);
+      }
+    } else {
+      console.log('- 暂无 API 结构快照');
     }
     console.log('');
 
     console.log('**OpenFour / 链上**');
     console.log('Registry：'+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
-    if(roleNames.length) console.log('模块角色：'+joinSample(roleNames,8));
-    if(nfts.length) console.log('AgentNFT 样例：'+joinSample(nfts.map(a=>bscAddress(a)),5));
+    if(roleNames.length) console.log('模块角色：'+roleNames.join('、'));
     console.log('创建者来源：'+modes.join(' + ')+'｜缓存 '+cachedCreators+' 个');
     if(feed.enabled!==undefined) console.log('新区块：'+(feed.connected?'WebSocket 已连接':'WebSocket 未连接')+'｜'+(feed.mode||'未知')+(feed.latestHeadBlock?'｜头块 '+feed.latestHeadBlock:''));
     if(am.lastBlock) {
@@ -365,13 +420,81 @@ if [ -f "$SNAP" ]; then
       console.log('扫链：已扫 '+am.lastBlock+'｜确认 '+(am.safeLatestBlock||'未知')+'｜最新 '+(am.latestBlock||'未知')+'｜延迟 '+lag+' 块（约 '+lagSec+' 秒）');
       console.log('上轮：'+(am.lastRunScannedBlocks||0)+' 块｜'+(am.lastRunBatches||0)+' 批');
     }
+    console.log('');
+
+    console.log('**OpenFour 模板（'+templateKeys.length+'）**');
+    if(templateKeys.length){
+      for(const id of templateKeys){
+        const t=templates[id]||{};
+        const parts=['- #'+id, value(t.name), value(t.status)];
+        if(t.tag) parts.push('tag '+t.tag);
+        if(t.codeType) parts.push('codeType '+t.codeType);
+        if(t.userAddress) parts.push('作者 '+bscAddress(t.userAddress));
+        if(t.time) parts.push('时间 '+value(t.time));
+        console.log(parts.join('｜'));
+      }
+    } else {
+      console.log('- 暂无 OpenFour 模板快照');
+    }
+    console.log('');
+
+    console.log('**OpenFour 模块（'+moduleEntries.length+'）**');
+    if(moduleEntries.length){
+      for(const [addr,m] of moduleEntries){
+        console.log('- '+bscAddress(addr)+'｜roles '+((m.roles||[]).join(', ')||'-')+'｜presetIds '+((m.presetIds||[]).join(', ')||'-'));
+      }
+    } else {
+      console.log('- 暂无 OpenFour 模块快照');
+    }
+    console.log('');
+
+    console.log('**GitHub 仓库（'+repos+'）**');
+    if(repoEntries.length){
+      for(const r of repoEntries){
+        const name=r.full_name||r.name||'unknown';
+        const url=r.html_url||('https://github.com/'+name);
+        const pushed=r.pushed_at?fmtTime(r.pushed_at):'未知';
+        console.log('- '+mdLink(name,url)+'｜默认分支 '+value(r.default_branch)+'｜推送 '+pushed);
+      }
+    } else {
+      console.log('- 暂无 GitHub 仓库快照');
+    }
+    console.log('主仓库：'+mdLink('four-meme-community/four-meme-ai','https://github.com/four-meme-community/four-meme-ai')+'｜最新 '+(sha&&sha!=='未知'?mdLink(short(sha,8),'https://github.com/four-meme-community/four-meme-ai/commit/'+sha):sha));
+    console.log('');
+
+    console.log('**智能合约（'+fpKeys.length+'）**');
+    if(fpKeys.length){
+      for(const k of fpKeys){
+        const c=fp[k]||{};
+        const addr=c.address||'-';
+        const impl=c.implAddress?('｜impl '+bscAddress(c.implAddress)):'';
+        const source=c.source?('｜'+c.source):'';
+        console.log('- '+k+'｜'+bscAddress(addr)+impl+source);
+      }
+    } else {
+      console.log('- 暂无合约快照');
+    }
+    console.log('');
+
+    console.log('**AgentNFT（'+nfts.length+'）**');
+    if(nfts.length){
+      for(const a of nfts) console.log('- '+bscAddress(a));
+    } else {
+      console.log('- 暂无 AgentNFT 地址');
+    }
+    console.log('');
+
+    console.log('**创建者动作监听（'+actors.length+'）**');
     if(actors.length){
-      const actorSamples=actors.slice(0,5).map(a=>{
+      for(const a of actors){
         const item=allActors[a]||{};
-        const role=((item.roles||[]).join(',')||'创建者');
-        return bscAddress(a)+' '+role;
-      });
-      console.log('监听样例：'+joinSample(actorSamples,5));
+        const roles=((item.roles||[]).join(',')||'创建者');
+        const labels=(item.labels||[]).length?'｜'+(item.labels||[]).join('/'):'';
+        const sources=(item.sources||[]).length?'｜来源 '+(item.sources||[]).join(','):'';
+        console.log('- '+bscAddress(a)+'｜'+roles+labels+sources);
+      }
+    } else {
+      console.log('- 暂无创建者动作监听地址');
     }
     console.log('');
 
