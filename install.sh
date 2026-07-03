@@ -351,7 +351,7 @@ if [ -f "$SNAP" ]; then
     const ignoredRoutes=Object.values(s._frontendIgnoredRoutes||{}).filter(r=>r&&r.status==='ignored').length;
     const approvedRoutes=Object.values(s._frontendRouteApprovals||{}).filter(r=>r&&r.status==='approved').length;
 
-    console.log('**02｜监控概览**');
+    console.log('**📌 02｜监控概览**');
     console.log('底池：'+allPools.length+' 个｜'+netStr);
     console.log('前端：'+pageEntries.length+' 个页面｜API '+apiKeys.length+' 个端点');
     console.log('OpenFour：模板 '+templateKeys.length+' 个（PUBLISHED '+published+'）｜模块 '+moduleItems.length+' 个｜Preset '+((ofm.presetIds||[]).length));
@@ -778,7 +778,8 @@ if [ -f "$SNAP" ]; then
     console.log('链上扫描：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
     console.log('');
 
-    console.log('**03｜页面监控（'+keys.length+'）**');
+    console.log('**🌐 03｜页面监控（'+keys.length+'）**');
+    console.log(keys.map(k=>{const f=pages[k]||{};const url=f.originalUrl||k;return mdLink(pageLabel(url),url)}).join(' ｜ ') || '-');
     for(const k of keys){
       const f=pages[k];
       const url=f.originalUrl||k;
@@ -796,7 +797,7 @@ if [ -f "$SNAP" ]; then
     if(keys.length===0) console.log('- 暂无页面快照');
 
     console.log('');
-    console.log('**04｜金库工厂（'+visibleFactories+'）**');
+    console.log('**🏦 04｜金库工厂（'+visibleFactories+'）**');
     console.log('CAStore 可见：'+visibleFactories+' 个｜已启用：'+enabledVisibleFactories+' 个');
     for(const v of visibleFactoryItems){
       const name=v.name||v.id||v.factory||'未知金库';
@@ -809,7 +810,7 @@ if [ -f "$SNAP" ]; then
     if(visibleFactoryItems.length===0) console.log('- 暂无 CAStore 可见金库工厂');
 
     console.log('');
-    console.log('**05｜链上注册中心（'+knownVaults.length+'）**');
+    console.log('**⛓️ 05｜链上注册中心（'+knownVaults.length+'）**');
     console.log('注册中心：'+mdLink(short(registryAddress,12),'https://bscscan.com/address/'+registryAddress));
     console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
     for(const addr of knownVaults){
@@ -820,9 +821,6 @@ if [ -f "$SNAP" ]; then
     }
     if(knownVaults.length===0) console.log('- 暂无链上金库记录');
 
-    console.log('');
-    console.log('**06｜操作入口**');
-    console.log(mdLink('打开 Flap.sh','https://flap.sh')+'｜'+mdLink('打开 CAStore','https://flap.sh/bnb/CAstore'));
     console.log('');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null

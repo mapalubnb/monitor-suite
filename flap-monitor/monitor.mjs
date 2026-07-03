@@ -922,17 +922,27 @@ function blockLink(blockNumber) {
 function formatFlapSection(title, lines = []) {
   const body = (lines || []).filter(line => line !== "" && line != null);
   if (body.length === 0) return [];
-  return [`**${title}**`, ...body, ""];
+  const icons = {
+    "结论摘要": "📌",
+    "重点信息": "🎯",
+    "重点变更": "🎯",
+    "影响范围": "🌐",
+    "证据详情": "🔎",
+    "AI 分析": "🤖",
+    "链上新金库注册": "⛓️",
+    "金库文案": "🏦",
+  };
+  const icon = icons[title] ? `${icons[title]} ` : "";
+  return [`**${icon}${title}**`, ...body, ""];
 }
 
-function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", primary = [], scope = [], details = [], ai = "", actions = [] } = {}) {
+function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", primary = [], scope = [], details = [], ai = "" } = {}) {
   const lines = [
     ...formatFlapSection("结论摘要", summary),
     ...formatFlapSection(primaryTitle, primary),
     ...formatFlapSection("影响范围", scope),
     ...formatFlapSection("证据详情", details),
     ...(ai ? formatFlapSection("AI 分析", [ai]) : []),
-    ...formatFlapSection("操作入口", actions),
   ];
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
@@ -1564,6 +1574,10 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   const compactAffectedUrls = affectedUrls.length > 6
     ? [...affectedUrls.slice(0, 6), `... 还有 ${affectedUrls.length - 6} 个页面`]
     : affectedUrls;
+  const affectedPageLinks = compactAffectedUrls.map(url => {
+    if (url.startsWith("...")) return url;
+    return flapLink(new URL(url).pathname || "首页", url);
+  }).join(" ｜ ");
   const localSignalLines = hasLocalSignals
     ? [
         ...jsTextDiffs.map(d => {
@@ -1607,7 +1621,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   ].filter(Boolean);
 
   const contentLines = [
-    "**结论摘要**",
+    "**📌 结论摘要**",
     hasLocalSignals
       ? `- 本地初筛: 检测到 ${localSignalSummary}。`
       : "- 本地初筛: 未发现结构化业务变更。",
@@ -1615,18 +1629,14 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     `- 影响页面: ${affectedUrls.length} 个`,
     `- 资源范围: ${resourceScope}`,
     "",
-    "**影响页面**",
-    ...compactAffectedUrls.map(url => url.startsWith("...") ? `- ${url}` : `- ${flapLink(new URL(url).pathname || "首页", url)}`),
+    "**🌐 影响页面**",
+    affectedPageLinks,
     "",
-    "**本地信号**",
+    "**🔎 本地信号**",
     ...localSignalLines,
     "",
-    "**AI 分析**",
+    "**🤖 AI 分析**",
     "AI 分析异步生成中，变更已先推送。",
-    "",
-    "**操作入口**",
-    `- ${flapLink("打开 Flap.sh", "https://flap.sh")}`,
-    "- 查看详情：点击卡片按钮下载完整 Diff",
   ];
 
   const fullDiffLines = [
@@ -2114,12 +2124,12 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   const hasBusinessChange = summary.some(s => !s.includes("未提取到结构化业务变更"));
   const intentSummary = buildResourceIntentSummary(assetStats || {});
 
-  lines.push("**结论摘要**");
+  lines.push("**📌 结论摘要**");
   lines.push(`- 页面: ${flapLink("打开页面", url)}`);
   lines.push(`- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`);
   if (assetStats) lines.push(`- 意图判断: ${intentSummary.verdict}；${intentSummary.intent}；置信度 ${intentSummary.confidence}`);
   lines.push("");
-  lines.push("**重点变更**");
+  lines.push("**🎯 重点变更**");
   lines.push("");
 
   let hasStructuredChange = false;
@@ -2340,12 +2350,8 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
 
   lines.push("---");
   lines.push("");
-  lines.push("**AI 分析:**");
+  lines.push("**🤖 AI 分析:**");
   lines.push(aiSummary || "AI 分析异步生成中，变更已先推送。");
-  lines.push("");
-  lines.push("**操作入口**");
-  lines.push(`- ${flapLink("打开页面", url)}`);
-  lines.push("- 查看详情：点击卡片按钮下载完整 Diff");
   lines.push("");
 
   return lines.join("\n");
@@ -2540,7 +2546,6 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
     primaryTitle: "链上新金库注册",
     primary: primaryLines,
     details: ["- 对照前端 vaultTypes、CAStore 展示和 launch 链接，确认是否已开放给用户"],
-    actions: [`- ${flapLink("查看注册中心", `https://bscscan.com/address/${CONFIG.registryMonitor.address}`)}`],
   });
   return content;
 }
@@ -3187,7 +3192,7 @@ function formatVaultFactoryChanges(changes) {
   const hiddenModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*true\s*→\s*false/.test(d)));
   const visibleModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*false\s*→\s*true/.test(d)));
   const lines = [
-    "**结论摘要**",
+    "**📌 结论摘要**",
     `- 新增 ${changes.added.length} 个 / 移除 ${changes.removed.length} 个 / 修改 ${changes.modified.length} 个`,
     visibleAdded.length ? `- 新增可见金库 ${visibleAdded.length} 个：${visibleAdded.map(v => v.name).join(", ")}` : "",
     hiddenModified.length ? `- CAStore 下架/隐藏 ${hiddenModified.length} 个：${hiddenModified.map(v => v.name).join(", ")}` : "",
@@ -3195,7 +3200,7 @@ function formatVaultFactoryChanges(changes) {
     "",
   ];
   if (visibleAdded.length > 0) {
-    lines.push("**重点变更**");
+    lines.push("**🎯 重点变更**");
     lines.push("- 新玩法/可见金库上线");
     for (const v of visibleAdded) {
       const flags = [];
@@ -3213,7 +3218,7 @@ function formatVaultFactoryChanges(changes) {
     lines.push("");
   }
   if (hiddenAdded.length > 0) {
-    lines.push("**新增隐藏金库工厂**");
+    lines.push("**🏦 新增隐藏金库工厂**");
     for (const v of hiddenAdded) {
       const flags = [];
       flags.push("隐藏");
@@ -3229,7 +3234,7 @@ function formatVaultFactoryChanges(changes) {
     lines.push("");
   }
   if (changes.removed.length > 0) {
-    lines.push("**移除金库工厂**");
+    lines.push("**🏦 移除金库工厂**");
     for (const v of changes.removed) {
       lines.push(`- ${formatRemovedLine(v.name).replace(/^- /, "")}`);
       lines.push(`  Factory: ${addressLink(v.factory)}`);
@@ -3237,7 +3242,7 @@ function formatVaultFactoryChanges(changes) {
     lines.push("");
   }
   if (changes.modified.length > 0) {
-    lines.push("**金库工厂配置变更**");
+    lines.push("**🏦 金库工厂配置变更**");
     for (const v of changes.modified) {
       lines.push(`- ${changedText(v.name)}`);
       lines.push(`  Factory: ${addressLink(v.factory)}`);
@@ -3250,10 +3255,6 @@ function formatVaultFactoryChanges(changes) {
       if (v.legacyFactories) lines.push(`  legacy: ${v.legacyFactories}`);
     }
   }
-  lines.push("");
-  lines.push("**操作入口**");
-  lines.push(`- ${flapLink("打开 CAStore", "https://flap.sh/bnb/CAstore")}`);
-  lines.push("- 查看详情：点击卡片按钮下载完整 Diff（如有）");
   return lines.filter(Boolean).join("\n");
 }
 
@@ -3860,10 +3861,6 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
     primaryTitle: "金库文案",
     primary: [`- ${cardText(copy)}`],
     ai: "AI 分析异步生成中，变更已先推送。",
-    actions: [
-      launchUrl ? `- ${flapLink("查看金库", launchUrl)}` : "- 暂无可跳转金库页面",
-      `- ${flapLink("打开 CAStore", "https://flap.sh/bnb/CAstore")}`,
-    ],
   });
 
   return {

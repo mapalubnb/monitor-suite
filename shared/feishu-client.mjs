@@ -178,22 +178,6 @@ function buildCardActions(opts = {}) {
   return actions;
 }
 
-const CARD_TONE = {
-  red: { label: "高优先级", color: "red", icon: "!" },
-  orange: { label: "需要关注", color: "orange", icon: "!" },
-  yellow: { label: "提醒", color: "yellow", icon: "i" },
-  green: { label: "运行正常", color: "green", icon: "✓" },
-  blue: { label: "信息", color: "blue", icon: "i" },
-  indigo: { label: "详情", color: "indigo", icon: "i" },
-  purple: { label: "分析", color: "purple", icon: "i" },
-  turquoise: { label: "同步", color: "turquoise", icon: "i" },
-  grey: { label: "通知", color: "grey", icon: "i" },
-};
-
-function cardTone(template = "blue") {
-  return CARD_TONE[template] || CARD_TONE.blue;
-}
-
 function buildCardFooterElements(opts = {}) {
   const parts = [`更新时间：${ts()}`];
   if (opts.footerText) parts.unshift(String(opts.footerText).slice(0, 80));
@@ -202,13 +186,7 @@ function buildCardFooterElements(opts = {}) {
 
 export function buildCardJson(title, content, template, diffFilePathOrOpts) {
   const opts = normalizeCardOptions(diffFilePathOrOpts);
-  const tone = cardTone(template);
   const elements = [
-    {
-      tag: "markdown",
-      content: `<font color="${tone.color}">**${tone.icon} ${tone.label}**</font>`,
-    },
-    { tag: "hr" },
     { tag: "markdown", content: String(content || "").trim() || "-" },
   ];
   const actions = buildCardActions(opts);

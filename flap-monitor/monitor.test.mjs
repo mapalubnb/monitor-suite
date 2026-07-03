@@ -252,7 +252,7 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.match(grouped[0].content, /<font color="green">新增文案<\/font>: <font color="green">Create an account and generate a wallet<\/font>/);
   assert.match(grouped[0].content, /Create an account and generate a wallet/);
   assert.match(grouped[0].content, /fees：<font color="red">\(新增\)<\/font> → <font color="green">void<\/font>/);
-  assert.match(grouped[0].content, /\*\*AI 分析\*\*/);
+  assert.match(grouped[0].content, /\*\*🤖 AI 分析\*\*/);
   assert.equal(grouped[0].skipBusinessPriorityTitle, true);
   assert.equal(grouped[0].skipAi, false);
   assert.equal(grouped[0].useFullDiffForAi, true);
@@ -724,7 +724,7 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   assert.match(notification.content, /禮物稅收金庫/);
   assert.match(notification.content, /指定一個 X 帳戶/);
   assert.match(notification.content, /<font color="green">新增金库<\/font>/);
-  assert.match(notification.content, /\[查看金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\)/);
+  assert.equal(notification.launchUrl, "https://flap.sh/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003");
   assert.match(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
@@ -977,8 +977,8 @@ test("page change card puts summary and important copy before ai analysis", () =
     [{ type: "added", area: "热门金库", name: "禮物稅收金庫", newDescription: "指定账户收取礼物税收" }],
   );
 
-  assert(content.startsWith("**结论摘要**"));
-  assert(content.indexOf("**重点变更**") < content.indexOf("**AI 分析:**"));
+  assert(content.startsWith("**📌 结论摘要**"));
+  assert(content.indexOf("**🎯 重点变更**") < content.indexOf("**🤖 AI 分析:**"));
   assert.doesNotMatch(content, /\*\*资源统计\*\*/);
   assert.doesNotMatch(content, /- 概览: 修改/);
   assert.doesNotMatch(content, /建议动作/);
@@ -1002,10 +1002,11 @@ test("site-wide asset card leads with no business-change conclusion", () => {
     },
   ]);
 
-  assert(notification.content.startsWith("**结论摘要**"));
-  assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**影响页面**"));
-  assert(notification.content.indexOf("**影响页面**") < notification.content.indexOf("**本地信号**"));
-  assert(notification.content.indexOf("**本地信号**") < notification.content.indexOf("**AI 分析**"));
+  assert(notification.content.startsWith("**📌 结论摘要**"));
+  assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**🌐 影响页面**"));
+  assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**🔎 本地信号**"));
+  assert(notification.content.indexOf("**🔎 本地信号**") < notification.content.indexOf("**🤖 AI 分析**"));
+  assert.doesNotMatch(notification.content, /\n- \[\/bnb\/CAstore\]/);
   assert.doesNotMatch(notification.content, /资源统计/);
   assert.doesNotMatch(notification.content, /完整资源 Diff/);
   assert.equal(notification.skipAi, false);
@@ -1074,7 +1075,7 @@ test("vault factory card summarizes counts before details", () => {
     modified: [{ name: "Old Vault", factory: "0xdef", diffs: ["enabled: true → false"] }],
   });
 
-  assert(content.startsWith("**结论摘要**"));
+  assert(content.startsWith("**📌 结论摘要**"));
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
   assert.match(content, /enabled：<font color="red">true<\/font> → <font color="green">false<\/font>/);
@@ -1182,7 +1183,7 @@ test("operational notice card is readable and action oriented", () => {
     consecutiveFailures: 3,
   });
 
-  assert(content.startsWith("**结论摘要**"));
+  assert(content.startsWith("**📌 结论摘要**"));
   assert.match(content, /- 状态: 页面请求失败/);
   assert.match(content, /- 连续失败: 3 次/);
   assert.doesNotMatch(content, /建议动作/);
