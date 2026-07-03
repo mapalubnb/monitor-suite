@@ -654,6 +654,7 @@ if [ -f "$SNAP" ]; then
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const short=(v,n=10)=>{const x=String(v||'');return x?x.length>n?x.slice(0,n)+'...':x:'-'};
+    const pageLabel=(url)=>{try{const u=new URL(url);return u.pathname||'/'}catch{return short(url,24)}};
     const pages=s.pages||{};
     const keys=Object.keys(pages);
     const factories=s.vaultFactories||{};
@@ -677,7 +678,7 @@ if [ -f "$SNAP" ]; then
     console.log('- 状态: 快照已读取');
     console.log('- 页面: '+keys.length+' 个');
     console.log('- CAStore可见金库工厂: '+visibleFactories+' 个（已启用 '+enabledVisibleFactories+'）');
-    console.log('- 链上注册中心: '+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
+    console.log('- 链上注册中心: '+mdLink(short(registryAddress,12),'https://bscscan.com/address/'+registryAddress));
     console.log('- 链上扫描: 已扫 '+lastBlock+' / 确认 '+safeLatest+' / 最新 '+latest+' / 延迟 '+lag+' 块');
     console.log('- 链上已知金库: '+knownVaults.length+' 个');
     console.log('');
@@ -692,7 +693,7 @@ if [ -f "$SNAP" ]; then
       const nextData=f.nextDataHash?'有 ('+f.nextDataHash.slice(0,8)+')':'无';
       const contentHash=(f.contentHash||'').slice(0,8)||'-';
       const textLen=(f.textContent||'').length;
-      console.log('- '+mdLink(url,url));
+      console.log('- '+mdLink(pageLabel(url),url));
       console.log('  资源: '+assets.length+' 个 (JS:'+jsCount+' CSS:'+cssCount+') | 文案: '+textLen+' 字 | hash: '+contentHash);
       console.log('  __NEXT_DATA__: '+nextData);
       const i18nHash=(f.i18nHash||'').slice(0,8);
@@ -711,26 +712,30 @@ if [ -f "$SNAP" ]; then
       const flags=[];
       flags.push('CAStore可见');
       flags.push(v.enabled?'已启用':'已禁用');
-      console.log('- '+name+' | '+flags.join(' / ')+' | '+(factory!=='-'?mdLink(short(factory,12),'https://flap.sh/launch?vaultfactory='+factory):'-'));
+      console.log('- '+name+' | '+flags.join(' / ')+' | '+(factory!=='-'?mdLink('查看金库','https://flap.sh/launch?vaultfactory='+factory):'-'));
     }
     if(visibleFactoryItems.length>10) console.log('- 其余 '+(visibleFactoryItems.length-10)+' 个已省略');
 
     console.log('');
     console.log('**链上注册中心**');
-    console.log('- 注册中心: '+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
+    console.log('- 注册中心: '+mdLink(short(registryAddress,12),'https://bscscan.com/address/'+registryAddress));
     console.log('- 扫描进度: 已扫 '+lastBlock+' / 确认 '+safeLatest+' / 最新 '+latest+' / 延迟 '+lag+' 块');
     console.log('- 已知链上金库: '+knownVaults.length+' 个');
     for(const addr of knownVaults.slice(-5)){
       const item=registry.knownVaults[addr]||{};
       const tx=item.txHash?mdLink(short(item.txHash,12),'https://bscscan.com/tx/'+item.txHash):'-';
       const block=item.blockNumber?mdLink(String(item.blockNumber),'https://bscscan.com/block/'+item.blockNumber):'-';
-      console.log('- '+mdLink(addr,'https://bscscan.com/address/'+addr)+' | 区块 '+block+' | 交易 '+tx);
+      console.log('- '+mdLink(short(addr,12),'https://bscscan.com/address/'+addr)+' | 区块 '+block+' | 交易 '+tx);
     }
 
     console.log('');
     console.log('**运行信息**');
     console.log('- 最后检测: '+(s.lastCheck||'未知'));
     console.log('- 心跳推送: 默认关闭（使用 fm-heartbeat on/数字 可开启）');
+    console.log('');
+    console.log('**操作入口**');
+    console.log('- '+mdLink('打开 Flap.sh','https://flap.sh'));
+    console.log('- '+mdLink('打开 CAStore','https://flap.sh/bnb/CAstore'));
   " 2>/dev/null
   echo ""
   echo "------"

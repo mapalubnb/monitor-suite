@@ -158,19 +158,22 @@ function buildCardActions(opts = {}) {
   if (opts.diffFilePath) {
     actions.push({
       tag: "button",
-      text: { tag: "plain_text", content: "📎 下载 Diff 详情" },
+      text: { tag: "plain_text", content: opts.diffButtonText || "查看详情" },
       type: "default",
       value: { action: "download_diff", file: opts.diffFilePath },
     });
   }
   for (const action of opts.actions || []) {
-    if (!action || action.tag !== "button" || !action.text?.content || !action.value?.action) continue;
-    actions.push({
+    if (!action || action.tag !== "button" || !action.text?.content) continue;
+    const item = {
       tag: "button",
       text: { tag: "plain_text", content: String(action.text.content).slice(0, 30) },
       type: action.type || "default",
-      value: action.value,
-    });
+    };
+    if (action.url) item.url = action.url;
+    if (action.value?.action) item.value = action.value;
+    if (!item.url && !item.value) continue;
+    actions.push(item);
   }
   return actions;
 }

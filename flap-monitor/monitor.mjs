@@ -760,19 +760,21 @@ function saveSnapshot(data) {
  * 带重试的卡片发送（兼容旧接口 sendFeishu）
  */
 async function sendFeishu(title, content, template = "red", _retries = 2) {
-  for (let attempt = 0; attempt <= _retries; attempt++) {
+  const opts = _retries && typeof _retries === "object" ? _retries : {};
+  const retryCount = _retries && typeof _retries === "object" ? 2 : _retries;
+  for (let attempt = 0; attempt <= retryCount; attempt++) {
     try {
-      const messageId = await sendCardQueued(title, content, template);
+      const messageId = await sendCardQueued(title, content, template, opts);
       if (!messageId) throw new Error("队列发送未返回 message_id");
       return true;
     } catch (err) {
       log(`飞书推送异常（第${attempt + 1}次）：${err.message}`);
-      if (attempt < _retries) {
+      if (attempt < retryCount) {
         await sleep(3_000 * (attempt + 1));
       }
     }
   }
-  log(`飞书推送最终失败（已重试 ${_retries} 次）`);
+  log(`飞书推送最终失败（已重试 ${retryCount} 次）`);
   return false;
 }
 
@@ -791,12 +793,13 @@ function isStylePseudoConfigDiff(cd = {}) {
 /**
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
-async function sendCardViaApi(title, content, template = "red", diffFilePath) {
+async function sendCardViaApi(title, content, template = "red", diffFilePath, cardOpts = {}) {
   const maxAttempts = 2;
   let lastError = null;
+  const opts = { ...cardOpts, diffFilePath };
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      return await sendCard(title, content, template, { diffFilePath });
+      return await sendCard(title, content, template, opts);
     } catch (err) {
       lastError = err;
       log(`[飞书 IM API] 直接发送失败（第 ${attempt + 1}/${maxAttempts} 次）：${err.message}`);
@@ -805,7 +808,7 @@ async function sendCardViaApi(title, content, template = "red", diffFilePath) {
   }
 
   log("[飞书 IM API] 直接发送失败，转入队列兜底补发");
-  const queuedMessageId = await sendCardQueued(title, content, template, { diffFilePath });
+  const queuedMessageId = await sendCardQueued(title, content, template, opts);
   if (queuedMessageId) return queuedMessageId;
   throw new Error(`飞书卡片发送失败：${lastError?.message || "队列补发失败"}`);
 }
@@ -813,8 +816,8 @@ async function sendCardViaApi(title, content, template = "red", diffFilePath) {
 /**
  * 编辑已发送的卡片消息
  */
-async function patchCardViaApi(messageId, title, content, template = "red", diffFilePath) {
-  await patchCard(messageId, title, content, template, { diffFilePath });
+async function patchCardViaApi(messageId, title, content, template = "red", diffFilePath, cardOpts = {}) {
+  await patchCard(messageId, title, content, template, { ...cardOpts, diffFilePath });
 }
 
 const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
@@ -830,9 +833,9 @@ function isTooLongForSingleCard(content) {
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
  * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
-async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, summarizeFn = aiSummarize) {
+async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, summarizeFn = aiSummarize, cardOpts = {}) {
   const initialContent = buildCardUrlPrefix(url, content) + content;
-  const messageId = await sendCardViaApi(title, initialContent, template, diffFilePath);
+  const messageId = await sendCardViaApi(title, initialContent, template, diffFilePath, cardOpts);
 
   if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
     const summarize = summarizeFn || aiSummarize;
@@ -848,7 +851,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
             log(`[AI 摘要] ${title} 正文较长，保留完整变更卡片，另发 AI 摘要卡片`);
             await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
           } else {
-            await patchCardViaApi(messageId, title, enrichedContent, template, diffFilePath);
+            await patchCardViaApi(messageId, title, enrichedContent, template, diffFilePath, cardOpts);
             log(`[AI 摘要→卡片更新] ${title} 已补充 AI 摘要`);
           }
         } catch (err) {
@@ -872,19 +875,76 @@ function shouldUseAiForNotification({ title = "", content = "", moduleContext = 
   return /重点变更|页面变更|文案|i18n|CAstore|金库|Vault|Factory|fee|rate|route|api|contract|address|enabled|staking|dividend/i.test(text);
 }
 
-async function sendNotificationMaybeAi({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, skipAi = false }) {
+async function sendNotificationMaybeAi({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, skipAi = false, cardOpts = {} }) {
   if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
     const cardContent = buildCardUrlPrefix(url, content) + content;
-    const messageId = await sendCardViaApi(title, cardContent, template, diffFilePath);
-    if (!messageId) await sendFeishu(title, cardContent, template);
+    const messageId = await sendCardViaApi(title, cardContent, template, diffFilePath, cardOpts);
+    if (!messageId) await sendFeishu(title, cardContent, template, cardOpts);
     else log(`[AI] 已跳过：${title}`);
     return messageId;
   }
-  return sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url);
+  return sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, aiSummarize, cardOpts);
 }
 
 function hasItems(value) {
   return Array.isArray(value) && value.length > 0;
+}
+
+function flapLink(label, url) {
+  return url ? `[${label}](${url})` : label;
+}
+
+function shortHash(value, head = 8, tail = 4) {
+  const text = String(value || "");
+  if (!text) return "-";
+  if (text.length <= head + tail + 3) return text;
+  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+}
+
+function addressLink(address, type = "address") {
+  const value = String(address || "");
+  if (!/^0x[a-fA-F0-9]{40}$/.test(value)) return value || "-";
+  const path = type === "tx" ? "tx" : "address";
+  return flapLink(shortHash(value, 8, 4), `https://bscscan.com/${path}/${value}`);
+}
+
+function txLink(txHash) {
+  const value = String(txHash || "");
+  if (!/^0x[a-fA-F0-9]{64}$/.test(value)) return value || "-";
+  return flapLink(shortHash(value, 10, 6), `https://bscscan.com/tx/${value}`);
+}
+
+function blockLink(blockNumber) {
+  if (!blockNumber && blockNumber !== 0) return "-";
+  return flapLink(String(blockNumber), `https://bscscan.com/block/${blockNumber}`);
+}
+
+function formatFlapSection(title, lines = []) {
+  const body = (lines || []).filter(line => line !== "" && line != null);
+  if (body.length === 0) return [];
+  return [`**${title}**`, ...body, ""];
+}
+
+function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", primary = [], scope = [], details = [], ai = "", actions = [] } = {}) {
+  const lines = [
+    ...formatFlapSection("结论摘要", summary),
+    ...formatFlapSection(primaryTitle, primary),
+    ...formatFlapSection("影响范围", scope),
+    ...formatFlapSection("证据详情", details),
+    ...(ai ? formatFlapSection("AI 分析", [ai]) : []),
+    ...formatFlapSection("操作入口", actions),
+  ];
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function linkAction(text, url, type = "default") {
+  if (!url) return null;
+  return {
+    tag: "button",
+    text: { tag: "plain_text", content: text },
+    type,
+    url,
+  };
 }
 
 function isFlapAssetOnlyNotification(notification) {
@@ -1555,14 +1615,18 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     `- 影响页面: ${affectedUrls.length} 个`,
     `- 资源范围: ${resourceScope}`,
     "",
-    "**AI 分析**",
-    "AI 分析异步生成中，变更已先推送。",
-    "",
     "**影响页面**",
-    ...compactAffectedUrls.map(url => url.startsWith("...") ? `- ${url}` : `- [${url}](${url})`),
+    ...compactAffectedUrls.map(url => url.startsWith("...") ? `- ${url}` : `- ${flapLink(new URL(url).pathname || "首页", url)}`),
     "",
     "**本地信号**",
     ...localSignalLines,
+    "",
+    "**AI 分析**",
+    "AI 分析异步生成中，变更已先推送。",
+    "",
+    "**操作入口**",
+    `- ${flapLink("打开 Flap.sh", "https://flap.sh")}`,
+    "- 查看详情：点击卡片按钮下载完整 Diff",
   ];
 
   const fullDiffLines = [
@@ -1669,10 +1733,14 @@ async function sendFlapChangeNotification(notification, { moduleContext = "Flap.
   const fullDiff = buildFlapFullDiff({ diffTitle, url: n.url, changes: n.changes, meta: n.meta });
   const diffFilePath = saveDiffLocally(n.title, fullDiff);
   const aiInput = n.useFullDiffForAi ? fullDiff : briefingInput;
+  const cardOpts = {
+    diffButtonText: "查看详情",
+    actions: [linkAction(n.url === "https://flap.sh" ? "打开 Flap.sh" : "打开页面", n.url, "primary")].filter(Boolean),
+  };
   await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput, enrichFn: (summary) => {
     if (n.content) return enrichExistingCardContentWithAi(n.content, summary);
     return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
-  }, diffFilePath, url: n.url, skipAi: n.skipAi });
+  }, diffFilePath, url: n.url, skipAi: n.skipAi, cardOpts });
   return n;
 }
 
@@ -2015,7 +2083,7 @@ function buildCardUrlPrefix(url, content) {
   if (!url) return "";
   const text = String(content || "");
   if (text.includes(url)) return "";
-  return `🔗 [${url}](${url})\n\n`;
+  return `- 页面: ${flapLink("打开页面", url)}\n\n`;
 }
 
 function compactTextDiffItems(items = [], max = 12) {
@@ -2047,7 +2115,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   const intentSummary = buildResourceIntentSummary(assetStats || {});
 
   lines.push("**结论摘要**");
-  lines.push(`- 监控页面: [${url}](${url})`);
+  lines.push(`- 页面: ${flapLink("打开页面", url)}`);
   lines.push(`- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`);
   if (assetStats) lines.push(`- 意图判断: ${intentSummary.verdict}；${intentSummary.intent}；置信度 ${intentSummary.confidence}`);
   lines.push("");
@@ -2275,6 +2343,10 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   lines.push("**AI 分析:**");
   lines.push(aiSummary || "AI 分析异步生成中，变更已先推送。");
   lines.push("");
+  lines.push("**操作入口**");
+  lines.push(`- ${flapLink("打开页面", url)}`);
+  lines.push("- 查看详情：点击卡片按钮下载完整 Diff");
+  lines.push("");
 
   return lines.join("\n");
 }
@@ -2453,24 +2525,24 @@ async function filterContractAddresses(addresses) {
 }
 
 function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
-  const lines = [
-    "**结论摘要**",
-    `- 链上注册中心发现新金库 ${events.length} 个`,
-    `- 注册中心: [${CONFIG.registryMonitor.address}](https://bscscan.com/address/${CONFIG.registryMonitor.address})`,
-    `- 扫描区块: ${fromBlock} → ${toBlock}`,
-    "",
-    "**🆕 链上新金库注册**",
-  ];
+  const primaryLines = [];
   for (const event of events) {
-    lines.push(`- \`${event.vault}\``);
-    lines.push(`  交易: [${event.txHash.slice(0, 10)}...](https://bscscan.com/tx/${event.txHash})`);
-    lines.push(`  区块: [${event.blockNumber}](https://bscscan.com/block/${event.blockNumber})`);
-    lines.push("  状态: 链上已注册");
+    primaryLines.push(`- Vault: ${addressLink(event.vault)}`);
+    primaryLines.push(`  交易: ${txLink(event.txHash)} / 区块: ${blockLink(event.blockNumber)}`);
+    primaryLines.push("  状态: 链上已注册");
   }
-  lines.push("");
-  lines.push("**后续确认**");
-  lines.push("- 对照前端 vaultTypes、CAStore 展示和 launch 链接，确认是否已开放给用户");
-  return lines.join("\n");
+  const content = buildFlapCardContent({
+    summary: [
+      `- 链上注册中心发现新金库 ${events.length} 个`,
+      `- 注册中心: ${addressLink(CONFIG.registryMonitor.address)}`,
+      `- 扫描区块: ${fromBlock} → ${toBlock}`,
+    ],
+    primaryTitle: "链上新金库注册",
+    primary: primaryLines,
+    details: ["- 对照前端 vaultTypes、CAStore 展示和 launch 链接，确认是否已开放给用户"],
+    actions: [`- ${flapLink("查看注册中心", `https://bscscan.com/address/${CONFIG.registryMonitor.address}`)}`],
+  });
+  return content;
 }
 
 function formatRegistryMonitorStatus(snapshot = {}, { includeRpc = false } = {}) {
@@ -2558,7 +2630,13 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
 
   const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
   const title = `${titlePrefix}Flap 链上金库注册变更`;
-  const messageId = await sendCardFn(title, content, "red");
+  const firstTx = newEvents[0]?.txHash ? `https://bscscan.com/tx/${newEvents[0].txHash}` : "";
+  const messageId = await sendCardFn(title, content, "red", undefined, {
+    actions: [
+      linkAction("查看注册中心", `https://bscscan.com/address/${CONFIG.registryMonitor.address}`, "primary"),
+      linkAction("查看交易", firstTx),
+    ].filter(Boolean),
+  });
   if (messageId) await pinMessage(messageId);
   return { changed: true, sent: Boolean(messageId), events: newEvents };
 }
@@ -3067,7 +3145,9 @@ async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries,
   const vfTitle = buildVaultFactoryChangeTitle(vfChanges, `🏦 ${titlePrefix}`);
   appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
   const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
-  const vfMsgId = await sendCardFn(vfTitle, `🔗 [${linkUrl}](${linkUrl})\n\n${vfContent}${conflictNote}`, vfTemplate);
+  const vfMsgId = await sendCardFn(vfTitle, `${vfContent}${conflictNote}`, vfTemplate, undefined, {
+    actions: [linkAction("查看 CAStore", linkUrl, "primary")].filter(Boolean),
+  });
   if (vfChanges.added.length > 0 && vfMsgId) {
     await pinMessage(vfMsgId);
   }
@@ -3077,18 +3157,25 @@ async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries,
 }
 
 function buildOperationalNoticeContent({ status, url, severity = "orange", reason = "", consecutiveFailures = 0, skipped = 0, detail = "" } = {}) {
-  const lines = [
-    "**结论摘要**",
-    `- 状态: ${status || "Flap 监控状态变化"}`,
-    severity ? `- 级别: ${severity}` : "",
-    url ? `- 影响页面: [${url}](${url})` : "",
-    consecutiveFailures ? `- 连续失败: ${consecutiveFailures} 次` : "",
-    skipped ? `- 跳过检测: ${skipped} 次` : "",
-    reason ? `- 原因: ${reason}` : "",
-    detail ? "\n**状态详情**" : "",
-    detail || "",
-  ];
-  return lines.filter(line => line !== "").join("\n");
+  return buildFlapCardContent({
+    summary: [
+      `- 状态: ${status || "Flap 监控状态变化"}`,
+      severity ? `- 级别: ${severity}` : "",
+      consecutiveFailures ? `- 连续失败: ${consecutiveFailures} 次` : "",
+      skipped ? `- 跳过检测: ${skipped} 次` : "",
+    ],
+    scope: [
+      url ? `- 页面: ${flapLink("打开页面", url)}` : "",
+    ],
+    details: [
+      reason ? `- 原因: ${cardText(reason)}` : "",
+      detail ? `- 详情:\n${indentCardText(detail, "  ")}` : "",
+    ],
+    actions: [
+      url ? `- ${flapLink("打开页面", url)}` : "",
+      "- 立即处理：查看 flap-monitor 日志与最近 Diff",
+    ],
+  });
 }
 
 /**
@@ -3108,7 +3195,8 @@ function formatVaultFactoryChanges(changes) {
     "",
   ];
   if (visibleAdded.length > 0) {
-    lines.push("**🆕 新玩法/可见金库上线:**");
+    lines.push("**重点变更**");
+    lines.push("- 新玩法/可见金库上线");
     for (const v of visibleAdded) {
       const flags = [];
       flags.push("前端可见");
@@ -3116,16 +3204,16 @@ function formatVaultFactoryChanges(changes) {
       if (v.enabled) flags.push("已启用");
       else flags.push("已禁用");
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
-      lines.push(`  ${formatAddedLine(v.name)}`);
-      lines.push(`    \`${v.factory}\``);
-      if (v.descriptionI18nKey) lines.push(`    ${v.descriptionI18nKey}`);
-      lines.push(`    ${flags.join(" | ")}`);
-      lines.push(`    🔗 [金库页面](https://flap.sh/launch?vaultfactory=${v.factory})`);
+      lines.push(`- ${formatAddedLine(v.name).replace(/^- /, "")}`);
+      lines.push(`  Factory: ${addressLink(v.factory)}`);
+      if (v.descriptionI18nKey) lines.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
+      lines.push(`  状态: ${flags.join(" / ")}`);
+      lines.push(`  操作: ${flapLink("查看金库", `https://flap.sh/launch?vaultfactory=${v.factory}`)}`);
     }
     lines.push("");
   }
   if (hiddenAdded.length > 0) {
-    lines.push("**🆕 新增隐藏金库工厂:**");
+    lines.push("**新增隐藏金库工厂**");
     for (const v of hiddenAdded) {
       const flags = [];
       flags.push("隐藏");
@@ -3133,35 +3221,39 @@ function formatVaultFactoryChanges(changes) {
       if (v.enabled) flags.push("已启用");
       else flags.push("已禁用");
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
-      lines.push(`  ${formatAddedLine(v.name)}`);
-      lines.push(`    \`${v.factory}\``);
-      if (v.descriptionI18nKey) lines.push(`    ${v.descriptionI18nKey}`);
-      lines.push(`    ${flags.join(" | ")}`);
+      lines.push(`- ${formatAddedLine(v.name).replace(/^- /, "")}`);
+      lines.push(`  Factory: ${addressLink(v.factory)}`);
+      if (v.descriptionI18nKey) lines.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
+      lines.push(`  状态: ${flags.join(" / ")}`);
     }
     lines.push("");
   }
   if (changes.removed.length > 0) {
-    lines.push("**❌ 移除金库工厂:**");
+    lines.push("**移除金库工厂**");
     for (const v of changes.removed) {
-      lines.push(`  ${formatRemovedLine(v.name)}`);
-      lines.push(`    \`${v.factory}\``);
+      lines.push(`- ${formatRemovedLine(v.name).replace(/^- /, "")}`);
+      lines.push(`  Factory: ${addressLink(v.factory)}`);
     }
     lines.push("");
   }
   if (changes.modified.length > 0) {
-    lines.push("**✏️ 金库工厂配置变更:**");
+    lines.push("**金库工厂配置变更**");
     for (const v of changes.modified) {
-      lines.push(`  ${changedText(v.name)}`);
-      lines.push(`    \`${v.factory}\``);
-      if (v.descriptionI18nKey) lines.push(`    ${v.descriptionI18nKey}`);
+      lines.push(`- ${changedText(v.name)}`);
+      lines.push(`  Factory: ${addressLink(v.factory)}`);
+      if (v.descriptionI18nKey) lines.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
       for (const d of v.diffs) {
         const pair = splitDiffPairText(d);
-        if (pair) pushDiffPairLines(lines, pair.key, pair.oldVal, pair.newVal, "    ");
-        else lines.push(`    ${d}`);
+        if (pair) pushDiffPairLines(lines, pair.key, pair.oldVal, pair.newVal, "  ");
+        else lines.push(`  ${d}`);
       }
-      if (v.legacyFactories) lines.push(`    legacy: ${v.legacyFactories}`);
+      if (v.legacyFactories) lines.push(`  legacy: ${v.legacyFactories}`);
     }
   }
+  lines.push("");
+  lines.push("**操作入口**");
+  lines.push(`- ${flapLink("打开 CAStore", "https://flap.sh/bnb/CAstore")}`);
+  lines.push("- 查看详情：点击卡片按钮下载完整 Diff（如有）");
   return lines.filter(Boolean).join("\n");
 }
 
@@ -3754,28 +3846,25 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
   const factory = resolveCaStoreVaultFactory(change, vaultFactoryMap);
   const launchUrl = buildVaultLaunchUrl(factory);
   const typeLabel = caStoreVaultChangeLabel(change?.type);
-  const contentLines = [
-    `**金库名字**`,
-    name,
-    "",
-    `**变更类型**`,
-    change?.type === "removed"
-      ? removedText(typeLabel)
-      : change?.type === "added"
-        ? addedText(typeLabel)
-        : changedText(typeLabel),
-    "",
-    `**文案**`,
-    copy,
-    "",
-    `**金库地址**`,
-    launchUrl ? `🔗 [打开金库页面](${launchUrl})` : "未匹配到 vault factory 地址。",
-    factory ? `Factory: \`${factory}\`` : "",
-    "",
-    `**AI 介绍**`,
-    "AI 分析异步生成中，变更已先推送。",
-  ];
-  const content = contentLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  const typeText = change?.type === "removed"
+    ? removedText(typeLabel)
+    : change?.type === "added"
+      ? addedText(typeLabel)
+      : changedText(typeLabel);
+  const content = buildFlapCardContent({
+    summary: [
+      `- 金库: ${cardText(name)}`,
+      `- 类型: ${typeText}`,
+      factory ? `- Factory: ${addressLink(factory)}` : "- Factory: 未匹配到",
+    ],
+    primaryTitle: "金库文案",
+    primary: [`- ${cardText(copy)}`],
+    ai: "AI 分析异步生成中，变更已先推送。",
+    actions: [
+      launchUrl ? `- ${flapLink("查看金库", launchUrl)}` : "- 暂无可跳转金库页面",
+      `- ${flapLink("打开 CAStore", "https://flap.sh/bnb/CAstore")}`,
+    ],
+  });
 
   return {
     title: `${titlePrefix}CAstore 金库变更：${name}`,
@@ -3834,6 +3923,12 @@ async function sendCaStoreVaultChangeNotification(notification) {
     null,
     notification.url,
     aiIntroduceCaStoreVault,
+    {
+      actions: [
+        linkAction(notification.launchUrl ? "查看金库" : "打开 CAStore", notification.url, "primary"),
+        notification.launchUrl ? linkAction("打开 CAStore", "https://flap.sh/bnb/CAstore") : null,
+      ].filter(Boolean),
+    },
   );
   if (messageId) await pinMessage(messageId);
   return messageId;
@@ -4866,24 +4961,25 @@ async function startMonitor() {
 
   await sendFeishu(
     "Flap 监控 v2 已启动",
-    [
-      "**结论摘要**",
-      "- 状态: 已启动",
-      `- 监控页面: ${CONFIG.urls.length} 个`,
-      `- 金库工厂基线: ${Object.keys(snapshot.vaultFactories || {}).length} 个`,
-      `- 轮询间隔: ${CONFIG.pollIntervalMs}ms`,
-      "",
-      "**监控范围**",
-      ...CONFIG.urls.map(u => `- ${u}`),
-      "",
-      "**链上注册中心**",
-      ...formatRegistryMonitorStatus(snapshot, { includeRpc: true }),
-      "",
-      "**运行参数**",
-      "- 反风控: UA 轮换 + 按页面/资源路径自适应退避 + 请求抖动",
-      `- 服务器: ${(await import("node:os")).hostname()}`,
-    ].join("\n"),
-    "blue"
+    buildFlapCardContent({
+      summary: [
+        "- 状态: 已启动",
+        `- 监控页面: ${CONFIG.urls.length} 个`,
+        `- 金库工厂基线: ${Object.keys(snapshot.vaultFactories || {}).length} 个`,
+        `- 轮询间隔: ${CONFIG.pollIntervalMs}ms`,
+      ],
+      scope: CONFIG.urls.map(u => `- ${flapLink(new URL(u).pathname || "首页", u)}`),
+      details: [
+        ...formatRegistryMonitorStatus(snapshot, { includeRpc: true }),
+        "- 反风控: UA 轮换 + 自适应退避 + 请求抖动",
+        `- 服务器: ${(await import("node:os")).hostname()}`,
+      ],
+      actions: [`- ${flapLink("打开 Flap.sh", "https://flap.sh")}`],
+    }),
+    "blue",
+    {
+      actions: [linkAction("打开 Flap.sh", "https://flap.sh", "primary")].filter(Boolean),
+    }
   );
 
   // 轮询函数：并行检测所有页面
@@ -5178,14 +5274,16 @@ async function startMonitor() {
 
     const pageCount = Object.keys(snapshot.pages || {}).length;
     const vaultFactoryCount = Object.keys(snapshot.vaultFactories || {}).length;
-    const lines = [
-      "**结论摘要**",
-      "- 状态: 运行中",
-      `- 已轮询: ${pollCount} 次`,
-      `- 页面: ${pageCount} 个`,
-      `- 金库工厂: ${vaultFactoryCount} 个`,
-      ...formatRegistryMonitorStatus(snapshot),
-    ];
+    const lines = buildFlapCardContent({
+      summary: [
+        "- 状态: 运行中",
+        `- 已轮询: ${pollCount} 次`,
+        `- 页面: ${pageCount} 个`,
+        `- 金库工厂: ${vaultFactoryCount} 个`,
+      ],
+      details: formatRegistryMonitorStatus(snapshot),
+      actions: [`- ${flapLink("打开 Flap.sh", "https://flap.sh")}`],
+    }).split("\n");
 
     // 汇总近一个心跳周期内的页面错误
     const twoHoursAgo = Date.now() - CONFIG.heartbeatMs;

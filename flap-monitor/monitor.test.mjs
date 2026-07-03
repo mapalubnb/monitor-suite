@@ -53,7 +53,7 @@ test("shared Flap asset-only page changes are summarized into one site-wide noti
   assert.match(grouped[0].changes.join("\n"), /影响页面 2 个/);
   assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.sh\/bnb\/CAstore/);
   assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.sh\/launch/);
-  assert.match(grouped[0].content, /\[https:\/\/flap\.sh\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
+  assert.match(grouped[0].content, /\[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
   assert.equal(grouped[0].skipAi, false);
   assert.equal(grouped[0].useFullDiffForAi, true);
   assert.equal(grouped[0].snapshotUpdates.length, 2);
@@ -720,11 +720,11 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   const notification = __testables.buildCaStoreVaultChangeNotification(diff, {});
 
   assert.equal(notification.title, "CAstore 金库变更：禮物稅收金庫");
-  assert.match(notification.content, /金库名字/);
+  assert.match(notification.content, /金库:/);
   assert.match(notification.content, /禮物稅收金庫/);
   assert.match(notification.content, /指定一個 X 帳戶/);
   assert.match(notification.content, /<font color="green">新增金库<\/font>/);
-  assert.match(notification.content, /🔗 \[打开金库页面\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\)/);
+  assert.match(notification.content, /\[查看金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\)/);
   assert.match(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
@@ -1003,8 +1003,9 @@ test("site-wide asset card leads with no business-change conclusion", () => {
   ]);
 
   assert(notification.content.startsWith("**结论摘要**"));
-  assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**AI 分析**"));
-  assert(notification.content.indexOf("**AI 分析**") < notification.content.indexOf("**影响页面**"));
+  assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**影响页面**"));
+  assert(notification.content.indexOf("**影响页面**") < notification.content.indexOf("**本地信号**"));
+  assert(notification.content.indexOf("**本地信号**") < notification.content.indexOf("**AI 分析**"));
   assert.doesNotMatch(notification.content, /资源统计/);
   assert.doesNotMatch(notification.content, /完整资源 Diff/);
   assert.equal(notification.skipAi, false);
@@ -1167,7 +1168,7 @@ test("registry log extraction detects on-chain registered vault address", () => 
   assert.deepEqual(addresses, ["0x5418f7e8ff90354db0ecd48c8b710219244eb3c5"]);
   assert.match(content, /链上注册中心发现新金库 1 个/);
   assert.match(content, /注册中心:/);
-  assert.match(content, /后续确认/);
+  assert.match(content, /证据详情/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
   assert.match(content, /0x9e239cd0/);
 });
