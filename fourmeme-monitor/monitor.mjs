@@ -815,7 +815,7 @@ async function patchCardViaApi(messageId, title, content, template = "red", diff
  */
 async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, cardOpts = {}) {
   // 卡片最上方加入监控目标网址
-  const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
+  const urlLine = url ? `🔗 [查看详情](${url})\n\n` : "";
   // 1. 立即推送裸 diff（秒级送达）
   let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath, 2, cardOpts);
   if (!messageId) {
@@ -925,7 +925,7 @@ function shouldUseAiForNotification({ title = "", content = "", moduleContext = 
 
 async function sendNotificationMaybeAi({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, cardOpts = {}, skipAi = false }) {
   if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
-    const urlLine = url ? `🔗 [${url}](${url})\n\n` : "";
+    const urlLine = url ? `🔗 [查看详情](${url})\n\n` : "";
     let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath, 2, cardOpts || {});
     if (!messageId) {
       log(`[推送] AI 已跳过，立即通道失败，切换队列兜底：${title}`);
@@ -1422,12 +1422,73 @@ function formatValueChangeLine(label, oldValue, newValue, max = 180) {
   return `- ${diffSnippet(label, 120)}：${removedText(oldValue, max)} → ${addedText(newValue, max)}`;
 }
 
+function isEvmAddress(value) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(value || ""));
+}
+
+function formatLinkedLine(label, markdownLink) {
+  return `- ${diffSnippet(label, 120)}：${markdownLink}`;
+}
+
+function formatLinkedAddedLine(label, markdownLink) {
+  return `- ${addedText(label, 120)}：${markdownLink}`;
+}
+
+function formatLinkedRemovedLine(label, markdownLink) {
+  return `- ${removedText(label, 120)}：${markdownLink}`;
+}
+
+function shortAddress(value) {
+  const text = String(value || "");
+  return isEvmAddress(text) ? `${text.slice(0, 6)}...${text.slice(-4)}` : diffSnippet(text, 32);
+}
+
+function cardLink(label, url) {
+  return `[${diffSnippet(label, 60)}](${url})`;
+}
+
+function bscAddressLink(address, label = "") {
+  return cardLink(label || shortAddress(address), `https://bscscan.com/address/${address}`);
+}
+
+function formatAddressLine(label, address) {
+  return isEvmAddress(address)
+    ? formatLinkedLine(label, bscAddressLink(address))
+    : `- ${diffSnippet(label, 120)}：${diffSnippet(address)}`;
+}
+
+function formatAddressChangeLine(label, oldAddress, newAddress) {
+  if (isEvmAddress(oldAddress) && isEvmAddress(newAddress)) {
+    return `- ${diffSnippet(label, 120)}：${removedText(shortAddress(oldAddress))} → ${addedText(shortAddress(newAddress))}（${bscAddressLink(oldAddress, "旧地址")} / ${bscAddressLink(newAddress, "新地址")}）`;
+  }
+  return formatValueChangeLine(label, oldAddress, newAddress);
+}
+
+function addressWithMeta(address, meta = "") {
+  const link = isEvmAddress(address) ? bscAddressLink(address) : diffSnippet(address);
+  return meta ? `${link} ${diffSnippet(meta, 80)}` : link;
+}
+
+function bscTxLink(txHash, label = "查看交易") {
+  return cardLink(label, `https://bscscan.com/tx/${txHash}`);
+}
+
+function bscBlockLink(blockNumber, label = "") {
+  return cardLink(label || `区块 ${blockNumber}`, `https://bscscan.com/block/${blockNumber}`);
+}
+
+function pageLink(url, label = "") {
+  return cardLink(label || urlLabel(url), url);
+}
+
 function formatPoolChanges(changes) {
   const lines = [];
   for (const c of changes) {
     if (c.type === "新增底池") {
       lines.push(`**🟢 新增底池：${c.symbol}**`);
-      lines.push(formatAddedLine("地址", c.address));
+      lines.push(/^0x[a-fA-F0-9]{40}$/.test(String(c.address || ""))
+        ? formatLinkedAddedLine("地址", bscAddressLink(c.address))
+        : formatAddedLine("地址", c.address));
       lines.push(formatAddedLine("状态", c.status));
       // 输出所有 WATCH_FIELDS 中有值的字段，附带中文注释
       const d = c.details || {};
@@ -1451,7 +1512,9 @@ function formatPoolChanges(changes) {
       lines.push("---");
     } else if (c.type === "移除底池") {
       lines.push(`**🔴 移除底池：${c.symbol}**`);
-      lines.push(formatRemovedLine("地址", c.address));
+      lines.push(/^0x[a-fA-F0-9]{40}$/.test(String(c.address || ""))
+        ? formatLinkedRemovedLine("地址", bscAddressLink(c.address))
+        : formatRemovedLine("地址", c.address));
       if (c.details) {
         for (const f of ["buyFee", "sellFee", "b0Amount", "totalBAmount", "status"]) {
           if (c.details[f] !== undefined) lines.push(`${formatRemovedLine(f, c.details[f])}${annotateField(f) ? `  ← ${diffSnippet(annotateField(f))}` : ""}`);
@@ -3671,7 +3734,7 @@ function buildGlobalI18nResourceNotification(group) {
   ];
   if (pageCount > 0) {
     lines.push(`**关联页面：** ${pageCount} 个`);
-    for (const p of pages.slice(0, 20)) lines.push(`- ${p.label}${p.url ? `：${p.url}` : ""}`);
+    for (const p of pages.slice(0, 20)) lines.push(`- ${p.url ? pageLink(p.url, p.label) : diffSnippet(p.label)}`);
     if (pageCount > 20) lines.push(`- ... 还有 ${pageCount - 20} 个页面`);
     lines.push("");
   }
@@ -3755,7 +3818,7 @@ function buildFrontendNewPageNotification(page) {
   const routeCount = (page.routes || []).length;
   const lines = [
     `**页面：${label}**`,
-    `URL: ${page.originalUrl}`,
+    `链接：${pageLink(page.originalUrl, "查看页面")}`,
     "",
     "**类型：前端新路由发现**",
     `已抓取页面结构，但尚未加入前端监控池。请在卡片下方选择“加入监控”或“忽略”。`,
@@ -4765,7 +4828,7 @@ function buildMergedFrontendAssetNotification(group) {
   const lines = [];
   if (pageCount > 1) {
     lines.push(`**📄 影响页面：${pageCount} 个**`);
-    for (const p of pages) lines.push(`- ${p.label}${p.url ? `：${p.url}` : ""}`);
+    for (const p of pages) lines.push(`- ${p.url ? pageLink(p.url, p.label) : diffSnippet(p.label)}`);
     lines.push("");
   } else if (pages[0]) {
     lines.push(`**📄 ${pages[0].label}**`);
@@ -4922,7 +4985,7 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
     lines.push("");
     lines.push("影响页面:");
     for (const url of group.urls.slice(0, 12)) {
-      lines.push(`- ${urlLabel(url)} (${url})`);
+      lines.push(`- ${pageLink(url, urlLabel(url))}`);
     }
     if (group.urls.length > 12) lines.push(`- ... 还有 ${group.urls.length - 12} 个页面`);
     return {
@@ -6014,18 +6077,17 @@ function diffOpenFourModules(oldState, newState) {
 
 function formatOpenFourNewModules(newModules, context = {}) {
   const lines = [];
-  lines.push(`**Registry：** [${CONFIG.contracts.openFourRegistry}](https://bscscan.com/address/${CONFIG.contracts.openFourRegistry})`);
+  lines.push(`**Registry：** ${bscAddressLink(CONFIG.contracts.openFourRegistry)}`);
   lines.push(`**新增模块实现：** ${newModules.length} 个`);
   if (context.reason) lines.push(`**触发：** ${context.reason}`);
-  if (context.blockNumber) lines.push(`**区块：** [${context.blockNumber}](https://bscscan.com/block/${context.blockNumber})`);
-  if (context.txHash) lines.push(`**交易：** [${context.txHash.slice(0, 10)}...](https://bscscan.com/tx/${context.txHash})`);
+  if (context.blockNumber) lines.push(`**区块：** ${bscBlockLink(context.blockNumber)}`);
+  if (context.txHash) lines.push(`**交易：** ${bscTxLink(context.txHash)}`);
   lines.push("---");
 
   for (const item of newModules) {
-    lines.push(`**${item.address}**`);
+    lines.push(`**${bscAddressLink(item.address)}**`);
     lines.push(formatAddedLine("roles", item.roles.join(", ") || "unknown"));
     lines.push(formatAddedLine("presetIds", item.presetIds.join(", ") || "unknown"));
-    lines.push(`[BscScan](https://bscscan.com/address/${item.address})`);
     lines.push("---");
   }
 
@@ -6208,6 +6270,22 @@ function formatGithubRepoChanges(changes) {
   return lines.join("\n");
 }
 
+function formatPatchPreviewLines(patch, maxLines = 8) {
+  const preview = [];
+  for (const raw of String(patch || "").split(/\r?\n/)) {
+    if (preview.length >= maxLines) break;
+    if (!raw || raw.startsWith("+++") || raw.startsWith("---")) continue;
+    if (raw.startsWith("@@")) {
+      preview.push(`- ${changedText(raw, 160)}`);
+    } else if (raw.startsWith("+")) {
+      preview.push(formatAddedLine(raw.slice(1).trim() || "+", "", 160));
+    } else if (raw.startsWith("-")) {
+      preview.push(formatRemovedLine(raw.slice(1).trim() || "-", "", 160));
+    }
+  }
+  return preview;
+}
+
 function formatGithubChanges(newCommits) {
   const lines = [];
   lines.push(`**仓库：** [${CONFIG.githubRepo}](https://github.com/${CONFIG.githubRepo})`);
@@ -6255,20 +6333,18 @@ function formatGithubChanges(newCommits) {
         .sort((a, b) => (b.additions + b.deletions) - (a.additions + a.deletions));
       if (patchFiles.length > 0) {
         lines.push("");
-        lines.push("**代码变更摘要：**");
-        let patchBudget = 6000; // 卡片内展示摘要；完整 patch 另存为 diff 文件
-        for (const f of patchFiles.slice(0, 5)) {
-          if (patchBudget <= 0) break;
-          const patch = f.patch.length > patchBudget
-            ? f.patch.slice(0, patchBudget) + "\n... (patch 已截断)"
-            : f.patch;
-          patchBudget -= patch.length;
+        lines.push("**关键改动预览：**");
+        let previewBudget = 18;
+        for (const f of patchFiles.slice(0, 4)) {
+          if (previewBudget <= 0) break;
+          const preview = formatPatchPreviewLines(f.patch, Math.min(6, previewBudget));
+          if (preview.length === 0) continue;
           lines.push(`\`${f.filename}\``);
-          lines.push("```diff");
-          lines.push(patch);
-          lines.push("```");
+          lines.push(...preview);
+          previewBudget -= preview.length;
         }
-        if (patchFiles.length > 5) lines.push(`... 还有 ${patchFiles.length - 5} 个文件有代码变更`);
+        if (patchFiles.length > 4) lines.push(`... 还有 ${patchFiles.length - 4} 个文件有代码变更`);
+        lines.push("完整 diff 已作为附件归档。");
       }
     } else {
       lines.push("  文件详情：未获取到 commit detail，已在日志记录失败原因。");
@@ -6908,20 +6984,20 @@ function formatContractChanges(changes) {
   for (const c of changes) {
     lines.push(`**🔧 ${c.type}：${c.label}**`);
     if (c.oldAddress) {
-      lines.push(formatValueChangeLine("address", c.oldAddress, c.address));
+      lines.push(formatAddressChangeLine("address", c.oldAddress, c.address));
     } else {
-      lines.push(`- address: ${diffSnippet(c.address)}`);
+      lines.push(formatAddressLine("address", c.address));
     }
     if (c.source) lines.push(`- source: ${diffSnippet(c.source)}`);
     if (c.discoveredVia) lines.push(`- via: ${diffSnippet(c.discoveredVia)}`);
     if (c.oldRelation && c.relation) {
-      lines.push(formatValueChangeLine(c.relationField, c.oldRelation, c.relation));
+      lines.push(formatAddressChangeLine(c.relationField, c.oldRelation, c.relation));
     }
-    if (c.linkedRegistry) lines.push(`- linkedRegistry: ${diffSnippet(c.linkedRegistry)}`);
-    if (c.linkedCore) lines.push(`- linkedCore: ${diffSnippet(c.linkedCore)}`);
-    if (c.linkedFeeRouter) lines.push(`- linkedFeeRouter: ${diffSnippet(c.linkedFeeRouter)}`);
+    if (c.linkedRegistry) lines.push(formatAddressLine("linkedRegistry", c.linkedRegistry));
+    if (c.linkedCore) lines.push(formatAddressLine("linkedCore", c.linkedCore));
+    if (c.linkedFeeRouter) lines.push(formatAddressLine("linkedFeeRouter", c.linkedFeeRouter));
     if (c.oldHash && c.newHash) lines.push(formatValueChangeLine("codeHash", c.oldHash, c.newHash));
-    if (c.oldImpl && c.newImpl) lines.push(formatValueChangeLine("impl", c.oldImpl, c.newImpl));
+    if (c.oldImpl && c.newImpl) lines.push(formatAddressChangeLine("impl", c.oldImpl, c.newImpl));
     if (c.oldSize !== undefined && c.newSize !== undefined) {
       const delta = c.newSize - c.oldSize;
       const sign = delta > 0 ? "+" : "";
@@ -7037,26 +7113,23 @@ function formatOnchainChanges(changes) {
       lines.push("---");
     } else if (c.type === "新增 Agent NFT 合约") {
       lines.push(`**🤖 ${c.type}（${c.addresses.length} 个）**`);
-      for (const addr of c.addresses) {
-        lines.push(formatAddedLine(addr, ""));
-      }
-      lines.push("**BSCscan 链接：**");
       for (const addr of c.addresses.slice(0, 10)) {
-        lines.push(`  [${addr.slice(0, 10)}...](https://bscscan.com/address/${addr})`);
+        lines.push(isEvmAddress(addr)
+          ? formatLinkedAddedLine("合约", bscAddressLink(addr))
+          : formatAddedLine("合约", addr));
       }
       if (c.addresses.length > 10) lines.push(`  ... 还有 ${c.addresses.length - 10} 个`);
-      lines.push(`\n说明：这些地址是新注册到 AgentIdentifier(${CONFIG.contracts.agentIdentifier}) 中的 Agent NFT 合约。每个 NFT 合约通常对应一个具有 AI Agent 属性的 Meme 代币项目。`);
+      lines.push(`说明：这些地址是新注册到 ${bscAddressLink(CONFIG.contracts.agentIdentifier, "AgentIdentifier")} 中的 Agent NFT 合约。每个 NFT 合约通常对应一个具有 AI Agent 属性的 Meme 代币项目。`);
       lines.push("---");
     } else if (c.type === "移除 Agent NFT 合约") {
       lines.push(`**🤖 ${c.type}（${c.addresses.length} 个）**`);
-      for (const addr of c.addresses) {
-        lines.push(formatRemovedLine(addr, ""));
-      }
-      lines.push("**BSCscan 链接：**");
       for (const addr of c.addresses.slice(0, 10)) {
-        lines.push(`  [${addr.slice(0, 10)}...](https://bscscan.com/address/${addr})`);
+        lines.push(isEvmAddress(addr)
+          ? formatLinkedRemovedLine("合约", bscAddressLink(addr))
+          : formatRemovedLine("合约", addr));
       }
-      lines.push(`\n说明：这些 Agent NFT 合约已从 AgentIdentifier 中移除，相关 AI Agent 代币可能已停止运营或迁移到新合约。`);
+      if (c.addresses.length > 10) lines.push(`  ... 还有 ${c.addresses.length - 10} 个`);
+      lines.push(`说明：这些 Agent NFT 合约已从 ${bscAddressLink(CONFIG.contracts.agentIdentifier, "AgentIdentifier")} 中移除，相关 AI Agent 代币可能已停止运营或迁移到新合约。`);
       lines.push("---");
     }
   }
@@ -7623,18 +7696,19 @@ function formatActorActions(actions) {
   const lines = [];
   for (const a of actions.slice(0, 12)) {
     lines.push(`**${riskIcon[a.risk] || "⚠️"} ${riskLabel[a.risk] || "未知风险"}：${a.method || "已监听地址交易"}**`);
-    lines.push(`- 区块: ${diffSnippet(a.blockNumber)}`);
-    lines.push(`- 发起地址: ${diffSnippet(a.from)}`);
+    lines.push(`- 区块: ${bscBlockLink(a.blockNumber)}`);
+    lines.push(formatLinkedLine("发起地址", addressWithMeta(a.from)));
     if (a.fromActor) lines.push(`- 角色: ${diffSnippet(`${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`)}`);
-    if (a.to) lines.push(`- 目标地址: ${diffSnippet(`${a.to}${a.toContract ? ` (${a.toContract.labels.join("/")})` : ""}`)}`);
+    if (a.to) lines.push(formatLinkedLine("目标地址", addressWithMeta(a.to, a.toContract ? `(${a.toContract.labels.join("/")})` : "")));
     if (a.selector) lines.push(`- 函数选择器: ${diffSnippet(a.selector)}`);
-    if (a.safeTarget) lines.push(`- 内部目标: ${diffSnippet(`${a.safeTarget}${a.safeTargetLabel ? ` (${a.safeTargetLabel})` : ""}`)}`);
+    if (a.safeTarget) lines.push(formatLinkedLine("内部目标", addressWithMeta(a.safeTarget, a.safeTargetLabel ? `(${a.safeTargetLabel})` : "")));
     if (a.safeSelector) lines.push(`- 内部选择器: ${diffSnippet(`${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`)}`);
-    if (a.contractAddress) lines.push(formatAddedLine("新合约", a.contractAddress));
+    if (a.contractAddress) lines.push(isEvmAddress(a.contractAddress)
+      ? formatLinkedAddedLine("新合约", bscAddressLink(a.contractAddress))
+      : formatAddedLine("新合约", a.contractAddress));
     if (a.status) lines.push(`- 状态: ${diffSnippet(a.status === "0x1" ? "成功" : a.status)}`);
     lines.push(`- 原因: ${diffSnippet(a.reason)}`);
-    lines.push(`[交易链接](https://bscscan.com/tx/${a.hash})`);
-    if (a.contractAddress) lines.push(`[新合约](https://bscscan.com/address/${a.contractAddress})`);
+    lines.push(`- 交易: ${bscTxLink(a.hash)}`);
     lines.push("---");
   }
   if (actions.length > 12) lines.push(`还有 ${actions.length - 12} 条动作未展开。`);
@@ -9096,7 +9170,7 @@ function buildStartupReadyContent() {
     `**前端监控:** ${pageCount} 个页面（固定入口 ${entryPageCount}，路由发现页面纳入同一监控池）— 每 ${CONFIG.intervals.frontend / 1000}s`,
     `  含 __NEXT_DATA__ / i18n / 路由与端点发现 / 新页面同层纳入`,
     `  HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)} / 资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)} / 资源小抖动 ${CONFIG.frontendAssetJitter.quickConfirmDelayMs}ms 快速复抓确认`,
-    `  ${getFrontendMonitorUrls().map(u => "- " + u).join("\n  ")}`,
+    `  固定入口 ${entryPageCount} 个，当前监控池 ${pageCount} 个；完整列表可通过 fm-status 查看`,
     `**API监控:** ${Object.keys(snapshot?.apiStructure || {}).length} 个端点（结构+值） — 每 ${CONFIG.intervals.api / 1000}s`,
     `**OpenFour模板:** ${openFourTemplateCount} 个业务模板（新增/状态变化）— 每 ${CONFIG.intervals.openfourTemplates / 1000}s`,
     `**OpenFour模块:** ${openFourModuleCount} 个实现地址 — Registry logs ${CONFIG.openFourRegistryLogMonitor.enabled ? "实时触发" : "关闭"}`,
@@ -9439,12 +9513,15 @@ export const __testables = {
   formatApiValueChanges,
   formatFrontendSignalChanges,
   formatOpenFourTemplateChanges,
+  formatOpenFourNewModules,
   formatGithubRepoChanges,
+  formatGithubChanges,
   formatI18nChangesForFullDiff,
   formatI18nChanges,
   formatRouteChanges,
   formatContractChanges,
   formatOnchainChanges,
+  formatActorActions,
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,
   diffRoutes,

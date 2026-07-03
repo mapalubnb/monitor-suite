@@ -19,6 +19,8 @@ test("startup card copy reflects active frontend and api cadences", () => {
   assert.match(progress, /API监控:[\s\S]*每 15s/);
   assert.match(ready, /前端监控:[\s\S]*每 10s/);
   assert.match(ready, /API监控:[\s\S]*每 15s/);
+  assert.doesNotMatch(ready, /- https:\/\/four\.meme/);
+  assert.match(ready, /完整列表可通过 fm-status 查看/);
 });
 
 test("canonicalFrontendUrl normalizes tracking params, hash, query order, and trailing slash", () => {
@@ -443,6 +445,24 @@ test("fourmeme diff cards use inline red-green highlights without scroll blocks"
       { type: "新增 Agent NFT 合约", addresses: ["0x0000000000000000000000000000000000000001"] },
       { type: "移除 Agent NFT 合约", addresses: ["0x0000000000000000000000000000000000000002"] },
     ]),
+    __testables.formatGithubChanges([
+      {
+        sha: "1234567890abcdef",
+        commit: {
+          author: { name: "dev", date: "2026-06-27T00:00:00Z" },
+          message: "更新文案",
+        },
+        files: [
+          {
+            filename: "src/page.tsx",
+            status: "modified",
+            additions: 1,
+            deletions: 1,
+            patch: "@@ -1 +1 @@\n-old copy\n+new copy",
+          },
+        ],
+      },
+    ]),
   ];
 
   for (const content of samples) {
@@ -450,6 +470,57 @@ test("fourmeme diff cards use inline red-green highlights without scroll blocks"
   }
   assert(samples.some(content => content.includes('<font color="green">')));
   assert(samples.some(content => content.includes('<font color="red">')));
+});
+
+test("fourmeme cards render long urls and addresses as concise links", () => {
+  const failure = __testables.buildFrontendFailureNotifications([
+    "https://four.meme/en/announcement",
+  ], {
+    _frontendFailCounts: {
+      [__testables.urlToKey("https://four.meme/en/announcement")]: {
+        count: 3,
+        reason: "http_500",
+        message: "HTTP 500",
+      },
+    },
+  })[0];
+  assert.match(failure.content, /\[\/en\/announcement\]\(https:\/\/four\.meme\/en\/announcement\)/);
+  assert.doesNotMatch(failure.content, /- https:\/\/four\.meme/);
+
+  const moduleCard = __testables.formatOpenFourNewModules([
+    { address: "0x0000000000000000000000000000000000000001", roles: ["swap"], presetIds: ["1"] },
+  ], { blockNumber: 123, txHash: "0xabcdef" });
+  assert.match(moduleCard, /\[0x0000\.\.\.0001\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000001\)/);
+  assert.doesNotMatch(moduleCard, /\*\*0x0000000000000000000000000000000000000001\*\*/);
+
+  const contractCard = __testables.formatContractChanges([
+    {
+      type: "合约地址变化",
+      label: "TokenManager",
+      oldAddress: "0x0000000000000000000000000000000000000001",
+      address: "0x0000000000000000000000000000000000000002",
+      oldImpl: "0x0000000000000000000000000000000000000003",
+      newImpl: "0x0000000000000000000000000000000000000004",
+    },
+  ]);
+  assert.match(contractCard, /\[旧地址\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000001\)/);
+  assert.match(contractCard, /\[新地址\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000002\)/);
+
+  const actorCard = __testables.formatActorActions([
+    {
+      risk: "high",
+      method: "create",
+      blockNumber: 123,
+      from: "0x0000000000000000000000000000000000000001",
+      to: "0x0000000000000000000000000000000000000002",
+      contractAddress: "0x0000000000000000000000000000000000000003",
+      status: "0x1",
+      reason: "test",
+      hash: "0xabc",
+    },
+  ]);
+  assert.match(actorCard, /\[0x0000\.\.\.0001\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000001\)/);
+  assert.match(actorCard, /\[查看交易\]\(https:\/\/bscscan\.com\/tx\/0xabc\)/);
 });
 
 test("small i18n remove-only changes require consecutive confirmation", () => {
