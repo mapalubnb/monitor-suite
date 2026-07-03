@@ -61,6 +61,19 @@ const CONFIG = {
     minAssetFiles: 2,
   },
   assetStringLimit: 300,
+  bscRpcUrls: (process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com,https://bsc-dataseed.binance.org/")
+    .split(",").map(s => s.trim()).filter(Boolean),
+  registryMonitor: {
+    enabled: process.env.FLAP_REGISTRY_MONITOR !== "false",
+    address: (process.env.FLAP_REGISTRY_ADDRESS || "0x90497450f2a706f1951b5bdda52b4e5d16f34c06").toLowerCase(),
+    confirmations: Number.parseInt(process.env.FLAP_REGISTRY_CONFIRMATIONS || "5", 10),
+    bootstrapLookbackBlocks: Number.parseInt(process.env.FLAP_REGISTRY_BOOTSTRAP_LOOKBACK_BLOCKS || "20", 10),
+    maxBlocksPerRun: Number.parseInt(process.env.FLAP_REGISTRY_MAX_BLOCKS_PER_RUN || "3000", 10),
+    watchedEventTopics: new Set([
+      "0xd8cf270eb9827992a063745f0afaa72431f8c63fc46736f8b484862dcc709787",
+      "0x566b7414cab715cde3c8bcc93daec35325367d6c648327d19a1867d1006af3b3",
+    ]),
+  },
 
   // 心跳推送开关；默认关闭，只影响周期性状态心跳，不影响页面变更/异常告警
   heartbeatEnabled: process.env.HEARTBEAT_ENABLED === "true",
@@ -684,7 +697,7 @@ function emptyFlapChangeMeta() {
 }
 
 /* ── 快照读写 ── */
-const CURRENT_SCHEMA_VERSION = 5;
+const CURRENT_SCHEMA_VERSION = 6;
 const CA_STORE_VAULT_SCHEMA_VERSION = 2;
 
 function loadSnapshot() {
@@ -723,6 +736,8 @@ function migrateSnapshot(data) {
   if (ver < 5) {
     log("[快照迁移] v4 → v5：CAstore 金库实例保留重复项");
   }
+  if (ver < 6) log("[快照迁移] v5 → v6：新增 Flap 注册中心链上监控字段");
+  if (!data.registryMonitor) data.registryMonitor = {};
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
 }
@@ -2353,6 +2368,172 @@ async function fetchPage(url) {
 /**
  * 从 JS/CSS 文件内容中提取有意义的字符串（用于内容级 diff）
  */
+function normalizeAddress(value) {
+  const m = String(value || "").match(/0x[a-fA-F0-9]{40}/);
+  return m ? m[0].toLowerCase() : "";
+}
+
+function hexToNumber(value) {
+  if (!value) return 0;
+  return Number.parseInt(String(value), 16);
+}
+
+function numberToHex(value) {
+  return `0x${Math.max(0, Number(value) || 0).toString(16)}`;
+}
+
+async function bscRpcCall(method, params = []) {
+  let lastErr = null;
+  for (const rpcUrl of CONFIG.bscRpcUrls) {
+    try {
+      const res = await fetchSafe(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      });
+      const json = await res.json();
+      if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
+      return json.result;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("所有 BSC RPC 节点均不可用");
+}
+
+async function bscRpcBatch(calls = []) {
+  if (calls.length === 0) return [];
+  if (calls.length === 1) return [await bscRpcCall(calls[0].method, calls[0].params)];
+  let lastErr = null;
+  const payload = calls.map((call, i) => ({ jsonrpc: "2.0", id: i + 1, method: call.method, params: call.params || [] }));
+  for (const rpcUrl of CONFIG.bscRpcUrls) {
+    try {
+      const res = await fetchSafe(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const json = await res.json();
+      if (!Array.isArray(json)) throw new Error("Batch RPC 返回非数组");
+      const byId = new Map(json.map(item => [item.id, item]));
+      return payload.map(item => {
+        const r = byId.get(item.id);
+        if (!r || r.error) return null;
+        return r.result;
+      });
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new Error("所有 BSC RPC 节点 batch 均不可用");
+}
+
+function extractRegistryVaultAddressesFromLog(logEntry) {
+  const registry = CONFIG.registryMonitor.address;
+  if (normalizeAddress(logEntry?.address) !== registry) return [];
+  const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
+  if (CONFIG.registryMonitor.watchedEventTopics.size > 0 && !CONFIG.registryMonitor.watchedEventTopics.has(topic0)) return [];
+  const data = String(logEntry?.data || "");
+  const found = [];
+  for (const m of data.matchAll(/000000000000000000000000([a-fA-F0-9]{40})/g)) {
+    const addr = `0x${m[1]}`.toLowerCase();
+    if (addr !== "0x0000000000000000000000000000000000000000"
+      && !/^0x0{24,}/.test(addr)) {
+      found.push(addr);
+    }
+  }
+  return uniqueStrings(found);
+}
+
+async function filterContractAddresses(addresses) {
+  const unique = uniqueStrings(addresses.map(normalizeAddress).filter(Boolean));
+  if (unique.length === 0) return [];
+  const codes = await bscRpcBatch(unique.map(addr => ({ method: "eth_getCode", params: [addr, "latest"] })));
+  return unique.filter((addr, i) => codes[i] && codes[i] !== "0x");
+}
+
+function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
+  const lines = [
+    "**结论摘要**",
+    `- 链上注册中心发现新金库 ${events.length} 个`,
+    `- 扫描区块: ${fromBlock} → ${toBlock}`,
+    "",
+    "**🆕 链上新金库注册:**",
+  ];
+  for (const event of events) {
+    lines.push(`- \`${event.vault}\``);
+    lines.push(`  交易: [${event.txHash.slice(0, 10)}...](https://bscscan.com/tx/${event.txHash})`);
+    lines.push(`  区块: [${event.blockNumber}](https://bscscan.com/block/${event.blockNumber})`);
+    lines.push(`  注册中心: [${CONFIG.registryMonitor.address}](https://bscscan.com/address/${CONFIG.registryMonitor.address})`);
+    lines.push("  状态: 链上已注册，等待/对照前端 vaultTypes 与 CAStore 展示确认");
+  }
+  return lines.join("\n");
+}
+
+async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, titlePrefix = "" } = {}) {
+  if (!CONFIG.registryMonitor.enabled) return { changed: false, sent: false };
+  const state = snapshot.registryMonitor || (snapshot.registryMonitor = {});
+  const latest = hexToNumber(await bscRpcCall("eth_blockNumber", []));
+  const safeLatest = Math.max(0, latest - CONFIG.registryMonitor.confirmations);
+  state.latestBlock = latest;
+  state.safeLatestBlock = safeLatest;
+
+  if (!state.lastBlock) {
+    state.lastBlock = Math.max(0, safeLatest - CONFIG.registryMonitor.bootstrapLookbackBlocks);
+    state.knownVaults = state.knownVaults || {};
+    log(`[Flap 注册中心] 初始化区块游标：${state.lastBlock}（确认块=${safeLatest}）`);
+    return { changed: true, sent: false, initialized: true };
+  }
+  if (state.lastBlock >= safeLatest) return { changed: false, sent: false };
+
+  const fromBlock = state.lastBlock + 1;
+  const toBlock = Math.min(safeLatest, state.lastBlock + CONFIG.registryMonitor.maxBlocksPerRun);
+  const logs = await bscRpcCall("eth_getLogs", [{
+    address: CONFIG.registryMonitor.address,
+    fromBlock: numberToHex(fromBlock),
+    toBlock: numberToHex(toBlock),
+  }]);
+
+  const candidates = [];
+  for (const item of logs || []) {
+    for (const addr of extractRegistryVaultAddressesFromLog(item)) {
+      candidates.push({
+        vault: addr,
+        txHash: String(item.transactionHash || "").toLowerCase(),
+        blockNumber: hexToNumber(item.blockNumber),
+        logIndex: hexToNumber(item.logIndex),
+        topic0: String(item.topics?.[0] || "").toLowerCase(),
+      });
+    }
+  }
+
+  const contractSet = new Set(await filterContractAddresses(candidates.map(c => c.vault)));
+  state.knownVaults = state.knownVaults || {};
+  const newEvents = [];
+  for (const event of candidates) {
+    if (!contractSet.has(event.vault)) continue;
+    if (state.knownVaults[event.vault]) continue;
+    state.knownVaults[event.vault] = {
+      firstSeenAt: ts(),
+      txHash: event.txHash,
+      blockNumber: event.blockNumber,
+      topic0: event.topic0,
+    };
+    newEvents.push(event);
+  }
+
+  state.lastBlock = toBlock;
+  state.lastBlockAt = ts();
+  state.lagBlocks = Math.max(0, safeLatest - state.lastBlock);
+  if (newEvents.length === 0) return { changed: true, sent: false, events: [] };
+
+  const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
+  const title = `${titlePrefix}Flap 链上金库注册变更`;
+  const messageId = await sendCardFn(title, content, "red");
+  if (messageId) await pinMessage(messageId);
+  return { changed: true, sent: Boolean(messageId), events: newEvents };
+}
+
 function extractStrings(content, ext) {
   const strings = new Set();
   if (ext === "js") {
@@ -4556,6 +4737,13 @@ async function runCheck() {
   });
   if (vfResult.changed) hasDetectedChange = true;
   if (vfResult.sent) hasNotifiedChange = true;
+  try {
+    const registryResult = await checkFlapRegistryLogs(snapshot, { titlePrefix: "手动检测 — " });
+    if (registryResult.changed) hasDetectedChange = true;
+    if (registryResult.sent) hasNotifiedChange = true;
+  } catch (err) {
+    log(`[Flap 注册中心] 手动检测失败：${err.message}`);
+  }
 
   for (const n of coalesceFlapNotifications(notifications, { titlePrefix: "手动检测 — " })) {
     for (const diff of getStandaloneCaStoreVaultDiffs(n)) {
@@ -4857,6 +5045,12 @@ async function startMonitor() {
       }
 
       await sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries });
+      try {
+        const registryResult = await checkFlapRegistryLogs(snapshot);
+        if (registryResult.changed) saveSnapshot(snapshot);
+      } catch (err) {
+        log(`[Flap 注册中心] 检测失败：${err.message}`);
+      }
 
       const notificationsToSend = coalesceFlapNotifications(notifications);
       if (notificationsToSend.length > 0) {
@@ -5072,6 +5266,9 @@ export const __testables = {
   getStandaloneCaStoreVaultDiffs,
   shouldSuppressCaStoreOnlyPageNotification,
   omitStandaloneCaStoreVaultDiffs,
+  normalizeAddress,
+  extractRegistryVaultAddressesFromLog,
+  buildRegistryMonitorContent,
   parseWebpackExportAliases,
   extractVaultFactories,
   factoryListToMap,

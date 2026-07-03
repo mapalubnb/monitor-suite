@@ -1147,6 +1147,29 @@ test("vault factory extraction resolves webpack aliases for visible CAStore vaul
   assert.match(content, /showInCAStore/);
 });
 
+test("registry log extraction detects on-chain registered vault address", () => {
+  const log = {
+    address: "0x90497450f2a706f1951b5bdda52b4e5d16f34c06",
+    topics: ["0xd8cf270eb9827992a063745f0afaa72431f8c63fc46736f8b484862dcc709787"],
+    data: "0x0000000000000000000000005418f7e8ff90354db0ecd48c8b710219244eb3c50000000000000000000000000000000000000000000000000000000000000001",
+    blockNumber: "0x66c7754",
+    transactionHash: "0x9e239cd0483e66d8f077f786fd5bfdee4036e838c0dedf680f63eabbd2614e68",
+  };
+
+  const addresses = __testables.extractRegistryVaultAddressesFromLog(log);
+  const content = __testables.buildRegistryMonitorContent([{
+    vault: addresses[0],
+    txHash: log.transactionHash,
+    blockNumber: Number.parseInt(log.blockNumber, 16),
+    topic0: log.topics[0],
+  }], { fromBlock: 107771732, toBlock: 107771732 });
+
+  assert.deepEqual(addresses, ["0x5418f7e8ff90354db0ecd48c8b710219244eb3c5"]);
+  assert.match(content, /链上注册中心发现新金库 1 个/);
+  assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
+  assert.match(content, /0x9e239cd0/);
+});
+
 test("operational notice card is readable and action oriented", () => {
   const content = __testables.buildOperationalNoticeContent({
     status: "页面请求失败",
