@@ -318,14 +318,10 @@ test("Flap asset extraction explains SVG paths Tailwind utilities and style pseu
     [],
   );
 
-  assert.match(content, /UI\/样式信号/);
-  assert.match(content, /禁用态交互/);
-  assert.match(content, /图标\/矢量/);
-  assert.match(content, /响应式布局/);
-  assert.match(content, /组件样式变量/);
-  assert.match(content, /范围：/);
-  assert.match(content, /顶部导航\/下拉菜单|代币创建表单控件|弹窗\/下拉层\/滚动区/);
-  assert.match(content, /意图判断/);
+  assert.doesNotMatch(content, /UI\/样式信号/);
+  assert.doesNotMatch(content, /禁用态交互|图标\/矢量|响应式布局|组件样式变量/);
+  assert.match(content, /完整资源\/UI\/实现信号见 Diff 详情/);
+  assert.doesNotMatch(content, /意图判断/);
   assert.doesNotMatch(content, /M7 0\.583984/);
   assert.doesNotMatch(content, /absolute bottom-2/);
   assert.doesNotMatch(content, /disabled:pointer-events-none/);
@@ -387,8 +383,8 @@ test("minified code fragments are folded into intent signals instead of readable
   assert.equal(meta.assetStats.jsTextDiffs[0].text, "you can still view its tax info while indexing.");
   assert(meta.assetStats.codeIntentDiffs.length > 0);
   assert.deepEqual(meta.assetStats.configDiffs.filter(d => d.field === "swapOpacity"), []);
-  assert.match(content, /实现意图信号/);
-  assert.match(content, /税费\/税务信息|Vault\/金库判定|分红参数|安全\/富文本白名单/);
+  assert.doesNotMatch(content, /实现意图信号/);
+  assert.doesNotMatch(content, /税费\/税务信息|Vault\/金库判定|分红参数|安全\/富文本白名单/);
   assert.match(content, /you can still view its tax info while indexing\./);
   assert.doesNotMatch(payload, /generateAbstractMask/);
   assert.doesNotMatch(content, /USE_PROFILES|showTaxInfo&&o|dividendBps,Z|!==e\.toLowerCase|generateAbstractMask/);
@@ -533,11 +529,11 @@ test("same Flap business change coalesces even when page chunks and UI impact di
   assert.equal(grouped[0].snapshotUpdates.length, 3);
   assert.match(grouped[0].content, /影响页面: 3 个/);
   assert.match(grouped[0].content, /功能文案 2 处/);
-  assert.match(grouped[0].content, /实现意图信号 2 处/);
-  assert.match(grouped[0].content, /UI\/样式信号 8 处/);
+  assert.doesNotMatch(grouped[0].content, /实现意图信号/);
+  assert.doesNotMatch(grouped[0].content, /UI\/样式信号/);
   assert.match(grouped[0].content, /DiamondPulse Tail-Cut Vault/);
   assert.match(grouped[0].content, /you can still view its fee info while indexing/);
-  assert.match(grouped[0].content, /钱包连接控件/);
+  assert.doesNotMatch(grouped[0].content, /钱包连接控件/);
   assert.doesNotMatch(grouped[0].title, /重点变更/);
 });
 
@@ -593,9 +589,10 @@ test("shared minified implementation signals are coalesced without raw code in t
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.equal(grouped[0].url, "https://flap.sh");
-  assert.match(grouped[0].content, /实现意图信号/);
-  assert.match(grouped[0].content, /税费\/税务信息/);
-  assert.match(grouped[0].content, /分红参数/);
+  assert.doesNotMatch(grouped[0].content, /实现意图信号/);
+  assert.doesNotMatch(grouped[0].content, /税费\/税务信息/);
+  assert.doesNotMatch(grouped[0].content, /分红参数/);
+  assert.match(grouped[0].content, /完整资源\/UI\/实现信号见 Diff 详情/);
   assert.doesNotMatch(grouped[0].content, /showTaxInfo&&o|dividendBps,Z|function\(|generateAbstractMask/);
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
@@ -644,12 +641,9 @@ test("shared UI style signals coalesce into one explanatory site-wide notificati
 
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
-  assert.match(grouped[0].content, /UI\/样式信号 2 处/);
-  assert.match(grouped[0].content, /未发现明确业务配置变化/);
-  assert.match(grouped[0].content, /禁用态交互/);
-  assert.match(grouped[0].content, /钱包连接控件/);
-  assert.match(grouped[0].content, /顶部导航\/下拉菜单/);
-  assert.match(grouped[0].content, /调整禁用状态下的点击或交互反馈/);
+  assert.doesNotMatch(grouped[0].content, /UI\/样式信号/);
+  assert.doesNotMatch(grouped[0].content, /禁用态交互|钱包连接控件|顶部导航\/下拉菜单/);
+  assert.match(grouped[0].content, /完整资源\/UI\/实现信号见 Diff 详情/);
   assert.equal(grouped[0].snapshotUpdates.length, 2);
 });
 
@@ -1004,8 +998,8 @@ test("site-wide asset card leads with no business-change conclusion", () => {
 
   assert(notification.content.startsWith("**📌 结论摘要**"));
   assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**🌐 影响页面**"));
-  assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**🔎 本地信号**"));
-  assert(notification.content.indexOf("**🔎 本地信号**") < notification.content.indexOf("**🤖 AI 分析**"));
+  assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**🔎 重点变更**"));
+  assert(notification.content.indexOf("**🔎 重点变更**") < notification.content.indexOf("**🤖 AI 分析**"));
   assert.doesNotMatch(notification.content, /\n- \[\/bnb\/CAstore\]/);
   assert.doesNotMatch(notification.content, /资源统计/);
   assert.doesNotMatch(notification.content, /完整资源 Diff/);
@@ -1061,9 +1055,10 @@ test("site-wide asset card summarizes runtime resources without raw webpack frag
     },
   ]);
 
-  assert.match(notification.content, /资源范围/);
-  assert.match(notification.content, /runtime/);
-  assert.match(notification.content, /共享 chunk/);
+  assert.doesNotMatch(notification.content, /资源范围/);
+  assert.doesNotMatch(notification.content, /runtime/);
+  assert.doesNotMatch(notification.content, /共享 chunk/);
+  assert.match(notification.content, /完整资源\/UI\/实现信号见 Diff 详情/);
   assert.doesNotMatch(notification.content, /trustedTypes|t=0;t/);
   assert.doesNotMatch(notification.content, /!=typeof/);
 });
@@ -1169,9 +1164,13 @@ test("registry log extraction detects on-chain registered vault address", () => 
   assert.deepEqual(addresses, ["0x5418f7e8ff90354db0ecd48c8b710219244eb3c5"]);
   assert.match(content, /链上注册中心发现新金库 1 个/);
   assert.match(content, /注册中心:/);
-  assert.match(content, /证据详情/);
+  assert.doesNotMatch(content, /证据详情/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
   assert.match(content, /0x9e239cd0/);
+  assert.equal(
+    __testables.buildVaultFactoryLaunchUrl(addresses[0]),
+    "https://flap.sh/launch?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&lang=zh",
+  );
 });
 
 test("operational notice card is readable and action oriented", () => {

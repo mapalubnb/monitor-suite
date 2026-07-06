@@ -1520,11 +1520,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   const intentSummary = buildResourceIntentSummary({ configDiffs, vaultDiffs, jsTextDiffs, uiStyleDiffs, codeIntentDiffs });
   const uiSignalLines = buildUiStyleSignalLines(intentSummary.uiSignals);
   const codeIntentLines = buildCodeIntentSignalLines(intentSummary.codeSignals);
-  const compactUiSignalLines = uiSignalLines.slice(0, 6);
-  if (uiSignalLines.length > compactUiSignalLines.length) compactUiSignalLines.push(`- 还有 ${uiSignalLines.length - compactUiSignalLines.length} 类 UI/样式信号，见 Diff 详情`);
-  const compactCodeIntentLines = codeIntentLines.slice(0, 6);
-  if (codeIntentLines.length > compactCodeIntentLines.length) compactCodeIntentLines.push(`- 还有 ${codeIntentLines.length - compactCodeIntentLines.length} 类实现意图信号，见 Diff 详情`);
-  const hasLocalSignals = hasBusinessResourceDiffs || compactUiSignalLines.length > 0 || compactCodeIntentLines.length > 0;
+  const hasCardSignals = hasBusinessResourceDiffs;
   const assetStats = {
     unchanged: maxStat(assetOnlyNotifications, "unchanged"),
     renamed: maxStat(assetOnlyNotifications, "renamed"),
@@ -1557,20 +1553,13 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     semanticProfile.style.length ? `样式 ${semanticProfile.style.length}` : "",
   ].filter(Boolean);
   const resourceScope = resourceScopeParts.length > 0 ? resourceScopeParts.join(" / ") : "未识别资源类型";
-  const localSignalSummary = hasBusinessResourceDiffs
+  const localSignalSummary = hasCardSignals
     ? [
         jsTextDiffs.length > 0 ? `功能文案 ${jsTextDiffs.length} 处` : "",
         businessConfigDiffs.length > 0 ? `业务配置 ${businessConfigDiffs.length} 项` : "",
         vaultDiffs.length > 0 ? `Vault 配置 ${vaultDiffs.length} 项` : "",
-        codeIntentDiffs.length > 0 ? `实现意图信号 ${codeIntentDiffs.length} 处` : "",
-        uiStyleDiffs.length > 0 ? `UI/样式信号 ${uiStyleDiffs.length} 处` : "",
       ].filter(Boolean).join("；")
-    : (codeIntentDiffs.length > 0 || uiStyleDiffs.length > 0
-        ? [
-            codeIntentDiffs.length > 0 ? `实现意图信号 ${codeIntentDiffs.length} 处` : "",
-            uiStyleDiffs.length > 0 ? `UI/样式信号 ${uiStyleDiffs.length} 处` : "",
-          ].filter(Boolean).join("；")
-        : "未提取到 UI 文案、业务配置、Vault/Factory 或合约相关变化");
+    : "未发现需卡片展示的文案或重要参数变更";
   const compactAffectedUrls = affectedUrls.length > 6
     ? [...affectedUrls.slice(0, 6), `... 还有 ${affectedUrls.length - 6} 个页面`]
     : affectedUrls;
@@ -1578,15 +1567,17 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     if (url.startsWith("...")) return url;
     return flapLink(new URL(url).pathname || "首页", url);
   }).join(" ｜ ");
-  const localSignalLines = hasLocalSignals
+  const cardSignalLines = hasCardSignals
     ? [
-        ...jsTextDiffs.map(d => {
+        ...jsTextDiffs.slice(0, 6).map(d => {
           const label = d.type === "removed" ? "移除文案" : d.type === "added" ? "新增文案" : "文案变更";
           const line = d.type === "removed" ? formatRemovedLine(label, d.text) : formatAddedLine(label, d.text);
           return `${line}${d.file ? `  ← ${cardText(d.file)}` : ""}`;
         }),
-        ...businessConfigDiffs.map(cd => `${formatValueChangeLine(cd.field, cd.oldVal, cd.newVal)}${cd.file ? `  ← ${cardText(cd.file)}` : ""}`),
-        ...vaultDiffs.flatMap(vd => {
+        jsTextDiffs.length > 6 ? `- 还有 ${jsTextDiffs.length - 6} 处功能文案变更，见 Diff 详情` : "",
+        ...businessConfigDiffs.slice(0, 8).map(cd => `${formatValueChangeLine(cd.field, cd.oldVal, cd.newVal)}${cd.file ? `  ← ${cardText(cd.file)}` : ""}`),
+        businessConfigDiffs.length > 8 ? `- 还有 ${businessConfigDiffs.length - 8} 项业务配置变更，见 Diff 详情` : "",
+        ...vaultDiffs.slice(0, 6).flatMap(vd => {
           if (vd.type === "modified") {
             return [
               `- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`,
@@ -1602,10 +1593,9 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
           if (vd.type === "removed") return [`- ${removedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
           return [`- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
         }),
-        ...compactCodeIntentLines,
-        ...compactUiSignalLines,
-      ]
-    : ["- 本地结构化提取未发现业务信号。"];
+        vaultDiffs.length > 6 ? `- 还有 ${vaultDiffs.length - 6} 项 Vault 配置变更，见 Diff 详情` : "",
+      ].filter(Boolean)
+    : ["- 未发现需卡片展示的文案或重要参数变更，完整资源/UI/实现信号见 Diff 详情。"];
 
   const changes = [
     `📦 Flap 全站前端资源变更：影响页面 ${affectedUrls.length} 个，修改资源 ${assetStats.modified} 个`,
@@ -1615,25 +1605,28 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     "",
     "受影响页面：",
     ...affectedUrls.map(url => `- ${url}`),
-    hasLocalSignals ? "" : "",
-    hasLocalSignals ? "本地信号：" : "",
-    ...localSignalLines,
+    hasCardSignals ? "" : "",
+    hasCardSignals ? "卡片展示信号：" : "",
+    ...cardSignalLines,
+    uiSignalLines.length || codeIntentLines.length ? "" : "",
+    uiSignalLines.length || codeIntentLines.length ? "UI/实现信号（仅 Diff）:" : "",
+    ...codeIntentLines,
+    ...uiSignalLines,
   ].filter(Boolean);
 
   const contentLines = [
     "**📌 结论摘要**",
-    hasLocalSignals
+    hasCardSignals
       ? `- 本地初筛: 检测到 ${localSignalSummary}。`
       : "- 本地初筛: 未发现结构化业务变更。",
-    `- 意图判断: ${intentSummary.verdict}；${intentSummary.intent}；置信度 ${intentSummary.confidence}`,
+    `- 卡片仅展示: 文案变更和重要参数变更`,
     `- 影响页面: ${affectedUrls.length} 个`,
-    `- 资源范围: ${resourceScope}`,
     "",
     "**🌐 影响页面**",
     affectedPageLinks,
     "",
-    "**🔎 本地信号**",
-    ...localSignalLines,
+    "**🔎 重点变更**",
+    ...cardSignalLines,
     "",
     "**🤖 AI 分析**",
     "AI 分析异步生成中，变更已先推送。",
@@ -2024,7 +2017,6 @@ function buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i
   const configCount = countBusinessConfigDiffs(assetStats);
   if (configCount > 0) summary.push(`业务配置 ${configCount} 项`);
   const uiSignalCount = (assetStats?.uiStyleDiffs || []).length;
-  if (uiSignalCount > 0) summary.push(`UI/样式信号 ${uiSignalCount} 处`);
   if (summary.length === 0 && assetStats) summary.push("未提取到结构化业务变更，仅有资源层变化");
   if (summary.length === 0) summary.push("检测到页面变化");
   return summary;
@@ -2127,7 +2119,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   lines.push("**📌 结论摘要**");
   lines.push(`- 页面: ${flapLink("打开页面", url)}`);
   lines.push(`- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`);
-  if (assetStats) lines.push(`- 意图判断: ${intentSummary.verdict}；${intentSummary.intent}；置信度 ${intentSummary.confidence}`);
+  if (assetStats) lines.push("- 卡片仅展示: 文案变更和重要参数变更");
   lines.push("");
   lines.push("**🎯 重点变更**");
   lines.push("");
@@ -2322,29 +2314,8 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     }
   }
 
-  const uiSignalLines = buildUiStyleSignalLines(intentSummary.uiSignals);
-  if (uiSignalLines.length > 0) {
-    hasStructuredChange = true;
-    const compactUiLines = uiSignalLines.slice(0, 12);
-    lines.push(`**🎨 UI/样式信号（${assetStats.uiStyleDiffs.length} 处）：**`);
-    lines.push(...compactUiLines);
-    if (uiSignalLines.length > compactUiLines.length) lines.push(`- 还有 ${uiSignalLines.length - compactUiLines.length} 类 UI/样式信号，见 Diff 详情`);
-    lines.push("");
-  }
-
-  const codeIntentLines = buildCodeIntentSignalLines(intentSummary.codeSignals);
-  if (codeIntentLines.length > 0) {
-    hasStructuredChange = true;
-    const totalCodeSignals = assetStats.codeIntentDiffs?.length || intentSummary.codeSignals.reduce((sum, s) => sum + s.total, 0);
-    const compactCodeLines = codeIntentLines.slice(0, 8);
-    lines.push(`**🧭 实现意图信号（${totalCodeSignals} 处）：**`);
-    lines.push(...compactCodeLines);
-    if (codeIntentLines.length > compactCodeLines.length) lines.push(`- 还有 ${codeIntentLines.length - compactCodeLines.length} 类实现意图信号，见 Diff 详情`);
-    lines.push("");
-  }
-
   if (!hasStructuredChange) {
-    lines.push("未提取到结构化文案/金库/配置变更。");
+    lines.push("未发现需卡片展示的文案或重要参数变更，完整资源/UI/实现信号见 Diff 详情。");
     lines.push("");
   }
 
@@ -2545,9 +2516,14 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
     ],
     primaryTitle: "链上新金库注册",
     primary: primaryLines,
-    details: ["- 对照前端 vaultTypes、CAStore 展示和 launch 链接，确认是否已开放给用户"],
   });
   return content;
+}
+
+function buildVaultFactoryLaunchUrl(factory) {
+  return /^0x[a-fA-F0-9]{40}$/.test(String(factory || ""))
+    ? `https://flap.sh/launch?vaultfactory=${factory}&lang=zh`
+    : "";
 }
 
 function formatRegistryMonitorStatus(snapshot = {}, { includeRpc = false } = {}) {
@@ -2635,11 +2611,10 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
 
   const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
   const title = `${titlePrefix}Flap 链上金库注册变更`;
-  const firstTx = newEvents[0]?.txHash ? `https://bscscan.com/tx/${newEvents[0].txHash}` : "";
+  const firstVaultUrl = buildVaultFactoryLaunchUrl(newEvents[0]?.vault);
   const messageId = await sendCardFn(title, content, "red", undefined, {
     actions: [
-      linkAction("查看注册中心", `https://bscscan.com/address/${CONFIG.registryMonitor.address}`, "primary"),
-      linkAction("查看交易", firstTx),
+      linkAction("打开金库页面", firstVaultUrl, "primary"),
     ].filter(Boolean),
   });
   if (messageId) await pinMessage(messageId);
@@ -5420,6 +5395,7 @@ export const __testables = {
   normalizeAddress,
   extractRegistryVaultAddressesFromLog,
   buildRegistryMonitorContent,
+  buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,
   extractVaultFactories,
   factoryListToMap,
