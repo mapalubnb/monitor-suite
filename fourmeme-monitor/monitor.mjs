@@ -5943,6 +5943,17 @@ function formatOpenFourTemplateChanges(changes) {
   return lines.join("\n");
 }
 
+function sortPresetIds(ids = []) {
+  return [...new Set((ids || []).map(id => String(id)).filter(Boolean))].sort((a, b) => {
+    try {
+      const ai = BigInt(a), bi = BigInt(b);
+      return ai < bi ? -1 : ai > bi ? 1 : 0;
+    } catch {
+      return a.localeCompare(b);
+    }
+  });
+}
+
 async function runOpenFourTemplateCheck() {
   const templates = await fetchOpenFourTemplates();
   if (!snapshot) snapshot = {};
@@ -5968,7 +5979,9 @@ async function runOpenFourTemplateCheck() {
     await saveSnapshot(snapshot);
     appendHistory("openfour", title, content.slice(0, 300), content);
     await sendNotificationMaybeAi({ title, content, template: "orange", moduleContext: "Four.meme OpenFour 业务模板变更", url: `${CONFIG.siteUrl}/zh-TW/contract/create` });
-  } else if (snapshotChanged) {
+  }
+
+  if (snapshotChanged || hasChanges) {
     await saveSnapshot(snapshot);
   }
 }
@@ -6109,10 +6122,20 @@ function diffOpenFourModules(oldState, newState) {
   return newModules.sort((a, b) => a.address.localeCompare(b.address));
 }
 
+function diffOpenFourPresetIds(oldState, newState) {
+  const oldSet = new Set(sortPresetIds(oldState?.presetIds || []));
+  const newSet = new Set(sortPresetIds(newState?.presetIds || []));
+  return {
+    added: sortPresetIds([...newSet].filter(id => !oldSet.has(id))),
+    removed: sortPresetIds([...oldSet].filter(id => !newSet.has(id))),
+  };
+}
+
 function formatOpenFourNewModules(newModules, context = {}) {
   const lines = [];
   lines.push(`**Registry：** ${bscAddressLink(CONFIG.contracts.openFourRegistry)}`);
   lines.push(`**新增模块实现：** ${newModules.length} 个`);
+  if (context.presetIds?.length) lines.push(`**本轮链上 presetIds：** ${context.presetIds.join(", ")}`);
   if (context.reason) lines.push(`**触发：** ${context.reason}`);
   if (context.blockNumber) lines.push(`**区块：** ${bscBlockLink(context.blockNumber)}`);
   if (context.txHash) lines.push(`**交易：** ${bscTxLink(context.txHash)}`);
@@ -6120,11 +6143,31 @@ function formatOpenFourNewModules(newModules, context = {}) {
 
   for (const item of newModules) {
     lines.push(`**${bscAddressLink(item.address)}**`);
-    lines.push(formatAddedLine("roles", item.roles.join(", ") || "unknown"));
-    lines.push(formatAddedLine("presetIds", item.presetIds.join(", ") || "unknown"));
+    lines.push(formatAddedLine("roles", item.roles.join(", ") || "-"));
+    lines.push(formatAddedLine("presetIds", item.presetIds.join(", ") || "-"));
     lines.push("---");
   }
 
+  return lines.join("\n");
+}
+
+function formatOpenFourPresetIdChanges(changes, context = {}) {
+  const lines = [];
+  lines.push(`**Registry：** ${bscAddressLink(CONFIG.contracts.openFourRegistry)}`);
+  if (context.reason) lines.push(`**触发：** ${context.reason}`);
+  if (context.blockNumber) lines.push(`**区块：** ${bscBlockLink(context.blockNumber)}`);
+  if (context.txHash) lines.push(`**交易：** ${bscTxLink(context.txHash)}`);
+  lines.push(`**链上 presetIds 总数：** ${context.presetIds?.length ?? 0} 个`);
+  lines.push("---");
+
+  if (changes.added.length > 0) {
+    lines.push("**新增 presetIds**");
+    for (const id of changes.added) lines.push(formatAddedLine("presetId", id));
+  }
+  if (changes.removed.length > 0) {
+    lines.push("**移除 presetIds**");
+    for (const id of changes.removed) lines.push(formatRemovedLine("presetId", id));
+  }
   return lines.join("\n");
 }
 
@@ -6133,6 +6176,7 @@ async function runOpenFourModuleDiscoveryCheck(context = {}) {
   if (!snapshot) snapshot = {};
   const oldState = snapshot.openFourModules || null;
   const newModules = oldState ? diffOpenFourModules(oldState, discovered) : [];
+  const presetIdChanges = oldState ? diffOpenFourPresetIds(oldState, discovered) : { added: [], removed: [] };
   const moduleSnapshotChanged = !oldState || !jsonEqual(
     { registry: oldState.registry, presetIds: oldState.presetIds, byAddress: oldState.byAddress },
     { registry: discovered.registry, presetIds: discovered.presetIds, byAddress: discovered.byAddress }
@@ -6150,15 +6194,27 @@ async function runOpenFourModuleDiscoveryCheck(context = {}) {
     return;
   }
 
+  if (moduleSnapshotChanged) {
+    await saveSnapshot(snapshot);
+  }
+
   if (newModules.length > 0) {
     log(`[OpenFour模块] 发现 ${newModules.length} 个新模块实现`);
     const title = `OpenFour 新模块发现（${newModules.length}个）`;
-    const content = formatOpenFourNewModules(newModules, context);
-    await saveSnapshot(snapshot);
+    const content = formatOpenFourNewModules(newModules, { ...context, presetIds: discovered.presetIds });
     appendHistory("openfour", title, content.slice(0, 300), content);
     await sendNotificationMaybeAi({ title, content, template: "orange", moduleContext: "Four.meme OpenFour Registry 新模块发现", url: `https://bscscan.com/address/${CONFIG.contracts.openFourRegistry}` });
-  } else if (moduleSnapshotChanged) {
-    await saveSnapshot(snapshot);
+  }
+
+  if (presetIdChanges.added.length > 0 || presetIdChanges.removed.length > 0) {
+    const count = presetIdChanges.added.length + presetIdChanges.removed.length;
+    log(`[OpenFour presetIds] 检测到 ${count} 项变化（新增 ${presetIdChanges.added.length}，移除 ${presetIdChanges.removed.length}）`);
+    const title = presetIdChanges.added.length > 0
+      ? `OpenFour presetIds 注册（${presetIdChanges.added.length}个）`
+      : `OpenFour presetIds 变化（${count}项）`;
+    const content = formatOpenFourPresetIdChanges(presetIdChanges, { ...context, presetIds: discovered.presetIds });
+    appendHistory("openfour", title, content.slice(0, 300), content);
+    await sendNotificationMaybeAi({ title, content, template: "orange", moduleContext: "Four.meme OpenFour presetIds 注册", url: `https://bscscan.com/address/${CONFIG.contracts.openFourRegistry}` });
   }
 }
 
@@ -9576,6 +9632,8 @@ export const __testables = {
   formatApiValueChanges,
   formatFrontendSignalChanges,
   formatOpenFourTemplateChanges,
+  diffOpenFourPresetIds,
+  formatOpenFourPresetIdChanges,
   formatOpenFourNewModules,
   formatGithubRepoChanges,
   formatGithubChanges,

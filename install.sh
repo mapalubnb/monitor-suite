@@ -411,6 +411,7 @@ if [ -f "$SNAP" ]; then
     console.log('**07｜OpenFour / 链上**');
     console.log('Registry：'+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
     if(roleNames.length) console.log('模块角色：'+roleNames.join('、'));
+    if((ofm.presetIds||[]).length) console.log('presetIds：'+(ofm.presetIds||[]).join(', '));
     console.log('创建者来源：'+modes.join(' + ')+'｜缓存 '+cachedCreators+' 个');
     if(feed.enabled!==undefined) console.log('新区块：'+(feed.connected?'WebSocket 已连接':'WebSocket 未连接')+'｜'+(feed.mode||'未知')+(feed.latestHeadBlock?'｜头块 '+feed.latestHeadBlock:''));
     if(am.lastBlock) {

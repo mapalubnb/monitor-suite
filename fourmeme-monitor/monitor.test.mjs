@@ -528,6 +528,38 @@ test("fourmeme cards render long urls and addresses as concise links", () => {
   assert.match(actorCard, /\[查看交易\]\(https:\/\/bscscan\.com\/tx\/0xabc\)/);
 });
 
+test("openfour presetIds monitor reports on-chain registrations directly", () => {
+  const diff = __testables.diffOpenFourPresetIds(
+    { presetIds: ["1778027615725"] },
+    { presetIds: ["1778027615725", "1778027615730"] }
+  );
+  assert.deepEqual(diff.added, ["1778027615730"]);
+  assert.deepEqual(diff.removed, []);
+
+  const content = __testables.formatOpenFourPresetIdChanges(diff, {
+    presetIds: ["1778027615725", "1778027615730"],
+    blockNumber: 123,
+    txHash: "0xabc",
+  });
+  assert.match(content, /新增 presetIds/);
+  assert.match(content, /presetId/);
+  assert.match(content, /1778027615730/);
+  assert.doesNotMatch(content, /未识别 schema/);
+  assert.doesNotMatch(content, /OpenFourTools/);
+});
+
+test("openfour new module card includes current presetIds", () => {
+  const content = __testables.formatOpenFourNewModules([
+    { address: "0x0000000000000000000000000000000000000001", roles: ["swap"], presetIds: ["1778027615730"] },
+  ], {
+    presetIds: ["1778027615725", "1778027615730"],
+  });
+  assert.match(content, /本轮链上 presetIds：\*\* 1778027615725, 1778027615730/);
+  assert.match(content, /presetIds/);
+  assert.match(content, /1778027615730/);
+  assert.doesNotMatch(content, /unknown/);
+});
+
 test("small i18n remove-only changes require consecutive confirmation", () => {
   const oldStrings = Object.fromEntries(Array.from({ length: 1102 }, (_, i) => [`k${i}`, `v${i}`]));
   const newStrings = { ...oldStrings };

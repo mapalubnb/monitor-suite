@@ -21,7 +21,7 @@ monitor-suite/
 | 底池配置 | Pool Config 变化 | 3s |
 | 前端页面池 | HTML、文案、`__NEXT_DATA__`、i18n、路由/端点、资源 diff | 10s |
 | API 结构和值 | public/KOL/token ranking/search 等公开端点 | 15s |
-| OpenFour 模板 | 新模板、模板状态变化 | 3s |
+| OpenFour 模板 | 新模板、模板状态变化、链上 presetIds 注册 | 3s |
 | GitHub | 主仓库提交、账号仓库列表 | 30s/90s，仓库列表 300s |
 | 合约与链上参数 | 合约 bytecode、AgentNFT 等链上参数 | 3s |
 | 创建者动作 | WebSocket 新区块驱动，HTTP 兜底 | 实时 + 10s 兜底 |
