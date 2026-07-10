@@ -88,6 +88,10 @@ async function setupHttpKeepAlive() {
       connections: readPositiveIntEnv("HTTP_KEEPALIVE_CONNECTIONS", 16),
       keepAliveTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_TIMEOUT_MS", 30_000),
       keepAliveMaxTimeout: readPositiveIntEnv("HTTP_KEEPALIVE_MAX_TIMEOUT_MS", 120_000),
+      connect: {
+        autoSelectFamily: true,
+        autoSelectFamilyAttemptTimeout: readPositiveIntEnv("HTTP_AUTO_SELECT_FAMILY_ATTEMPT_TIMEOUT_MS", 250),
+      },
     }));
     earlyLog("[HTTP] undici keep-alive dispatcher 已启用");
   } catch (err) {
@@ -1067,7 +1071,7 @@ function appendHistory(module, title, summary, diffSnippet = "") {
   });
 }
 
-/* ── HTTP 请求工具（含反风控 + 5xx 静默重试）── */
+/* ── HTTP 请求工具（含反风控 + 5xx/超时/瞬时网络错误重试）── */
 async function fetchWithTimeout(url, opts, timeoutMs) {
   return scheduleHostRequest(url, async () => {
     const ctrl = new AbortController();
@@ -1081,18 +1085,69 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
   });
 }
 
-async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
+const TRANSIENT_NETWORK_ERROR_CODES = new Set([
+  "EAI_AGAIN",
+  "ECONNREFUSED",
+  "ECONNRESET",
+  "EHOSTUNREACH",
+  "ENETUNREACH",
+  "ENOTFOUND",
+  "ETIMEDOUT",
+  "UND_ERR_BODY_TIMEOUT",
+  "UND_ERR_CONNECT_TIMEOUT",
+  "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_SOCKET",
+]);
+
+function flattenErrorChain(err) {
+  const result = [];
+  const queue = [err];
+  const seen = new Set();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || typeof current !== "object" || seen.has(current)) continue;
+    seen.add(current);
+    result.push(current);
+    if (current.cause) queue.push(current.cause);
+    if (Array.isArray(current.errors)) queue.push(...current.errors);
+  }
+  return result;
+}
+
+function isTransientNetworkError(err) {
+  const chain = flattenErrorChain(err);
+  if (chain.some(item => TRANSIENT_NETWORK_ERROR_CODES.has(String(item.code || "").toUpperCase()))) return true;
+  return chain.some(item => item?.name === "TypeError" && /fetch failed/i.test(item?.message || ""));
+}
+
+function formatNetworkError(err) {
+  const chain = flattenErrorChain(err);
+  const codes = [...new Set(chain.map(item => String(item.code || "").trim()).filter(Boolean))];
+  const causes = [...new Set(chain
+    .map(item => String(item.message || "").trim())
+    .filter(message => message && !/^fetch failed$/i.test(message)))];
+  const endpoints = [...new Set(chain
+    .filter(item => item.address || item.port)
+    .map(item => `${item.address || "未知地址"}${item.port ? `:${item.port}` : ""}`))];
+  return [
+    codes.length ? `错误码 ${codes.join("/")}` : "",
+    endpoints.length ? `目标 ${endpoints.join("、")}` : "",
+    causes.length ? `原因 ${causes.join("；")}` : "",
+  ].filter(Boolean).join("，") || String(err?.message || err || "未知网络错误");
+}
+
+async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, requestFn = fetchWithTimeout, delayFn = sleep) {
   const domain = getDomain(url);
   const backoffState = currentBackoffState(domain);
   if (backoffState) {
     const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
     throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
   }
-  const maxRetries = 2; // 5xx 最多重试 2 次（共 3 次尝试）
+  const maxRetries = 2; // 5xx、超时和瞬时网络错误最多重试 2 次（共 3 次尝试）
   let lastStatus = 0;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const res = await fetchWithTimeout(url, opts, timeoutMs);
+      const res = await requestFn(url, opts, timeoutMs);
       if (res.status === 429 || res.status === 403) {
         try { await res.text(); } catch {}
         recordFail(domain, res.status);
@@ -1102,7 +1157,7 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
         try { await res.text(); } catch {}
         lastStatus = res.status;
         if (attempt < maxRetries) {
-          await sleep(1_000 * (attempt + 1));
+          await delayFn(1_000 * (attempt + 1));
           continue;
         }
         recordFail(domain, res.status);
@@ -1118,10 +1173,19 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
       if (err.name === "AbortError") {
         lastStatus = -1;
         if (attempt < maxRetries) {
-          await sleep(1_000 * (attempt + 1));
+          await delayFn(1_000 * (attempt + 1));
           continue;
         }
         throw new Error(`请求超时 ${timeoutMs}ms (重试${maxRetries}次): ${url}`);
+      }
+      if (isTransientNetworkError(err)) {
+        const detail = formatNetworkError(err);
+        if (attempt < maxRetries) {
+          log(`[HTTP] 瞬时网络异常，${attempt + 1}/${maxRetries} 次重试：${domain}（${detail}）`);
+          await delayFn(1_000 * (attempt + 1));
+          continue;
+        }
+        throw new Error(`网络请求失败（重试${maxRetries}次）：${url}；${detail}`, { cause: err });
       }
       throw err;
     }
@@ -9489,6 +9553,9 @@ export const __testables = {
   buildGlobalFrontendRouteNotification,
   frontendAssetChangeSignature,
   classifyFetchFailure,
+  isTransientNetworkError,
+  formatNetworkError,
+  fetchSafe,
   shouldReuseFrontendAssetContents,
   compactFrontendAssetContents,
   hydrateFrontendAssetContents,

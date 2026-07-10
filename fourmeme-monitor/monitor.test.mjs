@@ -726,6 +726,44 @@ test("classifyFetchFailure distinguishes backoff and rate limits", () => {
   assert.equal(__testables.classifyFetchFailure(new Error("HTTP 429 (风控)")), "rate_limited");
 });
 
+test("transient fetch failures expose their network cause", () => {
+  const err = new TypeError("fetch failed", {
+    cause: Object.assign(new Error("Connect Timeout Error"), {
+      code: "UND_ERR_CONNECT_TIMEOUT",
+      address: "140.82.112.6",
+      port: 443,
+    }),
+  });
+  assert.equal(__testables.isTransientNetworkError(err), true);
+  assert.match(__testables.formatNetworkError(err), /UND_ERR_CONNECT_TIMEOUT/);
+  assert.match(__testables.formatNetworkError(err), /140\.82\.112\.6:443/);
+  assert.match(__testables.formatNetworkError(err), /Connect Timeout Error/);
+});
+
+test("fetchSafe retries transient network errors and returns the recovered response", async () => {
+  let attempts = 0;
+  const delays = [];
+  const response = { ok: true, status: 200 };
+  const result = await __testables.fetchSafe(
+    "https://api.github.com/repos/four-meme-community/four-meme-ai/commits",
+    {},
+    1_000,
+    async () => {
+      attempts++;
+      if (attempts < 3) {
+        throw new TypeError("fetch failed", {
+          cause: Object.assign(new Error("socket disconnected"), { code: "ECONNRESET" }),
+        });
+      }
+      return response;
+    },
+    async delayMs => { delays.push(delayMs); },
+  );
+  assert.equal(result, response);
+  assert.equal(attempts, 3);
+  assert.deepEqual(delays, [1_000, 2_000]);
+});
+
 test("unchanged create-token assets reuse previous asset contents", () => {
   const oldFeatures = {
     assetHash: "same-assets",

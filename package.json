@@ -1,6 +1,6 @@
 {
   "name": "monitor-suite",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Four.meme 和 Flap.sh 平台变更自动化监控系统",
   "type": "module",
   "private": true,
