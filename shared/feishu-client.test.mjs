@@ -49,7 +49,7 @@ test("cards use JSON 2.0 structured layout and table rows preserve full values",
     `02　符号 USDT｜状态 已启用｜地址 [${address}](https://bscscan.com/address/${address})｜募集总量 100 USDT`,
   ].join("\n"), "green"));
   assert.equal(card.schema, "2.0");
-  assert.equal(card.config.width_mode, "fill");
+  assert.equal(card.config.width_mode, "default");
   assert.ok(card.body.elements.some(element => element.tag === "column_set"));
   const table = card.body.elements.find(element => element.tag === "table");
   assert.ok(table);

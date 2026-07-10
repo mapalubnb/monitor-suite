@@ -395,7 +395,7 @@ export function buildCardJson(title, content, template, diffFilePathOrOpts) {
     schema: "2.0",
     config: {
       update_multi: true,
-      width_mode: "fill",
+      width_mode: "default",
       enable_forward: true,
       summary: { content: String(title || "监控通知") },
     },
