@@ -143,6 +143,13 @@ export function getChatId() {
   return CHAT_ID;
 }
 
+export function assertFeishuResponse(res, action = "飞书请求") {
+  if (res?.code !== 0) {
+    throw new Error(`${action}失败：code=${res?.code ?? "未知"}: ${res?.msg || res?.message || "未知错误"}`);
+  }
+  return res;
+}
+
 /* ══════════════════════════════════════════
    卡片 JSON 构建
    ══════════════════════════════════════════ */
@@ -628,9 +635,7 @@ export async function replyText(messageId, text) {
       },
     }, tokenOpt);
     if (!firstRes) firstRes = res;
-    if (res.code !== 0) {
-      log(`[飞书 SDK] 回复失败：code=${res.code}: ${res.msg}`);
-    }
+    assertFeishuResponse(res, "回复文本");
     await pauseBetweenChunks(i + 1, chunks.length);
   }
   return firstRes;
@@ -655,9 +660,7 @@ export async function replyCard(messageId, title, content, color = "blue") {
       },
     }, tokenOpt);
     if (!firstRes) firstRes = res;
-    if (res.code !== 0) {
-      log(`[飞书 SDK] 回复卡片失败：code=${res.code}: ${res.msg}`);
-    }
+    assertFeishuResponse(res, "回复卡片");
     await pauseBetweenChunks(i + 1, chunks.length);
   }
   return firstRes;
@@ -747,10 +750,7 @@ export async function replyFile(messageId, fileKey) {
       msg_type: "file",
     },
   }, tokenOpt);
-  if (res.code !== 0) {
-    log(`[飞书 SDK] 文件回复失败：code=${res.code}: ${res.msg}`);
-  }
-  return res;
+  return assertFeishuResponse(res, "回复文件");
 }
 
 /**

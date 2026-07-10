@@ -15,7 +15,7 @@
  *   SIGUSR1  立即触发一次检测
  */
 
-import { createHash, createHmac } from "node:crypto";
+import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync, statSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -1379,10 +1379,6 @@ function classifyAssetPath(path) {
   return { kind: "other", file: clean || name };
 }
 
-function classifyAssetFileName(filename) {
-  return classifyAssetPath(filename).kind;
-}
-
 function buildAssetSemanticProfile(assetPaths = [], assetStats = {}) {
   const profile = {
     runtime: [],
@@ -1432,64 +1428,6 @@ function summarizeBusinessSignals(assetStats = {}) {
   const uiSignals = summarizeUiStyleDiffs(assetStats.uiStyleDiffs || []);
   if (uiSignals.length > 0) parts.push(`UI/样式信号 ${uiSignals.reduce((sum, s) => sum + s.total, 0)} 处`);
   return parts;
-}
-
-function buildResourceSemanticSummary(assetStats, notifications = []) {
-  const files = uniqueStrings([
-    ...(assetStats?.substantiveAssetPaths || []),
-    ...(assetStats?.substantiveFileNames || []),
-    ...notifications.flatMap(n => extractAssetFileNamesFromChanges(n.changes)),
-  ]);
-  const profile = assetStats?.semanticProfile || buildAssetSemanticProfile(files, assetStats);
-  const businessSignals = summarizeBusinessSignals(assetStats);
-  const lines = [];
-  if (profile.runtime.length > 0) {
-    lines.push(`- webpack runtime/bootstrap: ${profile.runtime.length} 文件，运行时代码或 chunk 加载器更新；原始 minified 片段已移入下载 Diff。`);
-  }
-  if (profile.appShell.length > 0) {
-    const labels = uniqueStrings(profile.appShell.map(item => item.kind));
-    lines.push(`- 全站 app shell: ${profile.appShell.length} 文件（${labels.join(", ")}），可能影响布局、加载、错误页或兜底页面。`);
-  }
-  if (profile.shared.length > 0) {
-    lines.push(`- 共享应用 chunk: ${profile.shared.length} 文件，已完成业务文案/配置提取。`);
-  }
-  if (profile.page.length > 0) {
-    lines.push(`- 页面专属 chunk: ${profile.page.length} 文件（${profile.pageRoutes.join(", ")}），按对应页面优先判断。`);
-  }
-  if (profile.script.length > 0) {
-    lines.push(`- 页面/业务脚本 chunk: ${profile.script.length} 文件，已完成结构化信号提取。`);
-  }
-  if (profile.style.length > 0) {
-    lines.push(`- 样式资源: ${profile.style.length} 文件。`);
-  }
-  const intent = buildResourceIntentSummary(assetStats);
-  lines.push(`- 意图判断: ${intent.verdict}；${intent.intent}；置信度 ${intent.confidence}。`);
-  lines.push(businessSignals.length > 0
-    ? `- 结构化业务信号: ${businessSignals.join("、")}。`
-    : "- 结构化业务信号: 当前提取未发现 UI 文案、业务配置、Vault/Factory 或合约相关变化。");
-  return lines;
-}
-
-function summarizePageAssetChange(notification) {
-  const assetStats = notification.meta?.assetStats || {};
-  const files = uniqueStrings([
-    ...(assetStats.substantiveAssetPaths || []),
-    ...(assetStats.substantiveFileNames || []),
-    ...extractAssetFileNamesFromChanges(notification.changes),
-  ]);
-  const profile = assetStats.semanticProfile || buildAssetSemanticProfile(files, assetStats);
-  const parts = [];
-  if (profile.page.length > 0) parts.push(`页面专属 chunk ${profile.pageRoutes.join(", ")}：优先按对应页面推送`);
-  if (profile.runtime.length > 0) parts.push(`webpack runtime/bootstrap ${profile.runtime.map(i => assetPathToFilename(i.file)).join(", ")}：运行时代码更新，原始片段已隐藏`);
-  if (profile.appShell.length > 0) parts.push(`app shell ${profile.appShell.map(i => assetPathToFilename(i.file)).join(", ")}：布局/加载/错误页相关`);
-  if (profile.shared.length > 0) parts.push(`共享应用 chunk ${profile.shared.map(i => assetPathToFilename(i.file)).join(", ")}：已做业务信号提取`);
-  if (profile.script.length > 0) parts.push(`页面/业务脚本 ${profile.script.map(i => assetPathToFilename(i.file)).join(", ")}：已做结构化信号提取`);
-  if (profile.style.length > 0) parts.push(`样式资源 ${profile.style.map(i => assetPathToFilename(i.file)).join(", ")}`);
-  const signals = summarizeBusinessSignals(assetStats);
-  const intent = buildResourceIntentSummary(assetStats);
-  parts.push(signals.length > 0 ? `业务信号 ${signals.join("、")}` : "未发现结构化业务信号");
-  parts.push(`意图判断 ${intent.verdict}，置信度 ${intent.confidence}`);
-  return `${notification.url}: ${parts.join("；")}`;
 }
 
 function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
@@ -2609,32 +2547,6 @@ function buildVaultFactoryLaunchUrl(factory) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(factory || ""))
     ? `https://flap.sh/launch?vaultfactory=${factory}&lang=zh`
     : "";
-}
-
-function formatRegistryMonitorStatus(snapshot = {}, { includeRpc = false } = {}) {
-  if (!CONFIG.registryMonitor.enabled) return ["- 链上注册中心: 未启用"];
-  const state = snapshot.registryMonitor || {};
-  const knownCount = Object.keys(state.knownVaults || {}).length;
-  const lastBlock = state.lastBlock ?? "-";
-  const safeLatest = state.safeLatestBlock ?? "-";
-  const latest = state.latestBlock ?? "-";
-  const lagBlocks = state.lagBlocks ?? (
-    Number.isFinite(Number(safeLatest)) && Number.isFinite(Number(lastBlock))
-      ? Math.max(0, Number(safeLatest) - Number(lastBlock))
-      : "-"
-  );
-  const lines = [
-    `- 链上注册中心: \`${CONFIG.registryMonitor.address}\``,
-    `- 链上扫描: 已扫 ${lastBlock} / 确认 ${safeLatest} / 最新 ${latest} / 延迟 ${lagBlocks} 块`,
-    `- 链上已知金库: ${knownCount} 个`,
-  ];
-  if (includeRpc) {
-    const rpcPreview = CONFIG.bscRpcUrls.slice(0, 2).join(" / ");
-    const more = CONFIG.bscRpcUrls.length > 2 ? ` 等 ${CONFIG.bscRpcUrls.length} 个` : "";
-    lines.push(`- RPC: ${rpcPreview}${more}`);
-    lines.push(`- 确认块: ${CONFIG.registryMonitor.confirmations} / 单轮最多 ${CONFIG.registryMonitor.maxBlocksPerRun} 块`);
-  }
-  return lines;
 }
 
 async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, titlePrefix = "" } = {}) {

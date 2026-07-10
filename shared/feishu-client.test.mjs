@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { balanceCardFontTags, buildCardJson, splitMessageContent } from "./feishu-client.mjs";
+import { assertFeishuResponse, balanceCardFontTags, buildCardJson, splitMessageContent } from "./feishu-client.mjs";
 
 test("message chunks preserve every character and prefer semantic boundaries", () => {
   const address = "0x1234567890abcdef1234567890abcdef12345678";
@@ -106,4 +106,12 @@ test("table columns shrink to their text while long addresses receive bounded sp
   assert.ok(widths.地址 >= 180 && widths.地址 <= 360);
   assert.ok(widths.项目 <= 240);
   assert.ok(table.columns.every(column => /^\d+px$/.test(column.width)));
+});
+
+test("Feishu reply errors propagate instead of being treated as success", () => {
+  assert.equal(assertFeishuResponse({ code: 0, data: {} }, "回复卡片").code, 0);
+  assert.throws(
+    () => assertFeishuResponse({ code: 230099, msg: "invalid card" }, "回复卡片"),
+    /回复卡片失败：code=230099: invalid card/,
+  );
 });

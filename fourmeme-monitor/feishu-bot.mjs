@@ -18,10 +18,9 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
-  sendText as _sdkSendText,
   replyText as _sdkReplyText, replyCard as _sdkReplyCard,
-  replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile, sendFile as _sdkSendFile,
-  getClient, getChatId, lark,
+  replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile,
+  lark,
 } from "../shared/feishu-client.mjs";
 import { AI, chatCompletion, listProviders, listRemoteModels, switchProvider } from "../shared/ai-client.mjs";
 

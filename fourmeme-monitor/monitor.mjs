@@ -520,24 +520,6 @@ function recordCurrentModuleRequest() {
    ══════════════════════════════════════════ */
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 
-function formatDateTime(value = new Date()) {
-  const d = value instanceof Date ? value : new Date(value);
-  const pad = (n) => String(n).padStart(2, "0");
-  return [
-    d.getFullYear(),
-    "-",
-    pad(d.getMonth() + 1),
-    "-",
-    pad(d.getDate()),
-    " ",
-    pad(d.getHours()),
-    ":",
-    pad(d.getMinutes()),
-    ":",
-    pad(d.getSeconds()),
-  ].join("");
-}
-
 function formatInterval(ms) {
   const value = Number(ms || 0);
   if (!Number.isFinite(value) || value <= 0) return "未知";
@@ -823,6 +805,15 @@ async function patchCardViaApi(messageId, title, content, template = "red", diff
   await patchCard(messageId, title, content, template, { ...cardOpts, diffFilePath });
 }
 
+const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
+  const n = Number(process.env.FEISHU_CARD_CHUNK_LIMIT || 3500);
+  return Number.isFinite(n) && n >= 500 ? Math.floor(n) : 3500;
+})();
+
+function isTooLongForSingleCard(content) {
+  return String(content ?? "").length > FEISHU_CARD_PATCH_SAFE_LIMIT;
+}
+
 /**
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
  * @param {string} [url] - 监控目标网址，展示在卡片最上方
@@ -830,11 +821,12 @@ async function patchCardViaApi(messageId, title, content, template = "red", diff
 async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, cardOpts = {}) {
   // 卡片最上方加入监控目标网址
   const urlLine = url ? `🔗 [查看详情](${url})\n\n` : "";
+  const initialContent = urlLine + content;
   // 1. 立即推送裸 diff（秒级送达）
-  let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath, 2, cardOpts);
+  let messageId = await sendCardViaApi(title, initialContent, template, diffFilePath, 2, cardOpts);
   if (!messageId) {
     log(`[推送] 即时通道失败，切换队列兜底：${title}`);
-    messageId = await sendCardQueued(title, urlLine + content, template, { ...cardOpts, diffFilePath });
+    messageId = await sendCardQueued(title, initialContent, template, { ...cardOpts, diffFilePath });
   }
 
   // 2. 异步调用 AI → 编辑原消息补充摘要（不阻塞调用方）
@@ -844,19 +836,26 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
       const enriched = enrichFn
         ? enrichFn(summary)
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
+      const enrichedContent = urlLine + enriched;
       if (messageId) {
+        if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
+          log(`[AI→更新] ${title} 正文较长，保留完整分片卡片，另发 AI 摘要卡片`);
+          await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
+          return;
+        }
         try {
-          await patchCardViaApi(messageId, title, urlLine + enriched, template, diffFilePath, cardOpts);
+          await patchCardViaApi(messageId, title, enrichedContent, template, diffFilePath, cardOpts);
           log(`[AI→更新] ${title} 已补充 AI 摘要`);
         } catch (err) {
           log(`[AI→更新] 编辑失败(${err.message})，进入重试队列`);
-          scheduleAiPatchRetry({ messageId, title, content: urlLine + enriched, template, diffFilePath, cardOpts, summary });
+          scheduleAiPatchRetry({ messageId, title, content: enrichedContent, template, diffFilePath, cardOpts, summary });
         }
       } else {
         await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
       }
     }).catch(err => log(`[AI] 异步摘要异常：${err.message}`));
   }
+  return messageId;
 }
 
 async function summarizeWithRetry(input, moduleContext) {
@@ -3393,11 +3392,6 @@ function confirmGlobalI18nResourceWatches(state, pages = {}) {
     }
   }
   return { notifications, changed };
-}
-
-function pendingGlobalI18nResourceWatches(state = snapshot) {
-  return Object.values(ensureGlobalI18nResourceWatchState(state))
-    .filter(item => item && item.status !== "confirmed");
 }
 
 function canonicalStaticAssetPath(value = "") {
@@ -9237,7 +9231,7 @@ if (!IS_TEST_MODE) {
       // 等待 2s 后重试一次被跳过的模块
       await new Promise(r => setTimeout(r, 2000));
       for (const m of modules) {
-        try { await m.run(); } catch (err) { /* 第二次仍失败则放弃 */ }
+        try { await m.run(); } catch (err) { log(`[SIGUSR1] ${m.name} 重试仍异常：${err.message}`); }
       }
       log("SIGUSR1 全量检测完成");
     })();
@@ -9328,6 +9322,7 @@ export const __testables = {
   shouldConfirmI18nRemoval,
   frontendNotificationDedupeKey,
   shouldUseAiForNotification,
+  isTooLongForSingleCard,
   buildFrontendFailureNotifications,
   buildFrontendNewPageNotification,
   buildFrontendNewPageAiInput,

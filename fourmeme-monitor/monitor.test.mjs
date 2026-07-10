@@ -161,6 +161,11 @@ test("AI routing skips operational noise and keeps high-value changes", () => {
   }), true);
 });
 
+test("long Four.meme cards are kept as complete chunks instead of one-card patches", () => {
+  assert.equal(__testables.isTooLongForSingleCard("短内容"), false);
+  assert.equal(__testables.isTooLongForSingleCard("完整内容".repeat(25_000)), true);
+});
+
 test("token list optional sample fields do not trigger API structure noise", () => {
   const oldStruct = {
     token_search_new: {
