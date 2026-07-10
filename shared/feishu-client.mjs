@@ -265,7 +265,7 @@ function buildMetricRows(lines, idPrefix) {
         width: "weighted",
         weight: 1,
         background_style: "grey",
-        padding: "8px 10px",
+        padding: "8px 10px 8px 10px",
         vertical_spacing: "2px",
         elements: [{
           tag: "markdown",
@@ -378,11 +378,11 @@ export function buildCardJson(title, content, template, diffFilePathOrOpts) {
     header: {
       title: { tag: "plain_text", content: title },
       template,
-      padding: "12px 16px",
+      padding: "12px 16px 12px 16px",
     },
     body: {
       direction: "vertical",
-      padding: "12px 16px",
+      padding: "12px 16px 12px 16px",
       vertical_spacing: "small",
       elements: buildCardBodyElements(content, opts),
     },

@@ -72,3 +72,22 @@ test("ordinary card actions are removed and only an existing DIFF adds a button"
   assert.equal(buttons[0].behaviors[0].value.action, "download_diff");
   assert.equal(buttons[0].behaviors[0].value.file, "/tmp/full.diff");
 });
+
+test("JSON 2.0 card padding uses Feishu-compatible one-or-four-value syntax", () => {
+  const card = JSON.parse(buildCardJson("重启", "即将执行重启", "yellow"));
+  const paddings = [];
+  const visit = (value) => {
+    if (!value || typeof value !== "object") return;
+    if (typeof value.padding === "string") paddings.push(value.padding);
+    for (const child of Object.values(value)) {
+      if (Array.isArray(child)) child.forEach(visit);
+      else visit(child);
+    }
+  };
+  visit(card);
+  assert.ok(paddings.length >= 2);
+  for (const padding of paddings) {
+    const parts = padding.trim().split(/\s+/);
+    assert.ok(parts.length === 1 || parts.length === 4, `飞书不兼容的 padding：${padding}`);
+  }
+});
