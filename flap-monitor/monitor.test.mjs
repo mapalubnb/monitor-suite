@@ -972,7 +972,7 @@ test("page change card puts summary and important copy before ai analysis", () =
   );
 
   assert(content.startsWith("**📌 结论摘要**"));
-  assert(content.indexOf("**🎯 重点变更**") < content.indexOf("**🤖 AI 分析:**"));
+  assert(content.indexOf("**🎯 重点变更**") < content.indexOf("**🤖 AI 分析**"));
   assert.doesNotMatch(content, /\*\*资源统计\*\*/);
   assert.doesNotMatch(content, /- 概览: 修改/);
   assert.doesNotMatch(content, /建议动作/);
@@ -982,6 +982,42 @@ test("page change card puts summary and important copy before ai analysis", () =
   assert.match(content, /新配置说明 新配置说明 新配置说明/);
   assert.doesNotMatch(content, /\.\.\.|…/);
   assert.match(content, /AI 分析异步生成中，变更已先推送/);
+});
+
+test("launch text card summarizes anti-farmer duration changes without raw page noise", () => {
+  const cssNoise = `span:first-child]:h-1 [&>span:first-child]:rounded-none [&[role=slider]]:h-3 style="--radix-slider-thumb-transform:translateX(-50%)"`;
+  const addedDescription = "This feature ensures that trades occur primarily in the tax liquidity pool during the protection period, improving the stability of token tax revenue.";
+  const content = __testables.buildCardBriefing(
+    "https://flap.sh/launch",
+    null,
+    null,
+    8,
+    0,
+    [],
+    [
+      {
+        type: "modified",
+        oldText: `Payment token * BNB USDT USD1 ASTER U 币安人生 Token Setting Buy Tax Rate ${cssNoise} Anti-Farmer Protection Duration 3 day(s) During the anti-farmer protection period, users will not be able to add liquidity to some V3 pools. Set 0 days to disable the protection period. Min: 0 days · Max: 1 year (365 days) · Default: 3 days Tax Allocation Total allocation must be 100%`,
+        newText: `Payment token * BNB USDT USD1 ASTER U 币安人生 Token Setting Buy Tax Rate ${cssNoise} Anti-Farmer Protection Duration 30 day(s) During the anti-farmer protection period, users will not be able to add liquidity to some V3 pools. ${addedDescription} Set 0 days to disable the protection period. Min: 0 days · Max: 1 year (365 days) · Default: 30 days Tax Allocation Total allocation must be 100%`,
+        ctxBefore: "Create Tax Token Create Token Reserve Your Token CA",
+      },
+      {
+        type: "added",
+        text: addedDescription,
+        ctxBefore: "During the anti-farmer protection period, users will not be able to add liquidity to some V3 pools.",
+      },
+    ],
+    [],
+  );
+
+  assert.match(content, /页面文案变更（已归纳，原始 2 处）/);
+  assert.match(content, /防巨鲸薅币保护周期（Anti-Farmer Protection Duration）/);
+  assert.match(content, /默认时长/);
+  assert.match(content, /<font color="red">3 天<\/font> → <font color="green">30 天<\/font>/);
+  assert.match(content, /取值区间：最小值 0 天 \/ 最大值 365 天（1 年），区间规则未改动/);
+  assert.match(content, /新增说明/);
+  assert.match(content, /开关提示未改/);
+  assert.doesNotMatch(content, /radix-slider|span:first-child|Payment token \* BNB/);
 });
 
 test("site-wide asset card leads with no business-change conclusion", () => {
@@ -998,8 +1034,8 @@ test("site-wide asset card leads with no business-change conclusion", () => {
 
   assert(notification.content.startsWith("**📌 结论摘要**"));
   assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**🌐 影响页面**"));
-  assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**🔎 重点变更**"));
-  assert(notification.content.indexOf("**🔎 重点变更**") < notification.content.indexOf("**🤖 AI 分析**"));
+  assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**🎯 重点变更**"));
+  assert(notification.content.indexOf("**🎯 重点变更**") < notification.content.indexOf("**🤖 AI 分析**"));
   assert.doesNotMatch(notification.content, /\n- \[\/bnb\/CAstore\]/);
   assert.doesNotMatch(notification.content, /资源统计/);
   assert.doesNotMatch(notification.content, /完整资源 Diff/);

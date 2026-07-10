@@ -18,7 +18,7 @@ test("startup card copy reflects active frontend and api cadences", () => {
   assert.match(progress, /前端：当前快照 [\s\S]*每 10 秒/);
   assert.match(progress, /API：每 15 秒/);
   assert.match(ready, /✅ \*\*监控运行中\*\*/);
-  assert.match(ready, /\*\*运行状态\*\*[\s\S]*\*\*监控概览\*\*[\s\S]*\*\*前端能力\*\*[\s\S]*\*\*运行策略\*\*[\s\S]*\*\*通知状态\*\*/);
+  assert.match(ready, /\*\*📌 运行状态\*\*[\s\S]*\*\*🎯 监控概览\*\*[\s\S]*\*\*🌐 前端能力\*\*[\s\S]*\*\*🛡️ 运行策略\*\*[\s\S]*\*\*🔔 通知状态\*\*/);
   assert.match(ready, /前端：[\s\S]*每 10 秒/);
   assert.match(ready, /API：[\s\S]*每 15 秒/);
   assert.match(ready, /NEXT_DATA · i18n · 路由发现 · 端点发现 · 新页面自动纳管/);

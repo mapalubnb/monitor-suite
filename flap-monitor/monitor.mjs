@@ -926,6 +926,7 @@ function formatFlapSection(title, lines = []) {
     "结论摘要": "📌",
     "重点信息": "🎯",
     "重点变更": "🎯",
+    "影响页面": "🌐",
     "影响范围": "🌐",
     "证据详情": "🔎",
     "AI 分析": "🤖",
@@ -939,8 +940,8 @@ function formatFlapSection(title, lines = []) {
 function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", primary = [], scope = [], details = [], ai = "" } = {}) {
   const lines = [
     ...formatFlapSection("结论摘要", summary),
+    ...formatFlapSection("影响页面", scope),
     ...formatFlapSection(primaryTitle, primary),
-    ...formatFlapSection("影响范围", scope),
     ...formatFlapSection("证据详情", details),
     ...(ai ? formatFlapSection("AI 分析", [ai]) : []),
   ];
@@ -1614,23 +1615,22 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     ...uiSignalLines,
   ].filter(Boolean);
 
-  const contentLines = [
-    "**📌 结论摘要**",
-    hasCardSignals
-      ? `- 本地初筛: 检测到 ${localSignalSummary}。`
-      : "- 本地初筛: 未发现结构化业务变更。",
-    `- 卡片仅展示: 文案变更和重要参数变更`,
-    `- 影响页面: ${affectedUrls.length} 个`,
-    "",
-    "**🌐 影响页面**",
-    affectedPageLinks,
-    "",
-    "**🔎 重点变更**",
-    ...cardSignalLines,
-    "",
-    "**🤖 AI 分析**",
-    "AI 分析异步生成中，变更已先推送。",
-  ];
+  const content = buildFlapCardContent({
+    summary: [
+      hasCardSignals
+        ? `- 本地初筛: 检测到 ${localSignalSummary}。`
+        : "- 本地初筛: 未发现结构化业务变更。",
+      "- 卡片仅展示: 文案变更和重要参数变更",
+      `- 影响页面: ${affectedUrls.length} 个`,
+    ],
+    primaryTitle: "重点变更",
+    primary: cardSignalLines,
+    scope: [affectedPageLinks],
+    details: [
+      "- 完整资源/UI/实现信号见“查看详情”。",
+    ],
+    ai: "AI 分析异步生成中，变更已先推送。",
+  });
 
   const fullDiffLines = [
     "【Flap 全站前端资源变更】",
@@ -1647,8 +1647,6 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
       return lines.concat("");
     }),
   ].filter(line => line !== "");
-
-  const content = contentLines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 
   return {
     url: "https://flap.sh",
@@ -1735,7 +1733,7 @@ async function sendFlapChangeNotification(notification, { moduleContext = "Flap.
   appendHistory("flap-page", n.title, cardContent.slice(0, 300), n.changes.join("\n"));
   const fullDiff = buildFlapFullDiff({ diffTitle, url: n.url, changes: n.changes, meta: n.meta });
   const diffFilePath = saveDiffLocally(n.title, fullDiff);
-  const aiInput = n.useFullDiffForAi ? fullDiff : briefingInput;
+  const aiInput = n.skipAi ? briefingInput : fullDiff;
   const cardOpts = {
     diffButtonText: "查看详情",
     actions: [linkAction(n.url === "https://flap.sh" ? "打开 Flap.sh" : "打开页面", n.url, "primary")].filter(Boolean),
@@ -1803,11 +1801,14 @@ import { AI, aiSummarize as _aiSummarizeBase } from "../shared/ai-client.mjs";
 
 const AI_CONFIG = AI; // 兼容旧代码引用
 
-const AI_SYSTEM_PROMPT = `你是 Flap.sh 变更监控分析师。判断 diff 是构建噪音还是业务变化。
-重点看：Vault/fee/dividend/constraints/enabled、UI/i18n 文案、功能逻辑、链上参数、路由。
-中文输出，不超过 160 字：
+const AI_SYSTEM_PROMPT = `你是 Flap.sh 变更监控分析师。输入通常是详细 diff，可能包含大量未变化页面上下文、CSS class、构建 hash 和资源噪音。
+任务：只根据 diff 中旧值/新值、新增/删除行，提炼真实业务变化；不要把上下文里同时存在的内容误判为变化。
+重点看：Vault/fee/dividend/constraints/enabled、税率/时长/默认值/取值区间、UI/i18n 文案、功能逻辑、链上参数、路由。
+输出中文，不超过 260 字：
 **判定:** 纯构建噪音/有业务变化/新增功能
-**要点:** 1-3 条；纯噪音写“无业务影响”。`;
+**核心变化:** 用 1-3 条写清“改前 → 改后”；如取值区间、开关提示等未变，请明确写“未变化”。
+**影响:** 1 句说明可能影响；纯噪音写“无业务影响”。
+禁止编造 diff 中不存在的字段、数值、功能或链上结果。`;
 
 const CA_STORE_VAULT_AI_PROMPT = `根据金库名字、文案和链接，用中文介绍用途和注意点。
 不要编造收益率、TVL、链上数据或未给出的参数。不超过 90 字。`;
@@ -2105,6 +2106,105 @@ function pushDiffPairLines(lines, key, oldVal, newVal, indent = "  ") {
   lines.push(`${indent}${formatValueChangeLine(key, oldVal, newVal)}`);
 }
 
+function normalizeInsightText(value) {
+  return String(value || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\[[^\]]+\]:[^\s]+/g, " ")
+    .replace(/\b(?:flex|grid|rounded|border|bg|text|font|leading|transition|opacity|shadow|ring|focus|hover|data|span|style|class|button|type|role|slider|radix)[-\w:[\]#%.!/>="'()]+/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function textChangeCorpus(textChanges = [], side = "new") {
+  const parts = [];
+  for (const c of textChanges || []) {
+    if (!c) continue;
+    if (side === "old") {
+      if (c.oldText) parts.push(c.oldText);
+      if (c.type === "removed" && c.text) parts.push(c.text);
+      if (c.ctxBefore) parts.push(c.ctxBefore);
+      if (c.ctxAfter) parts.push(c.ctxAfter);
+    } else {
+      if (c.newText) parts.push(c.newText);
+      if (c.type === "added" && c.text) parts.push(c.text);
+      if (c.ctxBefore) parts.push(c.ctxBefore);
+      if (c.ctxAfter) parts.push(c.ctxAfter);
+    }
+  }
+  return normalizeInsightText(parts.join(" "));
+}
+
+function parseDurationDays(text) {
+  const patterns = [
+    /Anti-Farmer Protection Duration\s+(\d+)\s*day\(s\)/i,
+    /Default:\s*(\d+)\s*days?/i,
+  ];
+  for (const pattern of patterns) {
+    const m = String(text || "").match(pattern);
+    if (m) return Number.parseInt(m[1], 10);
+  }
+  return null;
+}
+
+function parseProtectionRange(text) {
+  const s = String(text || "");
+  const m = s.match(/Min:\s*(\d+)\s*days?\s*·\s*Max:\s*(?:1\s*year\s*)?\(?(\d+)\s*days?\)?/i);
+  if (!m) return "";
+  return `最小值 ${m[1]} 天 / 最大值 ${m[2]} 天（1 年）`;
+}
+
+function extractAntiFarmerDurationInsight(textChanges = []) {
+  const oldText = textChangeCorpus(textChanges, "old");
+  const newText = textChangeCorpus(textChanges, "new");
+  const combined = `${oldText} ${newText}`;
+  if (!/Anti-Farmer Protection Duration/i.test(combined)) return null;
+
+  const oldDays = parseDurationDays(oldText);
+  const newDays = parseDurationDays(newText);
+  const addedDescription = "This feature ensures that trades occur primarily in the tax liquidity pool during the protection period, improving the stability of token tax revenue.";
+  const disableHint = "Set 0 days to disable the protection period.";
+  const rangeOld = parseProtectionRange(oldText);
+  const rangeNew = parseProtectionRange(newText);
+  const range = rangeNew || rangeOld;
+
+  if (oldDays == null && newDays == null && !newText.includes(addedDescription)) return null;
+
+  return {
+    title: "防巨鲸薅币保护周期（Anti-Farmer Protection Duration）",
+    oldDays,
+    newDays,
+    range,
+    rangeChanged: Boolean(rangeOld && rangeNew && rangeOld !== rangeNew),
+    addedDescription: !oldText.includes(addedDescription) && newText.includes(addedDescription) ? addedDescription : "",
+    disableHintUnchanged: oldText.includes(disableHint) && newText.includes(disableHint),
+  };
+}
+
+function extractTextChangeInsights(textChanges = []) {
+  return [extractAntiFarmerDurationInsight(textChanges)].filter(Boolean);
+}
+
+function formatTextChangeInsights(lines, insights = []) {
+  for (const insight of insights) {
+    lines.push(`- **${cardText(insight.title)}**`);
+    if (insight.oldDays != null && insight.newDays != null && insight.oldDays !== insight.newDays) {
+      lines.push(`  ${formatValueChangeLine("默认时长", `${insight.oldDays} 天`, `${insight.newDays} 天`)}`);
+    } else if (insight.newDays != null) {
+      lines.push(`  - 默认时长：${cardText(`${insight.newDays} 天`)}`);
+    }
+    if (insight.range) {
+      const suffix = insight.rangeChanged ? "" : "，区间规则未改动";
+      lines.push(`  - 取值区间：${cardText(insight.range + suffix)}`);
+    }
+    if (insight.addedDescription) {
+      lines.push(`  ${formatAddedLine("新增说明", insight.addedDescription)}`);
+    }
+    if (insight.disableHintUnchanged) {
+      lines.push(`  - 开关提示未改：${cardText("Set 0 days to disable the protection period.")}`);
+    }
+  }
+}
+
 /**
  * 构建飞书卡片简报内容。
  * 展示优先级：结论摘要 → 重点变更 → AI/资源/详情。
@@ -2115,14 +2215,17 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   const summary = buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs);
   const hasBusinessChange = summary.some(s => !s.includes("未提取到结构化业务变更"));
   const intentSummary = buildResourceIntentSummary(assetStats || {});
-
-  lines.push("**📌 结论摘要**");
-  lines.push(`- 页面: ${flapLink("打开页面", url)}`);
-  lines.push(`- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`);
-  if (assetStats) lines.push("- 卡片仅展示: 文案变更和重要参数变更");
-  lines.push("");
-  lines.push("**🎯 重点变更**");
-  lines.push("");
+  const summaryLines = [
+    `- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`,
+    assetStats ? "- 卡片仅展示: 文案变更和重要参数变更" : "",
+  ];
+  const scopeLines = [
+    url ? `- 页面: ${flapLink("打开页面", url)}` : "",
+  ];
+  const detailLines = [
+    assetStats ? `- 资源统计: 不变 ${assetStats.unchanged || 0} / 重命名 ${assetStats.renamed || 0} / 修改 ${assetStats.modified || 0} / 新增 ${assetStats.added || 0} / 移除 ${assetStats.removed || 0}` : "",
+    "- 完整旧/新文本、资源 diff 与上下文见“查看详情”。",
+  ];
 
   let hasStructuredChange = false;
 
@@ -2171,36 +2274,48 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   // ═══ 2. 页面文案变更（提升优先级，展示实际内容）═══
   if (textChanges && textChanges.length > 0) {
     hasStructuredChange = true;
+    const textInsights = extractTextChangeInsights(textChanges);
     const modified = textChanges.filter(c => c.type === "modified");
     const added = textChanges.filter(c => c.type === "added");
     const removed = textChanges.filter(c => c.type === "removed");
-    lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
-    if (modified.length > 0) {
+    if (textInsights.length > 0) {
+      lines.push(`**✏️ 页面文案变更（已归纳，原始 ${textChanges.length} 处）：**`);
+      formatTextChangeInsights(lines, textInsights);
       lines.push("");
-      lines.push("**修改：**");
-      for (const c of modified) {
-        lines.push(`- 原：${removedText(c.oldText)}`);
-        lines.push(`  新：${addedText(c.newText)}`);
-        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
+      const summarizedCount = textInsights.length;
+      if (textChanges.length > summarizedCount) {
+        lines.push(`原始页面上下文较长，已折叠；完整旧/新文本见 Diff 详情。`);
+        lines.push("");
       }
-    }
-    if (added.length > 0) {
+    } else {
+      lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
+      if (modified.length > 0) {
+        lines.push("");
+        lines.push("**修改：**");
+        for (const c of modified) {
+          lines.push(`- 原：${removedText(c.oldText)}`);
+          lines.push(`  新：${addedText(c.newText)}`);
+          if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
+        }
+      }
+      if (added.length > 0) {
+        lines.push("");
+        lines.push("**新增：**");
+        for (const c of added) {
+          lines.push(formatAddedLine(c.text));
+          if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
+        }
+      }
+      if (removed.length > 0) {
+        lines.push("");
+        lines.push("**移除：**");
+        for (const c of removed) {
+          lines.push(formatRemovedLine(c.text));
+          if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
+        }
+      }
       lines.push("");
-      lines.push("**新增：**");
-      for (const c of added) {
-        lines.push(formatAddedLine(c.text));
-        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
-      }
     }
-    if (removed.length > 0) {
-      lines.push("");
-      lines.push("**移除：**");
-      for (const c of removed) {
-        lines.push(formatRemovedLine(c.text));
-        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
-      }
-    }
-    lines.push("");
   } else if (textChangeCount > 0) {
     hasStructuredChange = true;
     lines.push(`**✏️ 文案变更：** ${textChangeCount} 处`);
@@ -2319,13 +2434,14 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     lines.push("");
   }
 
-  lines.push("---");
-  lines.push("");
-  lines.push("**🤖 AI 分析:**");
-  lines.push(aiSummary || "AI 分析异步生成中，变更已先推送。");
-  lines.push("");
-
-  return lines.join("\n");
+  return buildFlapCardContent({
+    summary: summaryLines,
+    primaryTitle: "重点变更",
+    primary: lines,
+    scope: scopeLines,
+    details: detailLines,
+    ai: aiSummary || "AI 分析异步生成中，变更已先推送。",
+  });
 }
 
 /* ══════════════════════════════════════════
@@ -3166,17 +3282,16 @@ function formatVaultFactoryChanges(changes) {
   const hiddenAdded = changes.added.filter(v => !v.showInCAStore);
   const hiddenModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*true\s*→\s*false/.test(d)));
   const visibleModified = changes.modified.filter(v => v.diffs?.some(d => /showInCAStore:\s*false\s*→\s*true/.test(d)));
-  const lines = [
-    "**📌 结论摘要**",
+  const summary = [
     `- 新增 ${changes.added.length} 个 / 移除 ${changes.removed.length} 个 / 修改 ${changes.modified.length} 个`,
     visibleAdded.length ? `- 新增可见金库 ${visibleAdded.length} 个：${visibleAdded.map(v => v.name).join(", ")}` : "",
     hiddenModified.length ? `- CAStore 下架/隐藏 ${hiddenModified.length} 个：${hiddenModified.map(v => v.name).join(", ")}` : "",
     visibleModified.length ? `- CAStore 上架/可见 ${visibleModified.length} 个：${visibleModified.map(v => v.name).join(", ")}` : "",
-    "",
   ];
+  const primary = [];
+  const details = [];
   if (visibleAdded.length > 0) {
-    lines.push("**🎯 重点变更**");
-    lines.push("- 新玩法/可见金库上线");
+    primary.push("- 新玩法/可见金库上线");
     for (const v of visibleAdded) {
       const flags = [];
       flags.push("前端可见");
@@ -3184,16 +3299,15 @@ function formatVaultFactoryChanges(changes) {
       if (v.enabled) flags.push("已启用");
       else flags.push("已禁用");
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
-      lines.push(`- ${formatAddedLine(v.name).replace(/^- /, "")}`);
-      lines.push(`  Factory: ${addressLink(v.factory)}`);
-      if (v.descriptionI18nKey) lines.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
-      lines.push(`  状态: ${flags.join(" / ")}`);
-      lines.push(`  操作: ${flapLink("查看金库", `https://flap.sh/launch?vaultfactory=${v.factory}`)}`);
+      primary.push(`- ${formatAddedLine(v.name).replace(/^- /, "")}`);
+      primary.push(`  Factory: ${addressLink(v.factory)}`);
+      if (v.descriptionI18nKey) primary.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
+      primary.push(`  状态: ${flags.join(" / ")}`);
+      primary.push(`  操作: ${flapLink("查看金库", `https://flap.sh/launch?vaultfactory=${v.factory}`)}`);
     }
-    lines.push("");
   }
   if (hiddenAdded.length > 0) {
-    lines.push("**🏦 新增隐藏金库工厂**");
+    details.push("- 新增隐藏金库工厂");
     for (const v of hiddenAdded) {
       const flags = [];
       flags.push("隐藏");
@@ -3201,36 +3315,39 @@ function formatVaultFactoryChanges(changes) {
       if (v.enabled) flags.push("已启用");
       else flags.push("已禁用");
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
-      lines.push(`- ${formatAddedLine(v.name).replace(/^- /, "")}`);
-      lines.push(`  Factory: ${addressLink(v.factory)}`);
-      if (v.descriptionI18nKey) lines.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
-      lines.push(`  状态: ${flags.join(" / ")}`);
+      details.push(`  ${formatAddedLine(v.name).replace(/^- /, "")}`);
+      details.push(`    Factory: ${addressLink(v.factory)}`);
+      if (v.descriptionI18nKey) details.push(`    描述键: ${cardText(v.descriptionI18nKey)}`);
+      details.push(`    状态: ${flags.join(" / ")}`);
     }
-    lines.push("");
   }
   if (changes.removed.length > 0) {
-    lines.push("**🏦 移除金库工厂**");
+    primary.push("- 移除金库工厂");
     for (const v of changes.removed) {
-      lines.push(`- ${formatRemovedLine(v.name).replace(/^- /, "")}`);
-      lines.push(`  Factory: ${addressLink(v.factory)}`);
+      primary.push(`  ${formatRemovedLine(v.name).replace(/^- /, "")}`);
+      primary.push(`    Factory: ${addressLink(v.factory)}`);
     }
-    lines.push("");
   }
   if (changes.modified.length > 0) {
-    lines.push("**🏦 金库工厂配置变更**");
+    primary.push("- 金库工厂配置变更");
     for (const v of changes.modified) {
-      lines.push(`- ${changedText(v.name)}`);
-      lines.push(`  Factory: ${addressLink(v.factory)}`);
-      if (v.descriptionI18nKey) lines.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
+      primary.push(`  ${changedText(v.name)}`);
+      primary.push(`    Factory: ${addressLink(v.factory)}`);
+      if (v.descriptionI18nKey) primary.push(`    描述键: ${cardText(v.descriptionI18nKey)}`);
       for (const d of v.diffs) {
         const pair = splitDiffPairText(d);
-        if (pair) pushDiffPairLines(lines, pair.key, pair.oldVal, pair.newVal, "  ");
-        else lines.push(`  ${d}`);
+        if (pair) pushDiffPairLines(primary, pair.key, pair.oldVal, pair.newVal, "    ");
+        else primary.push(`    ${d}`);
       }
-      if (v.legacyFactories) lines.push(`  legacy: ${v.legacyFactories}`);
+      if (v.legacyFactories) primary.push(`    legacy: ${v.legacyFactories}`);
     }
   }
-  return lines.filter(Boolean).join("\n");
+  return buildFlapCardContent({
+    summary,
+    primaryTitle: "重点变更",
+    primary: primary.length ? primary : ["- 未发现可见金库上下架，仅有配置或隐藏项变化。"],
+    details,
+  });
 }
 
 function buildVaultFactoryChangeTitle(changes, prefix = "") {
@@ -4935,18 +5052,24 @@ async function startMonitor() {
     "Flap 监控 v2 已启动",
     buildFlapCardContent({
       summary: [
-        "- 状态: 已启动",
-        `- 监控页面: ${CONFIG.urls.length} 个`,
-        `- 金库工厂基线: ${Object.keys(snapshot.vaultFactories || {}).length} 个`,
-        `- 轮询间隔: ${CONFIG.pollIntervalMs}ms`,
+        "- 状态: ✅ **已启动**",
+        `- 页面: ${Object.keys(snapshot.pages || {}).length || CONFIG.urls.length} 个｜轮询 ${CONFIG.pollIntervalMs}ms + 抖动 ±${CONFIG.jitterMs}ms`,
+        `- 金库工厂: ${Object.keys(snapshot.vaultFactories || {}).length} 个`,
+      ],
+      primaryTitle: "重点能力",
+      primary: [
+        "- 页面 HTML / 资源 / i18n / 文案 diff",
+        "- CAstore 金库结构与 VaultFactory 配置",
+        "- 链上注册中心事件扫描",
       ],
       scope: CONFIG.urls.map(u => `- ${flapLink(new URL(u).pathname || "首页", u)}`),
       details: [
-        ...formatRegistryMonitorStatus(snapshot, { includeRpc: true }),
-        "- 反风控: UA 轮换 + 自适应退避 + 请求抖动",
+        `- 注册中心: ${addressLink(CONFIG.registryMonitor.address)}`,
+        `- 链上确认: ${CONFIG.registryMonitor.confirmations} 块｜单轮最多 ${CONFIG.registryMonitor.maxBlocksPerRun} 块`,
+        "- 反风控: UA 轮换 + 页面/资源自适应退避 + 请求抖动",
         `- 服务器: ${(await import("node:os")).hostname()}`,
       ],
-      actions: [`- ${flapLink("打开 Flap.sh", "https://flap.sh")}`],
+      ai: "启动完成后将只推送页面、金库、链上注册中心的实质变化。",
     }),
     "blue",
     {
