@@ -17,12 +17,12 @@ test("startup card copy reflects active frontend and api cadences", () => {
   const ready = __testables.buildStartupReadyContent();
   assert.match(progress, /前端页面：每 10 秒｜当前快照 \d+ 个页面/);
   assert.match(progress, /公开 API：每 15 秒/);
-  assert.match(ready, /\*\*01｜运行状态\*\*[\s\S]*\*\*02｜监控概览\*\*[\s\S]*\*\*03｜前端监控入口\*\*[\s\S]*\*\*04｜运行参数\*\*[\s\S]*\*\*05｜操作入口\*\*/);
+  assert.match(ready, /\*\*01｜运行状态\*\*[\s\S]*\*\*02｜监控概览\*\*[\s\S]*\*\*03｜前端监控入口\*\*[\s\S]*\*\*04｜运行参数\*\*/);
   assert.match(ready, /状态：监控运行中/);
   assert.match(ready, /前端页面：[\s\S]*每 10 秒/);
   assert.match(ready, /公开 API：[\s\S]*每 15 秒/);
   for (const url of __testables.CONFIG.monitorUrls) assert.match(ready, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(ready, /更新时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
+  assert.doesNotMatch(`${progress}\n${ready}`, /操作入口|更新时间：/);
   assert.doesNotMatch(ready, /每 \d+s/);
   assert.doesNotMatch(`${progress}\n${ready}`, /[\p{Extended_Pictographic}]/u);
   assert.doesNotMatch(`${progress}\n${ready}`, /(^|\n)-\s/m);
@@ -68,7 +68,8 @@ test("new frontend route notification asks for confirmation before monitoring en
   assert.equal(notification.title, "前端新路由发现：/en/presale/102364633");
   assert.match(notification.content, /尚未加入前端监控池/);
   assert.match(notification.aiInput, /Mame Inu Description Rule Details/);
-  assert.deepEqual(notification.cardOpts.actions.map(a => a.value.action), ["frontend_add_route", "frontend_ignore_route"]);
+  assert.equal(notification.cardOpts, undefined);
+  assert.doesNotMatch(notification.content, /卡片下方|加入监控”或“忽略/);
   assert.equal(notification.dedupeKey, "frontend:new-page:https://four.meme/en/presale/102364633");
 });
 

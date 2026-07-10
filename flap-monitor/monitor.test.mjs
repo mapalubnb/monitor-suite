@@ -18,12 +18,16 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
     }])),
     vaultFactories: {
       first: { name: "完整金库", factory: "0x0000000000000000000000000000000000000001", enabled: true, showInCAStore: true },
+      hidden: { name: "隐藏金库", factory: "0x0000000000000000000000000000000000000002", enabled: true, showInCAStore: false },
     },
     registryMonitor: { lastBlock: 100, safeLatestBlock: 105, latestBlock: 110, knownVaults: { one: {} } },
   }, "monitor-host");
   for (const url of __testables.CONFIG.urls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   for (const url of __testables.CONFIG.bscRpcUrls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(content, /0x0000000000000000000000000000000000000001/);
+  assert.doesNotMatch(content, /隐藏金库|0x0000000000000000000000000000000000000002/);
+  assert.match(content, /展示数量：1/);
+  assert.doesNotMatch(content, /操作入口|更新时间：|CAStore 展示/);
   assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
   assert.doesNotMatch(content, /(^|\n)-\s/m);
 });

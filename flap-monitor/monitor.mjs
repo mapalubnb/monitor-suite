@@ -944,16 +944,6 @@ function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", pri
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function linkAction(text, url, type = "default") {
-  if (!url) return null;
-  return {
-    tag: "button",
-    text: { tag: "plain_text", content: text },
-    type,
-    url,
-  };
-}
-
 function isFlapAssetOnlyNotification(notification) {
   if (!notification || notification.isRecoveryNotice || notification.content) return false;
   const meta = notification.meta || {};
@@ -1723,10 +1713,7 @@ async function sendFlapChangeNotification(notification, { moduleContext = "Flap.
   const fullDiff = buildFlapFullDiff({ diffTitle, url: n.url, changes: n.changes, meta: n.meta });
   const diffFilePath = saveDiffLocally(n.title, fullDiff);
   const aiInput = n.skipAi ? briefingInput : fullDiff;
-  const cardOpts = {
-    diffButtonText: "查看详情",
-    actions: [linkAction(n.url === "https://flap.sh" ? "打开 Flap.sh" : "打开页面", n.url, "primary")].filter(Boolean),
-  };
+  const cardOpts = { diffButtonText: "下载完整 DIFF" };
   await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput, enrichFn: (summary) => {
     if (n.content) return enrichExistingCardContentWithAi(n.content, summary);
     return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
@@ -2709,12 +2696,7 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
 
   const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
   const title = `${titlePrefix}Flap 链上金库注册变更`;
-  const firstVaultUrl = buildVaultFactoryLaunchUrl(newEvents[0]?.vault);
-  const messageId = await sendCardFn(title, content, "red", undefined, {
-    actions: [
-      linkAction("打开金库页面", firstVaultUrl, "primary"),
-    ].filter(Boolean),
-  });
+  const messageId = await sendCardFn(title, content, "red");
   if (messageId) await pinMessage(messageId);
   return { changed: true, sent: Boolean(messageId), events: newEvents };
 }
@@ -3198,7 +3180,7 @@ function collectRoundVaultFactory(roundEntries, url, features) {
   return map;
 }
 
-async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries, titlePrefix = "", linkUrl = "https://flap.sh/bnb/CAstore", sendCardFn = sendCardViaApi } = {}) {
+async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries, titlePrefix = "", sendCardFn = sendCardViaApi } = {}) {
   if (!roundVaultFactoryEntries?.length) return { sent: false, changed: false };
   const { map: currentVFMap, conflicts } = mergeRoundVaultFactoryMaps(roundVaultFactoryEntries);
   const oldVFMap = snapshot.vaultFactories || {};
@@ -3226,9 +3208,7 @@ async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries,
   const vfTitle = buildVaultFactoryChangeTitle(vfChanges, `🏦 ${titlePrefix}`);
   appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
   const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
-  const vfMsgId = await sendCardFn(vfTitle, `${vfContent}${conflictNote}`, vfTemplate, undefined, {
-    actions: [linkAction("查看 CAStore", linkUrl, "primary")].filter(Boolean),
-  });
+  const vfMsgId = await sendCardFn(vfTitle, `${vfContent}${conflictNote}`, vfTemplate);
   if (vfChanges.added.length > 0 && vfMsgId) {
     await pinMessage(vfMsgId);
   }
@@ -3251,10 +3231,6 @@ function buildOperationalNoticeContent({ status, url, severity = "orange", reaso
     details: [
       reason ? `- 原因: ${cardText(reason)}` : "",
       detail ? `- 详情:\n${indentCardText(detail, "  ")}` : "",
-    ],
-    actions: [
-      url ? `- ${flapLink("打开页面", url)}` : "",
-      "- 立即处理：查看 flap-monitor 日志与最近 Diff",
     ],
   });
 }
@@ -3997,12 +3973,6 @@ async function sendCaStoreVaultChangeNotification(notification) {
     null,
     notification.url,
     aiIntroduceCaStoreVault,
-    {
-      actions: [
-        linkAction(notification.launchUrl ? "查看金库" : "打开 CAStore", notification.url, "primary"),
-        notification.launchUrl ? linkAction("打开 CAStore", "https://flap.sh/bnb/CAstore") : null,
-      ].filter(Boolean),
-    },
   );
   if (messageId) await pinMessage(messageId);
   return messageId;
@@ -4971,21 +4941,21 @@ async function runCheck() {
 
 function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
   const pages = Object.values(snapshot.pages || {});
-  const factories = Object.values(snapshot.vaultFactories || {});
+  const factories = Object.values(snapshot.vaultFactories || {}).filter(factory => factory?.showInCAStore === true);
   const registry = snapshot.registryMonitor || {};
   const pageLines = CONFIG.urls.map((url, index) => {
     const page = pages.find(item => item?.originalUrl === url) || {};
     const assets = page.assetFiles?.length || 0;
     const i18n = Object.keys(page.i18nStrings || {}).length;
-    return `${String(index + 1).padStart(2, "0")}　${url}｜资源 ${assets} 个｜i18n ${i18n} 条`;
+    return `${String(index + 1).padStart(2, "0")}　[${url}](${url})｜资源 ${assets} 个｜i18n ${i18n} 条`;
   });
   const factoryLines = factories.length > 0
     ? factories.map((factory, index) => {
         const name = factory.name || factory.id || "未命名金库";
         const address = factory.factory || factory.address || "无地址";
-        return `${String(index + 1).padStart(2, "0")}　${name}｜地址 ${address}｜启用 ${factory.enabled ? "是" : "否"}｜CAStore 展示 ${factory.showInCAStore ? "是" : "否"}`;
+        return `${String(index + 1).padStart(2, "0")}　${name}｜状态 ${factory.enabled ? "已启用" : "未启用"}｜地址 ${addressLink(address)}`;
       })
-    : ["暂无金库工厂基线"];
+    : ["当前没有配置为 CAStore 展示的金库"];
   return [
     "**01｜运行状态**",
     "状态：监控运行中",
@@ -4996,8 +4966,8 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
     "**02｜页面监控**",
     ...pageLines,
     "",
-    "**03｜金库工厂**",
-    `工厂总数：${factories.length}`,
+    "**03｜CAStore 金库**",
+    `展示数量：${factories.length}`,
     ...factoryLines,
     "",
     "**04｜链上注册中心**",
@@ -5009,14 +4979,7 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
     `已知链上金库：${Object.keys(registry.knownVaults || {}).length} 个`,
     "",
     "**05｜RPC 节点**",
-    ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　${url}`),
-    "",
-    "**06｜操作入口**",
-    "状态命令：fl-status",
-    "日志命令：fl-log",
-    "全量检查：fl-check",
-    "",
-    `更新时间：${ts()}`,
+    ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
   ].join("\n");
 }
 
@@ -5082,10 +5045,7 @@ async function startMonitor() {
   await sendFeishu(
     "Flap 监控 v2 已启动",
     buildFlapStartupContent(snapshot, (await import("node:os")).hostname()),
-    "blue",
-    {
-      actions: [linkAction("打开 Flap.sh", "https://flap.sh", "primary")].filter(Boolean),
-    }
+    "blue"
   );
 
   // 轮询函数：并行检测所有页面

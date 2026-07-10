@@ -3765,25 +3765,6 @@ function frontendRouteActionToken(url) {
   return md5(`${canonicalFrontendUrl(url)}:${process.env.FEISHU_APP_SECRET || process.env.FEISHU_APP_ID || "fourmeme"}`).slice(0, 16);
 }
 
-function buildFrontendRouteActionButtons(url) {
-  const canonical = canonicalFrontendUrl(url);
-  const token = frontendRouteActionToken(canonical);
-  return [
-    {
-      tag: "button",
-      text: { tag: "plain_text", content: "加入监控" },
-      type: "primary",
-      value: { action: "frontend_add_route", url: canonical, token },
-    },
-    {
-      tag: "button",
-      text: { tag: "plain_text", content: "忽略" },
-      type: "default",
-      value: { action: "frontend_ignore_route", url: canonical, token },
-    },
-  ];
-}
-
 function buildFrontendNewPageAiInput(page) {
   const label = urlLabel(page.originalUrl);
   const text = frontendDisplaySnippet(page.textContent || "", 1200);
@@ -3817,7 +3798,7 @@ function buildFrontendNewPageNotification(page) {
     `链接：${pageLink(page.originalUrl, "查看页面")}`,
     "",
     "**类型：前端新路由发现**",
-    `已抓取页面结构，但尚未加入前端监控池。请在卡片下方选择“加入监控”或“忽略”。`,
+    `已抓取页面结构，但尚未加入前端监控池。发送 \`route add ${page.originalUrl}\` 加入监控，或发送 \`route ignore ${page.originalUrl}\` 忽略。`,
     `确认加入后，脚本会在下一轮前端检查建立基线，并按每 ${CONFIG.intervals.frontend / 1000}s 检查页面变化。`,
     "",
     `资源文件：${fileCount} 个`,
@@ -3839,7 +3820,6 @@ function buildFrontendNewPageNotification(page) {
     pageLabel: label,
     dedupeKey: `frontend:new-page:${canonicalFrontendUrl(page.originalUrl)}`,
     aiInput: buildFrontendNewPageAiInput(page),
-    cardOpts: { actions: buildFrontendRouteActionButtons(page.originalUrl) },
   };
 }
 
@@ -9116,14 +9096,7 @@ function buildStartupProgressContent() {
     `创建者动作：WebSocket 实时触发｜HTTP ${formatInterval(actorRunner?.intervalMs)}兜底`,
     ``,
     `**03｜监控入口**`,
-    ...CONFIG.monitorUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　${url}`),
-    ``,
-    `**04｜操作入口**`,
-    `状态命令：fm-status`,
-    `日志命令：fm-log`,
-    `全量检查：fm-check`,
-    ``,
-    `更新时间：${formatDateTime()}`,
+    ...CONFIG.monitorUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
   ].join("\n");
 }
 
@@ -9160,7 +9133,7 @@ function buildStartupReadyContent() {
     `创建者动作：${actorCount} 个地址｜WebSocket 实时监听｜HTTP ${formatInterval(actorRunner?.intervalMs)}兜底`,
     ``,
     `**03｜前端监控入口**`,
-    ...CONFIG.monitorUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　${url}`),
+    ...CONFIG.monitorUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
     ``,
     `**04｜运行参数**`,
     `HTML 并发：${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)}`,
@@ -9168,13 +9141,6 @@ function buildStartupReadyContent() {
     `异常资源复查：${formatDuration(CONFIG.frontendAssetJitter.quickConfirmDelayMs)}`,
     `请求策略：UA 轮换｜请求抖动｜同域限速｜条件请求｜失败退避`,
     `链上策略：tx.from 过滤｜确认块保护｜命中后合约复查`,
-    ``,
-    `**05｜操作入口**`,
-    `状态命令：fm-status`,
-    `日志命令：fm-log`,
-    `全量检查：fm-check`,
-    ``,
-    `更新时间：${formatDateTime()}`,
   ].join("\n");
 }
 
@@ -9364,7 +9330,6 @@ export const __testables = {
   shouldUseAiForNotification,
   buildFrontendFailureNotifications,
   buildFrontendNewPageNotification,
-  buildFrontendRouteActionButtons,
   buildFrontendNewPageAiInput,
   formatPoolChanges,
   formatApiChanges,

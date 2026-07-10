@@ -252,6 +252,13 @@ async function handleMessage(messageId, rawText) {
         return;
       }
 
+      case "route":
+      case "路由": {
+        reply = await cmdFrontendRoute(args);
+        await replyCard(messageId, "前端路由", reply, "blue");
+        return;
+      }
+
       case "exec":
       case "$": {
         const command = args.join(" ");
@@ -619,6 +626,9 @@ function cmdHelp() {
     "`ai list`　　 列出所有可用提供商及模型",
     "`ai models [提供商]` 从 API 获取远程模型列表",
     "`history [N]` 最近变更记录（默认 10）",
+    "`route list`　查看待确认的新路由",
+    "`route add <完整URL>`　加入前端监控",
+    "`route ignore <完整URL>`　忽略新路由",
     "",
     "**Shell 命令：**",
     "直接输入任意命令执行，如 `fm-status`、`fl-status`、`mon-status`",
@@ -1004,6 +1014,47 @@ function isValidFrontendRouteUrl(url) {
   } catch {
     return false;
   }
+}
+
+async function cmdFrontendRoute(args = []) {
+  const subcommand = String(args[0] || "list").toLowerCase();
+  const snap = ensureFrontendRouteState(readFourmemeSnapshot());
+  const decisions = ensureFrontendRouteState(readFrontendRouteDecisions());
+  if (["list", "列表"].includes(subcommand)) {
+    const pending = Object.values({ ...snap._frontendPendingRoutes, ...decisions._frontendPendingRoutes })
+      .filter(item => item?.status === "pending" && item?.url)
+      .sort((a, b) => String(a.url).localeCompare(String(b.url)));
+    if (pending.length === 0) return "当前没有待确认的新路由。";
+    return ["**待确认的新路由**", ...pending.map((item, index) => `${String(index + 1).padStart(2, "0")}　[${item.url}](${item.url})`)].join("\n");
+  }
+
+  const action = ["add", "加入", "批准"].includes(subcommand)
+    ? "frontend_add_route"
+    : ["ignore", "忽略"].includes(subcommand)
+      ? "frontend_ignore_route"
+      : "";
+  const canonical = canonicalFrontendUrl(args.slice(1).join(" "));
+  if (!action || !isValidFrontendRouteUrl(canonical)) {
+    return "用法：`route list`、`route add <完整URL>` 或 `route ignore <完整URL>`";
+  }
+
+  await handleFrontendRouteAction({
+    action: {
+      value: {
+        action,
+        url: canonical,
+        token: frontendRouteActionToken(canonical),
+      },
+    },
+  });
+  const updated = ensureFrontendRouteState(readFrontendRouteDecisions());
+  const expectedStatus = action === "frontend_add_route" ? "approved" : "ignored";
+  if (updated._frontendPendingRoutes[canonical]?.status !== expectedStatus) {
+    throw new Error(`路由状态未更新为 ${expectedStatus}`);
+  }
+  return action === "frontend_add_route"
+    ? `已加入前端监控：\n[${canonical}](${canonical})\n下一轮检查将建立基线。`
+    : `已忽略新路由：\n[${canonical}](${canonical})\n后续不会重复提醒。`;
 }
 
 /**

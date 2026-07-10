@@ -384,7 +384,7 @@ if [ -f "$SNAP" ]; then
 
     console.log('**04｜底池配置**');
     if(allPools.length===0) console.log('暂无底池');
-    for(const [index,p] of allPools.entries()) console.log(String(index+1).padStart(2,'0')+'　符号 '+value(p.symbol||p.nativeSymbol)+'｜状态 '+value(p.status)+'｜地址 '+bscAddress(p.symbolAddress)+'｜买入费 '+value(p.buyFee)+'｜卖出费 '+value(p.sellFee)+'｜初始金额 '+value(p.b0Amount)+'｜募集总量 '+value(p.totalBAmount));
+    for(const [index,p] of allPools.entries()) console.log(String(index+1).padStart(2,'0')+'　符号 '+value(p.symbol||p.nativeSymbol)+'｜状态 '+value(p.status)+'｜地址 '+bscAddress(p.symbolAddress)+'｜募集总量 '+value(p.totalBAmount));
     console.log('');
 
     console.log('**05｜前端页面**');
@@ -425,9 +425,6 @@ if [ -f "$SNAP" ]; then
     for(const [index,repo] of repoEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(repo.full_name||repo.name,repo.html_url||('https://github.com/'+repo.full_name))+'｜默认分支 '+value(repo.default_branch)+'｜更新时间 '+value(repo.updated_at));
     console.log('');
 
-    console.log('**11｜操作入口**');
-    console.log('详情快照：snapshot.json｜日志：fm-log｜全量检测：fm-check');
-    console.log('');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null
   echo ""
@@ -575,8 +572,6 @@ if [ -f "$SNAP" ]; then
     for(const [index,addr] of knownVaults.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(addr,'https://bscscan.com/address/'+addr));
     console.log('');
 
-    console.log('**06｜操作入口**');
-    console.log('详情快照：snapshot.json｜日志：fl-log｜全量检测：fl-check');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null
   echo ""
@@ -654,9 +649,6 @@ echo ""
 echo "**02｜服务能力**"
 echo "模式：WebSocket 长连接｜无需公网 IP"
 echo "能力：命令执行｜状态查询｜日志附件｜卡片交互｜AI 助手"
-echo ""
-echo "**03｜操作入口**"
-echo "发送 \`help\` 查看全部指令"
 echo ""
 echo "更新时间：$(date '+%Y-%m-%d %H:%M:%S')"
 EOF
@@ -803,10 +795,6 @@ FL_SIZE=$(du -sh "$FL_DIR" 2>/dev/null | awk '{print $1}' || echo '?')
 PM2_HOME="${PM2_HOME:-/root/.pm2}"
 LOG_SIZE=$(du -sh $PM2_HOME/logs 2>/dev/null | awk '{print $1}' || echo '?')
 echo "Four.meme：$FM_SIZE｜Flap：$FL_SIZE｜PM2 日志：$LOG_SIZE"
-echo ""
-echo "**05｜操作入口**"
-echo "详情：\`fm-status\`｜\`fl-status\`｜\`bot-status\`"
-echo "帮助：\`mon-help\`"
 echo ""
 echo "更新时间：$(date '+%Y-%m-%d %H:%M:%S')"
 EOF

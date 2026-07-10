@@ -153,60 +153,239 @@ function normalizeCardOptions(diffFilePathOrOpts) {
   return { diffFilePath: diffFilePathOrOpts };
 }
 
-function buildCardActions(opts = {}) {
-  const actions = [];
-  if (opts.diffFilePath) {
-    actions.push({
-      tag: "button",
-      text: { tag: "plain_text", content: opts.diffButtonText || "查看详情" },
-      type: "default",
+function buildDiffButton(opts = {}) {
+  if (!opts.diffFilePath) return null;
+  return {
+    tag: "button",
+    element_id: "download_diff",
+    text: { tag: "plain_text", content: opts.diffButtonText || "下载完整 DIFF" },
+    type: "default",
+    size: "small",
+    width: "default",
+    behaviors: [{
+      type: "callback",
       value: { action: "download_diff", file: opts.diffFilePath },
-    });
-  }
-  for (const action of opts.actions || []) {
-    if (!action || action.tag !== "button" || !action.text?.content) continue;
-    const item = {
-      tag: "button",
-      text: { tag: "plain_text", content: String(action.text.content).slice(0, 30) },
-      type: action.type || "default",
-    };
-    if (action.url) item.url = action.url;
-    if (action.value?.action) item.value = action.value;
-    if (!item.url && !item.value) continue;
-    actions.push(item);
-  }
-  return actions;
+    }],
+  };
 }
 
-function buildCardFooterElements(opts = {}) {
-  const parts = [`更新时间：${ts()}`];
-  if (opts.footerText) parts.unshift(String(opts.footerText).slice(0, 80));
-  return [{ tag: "plain_text", content: parts.join("｜") }];
+function sectionHeading(content, elementId) {
+  return {
+    tag: "div",
+    element_id: elementId,
+    margin: "8px 0 2px 0",
+    text: {
+      tag: "lark_md",
+      content: `**${content}**`,
+      text_size: "heading",
+      text_align: "left",
+    },
+  };
+}
+
+function markdownBlock(content, elementId, margin = "0") {
+  return {
+    tag: "markdown",
+    element_id: elementId,
+    content: String(content || "").trim() || "-",
+    text_align: "left",
+    text_size: "normal",
+    margin,
+  };
+}
+
+function parseNumberedTableRow(line) {
+  if (!/^\d{2}[　\s]/.test(line) || !line.includes("｜")) return null;
+  const parts = line.split("｜").map(part => part.trim()).filter(Boolean);
+  if (parts.length < 2) return null;
+  const values = { 项目: parts.shift() };
+  for (let index = 0; index < parts.length; index++) {
+    const part = parts[index];
+    const match = part.match(/^([^：:\s]{1,16})[：:\s]+([\s\S]+)$/);
+    const label = match?.[1] || `信息${index + 1}`;
+    values[label] = match?.[2] || part;
+  }
+  return values;
+}
+
+function buildTable(lines, elementId) {
+  const rows = lines.map(parseNumberedTableRow);
+  if (rows.some(row => !row)) return null;
+  const labels = [...new Set(rows.flatMap(row => Object.keys(row)))];
+  const columns = labels.map((label, index) => ({
+    name: `col_${index + 1}`,
+    display_name: label,
+    data_type: "markdown",
+    horizontal_align: "left",
+    vertical_align: "top",
+    width: label === "项目" ? "22%" : "auto",
+  }));
+  return {
+    tag: "table",
+    element_id: elementId,
+    margin: "2px 0 8px 0",
+    page_size: Math.min(10, Math.max(1, rows.length)),
+    row_height: "auto",
+    row_max_height: "999px",
+    freeze_first_column: true,
+    header_style: {
+      text_align: "left",
+      text_size: "normal",
+      background_style: "grey",
+      text_color: "default",
+      bold: true,
+      lines: 2,
+    },
+    columns,
+    rows: rows.map(row => Object.fromEntries(labels.map((label, index) => [`col_${index + 1}`, row[label] ?? "-"]))),
+  };
+}
+
+function parseSimpleMetric(line) {
+  const match = line.match(/^([^：\n]{1,24})：([\s\S]+)$/);
+  if (!match) return null;
+  return { label: match[1].trim(), value: match[2].trim() };
+}
+
+function buildMetricRows(lines, idPrefix) {
+  const metrics = lines.map(parseSimpleMetric);
+  if (metrics.some(metric => !metric) || metrics.length < 2 || metrics.length > 8) return null;
+  const elements = [];
+  for (let index = 0; index < metrics.length; index += 2) {
+    const pair = metrics.slice(index, index + 2);
+    elements.push({
+      tag: "column_set",
+      element_id: `${idPrefix}_${index / 2 + 1}`,
+      flex_mode: "bisect",
+      horizontal_spacing: "medium",
+      margin: "2px 0",
+      columns: pair.map((metric, columnIndex) => ({
+        tag: "column",
+        element_id: `${idPrefix}_${index / 2 + 1}_${columnIndex + 1}`,
+        width: "weighted",
+        weight: 1,
+        background_style: "grey",
+        padding: "8px 10px",
+        vertical_spacing: "2px",
+        elements: [{
+          tag: "markdown",
+          content: `**${metric.label}**\n${metric.value}`,
+          text_size: "normal",
+        }],
+      })),
+    });
+  }
+  return elements;
+}
+
+export function buildCardBodyElements(content, opts = {}) {
+  const lines = String(content || "").trim().split("\n");
+  const contentHasTimestamp = lines.some(line => /^更新时间：/.test(line.trim()));
+  const elements = [];
+  let markdownLines = [];
+  let elementIndex = 0;
+  let tableCount = 0;
+  let currentHeading = "";
+  const nextId = (prefix) => `${prefix}_${++elementIndex}`;
+  const flushMarkdown = () => {
+    while (markdownLines.length > 0 && !markdownLines[0].trim()) markdownLines.shift();
+    while (markdownLines.length > 0 && !markdownLines.at(-1).trim()) markdownLines.pop();
+    if (markdownLines.length === 0) return;
+
+    const compactLines = markdownLines.filter(line => line.trim());
+    const metricElements = /^(?:0[12]｜|运行状态|总览)/.test(currentHeading)
+      ? buildMetricRows(compactLines, nextId("metrics"))
+      : null;
+    if (metricElements) {
+      elements.push(...metricElements);
+      markdownLines = [];
+      return;
+    }
+
+    let plain = [];
+    const flushPlain = () => {
+      if (plain.length > 0) elements.push(markdownBlock(plain.join("\n"), nextId("text")));
+      plain = [];
+    };
+    for (let index = 0; index < markdownLines.length;) {
+      const tableLines = [];
+      while (index < markdownLines.length && parseNumberedTableRow(markdownLines[index])) {
+        tableLines.push(markdownLines[index]);
+        index++;
+      }
+      if (tableLines.length >= 1 && tableCount < 5) {
+        flushPlain();
+        const table = buildTable(tableLines, nextId("table"));
+        if (table) {
+          elements.push(table);
+          tableCount++;
+        }
+      } else if (tableLines.length > 0) {
+        plain.push(...tableLines);
+      } else {
+        plain.push(markdownLines[index]);
+        index++;
+      }
+    }
+    flushPlain();
+    markdownLines = [];
+  };
+
+  for (const line of lines) {
+    const heading = line.match(/^\*\*([^*\n]+)\*\*$/);
+    if (heading) {
+      flushMarkdown();
+      currentHeading = heading[1].trim();
+      elements.push(sectionHeading(currentHeading, nextId("section")));
+    } else {
+      markdownLines.push(line);
+    }
+  }
+  flushMarkdown();
+
+  const diffButton = buildDiffButton(opts);
+  if (diffButton) {
+    elements.push({ tag: "hr", element_id: nextId("divider"), margin: "6px 0" });
+    elements.push(diffButton);
+  }
+  if (opts.footerText || !contentHasTimestamp) {
+    elements.push({ tag: "hr", element_id: nextId("divider"), margin: "6px 0 2px 0" });
+    elements.push({
+      tag: "div",
+      element_id: nextId("footer"),
+      text: {
+        tag: "plain_text",
+        content: [opts.footerText, contentHasTimestamp ? "" : `更新时间：${ts()}`].filter(Boolean).join("｜"),
+        text_size: "notation",
+        text_color: "grey",
+        text_align: "left",
+      },
+    });
+  }
+  return elements;
 }
 
 export function buildCardJson(title, content, template, diffFilePathOrOpts) {
   const opts = normalizeCardOptions(diffFilePathOrOpts);
-  const elements = [
-    { tag: "markdown", content: String(content || "").trim() || "-" },
-  ];
-  const actions = buildCardActions(opts);
-  if (actions.length > 0) {
-    elements.push({ tag: "hr" });
-    elements.push({ tag: "markdown", content: "**操作**" });
-    elements.push({
-      tag: "action",
-      actions,
-    });
-  }
-  elements.push({ tag: "hr" });
-  elements.push({
-    tag: "note",
-    elements: buildCardFooterElements(opts),
-  });
   return JSON.stringify({
-    config: { wide_screen_mode: true },
-    header: { title: { tag: "plain_text", content: title }, template },
-    elements,
+    schema: "2.0",
+    config: {
+      update_multi: true,
+      width_mode: "fill",
+      enable_forward: true,
+      summary: { content: String(title || "监控通知") },
+    },
+    header: {
+      title: { tag: "plain_text", content: title },
+      template,
+      padding: "12px 16px",
+    },
+    body: {
+      direction: "vertical",
+      padding: "12px 16px",
+      vertical_spacing: "small",
+      elements: buildCardBodyElements(content, opts),
+    },
   });
 }
 

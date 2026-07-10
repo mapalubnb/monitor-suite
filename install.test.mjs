@@ -55,3 +55,11 @@ test("embedded status command JavaScript is syntactically valid", () => {
     }
   }
 });
+
+test("Four.meme pool status keeps only the requested four fields", () => {
+  const source = extractHeredoc("fm-status");
+  const poolLine = source.split("\n").find(line => line.includes("allPools.entries()) console.log"));
+  assert.ok(poolLine, "未找到底池状态输出");
+  for (const field of ["符号", "状态", "地址", "募集总量"]) assert.match(poolLine, new RegExp(field));
+  assert.doesNotMatch(poolLine, /买入费|卖出费|初始金额|buyFee|sellFee|b0Amount/);
+});
