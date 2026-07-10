@@ -9,6 +9,25 @@ test("default Flap polling interval remains fast and configurable", () => {
   assert.equal(__testables.CONFIG.pollIntervalMs, 1_500);
 });
 
+test("Flap startup card is complete and uses no emoji or bullet list markers", () => {
+  const content = __testables.buildFlapStartupContent({
+    pages: Object.fromEntries(__testables.CONFIG.urls.map((url, index) => [url, {
+      originalUrl: url,
+      assetFiles: [`asset-${index}.js`],
+      i18nStrings: { title: `页面 ${index}` },
+    }])),
+    vaultFactories: {
+      first: { name: "完整金库", factory: "0x0000000000000000000000000000000000000001", enabled: true, showInCAStore: true },
+    },
+    registryMonitor: { lastBlock: 100, safeLatestBlock: 105, latestBlock: 110, knownVaults: { one: {} } },
+  }, "monitor-host");
+  for (const url of __testables.CONFIG.urls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  for (const url of __testables.CONFIG.bscRpcUrls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(content, /0x0000000000000000000000000000000000000001/);
+  assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
+  assert.doesNotMatch(content, /(^|\n)-\s/m);
+});
+
 test("shared Flap asset-only page changes are summarized into one site-wide notification", () => {
   const notifications = [
     {

@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "check": "node --check fourmeme-monitor/monitor.mjs && node --check fourmeme-monitor/feishu-bot.mjs && node --check flap-monitor/monitor.mjs",
-    "test": "node --test shared/feishu-client.test.mjs fourmeme-monitor/monitor.test.mjs flap-monitor/monitor.test.mjs",
+    "test": "node --test install.test.mjs shared/feishu-client.test.mjs fourmeme-monitor/monitor.test.mjs flap-monitor/monitor.test.mjs",
     "check:fourmeme": "node --check fourmeme-monitor/monitor.mjs",
     "test:fourmeme": "node --test fourmeme-monitor/monitor.test.mjs",
     "test:flap": "node --test flap-monitor/monitor.test.mjs"

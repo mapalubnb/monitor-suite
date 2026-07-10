@@ -220,7 +220,10 @@ const statusText = (status) => ({
 process.stdin.on("data", c => d += c);
 process.stdin.on("end", () => {
   try {
-    const list = JSON.parse(d);
+    const clean = d.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g, "").trim();
+    const start = clean.indexOf("[");
+    const end = clean.lastIndexOf("]");
+    const list = JSON.parse(start >= 0 && end >= start ? clean.slice(start, end + 1) : "[]");
     const p = list.find(x => x.name === name);
     if (!p) { console.log(brief ? "  未找到进程" : "  状态: 未运行"); return; }
     const env = p.pm2_env || {};
@@ -234,8 +237,7 @@ process.stdin.on("end", () => {
     const cpu = p.monit?.cpu ?? "未知";
     const up = env.pm_uptime ? Math.floor((Date.now() - env.pm_uptime) / 1000) : 0;
     const h = Math.floor(up / 3600), m = Math.floor((up % 3600) / 60), s = up % 60;
-    const icon = env.status === "online" ? "●" : "○";
-    console.log("  " + icon + " 状态: " + statusText(env.status));
+    console.log("  状态: " + statusText(env.status));
     console.log("  PID: " + p.pid);
     console.log("  内存: " + mem + "  |  CPU: " + cpu + "%");
     console.log("  运行时间: " + h + "h " + m + "m " + s + "s");
@@ -252,7 +254,7 @@ SNAP="/root/monitor-suite/fourmeme-monitor/snapshot.json"
 [ -f "$SNAP" ] || SNAP="/root/fourmeme-monitor/snapshot.json"
 PM2_JSON="$(pm2 jlist 2>/dev/null)"
 
-echo "✅ **Four.meme 监控中心**"
+echo "**Four.meme 监控中心**"
 echo ""
 
 echo "$PM2_JSON" | node -e "
@@ -260,7 +262,9 @@ echo "$PM2_JSON" | node -e "
     const statusText=(status)=>({online:'在线',stopped:'已停止',errored:'异常',launching:'启动中',stopping:'停止中',waiting:'等待中'}[status]||'未知');
     const fmtUp=(ms)=>{if(!ms)return '未知';const sec=Math.max(0,Math.floor((Date.now()-ms)/1000));const day=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60);return day>0?day+' 天 '+h+' 小时':h+' 小时 '+m+' 分钟'};
     try{
-      const list=JSON.parse(d||'[]');
+      const clean=d.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g,'').trim();
+      const start=clean.indexOf('['),end=clean.lastIndexOf(']');
+      const list=JSON.parse(start>=0&&end>=start?clean.slice(start,end+1):'[]');
       const p=list.find(x=>x.name==='fourmeme-monitor');
       console.log('**01｜运行状态**');
       if(!p){
@@ -283,12 +287,10 @@ if [ -f "$SNAP" ]; then
   echo ""
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
-    const short=(v,n=10)=>{const x=String(v||'');return x?x.length>n?x.slice(0,n)+'...':x:'-'};
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const isAddr=(v)=>/^0x[a-fA-F0-9]{40}$/.test(String(v||''));
-    const shortAddr=(addr)=>isAddr(addr)?addr.slice(0,6)+'...'+addr.slice(-4):short(addr,16);
-    const bscAddress=(addr,label)=>addr?mdLink(label||shortAddr(addr),'https://bscscan.com/address/'+addr):'-';
-    const pageLabel=(url)=>{try{const u=new URL(url);return u.pathname+(u.search?u.search:'')||'/'}catch{return short(url,32)}};
+    const bscAddress=(addr,label)=>addr?mdLink(label||addr,'https://bscscan.com/address/'+addr):'-';
+    const pageLabel=(url)=>String(url||'-');
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
     const value=(v)=>v===undefined||v===null||v===''?'-':String(v);
     const quote=String.fromCharCode(34);
@@ -358,50 +360,73 @@ if [ -f "$SNAP" ]; then
     const ok=(text)=>color(text,'green');
     const warn=(text)=>color(text,'orange');
     const bad=(text)=>color(text,'red');
-    const compact=(arr,n)=>arr.length>n?[...arr.slice(0,n),'... 还有 '+(arr.length-n)+' 项']:arr;
+    const compact=(arr)=>arr;
     const lag=am.actorLagBlocks??(am.safeLatestBlock?Math.max(0,am.safeLatestBlock-am.lastBlock):'-');
     const health=[];
     if(pendingRoutes>0) health.push(warn('新路由待确认 '+pendingRoutes));
     if(feed.enabled!==undefined&&!feed.connected) health.push(warn('新区块 WS 未连接'));
     if(typeof lag==='number'&&lag>120) health.push(warn('扫链延迟 '+lag+' 块'));
 
-    console.log('**📌 02｜总览**');
-    console.log('- 状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
-    console.log('- 底池 '+allPools.length+'｜前端 '+pageEntries.length+'｜API '+apiKeys.length+'｜合约 '+fpKeys.length);
-    console.log('- OpenFour 模板 '+templateKeys.length+'（PUBLISHED '+published+'）｜模块 '+moduleItems.length+'｜Preset '+((ofm.presetIds||[]).length));
-    console.log('- GitHub 仓库 '+repos+'｜最新 '+(sha&&sha!=='未知'?mdLink(short(sha,8),'https://github.com/four-meme-community/four-meme-ai/commit/'+sha):sha));
+    console.log('**02｜总览**');
+    console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
+    console.log('底池：'+allPools.length+' 个｜前端：'+pageEntries.length+' 个页面｜API：'+apiKeys.length+' 个端点｜合约：'+fpKeys.length+' 个');
+    console.log('OpenFour：模板 '+templateKeys.length+' 个｜PUBLISHED '+published+' 个｜模块 '+moduleItems.length+' 个｜presetIds '+((ofm.presetIds||[]).length)+' 个');
+    console.log('GitHub：仓库 '+repos+' 个｜最新提交 '+(sha&&sha!=='未知'?mdLink(sha,'https://github.com/four-meme-community/four-meme-ai/commit/'+sha):sha));
     console.log('');
 
-    console.log('**🎯 03｜重点状态**');
-    console.log('- 前端资源：JS/CSS '+assetFiles+'｜已下载 '+downloaded+'｜i18n '+i18nTotal+' 键');
-    console.log('- 链上：AgentNFT '+(op.agentNftCount??'未知')+'｜创建者监听 '+actors.length+'｜缓存创建者 '+cachedCreators);
-    console.log('- 新路由：待确认 '+pendingRoutes+'｜已纳管 '+approvedRoutes+'｜已忽略 '+ignoredRoutes);
-    if(feed.enabled!==undefined) console.log('- 新区块：'+(feed.connected?ok('WS 已连接'):warn('WS 未连接'))+'｜'+(feed.mode||'未知')+(feed.latestHeadBlock?'｜头块 '+feed.latestHeadBlock:''));
-    if(am.lastBlock) console.log('- 扫链：已扫 '+am.lastBlock+'｜确认 '+(am.safeLatestBlock||'未知')+'｜延迟 '+lag+' 块');
+    console.log('**03｜重点状态**');
+    console.log('前端资源：JS/CSS '+assetFiles+' 个｜已下载 '+downloaded+' 个｜i18n '+i18nTotal+' 键');
+    console.log('链上：AgentNFT '+(op.agentNftCount??'未知')+' 个｜创建者监听 '+actors.length+' 个｜缓存创建者 '+cachedCreators+' 个');
+    console.log('新路由：待确认 '+pendingRoutes+' 个｜已纳管 '+approvedRoutes+' 个｜已忽略 '+ignoredRoutes+' 个');
+    if(feed.enabled!==undefined) console.log('新区块：'+(feed.connected?ok('WS 已连接'):warn('WS 未连接'))+'｜模式 '+(feed.mode||'未知')+(feed.latestHeadBlock?'｜头块 '+feed.latestHeadBlock:''));
+    console.log('扫链：已扫 '+(am.lastBlock||'未知')+'｜确认 '+(am.safeLatestBlock||'未知')+'｜延迟 '+lag+' 块');
     console.log('');
 
-    console.log('**🧩 04｜核心资产**');
-    const poolBrief=allPools.slice(0,6).map(p=>(p.symbol||p.nativeSymbol||'?')+' '+String(p.status||'?'));
-    if(allPools.length>6) poolBrief.push('... 还有 '+(allPools.length-6)+' 项');
-    console.log('- 底池：'+(poolBrief.length?poolBrief.join('｜'):'暂无'));
-    const pages=compact(pageEntries.map(([k,p])=>mdLink(pageLabel(p.originalUrl||k),p.originalUrl||k)),6);
-    console.log('- 页面：'+(pages.length?pages.join('｜'):'暂无'));
-    const apiBrief=compact(apiKeys.map(k=>apiLinks[k]?mdLink(apiLinks[k][0],apiLinks[k][1]):k),5);
-    console.log('- API：'+(apiBrief.length?apiBrief.join('｜'):'暂无'));
+    console.log('**04｜底池配置**');
+    if(allPools.length===0) console.log('暂无底池');
+    for(const [index,p] of allPools.entries()) console.log(String(index+1).padStart(2,'0')+'　符号 '+value(p.symbol||p.nativeSymbol)+'｜状态 '+value(p.status)+'｜地址 '+bscAddress(p.symbolAddress)+'｜买入费 '+value(p.buyFee)+'｜卖出费 '+value(p.sellFee)+'｜初始金额 '+value(p.b0Amount)+'｜募集总量 '+value(p.totalBAmount));
     console.log('');
 
-    console.log('**⛓️ 05｜OpenFour / 合约**');
-    console.log('- Registry：'+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
-    if(roleNames.length) console.log('- 模块角色：'+roleNames.join('、'));
-    if((ofm.presetIds||[]).length) console.log('- presetIds：'+compact(ofm.presetIds||[],12).join(', '));
-    const tmpl=compact(templateKeys.map(id=>{const t=templates[id]||{};return '#'+id+' '+value(t.name)+' '+value(t.status)}),6);
-    console.log('- 模板：'+(tmpl.length?tmpl.join('｜'):'暂无'));
-    console.log('- 合约：'+(fpKeys.length?compact(fpKeys,8).join('｜'):'暂无'));
+    console.log('**05｜前端页面**');
+    if(pageEntries.length===0) console.log('暂无页面快照');
+    for(const [index,[k,p]] of pageEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(pageLabel(p.originalUrl||k),p.originalUrl||k)+'｜资源 '+((p.assetFiles||[]).length)+' 个｜已下载 '+Object.keys(p.assetContents||{}).length+' 个｜i18n '+Object.keys(p.i18nStrings||{}).length+' 键');
     console.log('');
 
-    console.log('**🔎 06｜查看更多**');
-    console.log('- 详情快照：snapshot.json｜日志：fm-log｜全量检测：fm-check');
-    console.log('- 创建者来源：'+modes.join(' + '));
+    console.log('**06｜公开 API**');
+    if(apiKeys.length===0) console.log('暂无 API 快照');
+    for(const [index,k] of apiKeys.entries()) console.log(String(index+1).padStart(2,'0')+'　'+(apiLinks[k]?mdLink(apiLinks[k][0],apiLinks[k][1]):k));
+    console.log('');
+
+    console.log('**07｜OpenFour**');
+    console.log('Registry：'+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
+    console.log('模块角色：'+(roleNames.length?roleNames.join('、'):'暂无'));
+    console.log('presetIds：'+((ofm.presetIds||[]).length?(ofm.presetIds||[]).join(', '):'暂无'));
+    if(moduleEntries.length===0) console.log('模块实现：暂无');
+    for(const [index,[addr,m]] of moduleEntries.entries()) console.log('模块 '+String(index+1).padStart(2,'0')+'　'+bscAddress(addr)+'｜roles '+(m.roles||[]).join(', ')+'｜presetIds '+(m.presetIds||[]).join(', '));
+    if(templateKeys.length===0) console.log('模板：暂无');
+    for(const [index,id] of templateKeys.entries()){const t=templates[id]||{};console.log('模板 '+String(index+1).padStart(2,'0')+'　id '+id+'｜名称 '+value(t.name)+'｜状态 '+value(t.status)+'｜作者 '+value(t.userAddress))}
+    console.log('');
+
+    console.log('**08｜合约与链上资产**');
+    if(fpKeys.length===0) console.log('合约：暂无');
+    for(const [index,[name,data]] of Object.entries(fp).entries()) console.log('合约 '+String(index+1).padStart(2,'0')+'　'+name+'｜地址 '+value(data.address||data.contractAddress)+'｜实现 '+value(data.implAddress||data.implementation));
+    console.log('AgentNFT 数量：'+value(op.agentNftCount));
+    for(const [index,addr] of nfts.entries()) console.log('AgentNFT '+String(index+1).padStart(2,'0')+'　'+bscAddress(addr));
+    console.log('');
+
+    console.log('**09｜创建者动作监听**');
+    console.log('发现方式：'+modes.join(' + '));
+    if(actors.length===0) console.log('监听地址：暂无');
+    for(const [index,addr] of actors.entries()){const item=allActors[addr]||{};console.log(String(index+1).padStart(2,'0')+'　'+bscAddress(addr)+'｜角色 '+(item.roles||[]).join(', ')+'｜标签 '+(item.labels||[]).join(', '))}
+    console.log('');
+
+    console.log('**10｜GitHub 仓库**');
+    if(repoEntries.length===0) console.log('暂无仓库');
+    for(const [index,repo] of repoEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(repo.full_name||repo.name,repo.html_url||('https://github.com/'+repo.full_name))+'｜默认分支 '+value(repo.default_branch)+'｜更新时间 '+value(repo.updated_at));
+    console.log('');
+
+    console.log('**11｜操作入口**');
+    console.log('详情快照：snapshot.json｜日志：fm-log｜全量检测：fm-check');
     console.log('');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null
@@ -469,7 +494,7 @@ EOF
 # flap-monitor
 cat > "$BIN_DIR/fl-status" << 'EOF'
 #!/bin/sh
-echo "✅ **Flap.sh 监控中心**"
+echo "**Flap.sh 监控中心**"
 echo ""
 echo "**01｜运行状态**"
 pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor
@@ -481,8 +506,7 @@ if [ -f "$SNAP" ]; then
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
     const mdLink=(label,url)=>'['+label+']('+url+')';
-    const short=(v,n=10)=>{const x=String(v||'');return x?x.length>n?x.slice(0,n)+'...':x:'-'};
-    const pageLabel=(url)=>{try{const u=new URL(url);return u.pathname||'/'}catch{return short(url,24)}};
+    const pageLabel=(url)=>String(url||'-');
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
     const pages=s.pages||{};
     const keys=Object.keys(pages);
@@ -507,7 +531,6 @@ if [ -f "$SNAP" ]; then
     const color=(text,c)=>'<font color='+quote+c+quote+'>'+text+'</font>';
     const ok=(text)=>color(text,'green');
     const warn=(text)=>color(text,'orange');
-    const compact=(arr,n)=>arr.length>n?[...arr.slice(0,n),'... 还有 '+(arr.length-n)+' 项']:arr;
     const health=[];
     if(typeof lag==='number'&&lag>300) health.push(warn('链上延迟 '+lag+' 块'));
     if(enabledVisibleFactories<visibleFactories) health.push(warn('有可见金库未启用'));
@@ -523,37 +546,37 @@ if [ -f "$SNAP" ]; then
     const totalText=pageStats.reduce((sum,p)=>sum+p.text,0);
     const totalI18n=pageStats.reduce((sum,p)=>sum+p.i18n,0);
 
-    console.log('**📌 02｜总览**');
-    console.log('- 状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
-    console.log('- 页面 '+keys.length+'｜资源 '+totalAssets+'｜文案 '+totalText+' 字｜i18n '+totalI18n+' 键');
-    console.log('- CAStore 可见金库 '+visibleFactories+'｜已启用 '+enabledVisibleFactories+'｜链上金库 '+knownVaults.length);
+    console.log('**02｜总览**');
+    console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
+    console.log('页面：'+keys.length+' 个｜资源 '+totalAssets+' 个｜文案 '+totalText+' 字｜i18n '+totalI18n+' 键');
+    console.log('金库工厂：总数 '+factoryItems.length+' 个｜CAStore 可见 '+visibleFactories+' 个｜已启用 '+enabledVisibleFactories+' 个｜链上金库 '+knownVaults.length+' 个');
     console.log('');
 
-    console.log('**🌐 03｜页面监控**');
-    const pageBrief=compact(pageStats.map(p=>mdLink(p.label,p.url)+' '+p.assets+' 资源'),6);
-    console.log(pageBrief.length?pageBrief.join(' ｜ '):'- 暂无页面快照');
+    console.log('**03｜页面监控**');
+    if(pageStats.length===0) console.log('暂无页面快照');
+    for(const [index,p] of pageStats.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(p.label,p.url)+'｜资源 '+p.assets+' 个｜文案 '+p.text+' 字｜i18n '+p.i18n+' 键');
     console.log('');
 
-    console.log('**🏦 04｜金库工厂**');
-    console.log('- 可见：'+visibleFactories+'｜启用：'+enabledVisibleFactories+'｜隐藏/其他：'+Math.max(0,factoryItems.length-visibleFactories));
-    const vaultBrief=compact(visibleFactoryItems.map(v=>{
+    console.log('**04｜金库工厂**');
+    console.log('可见：'+visibleFactories+' 个｜启用：'+enabledVisibleFactories+' 个｜隐藏或其他：'+Math.max(0,factoryItems.length-visibleFactories)+' 个');
+    if(factoryItems.length===0) console.log('暂无金库工厂');
+    for(const [index,v] of factoryItems.entries()){
       const name=v.name||v.id||v.factory||'未知金库';
-      const factory=v.factory||'';
-      return (v.enabled?ok(name):warn(name))+(factory?(' '+mdLink('打开','https://flap.sh/launch?vaultfactory='+factory)):'');
-    }),8);
-    console.log(vaultBrief.length?vaultBrief.map(v=>'- '+v).join('\n'):'- 暂无 CAStore 可见金库工厂');
+      const factory=v.factory||v.address||'';
+      const link=factory?mdLink(factory,'https://bscscan.com/address/'+factory):'无地址';
+      console.log(String(index+1).padStart(2,'0')+'　名称 '+name+'｜地址 '+link+'｜启用 '+(v.enabled?'是':'否')+'｜CAStore 展示 '+(v.showInCAStore?'是':'否'));
+    }
     console.log('');
 
-    console.log('**⛓️ 05｜链上注册中心**');
-    console.log('- 注册中心：'+mdLink(short(registryAddress,12),'https://bscscan.com/address/'+registryAddress));
-    console.log('- 扫描：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
-    const vaults=compact(knownVaults,6);
-    console.log('- 新金库：'+(vaults.length?vaults.map(addr=>mdLink(short(addr,12),'https://bscscan.com/address/'+addr)).join(' ｜ '):'暂无'));
+    console.log('**05｜链上注册中心**');
+    console.log('注册中心：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
+    console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
+    console.log('已知链上金库：'+knownVaults.length+' 个');
+    for(const [index,addr] of knownVaults.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(addr,'https://bscscan.com/address/'+addr));
     console.log('');
 
-    console.log('**🔎 06｜查看更多**');
-    console.log('- 详情快照：snapshot.json｜日志：fl-log｜全量检测：fl-check');
-    console.log('');
+    console.log('**06｜操作入口**');
+    console.log('详情快照：snapshot.json｜日志：fl-log｜全量检测：fl-check');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null
   echo ""
@@ -623,7 +646,7 @@ EOF
 # feishu-bot
 cat > "$BIN_DIR/bot-status" << 'EOF'
 #!/bin/sh
-echo "✅ **飞书机器人状态**"
+echo "**飞书机器人状态**"
 echo ""
 echo "**01｜运行状态**"
 pm2 jlist 2>/dev/null | _pm2-proc-info feishu-bot
@@ -667,7 +690,7 @@ EOF
 # 全局
 cat > "$BIN_DIR/mon-status" << 'EOF'
 #!/bin/sh
-echo "✅ **Monitor Suite 状态总览**"
+echo "**Monitor Suite 状态总览**"
 echo ""
 echo "**01｜主机状态**"
 echo "主机：$(hostname)｜内核 $(uname -r)"
@@ -677,7 +700,9 @@ echo "**02｜进程状态**"
 pm2 jlist 2>/dev/null | node -e "
   let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
     try{
-      const list=JSON.parse(d);
+      const clean=d.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g,'').trim();
+      const start=clean.indexOf('['),end=clean.lastIndexOf(']');
+      const list=JSON.parse(start>=0&&end>=start?clean.slice(start,end+1):'[]');
       const statusText=(status)=>({
         online:'在线',
         stopped:'已停止',
@@ -693,17 +718,15 @@ pm2 jlist 2>/dev/null | node -e "
       ];
       for(const svc of services){
         const p=list.find(x=>x.name===svc.name);
-        if(!p){console.log('  ○ '+svc.label.padEnd(18)+' 未部署');continue}
+        if(!p){console.log(svc.label+'｜未部署');continue}
         const env=p.pm2_env||{};
         const mem=p.monit?.memory?(p.monit.memory/1024/1024).toFixed(1)+'MB':'?';
         const cpu=(p.monit?.cpu??0)+'%';
         const up=env.pm_uptime?Math.floor((Date.now()-env.pm_uptime)/1000):0;
         const d=Math.floor(up/86400),h=Math.floor((up%86400)/3600),m=Math.floor((up%3600)/60);
         const upStr=d>0?d+'d '+h+'h '+m+'m':h+'h '+m+'m';
-        const icon=env.status==='online'?'●':'○';
         const restarts=env.restart_time||0;
-        console.log('- '+icon+' '+svc.label+'｜'+statusText(env.status)+'｜PID '+String(p.pid)+'｜内存 '+mem+'｜CPU '+cpu+'｜运行 '+upStr);
-        if(restarts>0) console.log('  重启：'+restarts+' 次');
+        console.log(svc.label+'｜'+statusText(env.status)+'｜PID '+String(p.pid)+'｜内存 '+mem+'｜CPU '+cpu+'｜运行 '+upStr+'｜重启 '+restarts+' 次');
       }
     }catch(e){console.log('  解析失败: '+e.message)}
   })
@@ -727,7 +750,7 @@ if [ -f "$FM_SNAP" ]; then
     const published=Object.values(s.openFourTemplates||{}).filter(t=>String(t?.status||'').toUpperCase()==='PUBLISHED').length;
     const ofMods=Object.keys((s.openFourModules||{}).byAddress||{}).length;
     const ofPresets=((s.openFourModules||{}).presetIds||[]).length;
-    const sha=(s.githubSha||'').slice(0,8)||'-';
+    const sha=(s.githubSha||'')||'-';
     const repos=Object.keys(s.githubRepos||{}).length;
     const contracts=Object.keys(s.contractFingerprints||{}).length;
     const actors=(s.chainActorMonitor||{}).actionActorCount??Object.values((s.chainActorMonitor||{}).actors||{}).filter(a=>a&&a.actionWatched).length;

@@ -4969,6 +4969,57 @@ async function runCheck() {
    持续监控模式（主循环）
    ══════════════════════════════════════════ */
 
+function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
+  const pages = Object.values(snapshot.pages || {});
+  const factories = Object.values(snapshot.vaultFactories || {});
+  const registry = snapshot.registryMonitor || {};
+  const pageLines = CONFIG.urls.map((url, index) => {
+    const page = pages.find(item => item?.originalUrl === url) || {};
+    const assets = page.assetFiles?.length || 0;
+    const i18n = Object.keys(page.i18nStrings || {}).length;
+    return `${String(index + 1).padStart(2, "0")}　${url}｜资源 ${assets} 个｜i18n ${i18n} 条`;
+  });
+  const factoryLines = factories.length > 0
+    ? factories.map((factory, index) => {
+        const name = factory.name || factory.id || "未命名金库";
+        const address = factory.factory || factory.address || "无地址";
+        return `${String(index + 1).padStart(2, "0")}　${name}｜地址 ${address}｜启用 ${factory.enabled ? "是" : "否"}｜CAStore 展示 ${factory.showInCAStore ? "是" : "否"}`;
+      })
+    : ["暂无金库工厂基线"];
+  return [
+    "**01｜运行状态**",
+    "状态：监控运行中",
+    `服务器：${hostname}`,
+    `轮询间隔：${CONFIG.pollIntervalMs}ms｜请求抖动 ±${CONFIG.jitterMs}ms｜请求超时 ${CONFIG.fetchTimeoutMs}ms`,
+    `连续失败告警阈值：${CONFIG.failThreshold} 次`,
+    "",
+    "**02｜页面监控**",
+    ...pageLines,
+    "",
+    "**03｜金库工厂**",
+    `工厂总数：${factories.length}`,
+    ...factoryLines,
+    "",
+    "**04｜链上注册中心**",
+    `注册中心：${addressLink(CONFIG.registryMonitor.address)}`,
+    `确认块：${CONFIG.registryMonitor.confirmations}`,
+    `启动回溯：${CONFIG.registryMonitor.bootstrapLookbackBlocks} 块`,
+    `单轮最大扫描：${CONFIG.registryMonitor.maxBlocksPerRun} 块`,
+    `已扫描区块：${registry.lastBlock ?? "尚未建立"}｜安全区块 ${registry.safeLatestBlock ?? "尚未建立"}｜最新区块 ${registry.latestBlock ?? "尚未建立"}`,
+    `已知链上金库：${Object.keys(registry.knownVaults || {}).length} 个`,
+    "",
+    "**05｜RPC 节点**",
+    ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　${url}`),
+    "",
+    "**06｜操作入口**",
+    "状态命令：fl-status",
+    "日志命令：fl-log",
+    "全量检查：fl-check",
+    "",
+    `更新时间：${ts()}`,
+  ].join("\n");
+}
+
 async function startMonitor() {
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
   // failCounts 改为对象结构，记录失败次数、最近错误信息和时间
@@ -5030,27 +5081,7 @@ async function startMonitor() {
 
   await sendFeishu(
     "Flap 监控 v2 已启动",
-    buildFlapCardContent({
-      summary: [
-        "- 状态: ✅ **已启动**",
-        `- 页面: ${Object.keys(snapshot.pages || {}).length || CONFIG.urls.length} 个｜轮询 ${CONFIG.pollIntervalMs}ms + 抖动 ±${CONFIG.jitterMs}ms`,
-        `- 金库工厂: ${Object.keys(snapshot.vaultFactories || {}).length} 个`,
-      ],
-      primaryTitle: "重点能力",
-      primary: [
-        "- 页面 HTML / 资源 / i18n / 文案 diff",
-        "- CAstore 金库结构与 VaultFactory 配置",
-        "- 链上注册中心事件扫描",
-      ],
-      scope: CONFIG.urls.map(u => `- ${flapLink(new URL(u).pathname || "首页", u)}`),
-      details: [
-        `- 注册中心: ${addressLink(CONFIG.registryMonitor.address)}`,
-        `- 链上确认: ${CONFIG.registryMonitor.confirmations} 块｜单轮最多 ${CONFIG.registryMonitor.maxBlocksPerRun} 块`,
-        "- 反风控: UA 轮换 + 页面/资源自适应退避 + 请求抖动",
-        `- 服务器: ${(await import("node:os")).hostname()}`,
-      ],
-      ai: "启动完成后将只推送页面、金库、链上注册中心的实质变化。",
-    }),
+    buildFlapStartupContent(snapshot, (await import("node:os")).hostname()),
     "blue",
     {
       actions: [linkAction("打开 Flap.sh", "https://flap.sh", "primary")].filter(Boolean),
@@ -5400,6 +5431,7 @@ export const __testables = {
   buildBriefingInput,
   buildCardBriefing,
   buildOperationalNoticeContent,
+  buildFlapStartupContent,
   buildCaStoreVaultChangeNotification,
   getStandaloneCaStoreVaultDiffs,
   shouldSuppressCaStoreOnlyPageNotification,

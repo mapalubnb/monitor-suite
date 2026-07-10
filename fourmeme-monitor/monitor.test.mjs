@@ -15,17 +15,17 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
 test("startup card copy reflects active frontend and api cadences", () => {
   const progress = __testables.buildStartupProgressContent();
   const ready = __testables.buildStartupReadyContent();
-  assert.match(progress, /前端：当前快照 [\s\S]*每 10 秒/);
-  assert.match(progress, /API：每 15 秒/);
-  assert.match(ready, /✅ \*\*监控运行中\*\*/);
-  assert.match(ready, /\*\*📌 运行状态\*\*[\s\S]*\*\*🎯 监控概览\*\*[\s\S]*\*\*🌐 前端能力\*\*[\s\S]*\*\*🛡️ 运行策略\*\*/);
-  assert.match(ready, /前端：[\s\S]*每 10 秒/);
-  assert.match(ready, /API：[\s\S]*每 15 秒/);
-  assert.match(ready, /NEXT_DATA · i18n · 路由发现 · 端点发现 · 新页面自动纳管/);
-  assert.match(ready, /固定入口 \d+ 个｜当前监控池 \d+ 个｜详情：fm-status/);
+  assert.match(progress, /前端页面：每 10 秒｜当前快照 \d+ 个页面/);
+  assert.match(progress, /公开 API：每 15 秒/);
+  assert.match(ready, /\*\*01｜运行状态\*\*[\s\S]*\*\*02｜监控概览\*\*[\s\S]*\*\*03｜前端监控入口\*\*[\s\S]*\*\*04｜运行参数\*\*[\s\S]*\*\*05｜操作入口\*\*/);
+  assert.match(ready, /状态：监控运行中/);
+  assert.match(ready, /前端页面：[\s\S]*每 10 秒/);
+  assert.match(ready, /公开 API：[\s\S]*每 15 秒/);
+  for (const url of __testables.CONFIG.monitorUrls) assert.match(ready, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(ready, /更新时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
   assert.doesNotMatch(ready, /每 \d+s/);
-  assert.doesNotMatch(ready, /- https:\/\/four\.meme/);
+  assert.doesNotMatch(`${progress}\n${ready}`, /[\p{Extended_Pictographic}]/u);
+  assert.doesNotMatch(`${progress}\n${ready}`, /(^|\n)-\s/m);
   assert.doesNotMatch(ready, /心跳|日报/);
 });
 
