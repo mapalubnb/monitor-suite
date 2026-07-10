@@ -274,11 +274,12 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.equal(grouped[0].url, "https://flap.sh");
-  assert.match(grouped[0].content, /功能文案 1 处/);
-  assert.match(grouped[0].content, /业务配置 2 项/);
+  assert.doesNotMatch(grouped[0].content, /结论摘要|证据详情|本地初筛/);
+  assert.match(grouped[0].content, /\*\*资源统计\*\*[\s\S]*不变 28 \/ 重命名 2 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
   assert.match(grouped[0].content, /<font color="green">新增文案<\/font>: <font color="green">Create an account and generate a wallet<\/font>/);
   assert.match(grouped[0].content, /Create an account and generate a wallet/);
   assert.match(grouped[0].content, /fees：<font color="red">\(新增\)<\/font> → <font color="green">void<\/font>/);
+  assert.doesNotMatch(grouped[0].content, /8101-025ad0379fc93d08\.js/);
   assert.match(grouped[0].content, /\*\*🤖 AI 分析\*\*/);
   assert.equal(grouped[0].skipBusinessPriorityTitle, true);
   assert.equal(grouped[0].skipAi, false);
@@ -347,7 +348,8 @@ test("Flap asset extraction explains SVG paths Tailwind utilities and style pseu
 
   assert.doesNotMatch(content, /UI\/样式信号/);
   assert.doesNotMatch(content, /禁用态交互|图标\/矢量|响应式布局|组件样式变量/);
-  assert.match(content, /完整资源\/UI\/实现信号见 Diff 详情/);
+  assert.match(content, /\*\*资源统计\*\*[\s\S]*修改 1/);
+  assert.doesNotMatch(content, /完整资源\/UI\/实现信号见 Diff 详情/);
   assert.doesNotMatch(content, /意图判断/);
   assert.doesNotMatch(content, /M7 0\.583984/);
   assert.doesNotMatch(content, /absolute bottom-2/);
@@ -554,8 +556,10 @@ test("same Flap business change coalesces even when page chunks and UI impact di
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.equal(grouped[0].url, "https://flap.sh");
   assert.equal(grouped[0].snapshotUpdates.length, 3);
-  assert.match(grouped[0].content, /影响页面: 3 个/);
-  assert.match(grouped[0].content, /功能文案 2 处/);
+  assert.equal((grouped[0].content.match(/https:\/\/flap\.sh\/create/g) || []).length, 1);
+  assert.equal((grouped[0].content.match(/https:\/\/flap\.sh\/bnb\/CAstore/g) || []).length, 1);
+  assert.equal((grouped[0].content.match(/https:\/\/flap\.sh\/launch/g) || []).length, 1);
+  assert.match(grouped[0].content, /\*\*资源统计\*\*[\s\S]*不变 28 \/ 重命名 1 \/ 修改 8 \/ 新增 0 \/ 移除 0/);
   assert.doesNotMatch(grouped[0].content, /实现意图信号/);
   assert.doesNotMatch(grouped[0].content, /UI\/样式信号/);
   assert.match(grouped[0].content, /DiamondPulse Tail-Cut Vault/);
@@ -619,7 +623,8 @@ test("shared minified implementation signals are coalesced without raw code in t
   assert.doesNotMatch(grouped[0].content, /实现意图信号/);
   assert.doesNotMatch(grouped[0].content, /税费\/税务信息/);
   assert.doesNotMatch(grouped[0].content, /分红参数/);
-  assert.match(grouped[0].content, /完整资源\/UI\/实现信号见 Diff 详情/);
+  assert.match(grouped[0].content, /\*\*资源统计\*\*[\s\S]*修改 1/);
+  assert.doesNotMatch(grouped[0].content, /完整资源\/UI\/实现信号见 Diff 详情/);
   assert.doesNotMatch(grouped[0].content, /showTaxInfo&&o|dividendBps,Z|function\(|generateAbstractMask/);
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
@@ -670,7 +675,8 @@ test("shared UI style signals coalesce into one explanatory site-wide notificati
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
   assert.doesNotMatch(grouped[0].content, /UI\/样式信号/);
   assert.doesNotMatch(grouped[0].content, /禁用态交互|钱包连接控件|顶部导航\/下拉菜单/);
-  assert.match(grouped[0].content, /完整资源\/UI\/实现信号见 Diff 详情/);
+  assert.match(grouped[0].content, /\*\*资源统计\*\*[\s\S]*修改 1/);
+  assert.doesNotMatch(grouped[0].content, /完整资源\/UI\/实现信号见 Diff 详情/);
   assert.equal(grouped[0].snapshotUpdates.length, 2);
 });
 
@@ -970,7 +976,7 @@ test("business priority title can preserve manual check source prefix", () => {
   assert.equal(notification.template, "red");
 });
 
-test("page change card puts summary and important copy before ai analysis", () => {
+test("page change card puts concrete page link and important copy before ai analysis", () => {
   const longOldText = "旧手续费 " + "旧配置说明 ".repeat(40).trim();
   const longNewText = "新手续费 " + "新配置说明 ".repeat(40).trim();
   const content = __testables.buildCardBriefing(
@@ -998,9 +1004,11 @@ test("page change card puts summary and important copy before ai analysis", () =
     [{ type: "added", area: "热门金库", name: "禮物稅收金庫", newDescription: "指定账户收取礼物税收" }],
   );
 
-  assert(content.startsWith("**📌 结论摘要**"));
+  assert(content.startsWith("**🌐 影响页面**"));
+  assert.match(content, /- 页面: \[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
   assert(content.indexOf("**🎯 重点变更**") < content.indexOf("**🤖 AI 分析**"));
-  assert.doesNotMatch(content, /\*\*资源统计\*\*/);
+  assert.match(content, /\*\*资源统计\*\*[\s\S]*不变 28 \/ 重命名 0 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
+  assert.doesNotMatch(content, /结论摘要|证据详情|打开页面|卡片仅展示|完整旧\/新文本/);
   assert.doesNotMatch(content, /- 概览: 修改/);
   assert.doesNotMatch(content, /建议动作/);
   assert.match(content, /- 原：<font color="red">旧手续费 旧配置说明/);
@@ -1049,7 +1057,7 @@ test("launch text card summarizes anti-farmer duration changes and keeps full so
   assert.match(content, new RegExp(addedDescription.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
-test("site-wide asset card leads with no business-change conclusion", () => {
+test("site-wide asset card keeps only page scope resource stats and ai", () => {
   const notification = __testables.buildSiteWideAssetNotification([
     {
       url: "https://flap.sh/bnb/CAstore",
@@ -1061,12 +1069,12 @@ test("site-wide asset card leads with no business-change conclusion", () => {
     },
   ]);
 
-  assert(notification.content.startsWith("**📌 结论摘要**"));
-  assert(notification.content.indexOf("本地初筛") < notification.content.indexOf("**🌐 影响页面**"));
-  assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**🎯 重点变更**"));
-  assert(notification.content.indexOf("**🎯 重点变更**") < notification.content.indexOf("**🤖 AI 分析**"));
-  assert.doesNotMatch(notification.content, /\n- \[\/bnb\/CAstore\]/);
-  assert.doesNotMatch(notification.content, /资源统计/);
+  assert(notification.content.startsWith("**🌐 影响页面**"));
+  assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**资源统计**"));
+  assert(notification.content.indexOf("**资源统计**") < notification.content.indexOf("**🤖 AI 分析**"));
+  assert.match(notification.content, /\[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
+  assert.match(notification.content, /不变 28 \/ 重命名 0 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
+  assert.doesNotMatch(notification.content, /结论摘要|证据详情|本地初筛|重点变更/);
   assert.doesNotMatch(notification.content, /完整资源 Diff/);
   assert.equal(notification.skipAi, false);
   assert.equal(notification.useFullDiffForAi, true);
@@ -1123,7 +1131,8 @@ test("site-wide asset card summarizes runtime resources without raw webpack frag
   assert.doesNotMatch(notification.content, /资源范围/);
   assert.doesNotMatch(notification.content, /runtime/);
   assert.doesNotMatch(notification.content, /共享 chunk/);
-  assert.match(notification.content, /完整资源\/UI\/实现信号见 Diff 详情/);
+  assert.match(notification.content, /\*\*资源统计\*\*[\s\S]*修改 2/);
+  assert.doesNotMatch(notification.content, /完整资源\/UI\/实现信号见 Diff 详情/);
   assert.doesNotMatch(notification.content, /trustedTypes|t=0;t/);
   assert.doesNotMatch(notification.content, /!=typeof/);
 });
@@ -1135,7 +1144,8 @@ test("vault factory card summarizes counts before details", () => {
     modified: [{ name: "Old Vault", factory: "0xdef", diffs: ["enabled: true → false"] }],
   });
 
-  assert(content.startsWith("**📌 结论摘要**"));
+  assert(content.startsWith("- 新增 1 个 / 移除 0 个 / 修改 1 个"));
+  assert.doesNotMatch(content, /结论摘要|证据详情/);
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
   assert.match(content, /enabled：<font color="red">true<\/font> → <font color="green">false<\/font>/);
@@ -1247,9 +1257,11 @@ test("operational notice card is readable and action oriented", () => {
     consecutiveFailures: 3,
   });
 
-  assert(content.startsWith("**📌 结论摘要**"));
+  assert(content.startsWith("- 状态: 页面请求失败"));
   assert.match(content, /- 状态: 页面请求失败/);
   assert.match(content, /- 连续失败: 3 次/);
+  assert.match(content, /- 页面: \[\/launch\]\(https:\/\/flap\.sh\/launch\)/);
+  assert.doesNotMatch(content, /结论摘要|证据详情|打开页面/);
   assert.doesNotMatch(content, /建议动作/);
   assert.match(content, /HTTP 403/);
 });

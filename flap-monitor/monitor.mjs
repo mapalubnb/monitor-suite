@@ -892,6 +892,24 @@ function flapLink(label, url) {
   return url ? `[${label}](${url})` : label;
 }
 
+function flapPageLabel(url) {
+  try {
+    const parsed = new URL(url);
+    return `${parsed.pathname || "/"}${parsed.search || ""}`;
+  } catch {
+    return String(url || "页面");
+  }
+}
+
+function flapPageLink(url) {
+  return flapLink(flapPageLabel(url), url);
+}
+
+function formatFlapResourceStats(assetStats) {
+  if (!assetStats) return "";
+  return `- 不变 ${assetStats.unchanged || 0} / 重命名 ${assetStats.renamed || 0} / 修改 ${assetStats.modified || 0} / 新增 ${assetStats.added || 0} / 移除 ${assetStats.removed || 0}`;
+}
+
 function shortHash(value, head = 8, tail = 4) {
   const text = String(value || "");
   return text || "-";
@@ -919,12 +937,10 @@ function formatFlapSection(title, lines = []) {
   const body = (lines || []).filter(line => line !== "" && line != null);
   if (body.length === 0) return [];
   const icons = {
-    "结论摘要": "📌",
     "重点信息": "🎯",
     "重点变更": "🎯",
     "影响页面": "🌐",
     "影响范围": "🌐",
-    "证据详情": "🔎",
     "AI 分析": "🤖",
     "链上新金库注册": "⛓️",
     "金库文案": "🏦",
@@ -933,12 +949,14 @@ function formatFlapSection(title, lines = []) {
   return [`**${icon}${title}**`, ...body, ""];
 }
 
-function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", primary = [], scope = [], details = [], ai = "" } = {}) {
+function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", primary = [], scope = [], details = [], detailsTitle = "详情", ai = "" } = {}) {
+  const summaryBody = (summary || []).filter(line => line !== "" && line != null);
   const lines = [
-    ...formatFlapSection("结论摘要", summary),
+    ...summaryBody,
+    ...(summaryBody.length > 0 ? [""] : []),
     ...formatFlapSection("影响页面", scope),
     ...formatFlapSection(primaryTitle, primary),
-    ...formatFlapSection("证据详情", details),
+    ...formatFlapSection(detailsTitle, details),
     ...(ai ? formatFlapSection("AI 分析", [ai]) : []),
   ];
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
@@ -1449,7 +1467,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   const assetStats = {
     unchanged: maxStat(assetOnlyNotifications, "unchanged"),
     renamed: maxStat(assetOnlyNotifications, "renamed"),
-    modified: substantiveFileNames.length || maxStat(assetOnlyNotifications, "modified"),
+    modified: Math.max(substantiveFileNames.length, maxStat(assetOnlyNotifications, "modified")),
     added: maxStat(assetOnlyNotifications, "added"),
     removed: maxStat(assetOnlyNotifications, "removed"),
     noiseFiles: noiseFileNames.length || maxStat(assetOnlyNotifications, "noiseFiles"),
@@ -1492,10 +1510,9 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     ? [
         ...jsTextDiffs.map(d => {
           const label = d.type === "removed" ? "移除文案" : d.type === "added" ? "新增文案" : "文案变更";
-          const line = d.type === "removed" ? formatRemovedLine(label, d.text) : formatAddedLine(label, d.text);
-          return `${line}${d.file ? `  ← ${cardText(d.file)}` : ""}`;
+          return d.type === "removed" ? formatRemovedLine(label, d.text) : formatAddedLine(label, d.text);
         }),
-        ...businessConfigDiffs.map(cd => `${formatValueChangeLine(cd.field, cd.oldVal, cd.newVal)}${cd.file ? `  ← ${cardText(cd.file)}` : ""}`),
+        ...businessConfigDiffs.map(cd => formatValueChangeLine(cd.field, cd.oldVal, cd.newVal)),
         ...vaultDiffs.flatMap(vd => {
           if (vd.type === "modified") {
             return [
@@ -1513,7 +1530,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
           return [`- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
         }),
       ].filter(Boolean)
-    : ["- 未发现需卡片展示的文案或重要参数变更，完整资源/UI/实现信号见 Diff 详情。"];
+    : [];
 
   const changes = [
     `📦 Flap 全站前端资源变更：影响页面 ${affectedUrls.length} 个，修改资源 ${assetStats.modified} 个`,
@@ -1533,19 +1550,11 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   ].filter(Boolean);
 
   const content = buildFlapCardContent({
-    summary: [
-      hasCardSignals
-        ? `- 本地初筛: 检测到 ${localSignalSummary}。`
-        : "- 本地初筛: 未发现结构化业务变更。",
-      "- 卡片仅展示: 文案变更和重要参数变更",
-      `- 影响页面: ${affectedUrls.length} 个`,
-    ],
     primaryTitle: "重点变更",
     primary: cardSignalLines,
     scope: [affectedPageLinks],
-    details: [
-      "- 完整资源/UI/实现信号见“查看详情”。",
-    ],
+    detailsTitle: "资源统计",
+    details: [formatFlapResourceStats(assetStats)],
     ai: "AI 分析异步生成中，变更已先推送。",
   });
 
@@ -1918,25 +1927,6 @@ function saveDetailedDiff(url, changes) {
   }
 }
 
-function countBusinessConfigDiffs(assetStats) {
-  return (assetStats?.configDiffs || []).filter(isBusinessConfigDiff).length;
-}
-
-function buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs) {
-  const summary = [];
-  if (caStoreVaultDiffs.length > 0) summary.push(`CAstore 金库 ${caStoreVaultDiffs.length} 项`);
-  if (assetStats?.vaultDiffs?.length > 0) summary.push(`Vault 配置 ${assetStats.vaultDiffs.length} 项`);
-  if ((textChanges?.length || textChangeCount || 0) > 0) summary.push(`页面文案 ${textChanges?.length || textChangeCount} 处`);
-  if ((i18nDiffs?.length || i18nChangeCount || 0) > 0) summary.push(`i18n 文案 ${i18nDiffs?.length || i18nChangeCount} 处`);
-  if (assetStats?.jsTextDiffs?.length > 0) summary.push(`功能文案 ${assetStats.jsTextDiffs.length} 处`);
-  const configCount = countBusinessConfigDiffs(assetStats);
-  if (configCount > 0) summary.push(`业务配置 ${configCount} 项`);
-  const uiSignalCount = (assetStats?.uiStyleDiffs || []).length;
-  if (summary.length === 0 && assetStats) summary.push("未提取到结构化业务变更，仅有资源层变化");
-  if (summary.length === 0) summary.push("检测到页面变化");
-  return summary;
-}
-
 function normalizeCardText(value) {
   return String(value ?? "")
     .replace(/\r\n/g, "\n")
@@ -2000,7 +1990,7 @@ function buildCardUrlPrefix(url, content) {
   if (!url) return "";
   const text = String(content || "");
   if (text.includes(url)) return "";
-  return `- 页面: ${flapLink("打开页面", url)}\n\n`;
+  return `- 页面: ${flapPageLink(url)}\n\n`;
 }
 
 function compactTextDiffItems(items = [], max = 12) {
@@ -2119,30 +2109,19 @@ function formatTextChangeInsights(lines, insights = []) {
 
 /**
  * 构建飞书卡片简报内容。
- * 展示优先级：结论摘要 → 重点变更 → AI/资源/详情。
+ * 展示优先级：页面 → 重点变更 → 资源统计 → AI。
  */
 function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs = []) {
   const lines = [];
 
-  const summary = buildChangeSummaryLines(assetStats, textChangeCount, i18nChangeCount, i18nDiffs, textChanges, caStoreVaultDiffs);
-  const hasBusinessChange = summary.some(s => !s.includes("未提取到结构化业务变更"));
-  const intentSummary = buildResourceIntentSummary(assetStats || {});
-  const summaryLines = [
-    `- 结论: ${hasBusinessChange ? `发现 ${summary.join("、")}` : summary[0]}`,
-    assetStats ? "- 卡片仅展示: 文案变更和重要参数变更" : "",
-  ];
   const scopeLines = [
-    url ? `- 页面: ${flapLink("打开页面", url)}` : "",
+    url ? `- 页面: ${flapPageLink(url)}` : "",
   ];
   const detailLines = [
-    assetStats ? `- 资源统计: 不变 ${assetStats.unchanged || 0} / 重命名 ${assetStats.renamed || 0} / 修改 ${assetStats.modified || 0} / 新增 ${assetStats.added || 0} / 移除 ${assetStats.removed || 0}` : "",
-    "- 完整旧/新文本、资源 diff 与上下文见“查看详情”。",
+    formatFlapResourceStats(assetStats),
   ];
 
-  let hasStructuredChange = false;
-
   if (caStoreVaultDiffs.length > 0) {
-    hasStructuredChange = true;
     lines.push(`**🏦 CAstore 金库变更（${caStoreVaultDiffs.length} 项）：**`);
     for (const d of caStoreVaultDiffs) {
       const label = d.area ? `${d.area} / ${d.name}` : d.name;
@@ -2165,7 +2144,6 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
 
   // ═══ 1. Vault 变更（最高优先级）═══
   if (assetStats?.vaultDiffs?.length > 0) {
-    hasStructuredChange = true;
     lines.push(`**🏦 Vault 配置变更（${assetStats.vaultDiffs.length} 项）：**`);
     for (const vd of assetStats.vaultDiffs) {
       if (vd.type === "modified") {
@@ -2185,7 +2163,6 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
 
   // ═══ 2. 页面文案变更（提升优先级，展示实际内容）═══
   if (textChanges && textChanges.length > 0) {
-    hasStructuredChange = true;
     const textInsights = extractTextChangeInsights(textChanges);
     const modified = textChanges.filter(c => c.type === "modified");
     const added = textChanges.filter(c => c.type === "added");
@@ -2224,14 +2201,12 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     }
     lines.push("");
   } else if (textChangeCount > 0) {
-    hasStructuredChange = true;
     lines.push(`**✏️ 文案变更：** ${textChangeCount} 处`);
     lines.push("");
   }
 
   // ═══ 3. UI 文案变更（i18n）— 直接展示中文文案 ═══
   if (i18nDiffs && i18nDiffs.length > 0) {
-    hasStructuredChange = true;
     const added = i18nDiffs.filter(d => d.type === "added");
     const modified = i18nDiffs.filter(d => d.type === "modified");
     const removed = i18nDiffs.filter(d => d.type === "removed");
@@ -2257,14 +2232,12 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     }
     lines.push("");
   } else if (i18nChangeCount > 0) {
-    hasStructuredChange = true;
     lines.push(`**📝 i18n 变更：** ${i18nChangeCount} 处`);
     lines.push("");
   }
 
   // ═══ 4. JS 文件中的业务文案变更（Vault 描述、功能文案等）═══
   if (assetStats?.jsTextDiffs?.length > 0) {
-    hasStructuredChange = true;
     const added = assetStats.jsTextDiffs.filter(d => d.type === "added");
     const removed = assetStats.jsTextDiffs.filter(d => d.type === "removed");
     // 尝试配对：removed 和 added 中相似的文案（可能是修改）
@@ -2327,7 +2300,6 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     // 二次过滤：卡片层面只展示真实业务字段
     const businessDiffs = assetStats.configDiffs.filter(isBusinessConfigDiff);
     if (businessDiffs.length > 0) {
-      hasStructuredChange = true;
       lines.push(`**🔧 配置变更（${businessDiffs.length} 项）：**`);
       for (const cd of businessDiffs) {
         pushDiffPairLines(lines, cd.field, cd.oldVal, cd.newVal, "  ");
@@ -2336,16 +2308,11 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     }
   }
 
-  if (!hasStructuredChange) {
-    lines.push("未发现需卡片展示的文案或重要参数变更，完整资源/UI/实现信号见 Diff 详情。");
-    lines.push("");
-  }
-
   return buildFlapCardContent({
-    summary: summaryLines,
     primaryTitle: "重点变更",
     primary: lines,
     scope: scopeLines,
+    detailsTitle: "资源统计",
     details: detailLines,
     ai: aiSummary || "AI 分析异步生成中，变更已先推送。",
   });
@@ -3138,7 +3105,7 @@ function buildOperationalNoticeContent({ status, url, severity = "orange", reaso
       skipped ? `- 跳过检测: ${skipped} 次` : "",
     ],
     scope: [
-      url ? `- 页面: ${flapLink("打开页面", url)}` : "",
+      url ? `- 页面: ${flapPageLink(url)}` : "",
     ],
     details: [
       reason ? `- 原因: ${cardText(reason)}` : "",
