@@ -181,6 +181,7 @@ const CONFIG = {
       /^\/v\d+\/resolve-ens$/i,
     ],
   },
+  frontendRouteRemovalConfirmRuns: readPositiveIntEnv("FOURMEME_FRONTEND_ROUTE_REMOVAL_CONFIRM_RUNS", 2),
   frontendStaticIndex: {
     enabled: readBoolEnv("FOURMEME_FRONTEND_STATIC_INDEX", true),
     maxAssets: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_ASSETS", 400),
@@ -540,7 +541,7 @@ const md5 = (str) => createHash("md5").update(str).digest("hex");
 const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
-const CURRENT_SCHEMA_VERSION = 8;
+const CURRENT_SCHEMA_VERSION = 9;
 let snapshotWriteQueue = Promise.resolve();
 
 const REMOVED_FRONTEND_URLS = new Set([
@@ -652,10 +653,17 @@ function migrateSnapshot(data) {
   if (ver < 8) {
     log("[快照迁移] v7 → v8：启用前端资源摘要去重存储");
   }
+  if (ver < 9) {
+    data._frontendGlobalRoutes = collectFrontendRouteUnion(data.frontendPages || {});
+    data._frontendGlobalRoutePendingRemovals = {};
+    log("[快照迁移] v8 → v9：启用全站路由引用聚合与移除确认");
+  }
   ensureFrontendRouteState(data);
   if (!data._frontendDiscoveredHistory) data._frontendDiscoveredHistory = {};
   if (!data._frontendNotifyDedupe) data._frontendNotifyDedupe = {};
   if (!data._frontendWarmup) data._frontendWarmup = {};
+  if (!Array.isArray(data._frontendGlobalRoutes)) data._frontendGlobalRoutes = collectFrontendRouteUnion(data.frontendPages || {});
+  if (!data._frontendGlobalRoutePendingRemovals) data._frontendGlobalRoutePendingRemovals = {};
   hydrateFrontendSnapshotAssets(data);
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
@@ -3901,6 +3909,146 @@ function sanitizeRouteListForDiff(routes) {
   )].sort();
 }
 
+function collectFrontendRouteUnion(pages = {}) {
+  const routes = new Set();
+  for (const page of Object.values(pages || {})) {
+    for (const route of sanitizeRouteListForDiff(page?.routes || [])) routes.add(route);
+  }
+  return [...routes].sort();
+}
+
+function frontendPagesReferencingRoutes(pages = {}, routes = []) {
+  const targets = new Set(routes || []);
+  if (targets.size === 0) return [];
+  const result = [];
+  for (const page of Object.values(pages || {})) {
+    const pageRoutes = sanitizeRouteListForDiff(page?.routes || []);
+    if (!pageRoutes.some(route => targets.has(route))) continue;
+    const url = canonicalFrontendUrl(page?.originalUrl || "");
+    result.push({ label: url ? urlLabel(url) : "未知页面", url });
+  }
+  return compactFrontendUrlList(result);
+}
+
+function reconcileGlobalFrontendRoutes(state, oldPages = {}, newPages = {}) {
+  const effectivePages = { ...(oldPages || {}), ...(newPages || {}) };
+  const currentRoutes = collectFrontendRouteUnion(effectivePages);
+  const currentSet = new Set(currentRoutes);
+  const stableRoutes = sanitizeRouteListForDiff(
+    Array.isArray(state?._frontendGlobalRoutes)
+      ? state._frontendGlobalRoutes
+      : collectFrontendRouteUnion(oldPages),
+  );
+  const stableSet = new Set(stableRoutes);
+  const added = currentRoutes.filter(route => !stableSet.has(route));
+  const pending = state?._frontendGlobalRoutePendingRemovals && typeof state._frontendGlobalRoutePendingRemovals === "object"
+    ? { ...state._frontendGlobalRoutePendingRemovals }
+    : {};
+  const removed = [];
+  const confirmedRemovedPages = [];
+  let stateChanged = added.length > 0;
+  const now = Date.now();
+
+  for (const route of stableRoutes) {
+    if (currentSet.has(route)) {
+      if (pending[route]) {
+        delete pending[route];
+        stateChanged = true;
+        log(`[前端路由] ${route} 已恢复，取消移除确认`);
+      }
+      continue;
+    }
+    const prev = pending[route] || {};
+    const count = (Number(prev.count) || 0) + 1;
+    const sourcePages = Array.isArray(prev.pages) && prev.pages.length > 0
+      ? prev.pages
+      : frontendPagesReferencingRoutes(oldPages, [route]);
+    pending[route] = {
+      count,
+      firstSeenAt: prev.firstSeenAt || now,
+      lastSeenAt: now,
+      pages: sourcePages,
+    };
+    stateChanged = true;
+    if (count >= CONFIG.frontendRouteRemovalConfirmRuns) {
+      removed.push(route);
+      confirmedRemovedPages.push(...sourcePages);
+      delete pending[route];
+    }
+  }
+
+  for (const route of Object.keys(pending)) {
+    if (!stableSet.has(route) || currentSet.has(route)) {
+      delete pending[route];
+      stateChanged = true;
+    }
+  }
+
+  const removedSet = new Set(removed);
+  const nextStableRoutes = [...new Set([
+    ...stableRoutes.filter(route => !removedSet.has(route)),
+    ...added,
+  ])].sort();
+  if (!jsonEqual(state?._frontendGlobalRoutes || [], nextStableRoutes)) stateChanged = true;
+  state._frontendGlobalRoutes = nextStableRoutes;
+  state._frontendGlobalRoutePendingRemovals = pending;
+
+  return {
+    added,
+    removed,
+    stateChanged,
+    currentRoutes,
+    addedPages: frontendPagesReferencingRoutes(effectivePages, added),
+    removedPages: compactFrontendUrlList(confirmedRemovedPages),
+  };
+}
+
+function buildGlobalFrontendRouteNotification(change = {}) {
+  const routeDiff = { added: change.added || [], removed: change.removed || [] };
+  if (routeDiff.added.length === 0 && routeDiff.removed.length === 0) return null;
+  const lines = [
+    "**范围：全站前端路由与 API 引用**",
+    "说明：以下变化来自页面或前端资源中的引用，不代表对应功能或 API 已下线；真实 API 状态由独立 API 探针确认。",
+    "",
+  ];
+  for (const route of routeDiff.added) {
+    lines.push(`${isApiOrEndpointRoute(route) ? "API 引用新增" : "页面路由新增"}：${route}`);
+  }
+  for (const route of routeDiff.removed) {
+    lines.push(`${isApiOrEndpointRoute(route) ? "API 引用确认消失" : "页面路由确认消失"}：${route}`);
+  }
+  const pages = compactFrontendUrlList([...(change.addedPages || []), ...(change.removedPages || [])]);
+  if (pages.length > 0) {
+    lines.push("", `**关联页面：${pages.length} 个**`);
+    for (const page of pages) lines.push(page.url ? pageLink(page.url, page.label) : page.label);
+  }
+  const signature = md5(JSON.stringify({
+    added: [...routeDiff.added].sort(),
+    removed: [...routeDiff.removed].sort(),
+  }));
+  return {
+    title: "前端全站路由/API 引用变更",
+    content: lines.join("\n"),
+    template: "orange",
+    fullDiff: buildFullDiffText(
+      "全站路由/API 引用",
+      null,
+      null,
+      routeDiff,
+      null,
+      [],
+      null,
+      null,
+      CONFIG.siteUrl,
+      null,
+      { affectedPages: pages },
+    ),
+    url: CONFIG.siteUrl,
+    dedupeKey: `frontend:global-routes:${signature}`,
+    skipAi: true,
+  };
+}
+
 function formatRouteChanges(routeDiff) {
   const hasChanges = (routeDiff.added?.length > 0) || (routeDiff.removed?.length > 0);
   if (!hasChanges) return "";
@@ -4625,7 +4773,7 @@ function formatFrontendAssetBrief(assetSummary) {
 
 function normalizeFrontendNotificationTitle(title, fallbackUrl = "") {
   const raw = String(title || "");
-  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw) || /^前端 i18n 资源变更/.test(raw) || /^前端新路由发现：/.test(raw) || /^⚠️ 前端(?:抓取受限|页面不可达)：/.test(raw)) return raw;
+  if (/^前端(?:文案|路由\/端点)?变更：/.test(raw) || /^前端全站路由\/API 引用变更$/.test(raw) || /^前端 i18n 资源变更/.test(raw) || /^前端新路由发现：/.test(raw) || /^⚠️ 前端(?:抓取受限|页面不可达)：/.test(raw)) return raw;
   const m = raw.match(/\/(?:en|zh-TW)\/[A-Za-z0-9/_-]+/);
   const label = m?.[0] || (fallbackUrl ? urlLabel(fallbackUrl) : "未知页面");
   return `前端变更：${label}`;
@@ -8563,6 +8711,14 @@ async function runFrontendCheck() {
     snapshotDirty = true;
   }
 
+  const comparableRoutePages = Object.fromEntries(
+    Object.entries(newPages).filter(([key]) => Boolean(oldPages[key])),
+  );
+  const globalRouteChange = reconcileGlobalFrontendRoutes(snapshot, oldPages, comparableRoutePages);
+  if (globalRouteChange.stateChanged) snapshotDirty = true;
+  const globalRouteNotification = buildGlobalFrontendRouteNotification(globalRouteChange);
+  if (globalRouteNotification) notifications.push(globalRouteNotification);
+
   for (const [key, newData] of Object.entries(newPages)) {
     const oldData = oldPages[key];
     if (!oldData) {
@@ -8576,6 +8732,10 @@ async function runFrontendCheck() {
         baselineOnly: true,
       };
       snapshot._frontendWarmup[key] = { stableRuns: 1, firstSeenAt: Date.now() };
+      snapshot._frontendGlobalRoutes = [...new Set([
+        ...(snapshot._frontendGlobalRoutes || []),
+        ...sanitizeRouteListForDiff(newData.routes || []),
+      ])].sort();
       snapshot.frontendPages[key] = newData;
       snapshotDirty = true;
       continue;
@@ -8605,7 +8765,6 @@ async function runFrontendCheck() {
     let i18nChanges = null;
     let pageI18nChanges = null;
     let i18nChanged = false;
-    let routeChanged = false;
 
     // ── 1. 资源文件 diff（独立于下载成功与否）──
     // assetHash 监控文件列表；assetContentHash 补充监控创建页资源原地替换。
@@ -8758,29 +8917,9 @@ async function runFrontendCheck() {
       hasNonAssetChange = true;
     }
 
-    // ── 5. 路由/端点 diff（独立）──
-    const routeDiff = diffRoutes(oldData.routes, newData.routes);
-    if (routeDiff.added.length > 0 || routeDiff.removed.length > 0) {
-      const routeFormatted = formatRouteChanges(routeDiff);
-      if (routeFormatted) {
-        contentParts.push(routeFormatted);
-        pageContentParts.push(routeFormatted);
-        hasNonAssetChange = true;
-        routeChanged = true;
-      }
-    }
-    // 路由抖动保护：如果 diffRoutes 内部抑制了移除（removed 被清空），
-    // 将旧路由合并回 newData，避免下一轮对比时这些路由"复现"被报为新增
-    if (oldData.routes && newData.routes) {
-      const cleanNewRoutes = sanitizeRouteListForDiff(newData.routes);
-      const newSet = new Set(cleanNewRoutes);
-      const suppressed = sanitizeRouteListForDiff(oldData.routes).filter(r => !newSet.has(r));
-      if (suppressed.length > 0 && routeDiff.removed.length === 0) {
-        newData.routes = [...new Set([...cleanNewRoutes, ...suppressed])].sort();
-      } else {
-        newData.routes = cleanNewRoutes;
-      }
-    }
+    // ── 5. 路由/API 引用按全站集合统一比较 ──
+    // 页面级快照仍保留完整引用，用于下一轮生成全站集合；不再逐页重复推送共享资源变化。
+    newData.routes = sanitizeRouteListForDiff(newData.routes);
 
     // ── 汇总：只要有任何变更就推送 ──
     const label = urlLabel(newData.originalUrl);
@@ -8794,9 +8933,9 @@ async function runFrontendCheck() {
       log(`[前端] ${label} 变化！`);
 
       // 构建详细 diff 文件（复用已计算的 assetDiff）
-      const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, routeDiff, businessSignalDiff, [], oldData.assetContents, newData.assetContents, newData.originalUrl, pageI18nChanges);
+      const fullDiff = buildFullDiffText(label, cachedAssetDiff, textDiff, null, businessSignalDiff, [], oldData.assetContents, newData.assetContents, newData.originalUrl, pageI18nChanges);
       const assetSummary = cachedAssetDiff ? analyzeFrontendAssetDiff(cachedAssetDiff, oldData.assetContents, newData.assetContents, newData.originalUrl) : null;
-      const semanticSignature = frontendSemanticChangeSignature({ assetSummary, businessSignalDiff, i18nChanges: pageI18nChanges, textDiff, routeDiff });
+      const semanticSignature = frontendSemanticChangeSignature({ assetSummary, businessSignalDiff, i18nChanges: pageI18nChanges, textDiff });
       const contentV2 = [
         `**页面：${label}**`,
         "",
@@ -8804,7 +8943,7 @@ async function runFrontendCheck() {
       ].join("\n");
 
       notifications.push({
-        title: frontendNotificationTitle(label, { textDiff, i18nChanged, routeChanged }),
+        title: frontendNotificationTitle(label, { textDiff, i18nChanged }),
         content: contentV2,
         template: "orange",
         fullDiff,
@@ -9345,6 +9484,9 @@ export const __testables = {
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,
   diffRoutes,
+  collectFrontendRouteUnion,
+  reconcileGlobalFrontendRoutes,
+  buildGlobalFrontendRouteNotification,
   frontendAssetChangeSignature,
   classifyFetchFailure,
   shouldReuseFrontendAssetContents,

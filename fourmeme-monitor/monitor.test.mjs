@@ -17,6 +17,7 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
   assert.equal(__testables.CONFIG.jitterMs, 100);
   assert.equal(__testables.CONFIG.apiProbeStaggerMs, 150);
   assert.equal(__testables.CONFIG.hostRequestMinDelayMs, 60);
+  assert.equal(__testables.CONFIG.frontendRouteRemovalConfirmRuns, 2);
 });
 
 test("startup card copy reflects active frontend and api cadences", () => {
@@ -648,6 +649,53 @@ test("unchanged frontend route state is not reported as a merged change", () => 
 test("diffRoutes suppresses small remove-only SSR jitter", () => {
   const diff = __testables.diffRoutes(["/zh-TW/create-token", "/zh-TW/advanced"], ["/zh-TW/create-token"]);
   assert.deepEqual(diff, { added: [], removed: [] });
+});
+
+test("global route inventory ignores per-page deployment skew and confirms real removals", () => {
+  const route = "/v1/public/token/search";
+  const oldPages = {
+    a: { originalUrl: "https://four.meme/en/create-token", routes: [route] },
+    b: { originalUrl: "https://four.meme/en/advanced", routes: [route] },
+  };
+  const state = {
+    _frontendGlobalRoutes: [route],
+    _frontendGlobalRoutePendingRemovals: {},
+  };
+
+  const partial = __testables.reconcileGlobalFrontendRoutes(state, oldPages, {
+    a: { originalUrl: "https://four.meme/en/create-token", routes: [] },
+    b: oldPages.b,
+  });
+  assert.deepEqual(partial.added, []);
+  assert.deepEqual(partial.removed, []);
+  assert.deepEqual(state._frontendGlobalRoutePendingRemovals, {});
+
+  const absentPages = {
+    a: { originalUrl: "https://four.meme/en/create-token", routes: [] },
+    b: { originalUrl: "https://four.meme/en/advanced", routes: [] },
+  };
+  const firstMissing = __testables.reconcileGlobalFrontendRoutes(state, oldPages, absentPages);
+  assert.deepEqual(firstMissing.removed, []);
+  assert.equal(state._frontendGlobalRoutePendingRemovals[route].count, 1);
+
+  const confirmed = __testables.reconcileGlobalFrontendRoutes(state, absentPages, absentPages);
+  assert.deepEqual(confirmed.removed, [route]);
+  assert.deepEqual(state._frontendGlobalRoutes, []);
+  assert.deepEqual(confirmed.removedPages.map(page => page.label), ["/en/create-token", "/en/advanced"]);
+});
+
+test("global route additions notify immediately and use evidence-safe copy without AI", () => {
+  const route = "/v1/public/token/search";
+  const state = { _frontendGlobalRoutes: [], _frontendGlobalRoutePendingRemovals: {} };
+  const change = __testables.reconcileGlobalFrontendRoutes(state, {}, {
+    page: { originalUrl: "https://four.meme/en/create-token", routes: [route] },
+  });
+  assert.deepEqual(change.added, [route]);
+  const notification = __testables.buildGlobalFrontendRouteNotification(change);
+  assert.equal(notification.skipAi, true);
+  assert.match(notification.content, /API 引用新增：\/v1\/public\/token\/search/);
+  assert.match(notification.content, /不代表对应功能或 API 已下线/);
+  assert.doesNotMatch(notification.content, /功能失效|接口下线/);
 });
 
 test("extractRouteSignals separates frontend pages from API endpoints", () => {
