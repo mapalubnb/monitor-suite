@@ -6,7 +6,7 @@ process.env.FLAP_MONITOR_TEST = "1";
 const { __testables } = await import("./monitor.mjs");
 
 test("default Flap polling interval remains fast and configurable", () => {
-  assert.equal(__testables.CONFIG.pollIntervalMs, 1_500);
+  assert.equal(__testables.CONFIG.pollIntervalMs, 1_000);
 });
 
 test("Flap startup card is complete and uses no emoji or bullet list markers", () => {

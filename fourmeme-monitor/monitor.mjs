@@ -8,13 +8,13 @@
  *   4. 全面反风控：UA 轮换、按域名自适应退避、请求抖动、GitHub 认证限速
  *
  * 模块与频率：
- *   模块1: 底池配置   — 每 3s（纯 API，轻量，退避保护）
- *   模块2: 前端代码   — 每 10s（统一页面池，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
- *   模块3: API 结构    — 每 15s（多端点并行，含结构+值 diff）
- *   模块4: OpenFour模板 — 每 3s（新增模板 / 状态变化）
+ *   模块1: 底池配置   — 每 2s（纯 API，轻量，退避保护）
+ *   模块2: 前端代码   — 每 7s（统一页面池，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
+ *   模块3: API 结构    — 每 10s（多端点并行，含结构+值 diff）
+ *   模块4: OpenFour模板 — 每 2s（新增模板 / 状态变化）
  *   模块5: GitHub     — 有 token 每 30s / 无 token 每 90s（账号仓库列表每 5min）
- *   模块6: 智能合约   — 每 3s（RPC batch，单次请求）
- *   模块7: 链上参数   — 每 3s（RPC batch，单次请求）
+ *   模块6: 智能合约   — 每 2s（RPC batch，单次请求）
+ *   模块7: 链上参数   — 每 2s（RPC batch，单次请求）
  *   模块8: 创建者动作 — WebSocket 新区块驱动 + HTTP 兜底（只监听创建者/手动配置地址发起的交易）
  *
  * 用法：node monitor.mjs
@@ -140,13 +140,13 @@ const CONFIG = {
 
   // ── 各模块独立间隔（毫秒）──
   intervals: {
-    pool:     3_000,   // 模块1: 底池配置（3s，退避机制自动保护源站）
-    frontend: readClampedSecondsEnv("FOURMEME_FRONTEND_INTERVAL_SECONDS", 10, 10), // 模块2: 前端代码（默认/最低 10s）
-    api:      readClampedSecondsEnv("FOURMEME_API_INTERVAL_SECONDS", 15, 15),      // 模块3: API 结构（默认/最低 15s）
-    openfourTemplates: readClampedSecondsEnv("OPENFOUR_TEMPLATE_INTERVAL_SECONDS", 3, 3),
+    pool:     readClampedSecondsEnv("FOURMEME_POOL_INTERVAL_SECONDS", 2, 1),
+    frontend: readClampedSecondsEnv("FOURMEME_FRONTEND_INTERVAL_SECONDS", 7, 5),
+    api:      readClampedSecondsEnv("FOURMEME_API_INTERVAL_SECONDS", 10, 8),
+    openfourTemplates: readClampedSecondsEnv("OPENFOUR_TEMPLATE_INTERVAL_SECONDS", 2, 1),
     github:   readClampedSecondsEnv("GITHUB_INTERVAL_SECONDS", GITHUB_INTERVAL_FALLBACK_SECONDS, GITHUB_INTERVAL_MIN_SECONDS),
-    contract: 3_000,   // 模块6: 智能合约
-    onchain:  3_000,   // 模块7: 链上参数
+    contract: readClampedSecondsEnv("FOURMEME_CONTRACT_INTERVAL_SECONDS", 2, 1),
+    onchain:  readClampedSecondsEnv("FOURMEME_ONCHAIN_INTERVAL_SECONDS", 2, 1),
     actor:    3_000,   // 模块8: 合约创建者动作
   },
   githubRepoListIntervalMs: readClampedSecondsEnv("GITHUB_REPO_LIST_INTERVAL_SECONDS", 300, 300),
@@ -157,7 +157,7 @@ const CONFIG = {
 
   // ── 反风控 ──
   // 每次请求随机抖动范围（毫秒），叠加到间隔上
-  jitterMs: readNonNegativeIntEnv("FOURMEME_MODULE_JITTER_MS", 200),
+  jitterMs: readNonNegativeIntEnv("FOURMEME_MODULE_JITTER_MS", 100),
   // 默认 HTTP 超时
   defaultTimeoutMs: 10_000,
   // 退避：初始、最大、衰减因子
@@ -189,8 +189,8 @@ const CONFIG = {
     failureCooldownMs: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_FAILURE_COOLDOWN_MINUTES", 60) * 60_000,
     maxFailedAssets: readPositiveIntEnv("FOURMEME_FRONTEND_STATIC_INDEX_MAX_FAILED_ASSETS", 200),
   },
-  apiProbeStaggerMs: readNonNegativeIntEnv("FOURMEME_API_PROBE_STAGGER_MS", 200),
-  hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 80),
+  apiProbeStaggerMs: readNonNegativeIntEnv("FOURMEME_API_PROBE_STAGGER_MS", 150),
+  hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 60),
 
   // ── BSC RPC ──
   bscRpcUrls: [
@@ -283,7 +283,7 @@ const CONFIG = {
   actorMonitor: {
     enabled: process.env.FOURMEME_ACTOR_MONITOR !== "false",
     wsEnabled: readBoolEnv("FOURMEME_ACTOR_WS_ENABLED", true),
-    httpFallbackMs: readPositiveIntEnv("FOURMEME_ACTOR_HTTP_FALLBACK_MS", 10_000),
+    httpFallbackMs: readPositiveIntEnv("FOURMEME_ACTOR_HTTP_FALLBACK_MS", 8_000),
     confirmations: readPositiveIntEnv("FOURMEME_ACTOR_CONFIRMATIONS", 1),
     maxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_MAX_BLOCKS", 80),
     catchupMaxBlocksPerRun: readPositiveIntEnv("FOURMEME_ACTOR_CATCHUP_MAX_BLOCKS", 800),
@@ -306,7 +306,7 @@ const CONFIG = {
   },
   openFourRegistryLogMonitor: {
     enabled: readBoolEnv("OPENFOUR_REGISTRY_LOG_MONITOR", true),
-    discoveryDebounceMs: readPositiveIntEnv("OPENFOUR_REGISTRY_DISCOVERY_DEBOUNCE_MS", 3_000),
+    discoveryDebounceMs: readPositiveIntEnv("OPENFOUR_REGISTRY_DISCOVERY_DEBOUNCE_MS", 1_000),
   },
 };
 

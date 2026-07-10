@@ -54,7 +54,7 @@ const CONFIG = {
   feishuChatId: process.env.FEISHU_CHAT_ID || "",
 
   // 轮询间隔（毫秒）
-  pollIntervalMs: readPositiveIntEnv("FLAP_POLL_INTERVAL_MS", 1_500, 500),
+  pollIntervalMs: readPositiveIntEnv("FLAP_POLL_INTERVAL_MS", 1_000, 500),
 
   fetchTimeoutMs: 8_000,
   failThreshold: 3,

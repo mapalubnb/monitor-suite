@@ -6,21 +6,28 @@ process.env.FOURMEME_MONITOR_TEST = "1";
 const { __testables } = await import("./monitor.mjs");
 
 test("default fourmeme frontend and api cadences are fast but bounded", () => {
-  assert.equal(__testables.CONFIG.intervals.frontend, 10_000);
-  assert.equal(__testables.CONFIG.intervals.api, 15_000);
-  assert.equal(__testables.CONFIG.jitterMs, 200);
-  assert.equal(__testables.CONFIG.apiProbeStaggerMs, 200);
+  assert.equal(__testables.CONFIG.intervals.pool, 2_000);
+  assert.equal(__testables.CONFIG.intervals.frontend, 7_000);
+  assert.equal(__testables.CONFIG.intervals.api, 10_000);
+  assert.equal(__testables.CONFIG.intervals.openfourTemplates, 2_000);
+  assert.equal(__testables.CONFIG.intervals.contract, 2_000);
+  assert.equal(__testables.CONFIG.intervals.onchain, 2_000);
+  assert.equal(__testables.CONFIG.actorMonitor.httpFallbackMs, 8_000);
+  assert.equal(__testables.CONFIG.openFourRegistryLogMonitor.discoveryDebounceMs, 1_000);
+  assert.equal(__testables.CONFIG.jitterMs, 100);
+  assert.equal(__testables.CONFIG.apiProbeStaggerMs, 150);
+  assert.equal(__testables.CONFIG.hostRequestMinDelayMs, 60);
 });
 
 test("startup card copy reflects active frontend and api cadences", () => {
   const progress = __testables.buildStartupProgressContent();
   const ready = __testables.buildStartupReadyContent();
-  assert.match(progress, /前端页面：每 10 秒｜当前快照 \d+ 个页面/);
-  assert.match(progress, /公开 API：每 15 秒/);
+  assert.match(progress, /前端页面：每 7 秒｜当前快照 \d+ 个页面/);
+  assert.match(progress, /公开 API：每 10 秒/);
   assert.match(ready, /\*\*01｜运行状态\*\*[\s\S]*\*\*02｜监控概览\*\*[\s\S]*\*\*03｜前端监控入口\*\*[\s\S]*\*\*04｜运行参数\*\*/);
   assert.match(ready, /状态：监控运行中/);
-  assert.match(ready, /前端页面：[\s\S]*每 10 秒/);
-  assert.match(ready, /公开 API：[\s\S]*每 15 秒/);
+  assert.match(ready, /前端页面：[\s\S]*每 7 秒/);
+  assert.match(ready, /公开 API：[\s\S]*每 10 秒/);
   for (const url of __testables.CONFIG.monitorUrls) assert.match(ready, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.doesNotMatch(`${progress}\n${ready}`, /操作入口|更新时间：/);
   assert.doesNotMatch(ready, /每 \d+s/);
