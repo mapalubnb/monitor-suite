@@ -218,30 +218,103 @@ function normalizeChunkLimit(value, fallback) {
   return Number.isFinite(n) && n >= 500 ? Math.floor(n) : fallback;
 }
 
-function splitMessageContent(value, limit) {
+export function splitMessageContent(value, limit) {
   const text = String(value ?? "");
   if (text.length <= limit) return [text];
 
   const chunks = [];
   let current = "";
-  for (const line of text.split("\n")) {
-    const next = current ? `${current}\n${line}` : line;
+  const pushCurrent = () => {
+    if (current !== "") chunks.push(current);
+    current = "";
+  };
+  const appendPiece = (piece, separator = "") => {
+    const next = current ? `${current}${separator}${piece}` : piece;
     if (next.length <= limit) {
       current = next;
+      return;
+    }
+    pushCurrent();
+    if (piece.length <= limit) {
+      current = piece;
+      return;
+    }
+    let rest = piece;
+    while (rest.length > limit) {
+      let splitAt = Math.max(
+        rest.lastIndexOf(" ", limit),
+        rest.lastIndexOf("，", limit),
+        rest.lastIndexOf("。", limit),
+        rest.lastIndexOf("；", limit),
+        rest.lastIndexOf("、", limit),
+      );
+      if (splitAt < Math.floor(limit * 0.6)) splitAt = limit;
+      else splitAt += 1;
+      chunks.push(rest.slice(0, splitAt));
+      rest = rest.slice(splitAt);
+    }
+    current = rest;
+  };
+
+  const paragraphs = text.split(/(\n{2,})/);
+  for (const paragraph of paragraphs) {
+    if (!paragraph) continue;
+    if (/^\n{2,}$/.test(paragraph)) {
+      appendPiece(paragraph);
       continue;
     }
-    if (current) chunks.push(current);
-    if (line.length <= limit) {
-      current = line;
+    if (paragraph.length <= limit) {
+      appendPiece(paragraph);
       continue;
     }
-    for (let i = 0; i < line.length; i += limit) {
-      chunks.push(line.slice(i, i + limit));
+    const lines = paragraph.split(/(\n)/);
+    for (const line of lines) {
+      if (line === "") continue;
+      appendPiece(line);
     }
-    current = "";
   }
-  if (current || chunks.length === 0) chunks.push(current);
-  return chunks;
+  pushCurrent();
+  if (chunks.length === 0) chunks.push("");
+  const merged = [];
+  let pendingWhitespace = "";
+  for (const chunk of chunks) {
+    if (/^\s+$/.test(chunk)) {
+      pendingWhitespace += chunk;
+      continue;
+    }
+    if (pendingWhitespace) {
+      if (merged.length > 0 && merged[merged.length - 1].length + pendingWhitespace.length <= limit) {
+        merged[merged.length - 1] += pendingWhitespace;
+      } else {
+        const available = Math.max(0, limit - pendingWhitespace.length);
+        merged.push(pendingWhitespace + chunk.slice(0, available));
+        if (chunk.length > available) merged.push(chunk.slice(available));
+        pendingWhitespace = "";
+        continue;
+      }
+      pendingWhitespace = "";
+    }
+    merged.push(chunk);
+  }
+  if (pendingWhitespace) {
+    if (merged.length > 0) merged[merged.length - 1] += pendingWhitespace;
+    else merged.push(pendingWhitespace);
+  }
+  return merged;
+}
+
+export function balanceCardFontTags(chunks) {
+  let activeTag = "";
+  return chunks.map(chunk => {
+    let content = activeTag ? `${activeTag}${chunk}` : chunk;
+    const tokens = chunk.match(/<font\b[^>]*>|<\/font>/gi) || [];
+    for (const token of tokens) {
+      if (/^<\/font/i.test(token)) activeTag = "";
+      else activeTag = token;
+    }
+    if (activeTag) content += "</font>";
+    return content;
+  });
 }
 
 function partTitle(title, index, total) {
@@ -279,7 +352,7 @@ export async function sendCard(title, content, template = "red", opts = {}) {
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
-  const chunks = splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT);
+  const chunks = balanceCardFontTags(splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT - 40));
   const tokenOpt = await withToken();
   let firstMessageId = "";
   for (let i = 0; i < chunks.length; i++) {
@@ -287,7 +360,7 @@ export async function sendCard(title, content, template = "red", opts = {}) {
       partTitle(title, i + 1, chunks.length),
       chunks[i],
       template,
-      i === 0 ? opts : {},
+      opts,
     );
     const res = await client.im.message.create({
       params: { receive_id_type: "chat_id" },
@@ -366,7 +439,7 @@ export async function replyText(messageId, text) {
 export async function replyCard(messageId, title, content, color = "blue") {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
-  const chunks = splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT);
+  const chunks = balanceCardFontTags(splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT - 40));
   const tokenOpt = await withToken();
   let firstRes = null;
   for (let i = 0; i < chunks.length; i++) {
@@ -506,9 +579,7 @@ const messageThrottle = {
   timestamps: [],        // 最近 1s 内的发送时间戳
   maxPerSecond: 4,       // 预留 1 条余量（飞书限 5 QPS）
   queue: [],
-  maxQueueSize: 100,
   processing: false,
-  pendingHeartbeat: null,
 };
 
 let _processingPromise = null;
@@ -533,24 +604,6 @@ async function _doProcessQueue() {
       messageThrottle.timestamps.push(Date.now());
       await task();
     }
-    // 队列已空，处理低优先级心跳
-    if (messageThrottle.pendingHeartbeat) {
-      const heartbeatTask = messageThrottle.pendingHeartbeat;
-      messageThrottle.pendingHeartbeat = null;
-      const now = Date.now();
-      messageThrottle.timestamps = messageThrottle.timestamps.filter(t => now - t < 1_000);
-      if (messageThrottle.timestamps.length < messageThrottle.maxPerSecond) {
-        messageThrottle.timestamps.push(Date.now());
-        try {
-          await heartbeatTask();
-          log("[心跳] 队列空闲，心跳已推送");
-        } catch (err) {
-          log(`[心跳] 推送失败：${err.message}`);
-        }
-      } else {
-        messageThrottle.pendingHeartbeat = heartbeatTask;
-      }
-    }
   } finally {
     _processingPromise = null;
   }
@@ -562,11 +615,6 @@ async function _doProcessQueue() {
  */
 export async function sendCardQueued(title, content, template = "red", opts = {}) {
   return new Promise((resolve) => {
-    if (messageThrottle.queue.length >= messageThrottle.maxQueueSize) {
-      const dropped = messageThrottle.queue.shift();
-      if (dropped?.onDrop) dropped.onDrop();
-      log(`[飞书] 队列已满（${messageThrottle.maxQueueSize}），丢弃最早一条通知`);
-    }
     const task = async () => {
       try {
         const msgId = await sendCard(title, content, template, opts);
@@ -576,7 +624,6 @@ export async function sendCardQueued(title, content, template = "red", opts = {}
         resolve(null);
       }
     };
-    task.onDrop = () => resolve(null);
     messageThrottle.queue.push(task);
     processQueue().catch(err => {
       log(`[飞书] 消息队列处理异常：${err.message}`);
@@ -585,33 +632,17 @@ export async function sendCardQueued(title, content, template = "red", opts = {}
 }
 
 /**
- * 低优先级心跳消息 — 队列空闲时推送，新心跳覆盖旧心跳
- */
-export function sendHeartbeatQueued(title, content, template = "green") {
-  messageThrottle.pendingHeartbeat = async () => {
-    await sendCard(title, content, template);
-  };
-  log(`[心跳] 已挂起，等待队列空闲（当前队列：${messageThrottle.queue.length} 条）`);
-  if (messageThrottle.queue.length === 0) {
-    processQueue().catch(err => {
-      log(`[心跳] 消息队列处理异常：${err.message}`);
-    });
-  }
-}
-
-/**
  * 等待消息队列排空
  * @param {number} [timeoutMs=30000]
  */
 export async function waitQueueDrain(timeoutMs = 30_000) {
   const deadline = Date.now() + timeoutMs;
-  while (messageThrottle.queue.length > 0 && Date.now() < deadline) {
-    log(`等待 ${messageThrottle.queue.length} 条通知发送完成……`);
-    await new Promise(r => setTimeout(r, 2_000));
+  while ((messageThrottle.queue.length > 0 || _processingPromise) && Date.now() < deadline) {
+    log(`等待通知发送完成（排队 ${messageThrottle.queue.length} 条${_processingPromise ? "，发送中" : ""}）……`);
+    await new Promise(r => setTimeout(r, 200));
   }
-  messageThrottle.pendingHeartbeat = null;
-  if (messageThrottle.queue.length > 0) {
-    log(`超时退出，${messageThrottle.queue.length} 条通知未发送`);
+  if (messageThrottle.queue.length > 0 || _processingPromise) {
+    log(`超时退出，仍有 ${messageThrottle.queue.length} 条排队通知或正在发送的任务`);
   }
 }
 

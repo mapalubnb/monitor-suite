@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 
 import {
-  sendCard as _sdkSendCard, sendText as _sdkSendText,
+  sendText as _sdkSendText,
   replyText as _sdkReplyText, replyCard as _sdkReplyCard,
   replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile, sendFile as _sdkSendFile,
   getClient, getChatId, lark,
@@ -151,11 +151,6 @@ function checkRateLimit(senderId) {
   return entry.count <= rateLimiter.maxPerWindow;
 }
 
-/** 发送飞书卡片消息到群聊（通过 SDK） */
-async function sendWebhookCard(title, content, template = "blue") {
-  await _sdkSendCard(title, content, template);
-}
-
 /* ── 飞书 API：使用 SDK 自动管理 token ── */
 // getTenantToken 不再需要，SDK 内部自动处理
 
@@ -257,14 +252,6 @@ async function handleMessage(messageId, rawText) {
         return;
       }
 
-      case "report":
-      case "日报": {
-        await replyText(messageId, "正在生成日报...");
-        await sendDailyReport();
-        await replyText(messageId, "日报已推送到群聊");
-        return;
-      }
-
       case "exec":
       case "$": {
         const command = args.join(" ");
@@ -318,6 +305,10 @@ const AI_CONFIG = {
 };
 
 const AI_BOT_SYSTEM_PROMPT = `你是 Four.meme 和 Flap.sh 的监控助手。根据提供的监控快照数据回答用户问题，简洁专业，引用具体数值，中文回答，不超过 500 字。`;
+
+function firstExistingPath(paths) {
+  return paths.find(filePath => existsSync(filePath)) || "";
+}
 
 /**
  * 从快照文件构建监控上下文摘要（给 AI 参考）
@@ -395,8 +386,12 @@ function buildMonitorContext() {
   }
 
   // flap 快照
-  const flSnapPath = "/root/flap-monitor/snapshot.json";
-  if (existsSync(flSnapPath)) {
+  const flSnapPath = firstExistingPath([
+    join(CONFIG.monitorDir, "..", "flap-monitor", "snapshot.json"),
+    "/root/monitor-suite/flap-monitor/snapshot.json",
+    "/root/flap-monitor/snapshot.json",
+  ]);
+  if (flSnapPath) {
     try {
       const snap = JSON.parse(readFileSync(flSnapPath, "utf-8"));
       parts.push("\n=== Flap.sh 监控快照 ===");
@@ -464,10 +459,12 @@ function summarizeFlapSnapshot(snap = {}) {
 function readRecentHistory(n = 20) {
   const historyFiles = [
     join(CONFIG.monitorDir, "history.jsonl"),
+    join(CONFIG.monitorDir, "..", "flap-monitor", "history.jsonl"),
+    "/root/monitor-suite/flap-monitor/history.jsonl",
     "/root/flap-monitor/history.jsonl",
   ];
   const allRecords = [];
-  for (const f of historyFiles) {
+  for (const f of new Set(historyFiles)) {
     if (!existsSync(f)) continue;
     try {
       const lines = readFileSync(f, "utf-8").split("\n").filter(Boolean);
@@ -479,294 +476,6 @@ function readRecentHistory(n = 20) {
   // 按时间排序，取最近 N 条
   allRecords.sort((a, b) => (b.ts || "").localeCompare(a.ts || ""));
   return allRecords.slice(0, n);
-}
-
-/**
- * 调用 AI 对聚合后的变更摘要做日报总结
- */
-async function aiDailySummary(aggregatedText) {
-  if (!aggregatedText || !AI_CONFIG.enabled) return null;
-
-  const systemPrompt = `你是 Four.meme 和 Flap.sh 的监控日报分析师。
-
-根据以下 24h 变更摘要，输出一段 2-4 句话的总结，要求：
-- 第一句：整体判定（平静/常规构建更新/有实质变更/有重大变更）
-- 如有实质变更（底池参数、合约代码、费率、新功能、路由变化），逐条说明具体改了什么
-- 纯构建噪音（前端 hash 轮换、部署 ID、变量重命名）直接标注"常规构建更新"，不展开
-- 中文，不超过 200 字`;
-
-  const text = await chatCompletion({
-    systemPrompt,
-    userMessage: `以下是过去 24 小时的变更聚合摘要：\n\n${aggregatedText}`,
-    temperature: 0.3,
-    maxTokens: 500,
-    timeoutMs: AI_CONFIG.timeoutMs,
-    retries: 1,
-  });
-
-  if (text) log(`[日报AI] 总结生成成功（${text.length} 字）`);
-  else log(`[日报AI] 总结生成失败`);
-  return text;
-}
-
-/**
- * 预处理变更记录：按模块聚合、去重、提取实质事件
- */
-function aggregateChanges(todayChanges) {
-  // 按模块分组计数
-  const byModule = {};
-  for (const r of todayChanges) {
-    if (!byModule[r.module]) byModule[r.module] = { count: 0, items: [] };
-    byModule[r.module].count++;
-    byModule[r.module].items.push(r);
-  }
-
-  // 去重：相同 title 只保留一条 + 次数
-  const deduped = {};
-  for (const [mod, data] of Object.entries(byModule)) {
-    const titleMap = new Map();
-    for (const r of data.items) {
-      const key = r.title || "(无标题)";
-      if (!titleMap.has(key)) {
-        titleMap.set(key, { record: r, count: 1 });
-      } else {
-        titleMap.get(key).count++;
-      }
-    }
-    deduped[mod] = { total: data.count, titles: titleMap };
-  }
-
-  // 构建聚合文本（给 AI 的输入）
-  const lines = [];
-  for (const [mod, data] of Object.entries(deduped)) {
-    lines.push(`[${mod}] 共 ${data.total} 次变更：`);
-    for (const [title, info] of data.titles) {
-      const countStr = info.count > 1 ? ` (×${info.count})` : "";
-      const summary = info.record.summary
-        ? info.record.summary.slice(0, 200)
-        : "";
-      lines.push(`  - ${title}${countStr}${summary ? "：" + summary : ""}`);
-    }
-  }
-
-  // 提取实质事件（非前端构建噪音）
-  const substantive = todayChanges.filter(r => {
-    if (!r.summary) return false;
-    if (/常规构建|无实质|hash.*轮换|纯噪音|minifier|部署 ID/i.test(r.summary)) return false;
-    if (r.module === "frontend" && !/费率|fee|vault|dividend|staking|enabled|新增|移除|路由/i.test(r.summary)) return false;
-    return true;
-  });
-
-  // 实质事件去重
-  const seenSummary = new Set();
-  const uniqueSubstantive = [];
-  for (const r of substantive) {
-    const key = (r.summary || "").slice(0, 100);
-    if (seenSummary.has(key)) continue;
-    seenSummary.add(key);
-    uniqueSubstantive.push(r);
-  }
-
-  return {
-    byModule: deduped,
-    aggregatedText: lines.join("\n"),
-    substantiveEvents: uniqueSubstantive.slice(0, 5),
-    totalCount: todayChanges.length,
-    moduleStats: Object.entries(deduped).map(([mod, d]) => `${mod} ${d.total}`).join(", "),
-  };
-}
-
-/**
- * 生成每日报告内容（三板块结构）
- */
-async function buildDailyReport() {
-  const parts = [];
-  const now = new Date();
-  const yesterday = new Date(now.getTime() - 24 * 3600 * 1000);
-  const yStr = yesterday.toISOString();
-
-  const dateStr = now.toLocaleDateString("zh-CN", { year: "numeric", month: "2-digit", day: "2-digit" });
-
-  // ── 获取 24h 变更 ──
-  const allHistory = readRecentHistory(200);
-  const todayChanges = allHistory.filter(r => r.ts >= yStr);
-
-  // ═══ 板块一：AI 总结 ═══
-  if (todayChanges.length === 0) {
-    parts.push("**总结：** 过去 24 小时无任何变更，一切平静。");
-  } else {
-    const agg = aggregateChanges(todayChanges);
-
-    // AI 总结仅用于实质事件；纯失败/恢复/构建噪音用规则摘要，减少无意义调用。
-    const shouldUseAi = agg.substantiveEvents.length > 0;
-    const aiSummary = shouldUseAi ? await aiDailySummary(agg.aggregatedText) : null;
-    if (aiSummary) {
-      parts.push(`**总结：** ${aiSummary}`);
-    } else if (!shouldUseAi) {
-      parts.push(`**总结：** 过去 24h 共 ${agg.totalCount} 次记录（${agg.moduleStats}），未识别到需要 AI 解读的实质业务变更。`);
-    } else {
-      // Fallback：无 AI 时用一行统计代替
-      parts.push(`**总结：** 过去 24h 共 ${agg.totalCount} 次变更（${agg.moduleStats}），AI 分析不可用。`);
-    }
-
-    // ═══ 板块二：今日数据 ═══
-    parts.push("");
-    parts.push("---");
-    parts.push("");
-    parts.push(`**今日数据**`);
-    parts.push(`变更：共 ${agg.totalCount} 次（${agg.moduleStats}）`);
-
-    // 系统状态
-    try {
-      const { stdout: pm2Out } = await execAsync("pm2 jlist 2>/dev/null", { timeout: 5000 });
-      const list = JSON.parse(pm2Out);
-      const services = ["fourmeme-monitor", "flap-monitor", "feishu-bot"];
-      const online = services.filter(n => list.find(x => x.name === n)?.pm2_env?.status === "online");
-      const totalRestarts = services.reduce((sum, n) => {
-        const p = list.find(x => x.name === n);
-        return sum + (p?.pm2_env?.restart_time ?? 0);
-      }, 0);
-      const statusText = online.length === services.length
-        ? `${online.length} 进程正常`
-        : `${online.length}/${services.length} 进程在线`;
-      parts.push(`系统：${statusText}${totalRestarts > 0 ? "，累计重启 " + totalRestarts + " 次" : ""}`);
-    } catch {
-      parts.push("系统：无法获取状态");
-    }
-
-    // 快照指标
-    const fmSnapPath = join(CONFIG.monitorDir, "snapshot.json");
-    if (existsSync(fmSnapPath)) {
-      try {
-        const snap = JSON.parse(readFileSync(fmSnapPath, "utf-8"));
-        const pools = (snap.poolConfig || []).filter(p => p.networkCode === "BSC").length;
-        const contracts = Object.keys(snap.contractFingerprints || {}).length;
-        const sha = (snap.githubSha || "").slice(0, 8) || "-";
-        const repos = Object.keys(snap.githubRepos || {}).length;
-        const nfts = snap.onchainParams?.agentNftCount ?? "-";
-        const actors = snap.chainActorMonitor?.actionActorCount
-          ?? Object.values(snap.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
-        parts.push(`Four.meme：底池${pools} | 合约${contracts} | 创建者${actors} | NFT${nfts} | GitHub仓库${repos} | SHA:\`${sha}\``);
-      } catch { /* ignore */ }
-    }
-    const flSnapPath = "/root/flap-monitor/snapshot.json";
-    if (existsSync(flSnapPath)) {
-      try {
-        const snap = JSON.parse(readFileSync(flSnapPath, "utf-8"));
-        const flap = summarizeFlapSnapshot(snap);
-        parts.push(`Flap.sh：页面${flap.pageCount} | 金库工厂${flap.vaultFactoryCount} | 链上金库${flap.knownVaults} | 注册中心已扫 ${flap.lastBlock}/${flap.safeLatest} | 延迟${flap.lag}块`);
-      } catch { /* ignore */ }
-    }
-
-    // ═══ 板块三：重点事件（仅有实质变更时出现）═══
-    if (agg.substantiveEvents.length > 0) {
-      parts.push("");
-      parts.push("---");
-      parts.push("");
-      parts.push("**重点事件**");
-      for (const r of agg.substantiveEvents) {
-        const time = new Date(r.ts).toLocaleTimeString("zh-CN", { hour12: false, hour: "2-digit", minute: "2-digit" });
-        const summary = (r.summary || r.title || "").slice(0, 150);
-        parts.push(`${time} [${r.module}] ${summary}`);
-      }
-    }
-  }
-
-  return parts.join("\n");
-}
-
-/**
- * 发送每日报告到飞书群聊（通过飞书 SDK）
- */
-async function sendDailyReport() {
-  log("[日报] 开始生成每日报告...");
-  try {
-    const content = await buildDailyReport();
-    await sendWebhookCard("📊 监控日报", content, "indigo");
-    log("[日报] 推送成功");
-  } catch (err) {
-    log(`[日报] 生成/推送异常：${err.message}`);
-  }
-}
-
-/**
- * 读取 fourmeme-monitor 的 .env 配置，判断日报是否开启
- */
-function isDailyReportEnabled() {
-  const envFile = join(CONFIG.monitorDir, ".env");
-  try {
-    if (existsSync(envFile)) {
-      const content = readFileSync(envFile, "utf-8");
-      const match = content.match(/^DAILY_REPORT=(.+)$/m);
-      if (match) return match[1].trim() === "true";
-    }
-  } catch {}
-  // 也检查进程环境变量
-  if (process.env.DAILY_REPORT) return process.env.DAILY_REPORT === "true";
-  // 默认关闭
-  return false;
-}
-
-// 每日报告定时器：每天早上 9:00（UTC+8 = UTC 01:00）
-function scheduleDailyReport() {
-  // ── 持久化上次发送日期，防止重启后漏发或重复发 ──
-  const stateFile = join(CONFIG.monitorDir, ".daily-report-state.json");
-
-  let lastReportDate = "";
-  try {
-    if (existsSync(stateFile)) {
-      const saved = JSON.parse(readFileSync(stateFile, "utf-8"));
-      lastReportDate = saved.lastReportDate || "";
-      log(`[日报] 恢复上次发送日期：${lastReportDate}`);
-    }
-  } catch {}
-
-  function saveLastDate(dateStr) {
-    lastReportDate = dateStr;
-    try { writeFileSync(stateFile, JSON.stringify({ lastReportDate: dateStr }), "utf-8"); } catch {}
-  }
-
-  // ── 启动补发：如果今天日报未发且在补发窗口内（UTC 01:00~03:59 / 北京 09:00~11:59），立即补发 ──
-  const startupCatchUp = async () => {
-    try {
-      if (!isDailyReportEnabled()) {
-        log("[日报] 日报未开启（DAILY_REPORT!=true），跳过补发");
-        return;
-      }
-      const now = new Date();
-      const todayStr = now.toISOString().slice(0, 10);
-      const utcHour = now.getUTCHours();
-      if (lastReportDate !== todayStr && utcHour >= 1 && utcHour < 4) {
-        log("[日报] 检测到今日日报未发送，立即补发...");
-        saveLastDate(todayStr);
-        await sendDailyReport();
-      }
-    } catch (err) {
-      log(`[日报] 启动补发异常：${err.message}`);
-    }
-  };
-  setTimeout(startupCatchUp, 10_000); // 启动 10s 后检查
-
-  // ── 定时检查：UTC 01:00~01:04（北京 09:00~09:04）──
-  setInterval(async () => {
-    try {
-      if (!isDailyReportEnabled()) return;
-
-      const now = new Date();
-      const utcHour = now.getUTCHours();
-      const utcMinute = now.getUTCMinutes();
-      const todayStr = now.toISOString().slice(0, 10);
-
-      if (utcHour === 1 && utcMinute < 5 && lastReportDate !== todayStr) {
-        saveLastDate(todayStr);
-        await sendDailyReport();
-      }
-    } catch (err) {
-      log(`[日报] 定时检查异常：${err.message}`);
-    }
-  }, 30_000); // 每 30 秒检查一次
-
-  log(`[日报] 定时检查已启动（目标 UTC 01:00 / 北京 09:00，补发窗口至 11:59）当前状态：${isDailyReportEnabled() ? "开启" : "关闭"}`);
 }
 
 /**
@@ -910,7 +619,6 @@ function cmdHelp() {
     "`ai list`　　 列出所有可用提供商及模型",
     "`ai models [提供商]` 从 API 获取远程模型列表",
     "`history [N]` 最近变更记录（默认 10）",
-    "`report`　　　生成并发送日报",
     "",
     "**Shell 命令：**",
     "直接输入任意命令执行，如 `fm-status`、`fl-status`、`mon-status`",
@@ -1473,8 +1181,6 @@ wsClient.start({
 }).then(() => {
   log("飞书交互机器人已启动（WebSocket 长连接模式）");
   log("无需配置事件订阅地址，消息通过长连接接收");
-  // 启动每日报告定时器
-  scheduleDailyReport();
 }).catch((err) => {
   log(`WebSocket 连接失败：${err.message}`);
   process.exit(1);

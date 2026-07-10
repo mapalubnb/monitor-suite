@@ -28,6 +28,8 @@ monitor-suite/
 
 前端/API 已做 keep-alive、条件请求、并发抓取、风控退避、去重窗口和新页面 warm-up。稳定状态下会尽量贴近 `10s/15s`；遇到 403/429/Cloudflare 等风控时会自动退避。
 
+飞书变更通知会优先立即发送规则化结果，AI 分析完成后再补充。文案、i18n、URL、地址和交易哈希等可读变更保留完整内容；超长正文自动拆成连续多张卡片，不截断、不丢弃。
+
 ## 快速部署
 
 ```bash
@@ -71,9 +73,12 @@ FOURMEME_FRONTEND_ASSET_CONCURRENCY=6
 FOURMEME_API_PROBE_STAGGER_MS=200
 FOURMEME_HOST_REQUEST_MIN_DELAY_MS=80
 FOURMEME_FRONTEND_WARMUP_STABLE_RUNS=1
+FLAP_POLL_INTERVAL_MS=1500
 ```
 
 `FOURMEME_HOST_REQUEST_MIN_DELAY_MS` 只错开 Four.meme 同 host 的请求，不改变各模块监控间隔；设为 `0` 可关闭。
+
+`FLAP_POLL_INTERVAL_MS` 默认 `1500`，最低 `500`。遇到源站风控时可适当调高。
 
 被风控时建议先把前端并发降到：
 
@@ -118,7 +123,7 @@ pm2 status
 
 ```bash
 npm run check
-npm run test:fourmeme
+npm test
 ```
 
 ## 飞书应用
@@ -133,6 +138,7 @@ npm run test:fourmeme
 
 - `.env` 不提交到仓库。
 - `snapshot.json`、日志和历史文件是运行态数据，不应手动覆盖。
+- 飞书仅推送启动、变更、异常和恢复消息，不提供周期心跳与日报。
 - `SIGUSR1` 可立即触发全量检测，`SIGINT`/`SIGTERM` 会优雅退出并等待消息队列排空。
 
 ## License

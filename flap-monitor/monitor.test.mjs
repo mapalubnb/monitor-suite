@@ -5,6 +5,10 @@ process.env.FLAP_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
 
+test("default Flap polling interval remains fast and configurable", () => {
+  assert.equal(__testables.CONFIG.pollIntervalMs, 1_500);
+});
+
 test("shared Flap asset-only page changes are summarized into one site-wide notification", () => {
   const notifications = [
     {
@@ -984,7 +988,7 @@ test("page change card puts summary and important copy before ai analysis", () =
   assert.match(content, /AI 分析异步生成中，变更已先推送/);
 });
 
-test("launch text card summarizes anti-farmer duration changes without raw page noise", () => {
+test("launch text card summarizes anti-farmer duration changes and keeps full source copy", () => {
   const cssNoise = `span:first-child]:h-1 [&>span:first-child]:rounded-none [&[role=slider]]:h-3 style="--radix-slider-thumb-transform:translateX(-50%)"`;
   const addedDescription = "This feature ensures that trades occur primarily in the tax liquidity pool during the protection period, improving the stability of token tax revenue.";
   const content = __testables.buildCardBriefing(
@@ -1010,14 +1014,16 @@ test("launch text card summarizes anti-farmer duration changes without raw page 
     [],
   );
 
-  assert.match(content, /页面文案变更（已归纳，原始 2 处）/);
+  assert.match(content, /页面文案变更（归纳 \+ 完整原文，共 2 处）/);
   assert.match(content, /防巨鲸薅币保护周期（Anti-Farmer Protection Duration）/);
   assert.match(content, /默认时长/);
   assert.match(content, /<font color="red">3 天<\/font> → <font color="green">30 天<\/font>/);
   assert.match(content, /取值区间：最小值 0 天 \/ 最大值 365 天（1 年），区间规则未改动/);
   assert.match(content, /新增说明/);
   assert.match(content, /开关提示未改/);
-  assert.doesNotMatch(content, /radix-slider|span:first-child|Payment token \* BNB/);
+  assert.match(content, /radix-slider/);
+  assert.match(content, /Payment token \* BNB/);
+  assert.match(content, new RegExp(addedDescription.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("site-wide asset card leads with no business-change conclusion", () => {
@@ -1243,4 +1249,26 @@ test("full diff uses detailed lines without summary truncation", () => {
   assert.match(diff, /long added string 001/);
   assert.match(diff, /long added string 020/);
   assert.doesNotMatch(diff, /\.\.\. 还有 12 处新增/);
+});
+
+test("flap cards keep every readable copy change without truncation", () => {
+  const longOld = `旧文案-${"完整内容".repeat(80)}`;
+  const longNew = `新文案-${"完整内容".repeat(80)}`;
+  const textChanges = Array.from({ length: 15 }, (_, i) => ({
+    type: "modified",
+    oldText: `${longOld}-${i}`,
+    newText: `${longNew}-${i}`,
+  }));
+  const content = __testables.buildCardBriefing(
+    "https://flap.sh/create",
+    null,
+    null,
+    textChanges.length,
+    0,
+    [],
+    textChanges,
+  );
+  assert.match(content, new RegExp(`${longOld}-14`));
+  assert.match(content, new RegExp(`${longNew}-14`));
+  assert.doesNotMatch(content, /完整内容\.\.\.|完整内容…|还有 \d+ 处修改/);
 });

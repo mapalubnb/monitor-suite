@@ -199,6 +199,9 @@ echo "[6/6] 安装快捷命令到 /usr/local/bin/..."
 
 BIN_DIR="/usr/local/bin"
 
+# 清理旧版本遗留的心跳/日报快捷命令。
+rm -f "$BIN_DIR/fm-daily" "$BIN_DIR/fm-heartbeat"
+
 # 通用 pm2 进程状态显示工具（供其他命令复用）
 cat > "$BIN_DIR/_pm2-proc-info" << 'HELPER_EOF'
 #!/usr/bin/env node
@@ -439,22 +442,7 @@ pm2 restart fourmeme-monitor --update-env
 echo ""
 echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
 pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor --brief
-# 显示快捷配置状态
-CONF="/root/monitor-suite/.env"
-[ -f "$CONF" ] || CONF="/root/fourmeme-monitor/.env"
-if [ -f "$CONF" ]; then
-  HE=$(grep '^HEARTBEAT_ENABLED=' "$CONF" 2>/dev/null | cut -d= -f2)
-  HB=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
-  DR=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
-  DRH=$(grep '^DAILY_REPORT_HOUR=' "$CONF" 2>/dev/null | cut -d= -f2)
-  if [ "$HE" = "true" ]; then
-    echo "  心跳: 开启（${HB:-240} 分钟）"
-  else
-    echo "  心跳: 关闭"
-  fi
-  [ "$DR" = "true" ] && echo "  日报: 开启（每天 ${DRH:-9}:00）" || echo "  日报: 关闭"
-fi
-echo "========================================="
+  echo "========================================="
 EOF
 
 cat > "$BIN_DIR/fm-stop" << 'EOF'
@@ -477,164 +465,6 @@ fi
 echo "========================================="
 EOF
 
-cat > "$BIN_DIR/fm-daily" << 'EOF'
-#!/bin/sh
-echo "====== fourmeme 日报设置 ======"
-CONF="/root/monitor-suite/.env"
-[ -f "$CONF" ] || CONF="/root/fourmeme-monitor/.env"
-
-# 读取当前状态
-CURRENT_ENABLED=$(grep '^DAILY_REPORT=' "$CONF" 2>/dev/null | cut -d= -f2)
-CURRENT_HOUR=$(grep '^DAILY_REPORT_HOUR=' "$CONF" 2>/dev/null | cut -d= -f2)
-CURRENT_ENABLED="${CURRENT_ENABLED:-false}"
-CURRENT_HOUR="${CURRENT_HOUR:-9}"
-
-show_status() {
-  if [ "$CURRENT_ENABLED" = "true" ]; then
-    echo "  状态: 已开启"
-    echo "  发送时间: 每天 ${CURRENT_HOUR}:00"
-  else
-    echo "  状态: 已关闭"
-  fi
-}
-
-usage() {
-  echo ""
-  echo "用法:"
-  echo "  fm-daily              查看当前日报状态"
-  echo "  fm-daily on           开启日报（默认 9:00 发送）"
-  echo "  fm-daily on 20        开启日报，每天 20:00 发送"
-  echo "  fm-daily off          关闭日报"
-  echo ""
-  show_status
-  echo "========================================="
-}
-
-write_env() {
-  # 更新 .env 文件
-  touch "$CONF"
-  grep -v '^DAILY_REPORT=' "$CONF" | grep -v '^DAILY_REPORT_HOUR=' > "$CONF.tmp" 2>/dev/null || true
-  echo "DAILY_REPORT=$1" >> "$CONF.tmp"
-  echo "DAILY_REPORT_HOUR=$2" >> "$CONF.tmp"
-  mv "$CONF.tmp" "$CONF"
-}
-
-case "${1:-}" in
-  "")
-    usage
-    ;;
-  on)
-    HOUR="${2:-$CURRENT_HOUR}"
-    # 验证小时数
-    if ! echo "$HOUR" | grep -qE '^[0-9]+$' || [ "$HOUR" -gt 23 ]; then
-      echo "  错误：小时数必须为 0-23"
-      exit 1
-    fi
-    write_env "true" "$HOUR"
-    echo "  日报已开启，每天 ${HOUR}:00 发送"
-    echo ""
-    echo "  正在重启 fourmeme-monitor 使配置生效..."
-    pm2 restart fourmeme-monitor --update-env 2>/dev/null
-    echo "  重启完成 ✓"
-    echo "========================================="
-    ;;
-  off)
-    write_env "false" "$CURRENT_HOUR"
-    echo "  日报已关闭"
-    echo ""
-    echo "  正在重启 fourmeme-monitor 使配置生效..."
-    pm2 restart fourmeme-monitor --update-env 2>/dev/null
-    echo "  重启完成 ✓"
-    echo "========================================="
-    ;;
-  *)
-    echo "  未知参数: $1"
-    usage
-    exit 1
-    ;;
-esac
-EOF
-
-cat > "$BIN_DIR/fm-heartbeat" << 'EOF'
-#!/bin/sh
-echo "====== Monitor Suite 心跳推送设置 ======"
-CONF="/root/monitor-suite/.env"
-[ -f "$CONF" ] || CONF="/root/fourmeme-monitor/.env"
-
-# 读取当前值
-CURRENT_ENABLED=$(grep '^HEARTBEAT_ENABLED=' "$CONF" 2>/dev/null | cut -d= -f2)
-CURRENT_ENABLED="${CURRENT_ENABLED:-false}"
-CURRENT_MIN=$(grep '^HEARTBEAT_MINUTES=' "$CONF" 2>/dev/null | cut -d= -f2)
-CURRENT_MIN="${CURRENT_MIN:-240}"
-
-show_status() {
-  if [ "$CURRENT_ENABLED" = "true" ]; then
-    echo "  当前心跳: 开启（每 ${CURRENT_MIN} 分钟推送一次状态）"
-  else
-    echo "  当前心跳: 关闭"
-  fi
-}
-
-write_config() {
-  ENABLED="$1"
-  MINUTES="${2:-$CURRENT_MIN}"
-  touch "$CONF"
-  grep -v '^HEARTBEAT_ENABLED=' "$CONF" | grep -v '^HEARTBEAT_MINUTES=' > "$CONF.tmp" 2>/dev/null || true
-  echo "HEARTBEAT_ENABLED=$ENABLED" >> "$CONF.tmp"
-  echo "HEARTBEAT_MINUTES=$MINUTES" >> "$CONF.tmp"
-  mv "$CONF.tmp" "$CONF"
-}
-
-restart_monitors() {
-  echo ""
-  echo "  正在重启 fourmeme-monitor / flap-monitor 使配置生效..."
-  pm2 restart fourmeme-monitor --update-env 2>/dev/null || true
-  pm2 restart flap-monitor --update-env 2>/dev/null || true
-  echo "  重启完成 ✓"
-  echo "========================================="
-}
-
-usage() {
-  echo ""
-  echo "用法:"
-  echo "  fm-heartbeat          查看当前心跳状态"
-  echo "  fm-heartbeat off      关闭心跳推送"
-  echo "  fm-heartbeat on       开启心跳推送"
-  echo "  fm-heartbeat 30       开启并设为 30 分钟"
-  echo "  fm-heartbeat 60       开启并设为 1 小时"
-  echo "  fm-heartbeat 240      开启并设为 4 小时"
-  echo ""
-  show_status
-  echo "========================================="
-}
-
-case "${1:-}" in
-  "")
-    usage
-    ;;
-  off|false|disable|disabled)
-    write_config false "$CURRENT_MIN"
-    echo "  心跳推送已关闭"
-    restart_monitors
-    ;;
-  on|true|enable|enabled)
-    write_config true "$CURRENT_MIN"
-    echo "  心跳推送已开启（${CURRENT_MIN} 分钟）"
-    restart_monitors
-    ;;
-  *)
-    MINUTES="$1"
-    # 验证是否为正整数
-    if ! echo "$MINUTES" | grep -qE '^[0-9]+$' || [ "$MINUTES" -lt 1 ]; then
-      echo "  错误：参数必须为 off/on 或正整数（分钟）"
-      exit 1
-    fi
-    write_config true "$MINUTES"
-    echo "  心跳推送已开启，间隔设为 ${MINUTES} 分钟"
-    restart_monitors
-    ;;
-esac
-EOF
 
 # flap-monitor
 cat > "$BIN_DIR/fl-status" << 'EOF'
@@ -1140,8 +970,6 @@ cat << 'INNER'
   fm-restart          重启
   fm-stop             停止
   fm-check            SIGUSR1 触发全量检测
-  fm-daily            日报开关（on/off/on 20）
-  fm-heartbeat        心跳推送开关/间隔设置（off/on/分钟数）
 
 ── flap (fl-*) ──────────────────────────────────────
   fl-status           进程 + 页面/资源/i18n 摘要
@@ -1158,7 +986,7 @@ cat << 'INNER'
   bot-stop            停止
 
 ── 飞书 bot 内置指令 ────────────────────────────────
-  help / ai <问题> / history [N] / report
+  help / ai <问题> / history [N]
   直接输入任意 shell 命令亦可执行
 
 ══════════════════════════════════════════════════════

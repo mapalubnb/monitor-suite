@@ -16,9 +16,6 @@ snapshots/
 # PM2
 .pm2/
 
-# 日报状态
-.daily-report-state.json
-
 # OS
 .DS_Store
 Thumbs.db

@@ -29,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { parseHTML } from "linkedom";
 
-import { sendCard, sendCardQueued, sendHeartbeatQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FOURMEME_MONITOR_TEST === "1";
@@ -150,19 +150,6 @@ const CONFIG = {
     actor:    3_000,   // 模块8: 合约创建者动作
   },
   githubRepoListIntervalMs: readClampedSecondsEnv("GITHUB_REPO_LIST_INTERVAL_SECONDS", 300, 300),
-
-  // 心跳推送开关；默认关闭，只影响周期性状态心跳，不影响变更/异常告警
-  heartbeatEnabled: process.env.HEARTBEAT_ENABLED === "true",
-  // 心跳间隔（毫秒）— 支持环境变量 HEARTBEAT_MINUTES 覆盖（单位：分钟）
-  heartbeatMs: process.env.HEARTBEAT_MINUTES
-    ? parseInt(process.env.HEARTBEAT_MINUTES, 10) * 60_000
-    : 14_400_000, // 默认 240 分钟（4 小时）
-
-  // 日报配置 — DAILY_REPORT=true 开启，DAILY_REPORT_HOUR 设置发送时间（0-23，默认 9 点）
-  dailyReport: {
-    enabled: process.env.DAILY_REPORT === "true",
-    hour: parseInt(process.env.DAILY_REPORT_HOUR || "9", 10),
-  },
 
   // 快照文件
   snapshotFile: join(__dirname, "snapshot.json"),
@@ -795,13 +782,6 @@ async function sendFeishu(title, content, template = "red", _retries = 2) {
 }
 
 /**
- * 提交低优先级心跳消息
- */
-function sendHeartbeat(title, content, template = "green") {
-  sendHeartbeatQueued(title, content, template);
-}
-
-/**
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
 async function sendCardViaApi(title, content, template = "red", diffFilePath, retries = 2, cardOpts = {}) {
@@ -917,7 +897,7 @@ function shouldUseAiForNotification({ title = "", content = "", moduleContext = 
   const text = `${title}\n${moduleContext}\n${aiInput || content}`;
 
   // 明确噪音/状态类：不需要 AI。
-  if (/抓取受限|页面不可达|请求失败|处理失败|模块异常|模块恢复|退避恢复|基线已修复|心跳|状态总览|监控日报/i.test(text)) return false;
+  if (/抓取受限|页面不可达|请求失败|处理失败|模块异常|模块恢复|退避恢复|基线已修复|状态总览/i.test(text)) return false;
   if (/仅检测到构建产物|压缩变量噪音|无实质|常规构建|hash\s*轮换|部署 ID|sourceMappingURL/i.test(text)) return false;
 
   // 用户明确需要页面内容解释的新路由。
@@ -1474,11 +1454,11 @@ function formatLinkedRemovedLine(label, markdownLink) {
 
 function shortAddress(value) {
   const text = String(value || "");
-  return isEvmAddress(text) ? `${text.slice(0, 6)}...${text.slice(-4)}` : diffSnippet(text, 32);
+  return text;
 }
 
 function cardLink(label, url) {
-  return `[${diffSnippet(label, 60)}](${url})`;
+  return `[${diffSnippet(label)}](${url})`;
 }
 
 function bscAddressLink(address, label = "") {
@@ -1504,7 +1484,7 @@ function addressWithMeta(address, meta = "") {
 }
 
 function bscTxLink(txHash, label = "查看交易") {
-  return cardLink(label, `https://bscscan.com/tx/${txHash}`);
+  return cardLink(`${label} ${txHash}`.trim(), `https://bscscan.com/tx/${txHash}`);
 }
 
 function bscBlockLink(blockNumber, label = "") {
@@ -1512,7 +1492,7 @@ function bscBlockLink(blockNumber, label = "") {
 }
 
 function pageLink(url, label = "") {
-  return cardLink(label || urlLabel(url), url);
+  return cardLink(label || url, url);
 }
 
 function formatPoolChanges(changes) {
@@ -1539,7 +1519,7 @@ function formatPoolChanges(changes) {
         !watchSet.has(k) && k !== "symbolAddress" && k !== "networkCode"
         && typeof d[k] !== "object"
       );
-      for (const [k, v] of extraFields.slice(0, 10)) {
+      for (const [k, v] of extraFields) {
         if (v === undefined || v === null || v === "") continue;
         lines.push(formatAddedLine(k, v));
       }
@@ -1979,8 +1959,7 @@ function isBusinessConfigDiff(cd) {
 }
 
 function frontendDisplaySnippet(value, max = 120) {
-  const s = String(value || "").replace(/\s+/g, " ").trim();
-  return s.length > max ? s.slice(0, max) + "..." : s;
+  return String(value || "").replace(/\s+/g, " ").trim();
 }
 
 /* ── 配置参数结构化提取（移植自 flap-monitor，按 four.meme 业务调整） ── */
@@ -2069,9 +2048,9 @@ function isCriticalFrontendString(s) {
 
 function prioritizeFrontendStrings(strings, limit = 240) {
   const unique = [...new Set(strings || [])];
-  const critical = unique.filter(isCriticalFrontendString);
-  const rest = unique.filter(s => !isCriticalFrontendString(s));
-  return [...critical.sort(), ...rest.sort()].slice(0, limit);
+  const readable = unique.filter(s => isCriticalFrontendString(s) || isReadableBusinessText(s));
+  const rest = unique.filter(s => !isCriticalFrontendString(s) && !isReadableBusinessText(s));
+  return [...readable.sort(), ...rest.sort().slice(0, Math.max(0, limit - readable.length))];
 }
 
 /**
@@ -2095,7 +2074,7 @@ function extractStrings(content, ext) {
       if (/\.map$/.test(s)) continue;
       if (/^webpack/.test(s)) continue;
       if (s.length < 6 && !isReadableFrontendSignalString(s) && !isCriticalFrontendString(s)) continue;
-      strings.add(s.length > 200 ? s.slice(0, 200) : s);
+      strings.add(s);
     }
     const criticalKeyRe = /\b(?:enableTax|taxEnabled|taxFee|taxFeeSell|feeBurn|buyFee|sellFee|feeRate|feeBps|tradeFee|commission|create-token)\b/g;
     while ((m = criticalKeyRe.exec(content)) !== null) strings.add(m[0]);
@@ -2447,11 +2426,9 @@ function formatFrontendSignalChanges(diff, label = "关键业务指纹") {
   if (added.length === 0 && removed.length === 0) return "";
   const lines = [`**🔎 ${label}变化：**`];
   if (removed.length > 0) lines.push("", "**移除：**");
-  for (const s of removed.slice(0, 20)) lines.push(formatRemovedLine(s, "", 160));
-  if (removed.length > 20) lines.push(`  ... 还有 ${removed.length - 20} 项移除`);
+  for (const s of removed) lines.push(formatRemovedLine(s, "", 160));
   if (added.length > 0) lines.push("", "**新增：**");
-  for (const s of added.slice(0, 20)) lines.push(formatAddedLine(s, "", 160));
-  if (added.length > 20) lines.push(`  ... 还有 ${added.length - 20} 项新增`);
+  for (const s of added) lines.push(formatAddedLine(s, "", 160));
   return lines.join("\n");
 }
 
@@ -2560,15 +2537,13 @@ function diffNextData(oldData, newData) {
   const oldProps = flattenObject(oldData.props, "props");
   const newProps = flattenObject(newData.props, "props");
   for (const [k, v] of Object.entries(newProps)) {
-    if (!(k in oldProps)) changes.push({ type: "props.added", key: k, value: String(v).slice(0, 200) });
+    if (!(k in oldProps)) changes.push({ type: "props.added", key: k, value: String(v) });
     else if (String(oldProps[k]) !== String(v)) {
-      // 超长值通常是序列化的大数据块，跳过以减少噪音
-      if (String(v).length > 500 || String(oldProps[k]).length > 500) continue;
-      changes.push({ type: "props.changed", key: k, old: String(oldProps[k]).slice(0, 200), new: String(v).slice(0, 200) });
+      changes.push({ type: "props.changed", key: k, old: String(oldProps[k]), new: String(v) });
     }
   }
   for (const k of Object.keys(oldProps)) {
-    if (!(k in newProps)) changes.push({ type: "props.removed", key: k, value: String(oldProps[k]).slice(0, 200) });
+    if (!(k in newProps)) changes.push({ type: "props.removed", key: k, value: String(oldProps[k]) });
   }
 
   return changes;
@@ -2577,7 +2552,7 @@ function diffNextData(oldData, newData) {
 function formatNextDataChanges(changes) {
   if (changes.length === 0) return "";
   const lines = ["**📋 __NEXT_DATA__ 变更：**"];
-  for (const c of changes.slice(0, 30)) {
+  for (const c of changes) {
     switch (c.type) {
       case "buildId":
         lines.push(`  🔄 Build ID: \`${c.old}\` → \`${c.new}\``); break;
@@ -2601,7 +2576,6 @@ function formatNextDataChanges(changes) {
         lines.push(formatRemovedLine(c.key, c.value)); break;
     }
   }
-  if (changes.length > 30) lines.push(`  ... 还有 ${changes.length - 30} 处变更`);
   return lines.join("\n");
 }
 
@@ -3035,34 +3009,23 @@ function formatI18nChanges(changes) {
 
   const lines = [`**📝 UI 文案（i18n）变更：** 新增 ${added.length} | 修改 ${modified.length} | 删除 ${removed.length}`];
 
-  // 提取短 key（取最后两段）
-  const shortKey = (key) => {
-    const parts = key.split(".");
-    return parts.length > 2 ? parts.slice(-2).join(".") : key;
-  };
-  // 截断值
-  const clip = (s, max = 60) => s && s.length > max ? s.slice(0, max) + "…" : (s || "");
-
   if (added.length > 0) {
     lines.push("");
-    for (const c of added.slice(0, 20)) {
-      lines.push(formatAddedLine(shortKey(c.key), clip(c.value, 70)));
+    for (const c of added) {
+      lines.push(formatAddedLine(c.key, c.value));
     }
-    if (added.length > 20) lines.push(`  ... 还有 ${added.length - 20} 条新增`);
   }
   if (modified.length > 0) {
     lines.push("");
-    for (const c of modified.slice(0, 10)) {
-      lines.push(formatValueChangeLine(shortKey(c.key), clip(c.oldValue, 60), clip(c.newValue, 60)));
+    for (const c of modified) {
+      lines.push(formatValueChangeLine(c.key, c.oldValue, c.newValue));
     }
-    if (modified.length > 10) lines.push(`  ... 还有 ${modified.length - 10} 条修改`);
   }
   if (removed.length > 0) {
     lines.push("");
-    for (const c of removed.slice(0, 10)) {
-      lines.push(formatRemovedLine(shortKey(c.key), clip(c.value, 70)));
+    for (const c of removed) {
+      lines.push(formatRemovedLine(c.key, c.value));
     }
-    if (removed.length > 10) lines.push(`  ... 还有 ${removed.length - 10} 条删除`);
   }
   return lines.join("\n");
 }
@@ -3376,7 +3339,7 @@ function buildGlobalI18nResourceConfirmNotification(item) {
   }
   if (evidence.length > 12) lines.push(`- ... 还有 ${evidence.length - 12} 条依据`);
   lines.push("");
-  lines.push(formatI18nChanges((item.changes || []).slice(0, 30)));
+  lines.push(formatI18nChanges(item.changes || []));
 
   const fullDiff = buildFullDiffText(
     `${namespace} i18n 资源上线确认`,
@@ -3768,8 +3731,7 @@ function buildGlobalI18nResourceNotification(group) {
   ];
   if (pageCount > 0) {
     lines.push(`**关联页面：** ${pageCount} 个`);
-    for (const p of pages.slice(0, 20)) lines.push(`- ${p.url ? pageLink(p.url, p.label) : diffSnippet(p.label)}`);
-    if (pageCount > 20) lines.push(`- ... 还有 ${pageCount - 20} 个页面`);
+    for (const p of pages) lines.push(`- ${p.url ? pageLink(p.url, p.label) : diffSnippet(p.label)}`);
     lines.push("");
   }
   lines.push(formatI18nChanges(normalized.changes));
@@ -3969,14 +3931,12 @@ function formatRouteChanges(routeDiff) {
   const hasChanges = (routeDiff.added?.length > 0) || (routeDiff.removed?.length > 0);
   if (!hasChanges) return "";
   const lines = ["**🗺️ 路由/端点变更：**"];
-  for (const r of (routeDiff.added || []).slice(0, 20)) {
+  for (const r of (routeDiff.added || [])) {
     lines.push(formatAddedLine("新增", r));
   }
-  if ((routeDiff.added || []).length > 20) lines.push(`  ... 还有 ${routeDiff.added.length - 20} 个新增`);
-  for (const r of (routeDiff.removed || []).slice(0, 20)) {
+  for (const r of (routeDiff.removed || [])) {
     lines.push(formatRemovedLine("移除", r));
   }
-  if ((routeDiff.removed || []).length > 20) lines.push(`  ... 还有 ${routeDiff.removed.length - 20} 个移除`);
   return lines.join("\n");
 }
 
@@ -4530,8 +4490,8 @@ function diffTextContent(oldText, newText) {
       changes.push({
         type: "modified",
         summary: `"${rWords.filter(w => !aSet.has(w)).join(" ")}" → "${aWords.filter(w => !rSet.has(w)).join(" ")}"`,
-        oldText: rawRemoved[ri].length > 80 ? rawRemoved[ri].slice(0, 80) + "..." : rawRemoved[ri],
-        newText: rawAdded[bestMatch].length > 80 ? rawAdded[bestMatch].slice(0, 80) + "..." : rawAdded[bestMatch],
+        oldText: rawRemoved[ri],
+        newText: rawAdded[bestMatch],
       });
       matchedAdded.add(bestMatch);
       matchedRemoved.add(ri);
@@ -4546,8 +4506,8 @@ function diffTextContent(oldText, newText) {
   return { changes, reordered: false };
 }
 
-function formatFrontendTextChanges(changes = [], limit = 20) {
-  const selected = (changes || []).slice(0, limit);
+function formatFrontendTextChanges(changes = []) {
+  const selected = changes || [];
   if (selected.length === 0) return "";
   const added = selected.filter(c => c.type === "added");
   const removed = selected.filter(c => c.type === "removed");
@@ -4572,7 +4532,6 @@ function formatFrontendTextChanges(changes = [], limit = 20) {
     lines.push("**移除：**");
     for (const c of removed) lines.push(`- ${removedText(c.text)}`);
   }
-  if ((changes || []).length > limit) lines.push(`\n还有 ${(changes || []).length - limit} 处变更，完整内容见 Diff 详情。`);
   return lines.join("\n");
 }
 
@@ -5012,16 +4971,15 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
     if (backoffState) {
       lines.push(`当前退避: 剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${backoffState.lastStatusCode ? `，上次状态 ${backoffState.lastStatusCode}` : ""}`);
     }
-    const latestMessages = [...group.messages].slice(0, 3);
+    const latestMessages = [...group.messages];
     if (latestMessages.length) {
       lines.push(`最近错误: ${latestMessages.join(" | ")}`);
     }
     lines.push("");
     lines.push("影响页面:");
-    for (const url of group.urls.slice(0, 12)) {
-      lines.push(`- ${pageLink(url, urlLabel(url))}`);
+    for (const url of group.urls) {
+      lines.push(`- ${pageLink(url)}`);
     }
-    if (group.urls.length > 12) lines.push(`- ... 还有 ${group.urls.length - 12} 个页面`);
     return {
       title: group.isBackoffLike ? `⚠️ 前端抓取受限：${group.domain}` : `⚠️ 前端页面不可达：${group.domain}`,
       content: lines.join("\n"),
@@ -5086,10 +5044,9 @@ function buildFullDiffText(label, assetDiff, textDiff, routeDiff, businessSignal
           .filter(cd => !(pageUrl && !isTaxOrCreateScopedRoute(pageUrl) && isTaxOrCreateScopedConfigField(cd.field)));
         lines.push("");
         lines.push(`  [${fname}] (${totalChanges} 处资源字符串差异，已收敛为构建产物变化)`);
-        for (const cd of configDiffs.slice(0, 20)) {
+        for (const cd of configDiffs) {
           lines.push(`    * ${cd.field}: ${frontendDisplaySnippet(cd.oldVal, 80)} -> ${frontendDisplaySnippet(cd.newVal, 80)}`);
         }
-        if (configDiffs.length > 20) lines.push(`    ... 还有 ${configDiffs.length - 20} 项结构化配置变化`);
       }
     }
 
@@ -5619,7 +5576,7 @@ function inferEndpointPurpose(endpoint, fields, values) {
     if (typeof v === "string" && v.length > 0 && v.length <= 100 && !v.startsWith("[hash:")) return true;
     return false;
   });
-  for (const [k, v] of meaningful.slice(0, 15)) {
+  for (const [k, v] of meaningful) {
     sampleLines.push(`  ${k}: ${v}`);
   }
 
@@ -5632,7 +5589,6 @@ function inferEndpointPurpose(endpoint, fields, values) {
   if (sampleLines.length > 0) {
     parts.push(`**📎 关键字段样本：**`);
     for (const line of sampleLines) parts.push(`- ${diffSnippet(line, 160)}`);
-    if (meaningful.length > 15) parts.push(`  ... 还有 ${meaningful.length - 15} 个字段`);
   }
   return parts.join("\n");
 }
@@ -5792,11 +5748,9 @@ function formatApiValueChanges(changes) {
       if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
       const entries = Object.entries(c.values).filter(([k]) => !isDynamicField(k));
       if (entries.length > 0) {
-        for (const [k, v] of entries.slice(0, 30)) {
-          const display = typeof v === "string" && v.length > 100 ? v.slice(0, 100) + "..." : v;
-          lines.push(`- ${diffSnippet(k)}: ${diffSnippet(display, 120)}`);
+        for (const [k, v] of entries) {
+          lines.push(`- ${diffSnippet(k)}: ${diffSnippet(v)}`);
         }
-        if (entries.length > 30) lines.push(`  ... 还有 ${entries.length - 30} 个字段`);
       }
     } else {
       const label = apiEndpointLabel(c.endpoint);
@@ -5804,12 +5758,11 @@ function formatApiValueChanges(changes) {
       lines.push(`**📊 API 响应值变更：${link}**`);
       if (label !== c.endpoint) lines.push(`  key: \`${c.endpoint}\``);
       if (c.fieldChanges) {
-        for (const fc of c.fieldChanges.slice(0, 20)) {
+        for (const fc of c.fieldChanges) {
           if (fc.action === "added") lines.push(formatAddedLine(fc.key, fc.value));
           else if (fc.action === "removed") lines.push(formatRemovedLine(fc.key, fc.value));
           else if (fc.action === "changed") lines.push(formatValueChangeLine(fc.key, fc.old, fc.new));
         }
-        if (c.fieldChanges.length > 20) lines.push(`  ... 还有 ${c.fieldChanges.length - 20} 处变更`);
       }
     }
     lines.push("---");
@@ -5907,8 +5860,7 @@ function formatOpenFourTemplate(item) {
   if (item.time) lines.push(`time: ${item.time}`);
   if (item.imgUrl) lines.push(`imgUrl: ${item.imgUrl}`);
   if (item.descr) {
-    const descr = item.descr.length > 300 ? item.descr.slice(0, 300) + "..." : item.descr;
-    lines.push(`descr: ${descr}`);
+    lines.push(`descr: ${item.descr}`);
   }
   return lines.join("\n");
 }
@@ -6408,14 +6360,13 @@ function formatGithubChanges(newCommits) {
       if (removed.length) summary.push(`删除 ${removed.length}`);
       if (renamed.length) summary.push(`重命名 ${renamed.length}`);
       lines.push(`  文件：${summary.join("、")}（共 ${c.files.length} 个）`);
-      for (const f of c.files.slice(0, 10)) {
+      for (const f of c.files) {
         const detail = `${f.filename}  (+${f.additions} -${f.deletions})`;
         if (f.status === "added") lines.push(formatAddedLine(detail, ""));
         else if (f.status === "removed") lines.push(formatRemovedLine(detail, ""));
         else if (f.status === "renamed") lines.push(`- ${changedText(detail)}`);
         else lines.push(`- ${diffSnippet(detail)}`);
       }
-      if (c.files.length > 10) lines.push(`... 还有 ${c.files.length - 10} 个文件`);
 
       // 输出关键文件的 patch（实际代码变更内容），帮助 AI 理解具体改了什么
       const patchFiles = c.files
@@ -6425,7 +6376,7 @@ function formatGithubChanges(newCommits) {
         lines.push("");
         lines.push("**关键改动预览：**");
         let previewBudget = 18;
-        for (const f of patchFiles.slice(0, 4)) {
+        for (const f of patchFiles) {
           if (previewBudget <= 0) break;
           const preview = formatPatchPreviewLines(f.patch, Math.min(6, previewBudget));
           if (preview.length === 0) continue;
@@ -6433,7 +6384,6 @@ function formatGithubChanges(newCommits) {
           lines.push(...preview);
           previewBudget -= preview.length;
         }
-        if (patchFiles.length > 4) lines.push(`... 还有 ${patchFiles.length - 4} 个文件有代码变更`);
         lines.push("完整 diff 已作为附件归档。");
       }
     } else {
@@ -7099,16 +7049,14 @@ function formatContractChanges(changes) {
       const sd = c.selectorDiff;
       if (sd.added.length > 0 || sd.removed.length > 0) {
         lines.push("**接口变更（函数选择器 diff）：**");
-        for (const s of sd.added.slice(0, 15)) {
+        for (const s of sd.added) {
           const name = KNOWN_SELECTORS[s.toLowerCase()];
           lines.push(formatAddedLine(s, name || ""));
         }
-        if (sd.added.length > 15) lines.push(`  ... 还有 ${sd.added.length - 15} 个新增`);
-        for (const s of sd.removed.slice(0, 15)) {
+        for (const s of sd.removed) {
           const name = KNOWN_SELECTORS[s.toLowerCase()];
           lines.push(formatRemovedLine(s, name || ""));
         }
-        if (sd.removed.length > 15) lines.push(`  ... 还有 ${sd.removed.length - 15} 个移除`);
         // 生成可读摘要供 AI 分析
         const addedNames = sd.added.map(s => KNOWN_SELECTORS[s.toLowerCase()]).filter(Boolean);
         const removedNames = sd.removed.map(s => KNOWN_SELECTORS[s.toLowerCase()]).filter(Boolean);
@@ -7203,22 +7151,20 @@ function formatOnchainChanges(changes) {
       lines.push("---");
     } else if (c.type === "新增 Agent NFT 合约") {
       lines.push(`**🤖 ${c.type}（${c.addresses.length} 个）**`);
-      for (const addr of c.addresses.slice(0, 10)) {
+      for (const addr of c.addresses) {
         lines.push(isEvmAddress(addr)
           ? formatLinkedAddedLine("合约", bscAddressLink(addr))
           : formatAddedLine("合约", addr));
       }
-      if (c.addresses.length > 10) lines.push(`  ... 还有 ${c.addresses.length - 10} 个`);
       lines.push(`说明：这些地址是新注册到 ${bscAddressLink(CONFIG.contracts.agentIdentifier, "AgentIdentifier")} 中的 Agent NFT 合约。每个 NFT 合约通常对应一个具有 AI Agent 属性的 Meme 代币项目。`);
       lines.push("---");
     } else if (c.type === "移除 Agent NFT 合约") {
       lines.push(`**🤖 ${c.type}（${c.addresses.length} 个）**`);
-      for (const addr of c.addresses.slice(0, 10)) {
+      for (const addr of c.addresses) {
         lines.push(isEvmAddress(addr)
           ? formatLinkedRemovedLine("合约", bscAddressLink(addr))
           : formatRemovedLine("合约", addr));
       }
-      if (c.addresses.length > 10) lines.push(`  ... 还有 ${c.addresses.length - 10} 个`);
       lines.push(`说明：这些 Agent NFT 合约已从 ${bscAddressLink(CONFIG.contracts.agentIdentifier, "AgentIdentifier")} 中移除，相关 AI Agent 代币可能已停止运营或迁移到新合约。`);
       lines.push("---");
     }
@@ -7774,7 +7720,7 @@ function formatActorWatchList(context) {
   return [...context.actors.values()].map(actor => ({
     address: actor.address,
     roles: actor.roles,
-    labels: actor.labels.slice(0, 8),
+    labels: actor.labels,
     sources: actor.sources,
     actionWatched: isCreatorActionActor(actor),
   }));
@@ -7784,11 +7730,11 @@ function formatActorActions(actions) {
   const riskIcon = { high: "🚨", medium: "⚠️", low: "ℹ️" };
   const riskLabel = { high: "高风险", medium: "中风险", low: "低风险" };
   const lines = [];
-  for (const a of actions.slice(0, 12)) {
+  for (const a of actions) {
     lines.push(`**${riskIcon[a.risk] || "⚠️"} ${riskLabel[a.risk] || "未知风险"}：${a.method || "已监听地址交易"}**`);
     lines.push(`- 区块: ${bscBlockLink(a.blockNumber)}`);
     lines.push(formatLinkedLine("发起地址", addressWithMeta(a.from)));
-    if (a.fromActor) lines.push(`- 角色: ${diffSnippet(`${a.fromActor.roles.join(",")} (${a.fromActor.labels.slice(0, 4).join("/")})`)}`);
+    if (a.fromActor) lines.push(`- 角色: ${diffSnippet(`${a.fromActor.roles.join(",")} (${a.fromActor.labels.join("/")})`)}`);
     if (a.to) lines.push(formatLinkedLine("目标地址", addressWithMeta(a.to, a.toContract ? `(${a.toContract.labels.join("/")})` : "")));
     if (a.selector) lines.push(`- 函数选择器: ${diffSnippet(a.selector)}`);
     if (a.safeTarget) lines.push(formatLinkedLine("内部目标", addressWithMeta(a.safeTarget, a.safeTargetLabel ? `(${a.safeTargetLabel})` : "")));
@@ -7801,7 +7747,6 @@ function formatActorActions(actions) {
     lines.push(`- 交易: ${bscTxLink(a.hash)}`);
     lines.push("---");
   }
-  if (actions.length > 12) lines.push(`还有 ${actions.length - 12} 条动作未展开。`);
   lines.push(`监控时间：${ts()}`);
   return lines.join("\n");
 }
@@ -8392,7 +8337,7 @@ function recordModuleError(name, errMsg) {
   e.total++;
   e.lastMsg = errMsg;
   e.lastFailTime = Date.now();
-  // 记录最近 2 小时内的错误时间戳（用于心跳汇总）
+  // 记录最近 2 小时内的错误时间戳（用于状态汇总）
   e.hourlyErrors.push(Date.now());
   if (e.consecutive >= ERROR_ALERT_THRESHOLD && !e.alerted) {
     e.alerted = true;
@@ -9152,87 +9097,6 @@ const modules = [
 ];
 const actorRunner = modules.find(m => m.name === "actor");
 
-/**
- * 每日报告：汇总过去 24 小时的变更历史
- */
-async function sendDailyReport() {
-  try {
-    const lines = ["**📊 Four.meme 监控日报**", ""];
-
-    // 读取 history.jsonl，筛选过去 24 小时的记录
-    const oneDayAgo = new Date(Date.now() - 86_400_000).toISOString();
-    let records = [];
-    if (existsSync(HISTORY_FILE)) {
-      const raw = readFileSync(HISTORY_FILE, "utf-8").split("\n").filter(Boolean);
-      for (const line of raw) {
-        try {
-          const r = JSON.parse(line);
-          if (r.ts >= oneDayAgo) records.push(r);
-        } catch { /* skip malformed */ }
-      }
-    }
-
-    // 按模块分组统计
-    const byModule = {};
-    for (const r of records) {
-      if (!byModule[r.module]) byModule[r.module] = [];
-      byModule[r.module].push(r);
-    }
-
-    // 运行时统计
-    const upSec = Math.floor((Date.now() - startTime) / 1000);
-    const h = Math.floor(upSec / 3600), m = Math.floor((upSec % 3600) / 60);
-    const total = Object.values(modulePollCounts).reduce((a, b) => a + b, 0);
-    lines.push(`**运行时长：** ${h}h${m}m | **总检测次数：** ${total}`);
-    lines.push("");
-
-    // 变更汇总
-    if (records.length === 0) {
-      lines.push("✅ 过去 24 小时无变更检出");
-    } else {
-      lines.push(`**过去 24 小时共 ${records.length} 条变更：**`);
-      for (const [mod, items] of Object.entries(byModule)) {
-        lines.push(`  • ${mod}: ${items.length} 条`);
-        // 列出最近 3 条标题
-        for (const item of items.slice(-3)) {
-          const time = new Date(item.ts).toLocaleTimeString("zh-CN", { timeZone: "Asia/Shanghai", hour12: false });
-          lines.push(`    - [${time}] ${item.title}`);
-        }
-        if (items.length > 3) lines.push(`    ... 还有 ${items.length - 3} 条`);
-      }
-    }
-
-    // 模块错误汇总
-    const errorSummary = [];
-    for (const [name, e] of Object.entries(moduleErrors)) {
-      const recentCount = (e.hourlyErrors || []).length;
-      if (recentCount > 0 || e.consecutive > 0) {
-        errorSummary.push(`  • ${name}: ${e.consecutive > 0 ? `当前连续失败 ${e.consecutive} 次` : `已恢复（24h 内失败 ${recentCount} 次）`}`);
-      }
-    }
-    if (errorSummary.length > 0) {
-      lines.push("");
-      lines.push("**⚠ 异常模块：**");
-      lines.push(errorSummary.join("\n"));
-    } else {
-      lines.push("");
-      lines.push("✅ 所有模块运行正常");
-    }
-
-    // 底池状态
-    const poolCount = buildPoolMap(snapshot?.poolConfig).size;
-    if (poolCount > 0) {
-      lines.push("");
-      lines.push(`**当前底池：** ${poolCount} 个`);
-    }
-
-    await sendFeishu("📊 监控日报", lines.join("\n"), "blue");
-    log("[日报] 已发送");
-  } catch (err) {
-    log(`[日报] 发送失败：${err.message}`);
-  }
-}
-
 function buildStartupProgressContent() {
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
   return [
@@ -9266,12 +9130,6 @@ function buildStartupReadyContent() {
   const githubSha = (snapshot?.githubSha || "").slice(0, 8) || "未知";
   const actorCount = snapshot?.chainActorMonitor?.actionActorCount
     ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
-  const heartbeatText = CONFIG.heartbeatEnabled
-    ? `${formatInterval(CONFIG.heartbeatMs)}（低优先级，队列空闲时推送）`
-    : "关闭";
-  const dailyReportText = CONFIG.dailyReport.enabled
-    ? `开启（每日 ${CONFIG.dailyReport.hour}:00）`
-    : "关闭";
   const registryTrigger = CONFIG.openFourRegistryLogMonitor.enabled ? "**Registry Logs 实时触发**" : "Registry Logs 关闭";
   return [
     `**📌 运行状态**`,
@@ -9295,10 +9153,6 @@ function buildStartupReadyContent() {
     `**🛡️ 运行策略**`,
     `- HTML 并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)}｜资源并发 ${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)}｜异常资源 ${formatDuration(CONFIG.frontendAssetJitter.quickConfirmDelayMs)}快速复查`,
     `- UA 轮换｜请求抖动｜按域名自适应退避｜tx.from 过滤｜命中后合约复查`,
-    ``,
-    `**🔔 通知状态**`,
-    `- 心跳：${heartbeatText}`,
-    `- 日报：${dailyReportText}`,
     ``,
     `更新时间：${formatDateTime()}`,
   ].join("\n");
@@ -9382,143 +9236,6 @@ async function startAllModules() {
 
   // 暴露给 gracefulShutdown 使用
   global.__moduleTimers = moduleTimers;
-
-  // 心跳定时器（低优先级：仅在队列空闲时推送，避免被变更通知挤掉）
-  // 合并 fourmeme + flap 两个监控的心跳到一张卡片
-  if (CONFIG.heartbeatEnabled) {
-    const FLAP_HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
-    setInterval(() => {
-    try {
-      const upSec = Math.floor((Date.now() - startTime) / 1000);
-      const h = Math.floor(upSec / 3600), m = Math.floor((upSec % 3600) / 60);
-      const total = Object.values(modulePollCounts).reduce((a, b) => a + b, 0);
-      const poolCount = buildPoolMap(snapshot?.poolConfig).size;
-      log(`运行正常，已运行 ${h}h${m}m，总检测 ${total} 次`);
-
-      const lines = [
-        `**── Four.meme ──**`,
-        "**结论摘要**",
-        "- 状态: 运行中",
-        `- 运行时长: ${h}h${m}m`,
-        `- 总检测: ${total} 次`,
-        `- 当前底池: ${poolCount} 个`,
-        `- 前端页面: ${Object.keys(snapshot?.frontendPages || {}).length} 个`,
-        `- 待确认新路由: ${Object.values(snapshot?._frontendPendingRoutes || {}).filter(r => r?.status === "pending").length} 个`,
-        "",
-        "**模块轮询**",
-        Object.entries(modulePollCounts).map(([k, v]) => `- ${k}: ${v}`).join("\n"),
-        "",
-        "**前端状态**",
-        `- 最近一轮: 成功 ${frontendMetrics.success} / 失败 ${frontendMetrics.failed}`,
-        `- 累计推送: ${frontendMetrics.notifications} / 抑制 ${frontendMetrics.suppressed}`,
-      ];
-
-      // 汇总近 2 小时内的模块错误
-      const twoHoursAgo = Date.now() - 7_200_000;
-      const errorLines = [];
-      for (const [name, e] of Object.entries(moduleErrors)) {
-        // 清理超过 2 小时的错误记录
-        e.hourlyErrors = (e.hourlyErrors || []).filter(t => t > twoHoursAgo);
-        const recentCount = e.hourlyErrors.length;
-        if (recentCount === 0 && e.consecutive === 0) continue;
-
-        let line = `  ${name}: `;
-        if (e.consecutive > 0) {
-          line += `连续失败 ${e.consecutive} 次`;
-          if (recentCount > e.consecutive) line += `（2h 内共 ${recentCount} 次）`;
-        } else if (recentCount > 0) {
-          line += `2h 内失败 ${recentCount} 次（已恢复）`;
-        }
-        line += `\n    → ${e.lastMsg}`;
-        errorLines.push(line);
-      }
-
-      // 汇总当前退避状态
-      const backoffLines = [];
-      for (const [domain, b] of domainBackoff) {
-        const remaining = Math.max(0, b.delayMs - (Date.now() - b.lastFail));
-        if (remaining > 0) {
-          backoffLines.push(`  ${domain} ${Math.ceil(remaining / 1000)}s`);
-        }
-      }
-
-      let color = "green";
-      if (errorLines.length > 0) {
-        lines.push("");
-        lines.push("**异常状态（近 2h）**");
-        lines.push(errorLines.join("\n"));
-        color = "yellow";
-      }
-      if (backoffLines.length > 0) {
-        lines.push("");
-        lines.push("**退避状态**");
-        lines.push(backoffLines.join("\n"));
-        if (color === "green") color = "yellow";
-      }
-      if (errorLines.length === 0 && backoffLines.length === 0) {
-        lines.push("");
-        lines.push("**运行状态**");
-        lines.push("- 全部模块运行正常");
-      }
-
-      // ── 读取 Flap 心跳数据，合并到同一张卡片 ──
-      lines.push("");
-      lines.push("---");
-      lines.push("");
-      lines.push(`**── Flap.sh ──**`);
-      try {
-        if (existsSync(FLAP_HEARTBEAT_FILE)) {
-          const flapData = JSON.parse(readFileSync(FLAP_HEARTBEAT_FILE, "utf-8"));
-          // 检查数据是否过期（超过 2 倍心跳周期视为过期）
-          const maxAge = CONFIG.heartbeatMs * 2;
-          if (Date.now() - flapData.ts > maxAge) {
-            lines.push("⚠ Flap 心跳数据已过期，进程可能未运行");
-            if (color === "green") color = "yellow";
-          } else {
-            lines.push(flapData.content);
-            if (flapData.color === "yellow" && color === "green") color = "yellow";
-          }
-        } else {
-          lines.push("⚠ Flap 心跳文件不存在，进程可能未启动");
-          if (color === "green") color = "yellow";
-        }
-      } catch (err) {
-        lines.push(`⚠ 读取 Flap 心跳失败：${err.message}`);
-        if (color === "green") color = "yellow";
-      }
-
-      sendHeartbeat("监控心跳", lines.join("\n"), color);
-    } catch (err) {
-      log(`[心跳] 构建心跳消息异常：${err.message}`);
-    }
-    }, CONFIG.heartbeatMs);
-    log(`[心跳] 间隔 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟，低优先级（队列空闲时推送）`);
-  } else {
-    log("[心跳] 已关闭（HEARTBEAT_ENABLED=false）");
-  }
-
-  // ── 日报定时器 ──
-  if (CONFIG.dailyReport.enabled) {
-    const scheduleDaily = () => {
-      const now = new Date();
-      const target = new Date(now);
-      target.setHours(CONFIG.dailyReport.hour, 0, 0, 0);
-      if (target <= now) target.setDate(target.getDate() + 1);
-      const msUntil = target - now;
-      log(`[日报] 已开启，下次发送时间：${target.toLocaleString("zh-CN", { timeZone: "Asia/Shanghai" })}（${Math.round(msUntil / 60000)} 分钟后）`);
-      setTimeout(async () => {
-        try {
-          await sendDailyReport();
-        } catch (err) {
-          log(`[日报] 定时发送异常：${err.message}`);
-        }
-        scheduleDaily(); // 递归调度下一天（无论成功失败都继续）
-      }, msUntil);
-    };
-    scheduleDaily();
-  } else {
-    log("[日报] 未开启（设置 DAILY_REPORT=true 可开启）");
-  }
 
 }
 

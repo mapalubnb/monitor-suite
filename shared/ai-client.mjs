@@ -196,9 +196,10 @@ export async function listRemoteModels(providerName) {
     return { ok: true, models: provider.models || [provider.model], source: "local" };
   }
 
+  let timer;
   try {
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 10_000);
+    timer = setTimeout(() => ctrl.abort(), 10_000);
 
     const headers = { "Content-Type": "application/json" };
     // Anthropic 没有 list models API
@@ -214,8 +215,6 @@ export async function listRemoteModels(providerName) {
     }
 
     const res = await fetch(modelsUrl, { headers, signal: ctrl.signal });
-    clearTimeout(timer);
-
     if (!res.ok) {
       const errText = await res.text().catch(() => "");
       return { ok: false, message: `HTTP ${res.status}: ${errText.slice(0, 100)}` };
@@ -265,6 +264,8 @@ export async function listRemoteModels(providerName) {
       return { ok: false, message: "请求超时（10s）" };
     }
     return { ok: false, message: err.message };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

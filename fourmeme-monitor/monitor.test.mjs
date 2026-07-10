@@ -18,7 +18,7 @@ test("startup card copy reflects active frontend and api cadences", () => {
   assert.match(progress, /前端：当前快照 [\s\S]*每 10 秒/);
   assert.match(progress, /API：每 15 秒/);
   assert.match(ready, /✅ \*\*监控运行中\*\*/);
-  assert.match(ready, /\*\*📌 运行状态\*\*[\s\S]*\*\*🎯 监控概览\*\*[\s\S]*\*\*🌐 前端能力\*\*[\s\S]*\*\*🛡️ 运行策略\*\*[\s\S]*\*\*🔔 通知状态\*\*/);
+  assert.match(ready, /\*\*📌 运行状态\*\*[\s\S]*\*\*🎯 监控概览\*\*[\s\S]*\*\*🌐 前端能力\*\*[\s\S]*\*\*🛡️ 运行策略\*\*/);
   assert.match(ready, /前端：[\s\S]*每 10 秒/);
   assert.match(ready, /API：[\s\S]*每 15 秒/);
   assert.match(ready, /NEXT_DATA · i18n · 路由发现 · 端点发现 · 新页面自动纳管/);
@@ -26,6 +26,7 @@ test("startup card copy reflects active frontend and api cadences", () => {
   assert.match(ready, /更新时间：\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/);
   assert.doesNotMatch(ready, /每 \d+s/);
   assert.doesNotMatch(ready, /- https:\/\/four\.meme/);
+  assert.doesNotMatch(ready, /心跳|日报/);
 });
 
 test("canonicalFrontendUrl normalizes tracking params, hash, query order, and trailing slash", () => {
@@ -477,7 +478,7 @@ test("fourmeme diff cards use inline red-green highlights without scroll blocks"
   assert(samples.some(content => content.includes('<font color="red">')));
 });
 
-test("fourmeme cards render long urls and addresses as concise links", () => {
+test("fourmeme cards render complete urls, addresses and transaction hashes", () => {
   const failure = __testables.buildFrontendFailureNotifications([
     "https://four.meme/en/announcement",
   ], {
@@ -489,14 +490,12 @@ test("fourmeme cards render long urls and addresses as concise links", () => {
       },
     },
   })[0];
-  assert.match(failure.content, /\[\/en\/announcement\]\(https:\/\/four\.meme\/en\/announcement\)/);
-  assert.doesNotMatch(failure.content, /- https:\/\/four\.meme/);
+  assert.match(failure.content, /\[https:\/\/four\.meme\/en\/announcement\]\(https:\/\/four\.meme\/en\/announcement\)/);
 
   const moduleCard = __testables.formatOpenFourNewModules([
     { address: "0x0000000000000000000000000000000000000001", roles: ["swap"], presetIds: ["1"] },
   ], { blockNumber: 123, txHash: "0xabcdef" });
-  assert.match(moduleCard, /\[0x0000\.\.\.0001\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000001\)/);
-  assert.doesNotMatch(moduleCard, /\*\*0x0000000000000000000000000000000000000001\*\*/);
+  assert.match(moduleCard, /\[0x0000000000000000000000000000000000000001\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000001\)/);
 
   const contractCard = __testables.formatContractChanges([
     {
@@ -524,8 +523,32 @@ test("fourmeme cards render long urls and addresses as concise links", () => {
       hash: "0xabc",
     },
   ]);
-  assert.match(actorCard, /\[0x0000\.\.\.0001\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000001\)/);
-  assert.match(actorCard, /\[查看交易\]\(https:\/\/bscscan\.com\/tx\/0xabc\)/);
+  assert.match(actorCard, /\[0x0000000000000000000000000000000000000001\]\(https:\/\/bscscan\.com\/address\/0x0000000000000000000000000000000000000001\)/);
+  assert.match(actorCard, /\[查看交易 0xabc\]\(https:\/\/bscscan\.com\/tx\/0xabc\)/);
+});
+
+test("fourmeme cards keep all readable copy and i18n values without truncation", () => {
+  const longOld = `旧文案-${"完整内容".repeat(80)}`;
+  const longNew = `新文案-${"完整内容".repeat(80)}`;
+  const textChanges = Array.from({ length: 25 }, (_, i) => ({
+    type: "modified",
+    oldText: `${longOld}-${i}`,
+    newText: `${longNew}-${i}`,
+  }));
+  const textContent = __testables.formatFrontendTextChanges(textChanges);
+  assert.match(textContent, new RegExp(`${longOld}-24`));
+  assert.match(textContent, new RegExp(`${longNew}-24`));
+  assert.doesNotMatch(textContent, /完整内容\.\.\.|完整内容…|见 Diff 详情/);
+
+  const i18nChanges = Array.from({ length: 25 }, (_, i) => ({
+    type: "added",
+    key: `full.namespace.copy_${i}`,
+    value: `${longNew}-${i}`,
+  }));
+  const i18nContent = __testables.formatI18nChanges(i18nChanges);
+  assert.match(i18nContent, /full\.namespace\.copy_24/);
+  assert.match(i18nContent, new RegExp(`${longNew}-24`));
+  assert.doesNotMatch(i18nContent, /还有 \d+ 条|完整内容…/);
 });
 
 test("openfour presetIds monitor reports on-chain registrations directly", () => {

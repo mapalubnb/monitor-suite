@@ -36,6 +36,11 @@ for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) 
   }
 }
 
+function readPositiveIntEnv(name, fallback, min = 1) {
+  const value = Number.parseInt(process.env[name] || "", 10);
+  return Number.isFinite(value) && value >= min ? value : fallback;
+}
+
 /* ── 配置 ── */
 const CONFIG = {
   urls: [
@@ -49,7 +54,7 @@ const CONFIG = {
   feishuChatId: process.env.FEISHU_CHAT_ID || "",
 
   // 轮询间隔（毫秒）
-  pollIntervalMs: 1_500,
+  pollIntervalMs: readPositiveIntEnv("FLAP_POLL_INTERVAL_MS", 1_500, 500),
 
   fetchTimeoutMs: 8_000,
   failThreshold: 3,
@@ -74,13 +79,6 @@ const CONFIG = {
       "0x566b7414cab715cde3c8bcc93daec35325367d6c648327d19a1867d1006af3b3",
     ]),
   },
-
-  // 心跳推送开关；默认关闭，只影响周期性状态心跳，不影响页面变更/异常告警
-  heartbeatEnabled: process.env.HEARTBEAT_ENABLED === "true",
-  // 心跳间隔（毫秒）— 支持环境变量 HEARTBEAT_MINUTES 覆盖（单位：分钟）
-  heartbeatMs: process.env.HEARTBEAT_MINUTES
-    ? parseInt(process.env.HEARTBEAT_MINUTES, 10) * 60_000
-    : 14_400_000, // 默认 240 分钟（4 小时），与 fourmeme-monitor 保持一致
 
   // 反风控
   jitterMs: 500,
@@ -869,7 +867,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
 function shouldUseAiForNotification({ title = "", content = "", moduleContext = "", aiInput = "", skipAi = false } = {}) {
   if (skipAi) return false;
   const text = `${title}\n${moduleContext}\n${aiInput || content}`;
-  if (/请求失败|处理失败|退避恢复|基线已修复|页面样本无效|模块异常|模块恢复|心跳|状态/i.test(text)) return false;
+  if (/请求失败|处理失败|退避恢复|基线已修复|页面样本无效|模块异常|模块恢复|状态/i.test(text)) return false;
   if (/全站前端资源变更|Flap\.sh 全站前端资源变更|Flap 全站前端资源变更/i.test(text)) return true;
   if (/仅检测到构建产物|压缩变量噪音|hash\s*轮换|sourceMappingURL|无实质|常规构建/i.test(text)) return false;
   return /重点变更|页面变更|文案|i18n|CAstore|金库|Vault|Factory|fee|rate|route|api|contract|address|enabled|staking|dividend/i.test(text);
@@ -896,9 +894,7 @@ function flapLink(label, url) {
 
 function shortHash(value, head = 8, tail = 4) {
   const text = String(value || "");
-  if (!text) return "-";
-  if (text.length <= head + tail + 3) return text;
-  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+  return text || "-";
 }
 
 function addressLink(address, type = "address") {
@@ -1561,24 +1557,18 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
         vaultDiffs.length > 0 ? `Vault 配置 ${vaultDiffs.length} 项` : "",
       ].filter(Boolean).join("；")
     : "未发现需卡片展示的文案或重要参数变更";
-  const compactAffectedUrls = affectedUrls.length > 6
-    ? [...affectedUrls.slice(0, 6), `... 还有 ${affectedUrls.length - 6} 个页面`]
-    : affectedUrls;
-  const affectedPageLinks = compactAffectedUrls.map(url => {
-    if (url.startsWith("...")) return url;
+  const affectedPageLinks = affectedUrls.map(url => {
     return flapLink(new URL(url).pathname || "首页", url);
   }).join(" ｜ ");
   const cardSignalLines = hasCardSignals
     ? [
-        ...jsTextDiffs.slice(0, 6).map(d => {
+        ...jsTextDiffs.map(d => {
           const label = d.type === "removed" ? "移除文案" : d.type === "added" ? "新增文案" : "文案变更";
           const line = d.type === "removed" ? formatRemovedLine(label, d.text) : formatAddedLine(label, d.text);
           return `${line}${d.file ? `  ← ${cardText(d.file)}` : ""}`;
         }),
-        jsTextDiffs.length > 6 ? `- 还有 ${jsTextDiffs.length - 6} 处功能文案变更，见 Diff 详情` : "",
-        ...businessConfigDiffs.slice(0, 8).map(cd => `${formatValueChangeLine(cd.field, cd.oldVal, cd.newVal)}${cd.file ? `  ← ${cardText(cd.file)}` : ""}`),
-        businessConfigDiffs.length > 8 ? `- 还有 ${businessConfigDiffs.length - 8} 项业务配置变更，见 Diff 详情` : "",
-        ...vaultDiffs.slice(0, 6).flatMap(vd => {
+        ...businessConfigDiffs.map(cd => `${formatValueChangeLine(cd.field, cd.oldVal, cd.newVal)}${cd.file ? `  ← ${cardText(cd.file)}` : ""}`),
+        ...vaultDiffs.flatMap(vd => {
           if (vd.type === "modified") {
             return [
               `- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`,
@@ -1594,7 +1584,6 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
           if (vd.type === "removed") return [`- ${removedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
           return [`- ${changedText(`Vault ${vd.name || JSON.stringify(vd)}`)}`];
         }),
-        vaultDiffs.length > 6 ? `- 还有 ${vaultDiffs.length - 6} 项 Vault 配置变更，见 Diff 详情` : "",
       ].filter(Boolean)
     : ["- 未发现需卡片展示的文案或重要参数变更，完整资源/UI/实现信号见 Diff 详情。"];
 
@@ -2091,9 +2080,7 @@ function buildCardUrlPrefix(url, content) {
 
 function compactTextDiffItems(items = [], max = 12) {
   const arr = Array.isArray(items) ? items : [];
-  const visible = arr.slice(0, max);
-  const hidden = Math.max(0, arr.length - visible.length);
-  return { visible, hidden };
+  return { visible: arr, hidden: 0 };
 }
 
 function splitDiffPairText(text) {
@@ -2279,43 +2266,38 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     const added = textChanges.filter(c => c.type === "added");
     const removed = textChanges.filter(c => c.type === "removed");
     if (textInsights.length > 0) {
-      lines.push(`**✏️ 页面文案变更（已归纳，原始 ${textChanges.length} 处）：**`);
+      lines.push(`**✏️ 页面文案变更（归纳 + 完整原文，共 ${textChanges.length} 处）：**`);
       formatTextChangeInsights(lines, textInsights);
       lines.push("");
-      const summarizedCount = textInsights.length;
-      if (textChanges.length > summarizedCount) {
-        lines.push(`原始页面上下文较长，已折叠；完整旧/新文本见 Diff 详情。`);
-        lines.push("");
-      }
     } else {
       lines.push(`**✏️ 页面文案变更（${textChanges.length} 处）：**`);
-      if (modified.length > 0) {
-        lines.push("");
-        lines.push("**修改：**");
-        for (const c of modified) {
-          lines.push(`- 原：${removedText(c.oldText)}`);
-          lines.push(`  新：${addedText(c.newText)}`);
-          if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
-        }
-      }
-      if (added.length > 0) {
-        lines.push("");
-        lines.push("**新增：**");
-        for (const c of added) {
-          lines.push(formatAddedLine(c.text));
-          if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
-        }
-      }
-      if (removed.length > 0) {
-        lines.push("");
-        lines.push("**移除：**");
-        for (const c of removed) {
-          lines.push(formatRemovedLine(c.text));
-          if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
-        }
-      }
-      lines.push("");
     }
+    if (modified.length > 0) {
+      lines.push("");
+      lines.push("**修改：**");
+      for (const c of modified) {
+        lines.push(`- 原：${removedText(c.oldText)}`);
+        lines.push(`  新：${addedText(c.newText)}`);
+        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
+      }
+    }
+    if (added.length > 0) {
+      lines.push("");
+      lines.push("**新增：**");
+      for (const c of added) {
+        lines.push(formatAddedLine(c.text));
+        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
+      }
+    }
+    if (removed.length > 0) {
+      lines.push("");
+      lines.push("**移除：**");
+      for (const c of removed) {
+        lines.push(formatRemovedLine(c.text));
+        if (c.ctxBefore) lines.push(`  上文：${cardText(c.ctxBefore)}`);
+      }
+    }
+    lines.push("");
   } else if (textChangeCount > 0) {
     hasStructuredChange = true;
     lines.push(`**✏️ 文案变更：** ${textChangeCount} 处`);
@@ -2750,7 +2732,7 @@ function extractStrings(content, ext) {
       if (/^data:/.test(s)) continue;
       if (/\.map$/.test(s)) continue;
       if (/^webpack/.test(s)) continue;
-      strings.add(s.length > 200 ? s.slice(0, 200) : s);
+      strings.add(s);
     }
   } else if (ext === "css") {
     const propRe = /--[\w-]{4,}/g;
@@ -2762,7 +2744,10 @@ function extractStrings(content, ext) {
   const sorted = [...strings].sort();
   const business = sorted.filter(isBusinessAssetString);
   const ordinary = sorted.filter(s => !isBusinessAssetString(s));
-  return uniqueStrings([...business, ...ordinary]).slice(0, CONFIG.assetStringLimit);
+  return uniqueStrings([
+    ...business,
+    ...ordinary.slice(0, Math.max(0, CONFIG.assetStringLimit - business.length)),
+  ]);
 }
 
 /**
@@ -4526,8 +4511,8 @@ function diffFeatures(oldF, newF) {
       const newKeys = Object.keys(flattenKeys(newF.nextData.props));
       const added = newKeys.filter(k => !oldKeys.includes(k));
       const removed = oldKeys.filter(k => !newKeys.includes(k));
-      if (added.length) changes.push(`  新增字段：${added.slice(0, 10).join(", ")}`);
-      if (removed.length) changes.push(`  移除字段：${removed.slice(0, 10).join(", ")}`);
+      if (added.length) changes.push(`  新增字段：${added.join(", ")}`);
+      if (removed.length) changes.push(`  移除字段：${removed.join(", ")}`);
       meta.fullDiffLines.push("【页面数据 __NEXT_DATA__ 完整 Diff】");
       for (const key of added) meta.fullDiffLines.push(`+ ${key}`);
       for (const key of removed) meta.fullDiffLines.push(`- ${key}`);
@@ -4672,7 +4657,7 @@ function diffFeatures(oldF, newF) {
         for (const vd of vaultDiffs) {
           if (vd.type === "modified") {
             changes.push(`  ${vd.name} — ${vd.fieldChanges.length} 个字段:`);
-            for (const fc of vd.fieldChanges.slice(0, 15)) {
+            for (const fc of vd.fieldChanges) {
               changes.push(`    ${fc.key}: ${fc.oldVal} → ${fc.newVal}`);
             }
           } else if (vd.type === "added") {
@@ -4681,7 +4666,7 @@ function diffFeatures(oldF, newF) {
         }
       }
 
-      for (const m of substantiveFiles.slice(0, 8)) {
+      for (const m of substantiveFiles) {
         const label = m.oldFile === m.newFile ? m.newFile : `${m.oldFile} → ${m.newFile}`;
         const total = m.realAdded.length + m.realRemoved.length;
         const noiseNote = m.totalNoise > 0 ? ` + ${m.totalNoise} 噪音已过滤` : "";
@@ -4689,10 +4674,8 @@ function diffFeatures(oldF, newF) {
         changes.push(`📝 ${label} (${total} 处实质变更${noiseNote})`);
         const readableRemoved = m.realRemoved.filter(isReadableBusinessText);
         const readableAdded = m.realAdded.filter(isReadableBusinessText);
-        for (const s of readableRemoved.slice(0, 4)) changes.push(`  - ${s}`);
-        if (readableRemoved.length > 4) changes.push(`  ... 还有 ${readableRemoved.length - 4} 处可读移除，见 Diff 详情`);
-        for (const s of readableAdded.slice(0, 4)) changes.push(`  + ${s}`);
-        if (readableAdded.length > 4) changes.push(`  ... 还有 ${readableAdded.length - 4} 处可读新增，见 Diff 详情`);
+        for (const s of readableRemoved) changes.push(`  - ${s}`);
+        for (const s of readableAdded) changes.push(`  + ${s}`);
         const hiddenCount = total - readableRemoved.length - readableAdded.length;
         if (hiddenCount > 0) changes.push(`  · ${hiddenCount} 处不可读实现片段已折叠到 Diff 详情`);
       }
@@ -4702,15 +4685,15 @@ function diffFeatures(oldF, newF) {
         const names = noiseOnlyFiles.map(f => f.label.split("/").pop().split(" → ").pop());
         changes.push(`🔇 构建噪音： ${noiseOnlyFiles.length} 文件 ${totalNoise} 处 (${names.slice(0, 4).join(", ")})`);
       }
-      if (assetDiff.added.length > 0) changes.push(`🆕 新增文件： ${assetDiff.added.slice(0, 10).join(", ")}`);
-      if (assetDiff.removed.length > 0) changes.push(`🗑️ 移除文件： ${assetDiff.removed.slice(0, 10).join(", ")}`);
+      if (assetDiff.added.length > 0) changes.push(`🆕 新增文件： ${assetDiff.added.join(", ")}`);
+      if (assetDiff.removed.length > 0) changes.push(`🗑️ 移除文件： ${assetDiff.removed.join(", ")}`);
     } else {
       changes.push("前端代码（JS/CSS 资源）更新");
       const oldSet = new Set(oldF.assetFiles || []), newSet = new Set(newF.assetFiles || []);
       const added = [...newSet].filter(f => !oldSet.has(f));
       const removed = [...oldSet].filter(f => !newSet.has(f));
-      if (added.length) changes.push(`  新增：${added.slice(0, 5).map(f => f.split("/").pop()).join(", ")}`);
-      if (removed.length) changes.push(`  移除：${removed.slice(0, 5).map(f => f.split("/").pop()).join(", ")}`);
+      if (added.length) changes.push(`  新增：${added.map(f => f.split("/").pop()).join(", ")}`);
+      if (removed.length) changes.push(`  移除：${removed.map(f => f.split("/").pop()).join(", ")}`);
       meta.fullDiffLines.push("【前端资源文件完整 Diff】");
       for (const f of added) meta.fullDiffLines.push(`+ ${f}`);
       for (const f of removed) meta.fullDiffLines.push(`- ${f}`);
@@ -4727,23 +4710,21 @@ function diffFeatures(oldF, newF) {
         meta.textChangeCount = textDiff.changes.length;
         meta.textChanges = textDiff.changes;
         appendTextFullDiffLines(meta.fullDiffLines, textDiff);
-        const truncSeg = (s, max = 120) => s && s.length > max ? s.slice(0, max) + "…" : s;
-        for (const c of textDiff.changes.slice(0, 20)) {
-          const ctx = c.ctxBefore ? `  上文: ${truncSeg(c.ctxBefore, 60)}` : "";
+        for (const c of textDiff.changes) {
+          const ctx = c.ctxBefore ? `  上文: ${c.ctxBefore}` : "";
           if (c.type === "modified") {
             changes.push(`✏️ 文案修改：`);
-            changes.push(`  旧: ${truncSeg(c.oldText)}`);
-            changes.push(`  新: ${truncSeg(c.newText)}`);
+            changes.push(`  旧: ${c.oldText}`);
+            changes.push(`  新: ${c.newText}`);
             if (ctx) changes.push(ctx);
           } else if (c.type === "added") {
-            changes.push(`🟢 新增文案： ${truncSeg(c.text)}`);
+            changes.push(`🟢 新增文案： ${c.text}`);
             if (ctx) changes.push(ctx);
           } else if (c.type === "removed") {
-            changes.push(`🔴 删除文案： ${truncSeg(c.text)}`);
+            changes.push(`🔴 删除文案： ${c.text}`);
             if (ctx) changes.push(ctx);
           }
         }
-        if (textDiff.changes.length > 20) changes.push(`... 还有 ${textDiff.changes.length - 20} 处变更`);
       }
     } else { changes.push("页面文本内容变更"); }
   }
@@ -4754,12 +4735,11 @@ function diffFeatures(oldF, newF) {
       meta.i18nDiffs = i18nDiff;
       appendI18nFullDiffLines(meta.fullDiffLines, i18nDiff);
       changes.push("📝 UI 文案（i18n）变更：");
-      for (const c of i18nDiff.slice(0, 30)) {
-        if (c.type === "modified") { changes.push(`  ✏️ ${c.key}: "${(c.oldValue.length > 60 ? c.oldValue.slice(0, 60) + "…" : c.oldValue)}" → "${(c.newValue.length > 60 ? c.newValue.slice(0, 60) + "…" : c.newValue)}"`); }
-        else if (c.type === "added") { changes.push(`  🟢 新增 ${c.key}: "${(c.value.length > 80 ? c.value.slice(0, 80) + "…" : c.value)}"`); }
-        else if (c.type === "removed") { changes.push(`  🔴 删除 ${c.key}: "${(c.value.length > 80 ? c.value.slice(0, 80) + "…" : c.value)}"`); }
+      for (const c of i18nDiff) {
+        if (c.type === "modified") { changes.push(`  ✏️ ${c.key}: "${c.oldValue}" → "${c.newValue}"`); }
+        else if (c.type === "added") { changes.push(`  🟢 新增 ${c.key}: "${c.value}"`); }
+        else if (c.type === "removed") { changes.push(`  🔴 删除 ${c.key}: "${c.value}"`); }
       }
-      if (i18nDiff.length > 30) changes.push(`  ... 还有 ${i18nDiff.length - 30} 处 i18n 变更`);
     }
   } else if (!oldF.i18nHash && newF.i18nHash && newF.i18nStrings) {
     // 首次检测到 i18n 数据
@@ -5359,97 +5339,6 @@ async function startMonitor() {
   await poll();
   scheduleNext();
 
-  // 独立心跳定时器（不受轮询耗时影响）
-  // 不再直接发送卡片，改为写入共享文件，由 fourmeme-monitor 合并推送
-  if (CONFIG.heartbeatEnabled) {
-    const HEARTBEAT_FILE = join(__dirname, "..", ".flap-heartbeat.json");
-    setInterval(async () => {
-    log(`运行正常，已轮询 ${pollCount} 次`);
-    cleanOldSnapshots();
-
-    const pageCount = Object.keys(snapshot.pages || {}).length;
-    const vaultFactoryCount = Object.keys(snapshot.vaultFactories || {}).length;
-    const lines = buildFlapCardContent({
-      summary: [
-        "- 状态: 运行中",
-        `- 已轮询: ${pollCount} 次`,
-        `- 页面: ${pageCount} 个`,
-        `- 金库工厂: ${vaultFactoryCount} 个`,
-      ],
-      details: formatRegistryMonitorStatus(snapshot),
-      actions: [`- ${flapLink("打开 Flap.sh", "https://flap.sh")}`],
-    }).split("\n");
-
-    // 汇总近一个心跳周期内的页面错误
-    const twoHoursAgo = Date.now() - CONFIG.heartbeatMs;
-    const errorLines = [];
-    for (const [key, fc] of Object.entries(failCounts)) {
-      // 清理超过一个心跳周期的错误记录
-      fc.hourlyErrors = (fc.hourlyErrors || []).filter(t => t > twoHoursAgo);
-      const recentCount = fc.hourlyErrors.length;
-      if (recentCount === 0 && fc.count === 0) continue;
-
-      // 从 key 还原可读 URL
-      const page = snapshot.pages?.[key];
-      const label = page?.originalUrl || key;
-
-      const periodLabel = `${Math.round(CONFIG.heartbeatMs / 3_600_000)}h`;
-      let line = `  ${label}: `;
-      if (fc.count > 0) {
-        line += `连续失败 ${fc.count} 次`;
-        if (recentCount > fc.count) line += `（${periodLabel} 内共 ${recentCount} 次）`;
-      } else if (recentCount > 0) {
-        line += `${periodLabel} 内失败 ${recentCount} 次（已恢复）`;
-      }
-      line += `\n    → ${fc.lastMsg}`;
-      errorLines.push(line);
-    }
-
-    // 汇总当前退避状态
-    const backoffLines = [];
-    for (const [domain, b] of domainBackoff) {
-      const remaining = Math.max(0, b.delayMs - (Date.now() - b.lastFail));
-      if (remaining > 0) {
-        backoffLines.push(`  ${domain} ${Math.ceil(remaining / 1000)}s`);
-      }
-    }
-
-    let color = "green";
-    if (errorLines.length > 0) {
-      lines.push("");
-      lines.push(`**异常状态（近 ${Math.round(CONFIG.heartbeatMs / 3_600_000)}h）**`);
-      lines.push(errorLines.join("\n"));
-      color = "yellow";
-    }
-    if (backoffLines.length > 0) {
-      lines.push("");
-      lines.push("**退避状态**");
-      lines.push(backoffLines.join("\n"));
-      if (color === "green") color = "yellow";
-    }
-    if (errorLines.length === 0 && backoffLines.length === 0) {
-      lines.push("");
-      lines.push("**运行状态**");
-      lines.push("- 全部页面监控正常");
-    }
-
-    // 写入共享心跳文件，供 fourmeme-monitor 合并推送
-    try {
-      writeFileSync(HEARTBEAT_FILE, JSON.stringify({
-        ts: Date.now(),
-        content: lines.join("\n"),
-        color,
-        pollCount,
-      }), "utf-8");
-      log("[心跳] 已写入共享心跳文件，等待合并推送");
-    } catch (err) {
-      log(`[心跳] 写入共享心跳文件失败：${err.message}`);
-    }
-    }, CONFIG.heartbeatMs);
-    log(`[心跳] 间隔 ${Math.round(CONFIG.heartbeatMs / 60000)} 分钟，写入共享心跳文件`);
-  } else {
-    log("[心跳] 已关闭（HEARTBEAT_ENABLED=false）");
-  }
 }
 
 /* ══════════════════════════════════════════
