@@ -208,6 +208,30 @@ function parseNumberedTableRow(line) {
   return values;
 }
 
+function tableTextLength(value) {
+  const text = String(value ?? "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/<[^>]+>/g, "")
+    .replace(/[*_`~]/g, "")
+    .trim();
+  let length = 0;
+  for (const char of text) length += /[\u2e80-\u9fff\uff00-\uffef]/u.test(char) ? 2 : 1;
+  return length;
+}
+
+function tableColumnWidth(label, rows) {
+  const longest = Math.max(tableTextLength(label), ...rows.map(row => tableTextLength(row[label] ?? "-")));
+  const preferred = Math.round(longest * 7 + 24);
+  const limits = /地址|URL|链接|页面/i.test(label)
+    ? [180, 360]
+    : /状态|符号|ID|数量/i.test(label)
+      ? [80, 140]
+      : label === "项目"
+        ? [90, 240]
+        : [80, 260];
+  return `${Math.min(limits[1], Math.max(limits[0], preferred))}px`;
+}
+
 function buildTable(lines, elementId) {
   const rows = lines.map(parseNumberedTableRow);
   if (rows.some(row => !row)) return null;
@@ -218,7 +242,7 @@ function buildTable(lines, elementId) {
     data_type: "markdown",
     horizontal_align: "left",
     vertical_align: "top",
-    width: label === "项目" ? "22%" : "auto",
+    width: tableColumnWidth(label, rows),
   }));
   return {
     tag: "table",

@@ -91,3 +91,19 @@ test("JSON 2.0 card padding uses Feishu-compatible one-or-four-value syntax", ()
     assert.ok(parts.length === 1 || parts.length === 4, `飞书不兼容的 padding：${padding}`);
   }
 });
+
+test("table columns shrink to their text while long addresses receive bounded space", () => {
+  const address = "0x1234567890abcdef1234567890abcdef12345678";
+  const card = JSON.parse(buildCardJson("状态", [
+    "**04｜底池配置**",
+    `01　符号 BNB｜状态 已启用｜地址 [${address}](https://bscscan.com/address/${address})｜募集总量 24 BNB`,
+  ].join("\n"), "green"));
+  const table = card.body.elements.find(element => element.tag === "table");
+  assert.ok(table);
+  const widths = Object.fromEntries(table.columns.map(column => [column.display_name, Number.parseInt(column.width, 10)]));
+  assert.ok(widths.状态 <= 140);
+  assert.ok(widths.募集总量 <= 260);
+  assert.ok(widths.地址 >= 180 && widths.地址 <= 360);
+  assert.ok(widths.项目 <= 240);
+  assert.ok(table.columns.every(column => /^\d+px$/.test(column.width)));
+});

@@ -360,7 +360,6 @@ if [ -f "$SNAP" ]; then
     const ok=(text)=>color(text,'green');
     const warn=(text)=>color(text,'orange');
     const bad=(text)=>color(text,'red');
-    const compact=(arr)=>arr;
     const lag=am.actorLagBlocks??(am.safeLatestBlock?Math.max(0,am.safeLatestBlock-am.lastBlock):'-');
     const health=[];
     if(pendingRoutes>0) health.push(warn('新路由待确认 '+pendingRoutes));
@@ -397,30 +396,31 @@ if [ -f "$SNAP" ]; then
     for(const [index,k] of apiKeys.entries()) console.log(String(index+1).padStart(2,'0')+'　'+(apiLinks[k]?mdLink(apiLinks[k][0],apiLinks[k][1]):k));
     console.log('');
 
-    console.log('**07｜OpenFour**');
+    console.log('**07｜OpenFour 概览**');
     console.log('Registry：'+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
-    console.log('模块角色：'+(roleNames.length?roleNames.join('、'):'暂无'));
-    console.log('presetIds：'+((ofm.presetIds||[]).length?(ofm.presetIds||[]).join(', '):'暂无'));
-    if(moduleEntries.length===0) console.log('模块实现：暂无');
-    for(const [index,[addr,m]] of moduleEntries.entries()) console.log('模块 '+String(index+1).padStart(2,'0')+'　'+bscAddress(addr)+'｜roles '+(m.roles||[]).join(', ')+'｜presetIds '+(m.presetIds||[]).join(', '));
+    console.log('模板：'+templateKeys.length+' 个｜PUBLISHED '+published+' 个｜其他 '+Math.max(0,templateKeys.length-published)+' 个');
+    console.log('模块：'+moduleEntries.length+' 个｜presetIds '+((ofm.presetIds||[]).length)+' 个');
+    console.log('角色分布：'+(roleNames.length?roleNames.map(role=>role+' '+roleCounts[role]).join('｜'):'暂无'));
+    console.log('');
+
+    console.log('**08｜OpenFour 模板**');
     if(templateKeys.length===0) console.log('模板：暂无');
-    for(const [index,id] of templateKeys.entries()){const t=templates[id]||{};console.log('模板 '+String(index+1).padStart(2,'0')+'　id '+id+'｜名称 '+value(t.name)+'｜状态 '+value(t.status)+'｜作者 '+value(t.userAddress))}
+    for(const [index,id] of templateKeys.entries()){const t=templates[id]||{};console.log(String(index+1).padStart(2,'0')+'　ID '+id+'｜名称 '+value(t.name)+'｜状态 '+value(t.status)+'｜标签 '+value(t.tag))}
     console.log('');
 
-    console.log('**08｜合约与链上资产**');
-    if(fpKeys.length===0) console.log('合约：暂无');
-    for(const [index,[name,data]] of Object.entries(fp).entries()) console.log('合约 '+String(index+1).padStart(2,'0')+'　'+name+'｜地址 '+value(data.address||data.contractAddress)+'｜实现 '+value(data.implAddress||data.implementation));
-    console.log('AgentNFT 数量：'+value(op.agentNftCount));
-    for(const [index,addr] of nfts.entries()) console.log('AgentNFT '+String(index+1).padStart(2,'0')+'　'+bscAddress(addr));
+    console.log('**09｜合约与链上资产**');
+    console.log('监控合约：'+fpKeys.length+' 个');
+    console.log('合约名称：'+(fpKeys.length?fpKeys.join('、'):'暂无'));
+    console.log('AgentNFT：'+value(op.agentNftCount??nfts.length)+' 个');
     console.log('');
 
-    console.log('**09｜创建者动作监听**');
+    console.log('**10｜创建者动作监听**');
     console.log('发现方式：'+modes.join(' + '));
-    if(actors.length===0) console.log('监听地址：暂无');
-    for(const [index,addr] of actors.entries()){const item=allActors[addr]||{};console.log(String(index+1).padStart(2,'0')+'　'+bscAddress(addr)+'｜角色 '+(item.roles||[]).join(', ')+'｜标签 '+(item.labels||[]).join(', '))}
+    console.log('监听地址：'+actors.length+' 个｜缓存创建者 '+cachedCreators+' 个');
+    for(const [index,addr] of actors.entries()){const item=allActors[addr]||{};const roles=(item.roles||[]).map(role=>role==='creator'?'创建者':role==='manual'?'手动配置':role);console.log(String(index+1).padStart(2,'0')+'　'+bscAddress(addr)+'｜角色 '+(roles.length?roles.join('、'):'未分类'))}
     console.log('');
 
-    console.log('**10｜GitHub 仓库**');
+    console.log('**11｜GitHub 仓库**');
     if(repoEntries.length===0) console.log('暂无仓库');
     for(const [index,repo] of repoEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(repo.full_name||repo.name,repo.html_url||('https://github.com/'+repo.full_name))+'｜默认分支 '+value(repo.default_branch)+'｜更新时间 '+value(repo.updated_at));
     console.log('');
