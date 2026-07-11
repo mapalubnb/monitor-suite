@@ -110,6 +110,10 @@ test("Flap status links current factories and registered vaults to launch pages"
   });
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}`));
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${registered}`));
+  assert.match(output, /\*\*05｜Robinhood CAStore\*\*/);
+  assert.match(output, /https:\/\/flap\.sh\/robinhood\/CAstore\?lang=zh/);
+  assert.match(output, /币股（IndexVault）｜状态 监控中/);
+  assert.match(output, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
 });
 
 test("Four.meme pool status keeps only the requested four fields", () => {

@@ -28,6 +28,11 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
   assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x0000000000000000000000000000000000000001/);
   assert.doesNotMatch(content, /隐藏金库|0x0000000000000000000000000000000000000002/);
   assert.match(content, /展示数量：1/);
+  assert.match(content, /\*\*04｜Robinhood CAStore\*\*/);
+  assert.match(content, /https:\/\/flap\.sh\/robinhood\/CAstore\?lang=zh/);
+  assert.match(content, /币股（IndexVault）｜状态 监控中/);
+  assert.match(content, /0xe6ca297D1d963b6F00d5b216986123CAeB883AF6/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
   assert.doesNotMatch(content, /操作入口|更新时间：|CAStore 展示/);
   assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
   assert.doesNotMatch(content, /(^|\n)-\s/m);

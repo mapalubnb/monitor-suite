@@ -503,7 +503,10 @@ if [ -f "$SNAP" ]; then
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
     const mdLink=(label,url)=>'['+label+']('+url+')';
-    const vaultLink=(address)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address);
+    const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+(chain==='robinhood'?'&chain=robinhood&lang=zh':''));
+    const robinhoodPage='https://flap.sh/robinhood/CAstore?lang=zh';
+    const robinhoodFactory='0xe6ca297D1d963b6F00d5b216986123CAeB883AF6';
+    const robinhoodLaunch='https://flap.sh/launch?vaultfactory='+robinhoodFactory+'&chain=robinhood&lang=zh';
     const pageLabel=(url)=>String(url||'-');
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
     const pages=s.pages||{};
@@ -566,7 +569,14 @@ if [ -f "$SNAP" ]; then
     }
     console.log('');
 
-    console.log('**05｜链上注册中心**');
+    console.log('**05｜Robinhood CAStore**');
+    console.log('页面：'+mdLink(robinhoodPage,robinhoodPage));
+    console.log('模板：币股（IndexVault）｜状态 监控中');
+    console.log('Factory：'+mdLink(robinhoodFactory,robinhoodLaunch));
+    console.log('金库入口：'+mdLink(robinhoodLaunch,robinhoodLaunch));
+    console.log('');
+
+    console.log('**06｜链上注册中心**');
     console.log('注册中心：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
     console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
     console.log('已知链上金库：'+knownVaults.length+' 个');

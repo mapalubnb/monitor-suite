@@ -4863,6 +4863,7 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
         return `${String(index + 1).padStart(2, "0")}　${name}｜状态 ${factory.enabled ? "已启用" : "未启用"}｜地址 ${addressLink(address)}${launch ? `｜金库 ${launch}` : ""}`;
       })
     : ["当前没有配置为 CAStore 展示的金库"];
+  const robinhoodLaunchUrl = buildVaultFactoryLaunchUrl(ROBINHOOD_INDEX_VAULT_FACTORY, { chain: "robinhood" });
   return [
     "**01｜运行状态**",
     "状态：监控运行中",
@@ -4877,7 +4878,13 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
     `展示数量：${factories.length}`,
     ...factoryLines,
     "",
-    "**04｜链上注册中心**",
+    "**04｜Robinhood CAStore**",
+    `页面：[https://flap.sh/robinhood/CAstore?lang=zh](https://flap.sh/robinhood/CAstore?lang=zh)`,
+    "模板：币股（IndexVault）｜状态 监控中",
+    `Factory：${flapLink(ROBINHOOD_INDEX_VAULT_FACTORY, robinhoodLaunchUrl)}`,
+    `金库入口：${flapLink(robinhoodLaunchUrl, robinhoodLaunchUrl)}`,
+    "",
+    "**05｜链上注册中心**",
     `注册中心：${addressLink(CONFIG.registryMonitor.address)}`,
     `确认块：${CONFIG.registryMonitor.confirmations}`,
     `启动回溯：${CONFIG.registryMonitor.bootstrapLookbackBlocks} 块`,
@@ -4885,7 +4892,7 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
     `已扫描区块：${registry.lastBlock ?? "尚未建立"}｜安全区块 ${registry.safeLatestBlock ?? "尚未建立"}｜最新区块 ${registry.latestBlock ?? "尚未建立"}`,
     `已知链上金库：${Object.keys(registry.knownVaults || {}).length} 个`,
     "",
-    "**05｜RPC 节点**",
+    "**06｜RPC 节点**",
     ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
   ].join("\n");
 }
