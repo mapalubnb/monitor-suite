@@ -737,6 +737,48 @@ test("CAstore Chinese vault headings are extracted as structured vault sections"
   assert.match(features.caStoreVaults[1].description, /LP 代币质押进金库/);
 });
 
+test("Robinhood CAstore extracts IndexVault without treating the unlisted template heading as a vault", () => {
+  const html = `
+    <main>
+      <h2>热门金库</h2>
+      <h3>未上架的税收模板</h3>
+      <p>输入任何税收金库模板合约地址来使用。</p>
+      <h3>币股</h3>
+      <img alt="IndexVault" src="/stocks-vault-logo.svg">
+      <p>税收 ETH 会预留给代币化股票资产购买。Keeper 向金库出售受支持的 RWA 资产，持有人可以领取 RWA 分红。</p>
+    </main>
+  `;
+
+  const features = __testables.extractPageFeatures(html, {
+    url: "https://flap.sh/robinhood/CAstore?lang=zh",
+  });
+
+  assert.deepEqual(features.caStoreVaults.map(v => v.name), ["币股"]);
+  assert.equal(features.caStoreVaults[0].area, "热门金库");
+  assert.equal(features.caStoreVaults[0].chain, "robinhood");
+  assert.equal(features.caStoreVaults[0].sourceUrl, "https://flap.sh/robinhood/CAstore?lang=zh");
+  assert.equal(features.caStoreVaults[0].factory, "0xe6ca297D1d963b6F00d5b216986123CAeB883AF6");
+  assert.match(features.caStoreVaults[0].description, /持有人可以领取 RWA 分红/);
+});
+
+test("Robinhood CAstore card uses the complete chain-specific vault link", () => {
+  const notification = __testables.buildCaStoreVaultChangeNotification({
+    type: "added",
+    area: "热门金库",
+    name: "币股",
+    newDescription: "持有人可以领取 RWA 分红。",
+    factory: "0xe6ca297D1d963b6F00d5b216986123CAeB883AF6",
+    chain: "robinhood",
+    sourceUrl: "https://flap.sh/robinhood/CAstore?lang=zh",
+  }, {});
+
+  const expected = "https://flap.sh/launch?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh";
+  assert.equal(notification.title, "Robinhood CAstore 金库变更：币股");
+  assert.equal(notification.launchUrl, expected);
+  assert.equal(notification.url, expected);
+  assert.match(notification.content, new RegExp(expected.replace(/[?&]/g, "\\$&")));
+});
+
 test("CAstore vault change notification is simple, linked, AI-ready and suppresses duplicate page card", () => {
   const diff = {
     type: "added",

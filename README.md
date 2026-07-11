@@ -93,7 +93,7 @@ Four.meme 前端最低 `5` 秒，API 最低 `8` 秒；底池、OpenFour、合约
 
 GitHub 等外部请求遇到 DNS、连接超时、连接重置或 IPv6 路由异常时会自动择优 IPv4/IPv6，并进行两次短间隔重试。最终失败日志会包含底层错误码、目标地址和原因，便于区分服务器网络问题与 GitHub API 错误。
 
-Flap 新金库通知、金库工厂变更和状态输出会同时提供 BscScan 合约链接与 `flap.sh/launch?vaultfactory=<地址>` 金库入口。
+Flap 新金库通知、金库工厂变更和状态输出会同时提供 BscScan 合约链接与 `flap.sh/launch?vaultfactory=<地址>` 金库入口。页面监控同时覆盖 BNB CAstore 与 Robinhood 中文 CAstore；Robinhood 币股金库使用独立快照及带 `chain=robinhood&lang=zh` 的金库入口，不会并入 BSC 金库工厂状态。
 
 被风控时建议先把前端并发降到：
 

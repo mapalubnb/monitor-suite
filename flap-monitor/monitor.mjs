@@ -45,6 +45,7 @@ function readPositiveIntEnv(name, fallback, min = 1) {
 const CONFIG = {
   urls: [
     "https://flap.sh/bnb/CAstore",
+    "https://flap.sh/robinhood/CAstore?lang=zh",
     "https://flap.sh/launch",
     "https://flap.sh/create",
   ],
@@ -281,6 +282,8 @@ const UI_STYLE_CATEGORY_META = {
     evidence: "CSS utility",
   },
 };
+
+const ROBINHOOD_INDEX_VAULT_FACTORY = "0xe6ca297D1d963b6F00d5b216986123CAeB883AF6";
 
 function classifyUiStyleString(value) {
   const s = String(value || "").trim();
@@ -696,7 +699,7 @@ function emptyFlapChangeMeta() {
 
 /* ── 快照读写 ── */
 const CURRENT_SCHEMA_VERSION = 6;
-const CA_STORE_VAULT_SCHEMA_VERSION = 2;
+const CA_STORE_VAULT_SCHEMA_VERSION = 3;
 
 function loadSnapshot() {
   try {
@@ -2512,10 +2515,10 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
   return content;
 }
 
-function buildVaultFactoryLaunchUrl(factory) {
-  return /^0x[a-fA-F0-9]{40}$/.test(String(factory || ""))
-    ? `https://flap.sh/launch?vaultfactory=${factory}`
-    : "";
+function buildVaultFactoryLaunchUrl(factory, options = {}) {
+  if (!/^0x[a-fA-F0-9]{40}$/.test(String(factory || ""))) return "";
+  const suffix = options.chain === "robinhood" ? "&chain=robinhood&lang=zh" : "";
+  return `https://flap.sh/launch?vaultfactory=${factory}${suffix}`;
 }
 
 function vaultLaunchLink(factory, label = "打开金库") {
@@ -3070,6 +3073,9 @@ function mergeRoundVaultFactoryMaps(entries = []) {
 }
 
 function collectRoundVaultFactory(roundEntries, url, features) {
+  // Robinhood currently shares frontend chunks with BNB. Do not merge those
+  // chain-specific values into the BSC factory state.
+  if (/\/robinhood\//i.test(url)) return null;
   const map = extractVaultFactoryMapFromFeatures(features);
   if (map) roundEntries.push({ url, map });
   return map;
@@ -3539,7 +3545,8 @@ function normalizeVaultName(name) {
 function isCaStoreVaultHeading(text) {
   const t = String(text || "").trim();
   if (!t) return false;
-  if (/^(hot vaults|热门金库|熱門金庫|ca store|home|store|ai oracle|rank|profile|create|search|support|docs|debox)$/i.test(t)) return false;
+  if (/^(hot vaults|热门金库|熱門金庫|未上架的税收模板|未上架的稅收模板|ca store|home|store|ai oracle|rank|profile|create|search|support|docs|debox)$/i.test(t)) return false;
+  if (/^(币股|幣股)$/i.test(t)) return true;
   return /vault|金库|金庫|stocks|lista|custom vault factory|split|分红|分紅|质押|質押|燃烧|燃燒|回购|回購|稅收|税收/i.test(t);
 }
 
@@ -3567,7 +3574,9 @@ function extractVaultFactoryAddress(text) {
   return null;
 }
 
-function extractCaStoreVaultSections(html) {
+function extractCaStoreVaultSections(html, options = {}) {
+  const sourceUrl = String(options.url || "");
+  const chain = /\/robinhood\//i.test(sourceUrl) ? "robinhood" : /\/bnb\//i.test(sourceUrl) ? "bnb" : "";
   const headings = [];
   const headingRe = /<h([1-4])[^>]*>([\s\S]*?)<\/h\1>/gi;
   let m;
@@ -3590,7 +3599,8 @@ function extractCaStoreVaultSections(html) {
     const rawDescription = htmlFragmentToText(rawSectionHtml);
     const description = cleanVaultDescription(rawDescription);
     if (!description && !/custom vault factory/i.test(h.name)) continue;
-    const factory = extractVaultFactoryAddress(rawSectionHtml);
+    const factory = extractVaultFactoryAddress(rawSectionHtml)
+      || (chain === "robinhood" && /^(币股|幣股)$/i.test(h.name) ? ROBINHOOD_INDEX_VAULT_FACTORY : null);
     const areaKey = normalizeVaultName(currentArea || "Featured Vaults");
     const nameKey = normalizeVaultName(h.name);
     const baseKey = `${areaKey}::${nameKey}`;
@@ -3606,6 +3616,8 @@ function extractCaStoreVaultSections(html) {
       key: `${baseKey}#${occurrence}`,
       description,
       factory,
+      chain,
+      sourceUrl,
       signature: md5(`${h.name}\n${description}`),
     });
   }
@@ -3613,8 +3625,8 @@ function extractCaStoreVaultSections(html) {
   return sections;
 }
 
-function extractPageFeatures(html) {
-  const features = { fullHash: md5(html), nextData: null, nextDataHash: null, assetFiles: [], assetHash: null, contentHash: null, caStoreVaults: [], caStoreVaultHash: null, caStoreVaultSchemaVersion: CA_STORE_VAULT_SCHEMA_VERSION };
+function extractPageFeatures(html, options = {}) {
+  const features = { fullHash: md5(html), nextData: null, nextDataHash: null, assetFiles: [], assetHash: null, contentHash: null, caStoreVaults: [], caStoreVaultHash: null, caStoreVaultSchemaVersion: CA_STORE_VAULT_SCHEMA_VERSION, originalUrl: options.url || "" };
 
   const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
   if (nextDataMatch) {
@@ -3637,7 +3649,7 @@ function extractPageFeatures(html) {
   const textContent = htmlFragmentToText(html);
   features.contentHash = md5(textContent);
   features.textContent = textContent;
-  features.caStoreVaults = extractCaStoreVaultSections(html);
+  features.caStoreVaults = extractCaStoreVaultSections(html, options);
   if (features.caStoreVaults.length > 0) {
     features.caStoreVaultHash = md5(JSON.stringify(features.caStoreVaults.map(v => [v.key, v.signature])));
   }
@@ -3667,7 +3679,7 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
   for (const [key, nv] of newMap) {
     const ov = oldMap.get(key);
     if (!ov) {
-      changes.push({ type: "added", name: nv.name, area: nv.area, newDescription: nv.description, factory: nv.factory || null });
+      changes.push({ type: "added", name: nv.name, area: nv.area, newDescription: nv.description, factory: nv.factory || null, chain: nv.chain || "", sourceUrl: nv.sourceUrl || "" });
       continue;
     }
     if ((ov.signature || md5(`${ov.name}\n${ov.description || ""}`)) !== (nv.signature || md5(`${nv.name}\n${nv.description || ""}`))) {
@@ -3682,13 +3694,15 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
         oldFactory: ov.factory || null,
         newFactory: nv.factory || null,
         factory: nv.factory || ov.factory || null,
+        chain: nv.chain || ov.chain || "",
+        sourceUrl: nv.sourceUrl || ov.sourceUrl || "",
       });
     }
   }
 
   for (const [key, ov] of oldMap) {
     if (!newMap.has(key)) {
-      changes.push({ type: "removed", name: ov.name, area: ov.area, oldDescription: ov.description || "", factory: ov.factory || null });
+      changes.push({ type: "removed", name: ov.name, area: ov.area, oldDescription: ov.description || "", factory: ov.factory || null, chain: ov.chain || "", sourceUrl: ov.sourceUrl || "" });
     }
   }
 
@@ -3789,7 +3803,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
   const name = getCaStoreVaultDisplayName(change);
   const copy = getCaStoreVaultCopy(change);
   const factory = resolveCaStoreVaultFactory(change, vaultFactoryMap);
-  const launchUrl = buildVaultFactoryLaunchUrl(factory);
+  const launchUrl = buildVaultFactoryLaunchUrl(factory, { chain: change?.chain });
   const typeLabel = caStoreVaultChangeLabel(change?.type);
   const typeText = change?.type === "removed"
     ? removedText(typeLabel)
@@ -3809,10 +3823,10 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
   });
 
   return {
-    title: `${titlePrefix}CAstore 金库变更：${name}`,
+    title: `${titlePrefix}${change?.chain === "robinhood" ? "Robinhood " : ""}CAstore 金库变更：${name}`,
     content,
     template: change?.type === "removed" ? "orange" : "red",
-    url: launchUrl || "https://flap.sh/bnb/CAstore",
+    url: launchUrl || change?.sourceUrl || "https://flap.sh/bnb/CAstore",
     moduleContext: "Flap.sh CAstore 金库内容介绍",
     aiInput: buildCaStoreVaultAiInput(change, factory, launchUrl),
     factory,
@@ -3912,7 +3926,7 @@ function getFlapPageQuality(url, html, features) {
     reasons.push(`疑似错误页(${matchedError.source})`);
   }
 
-  if (/\/bnb\/CAstore/i.test(url) && !/Vault|CA STORE|STORE|Connect Wallet/i.test(text)) {
+  if (/\/(?:bnb|robinhood)\/CAstore/i.test(url) && !/Vault|金库|金庫|CA STORE|STORE|Connect Wallet/i.test(text)) {
     warnings.push("CAstore 关键文案缺失");
   } else if (/\/(?:launch|create)(?:$|\?)/i.test(url) && !/Create|Token|Connect Wallet/i.test(text)) {
     warnings.push("创建页关键文案缺失");
@@ -4720,7 +4734,7 @@ async function runCheck() {
     const { url, html } = r.value;
     const key = urlToKey(url);
     try {
-      const features = extractPageFeatures(html);
+      const features = extractPageFeatures(html, { url });
       assertValidFlapPage(url, html, features);
       const i18n = await fetchI18nStrings(features.assetFiles);
       if (i18n) { features.i18nStrings = i18n.i18nStrings; features.i18nHash = i18n.i18nHash; features.i18nChunk = i18n.i18nChunk; }
@@ -4904,7 +4918,7 @@ async function startMonitor() {
     const tasks = CONFIG.urls.map((url, i) => sleep(i * 300).then(async () => {
       const key = urlToKey(url);
       const html = await fetchPage(url);
-      const features = extractPageFeatures(html);
+      const features = extractPageFeatures(html, { url });
       features.originalUrl = url;
       assertValidFlapPage(url, html, features);
       const i18n = await fetchI18nStrings(features.assetFiles);
@@ -5015,7 +5029,7 @@ async function startMonitor() {
           continue;
         }
         try {
-          const features = extractPageFeatures(html);
+          const features = extractPageFeatures(html, { url });
           features.originalUrl = url;
           assertValidFlapPage(url, html, features);
 
