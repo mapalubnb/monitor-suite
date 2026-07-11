@@ -1,6 +1,6 @@
 {
   "name": "flap-monitor",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Flap.sh 页面监控（前端/i18n/API/路由）",
   "type": "module",
   "private": true,

@@ -503,6 +503,7 @@ if [ -f "$SNAP" ]; then
   node -e "
     const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
     const mdLink=(label,url)=>'['+label+']('+url+')';
+    const vaultLink=(address)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address);
     const pageLabel=(url)=>String(url||'-');
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
     const pages=s.pages||{};
@@ -561,7 +562,7 @@ if [ -f "$SNAP" ]; then
       const name=v.name||v.id||v.factory||'未知金库';
       const factory=v.factory||v.address||'';
       const link=factory?mdLink(factory,'https://bscscan.com/address/'+factory):'无地址';
-      console.log(String(index+1).padStart(2,'0')+'　名称 '+name+'｜地址 '+link+'｜启用 '+(v.enabled?'是':'否')+'｜CAStore 展示 '+(v.showInCAStore?'是':'否'));
+      console.log(String(index+1).padStart(2,'0')+'　名称 '+name+'｜地址 '+link+(factory?'｜金库 '+vaultLink(factory):'')+'｜启用 '+(v.enabled?'是':'否')+'｜CAStore 展示 '+(v.showInCAStore?'是':'否'));
     }
     console.log('');
 
@@ -569,7 +570,7 @@ if [ -f "$SNAP" ]; then
     console.log('注册中心：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
     console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
     console.log('已知链上金库：'+knownVaults.length+' 个');
-    for(const [index,addr] of knownVaults.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(addr,'https://bscscan.com/address/'+addr));
+    for(const [index,addr] of knownVaults.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(addr,'https://bscscan.com/address/'+addr)+'｜金库 '+vaultLink(addr));
     console.log('');
 
     console.log('更新时间：'+fmtTime(new Date()));

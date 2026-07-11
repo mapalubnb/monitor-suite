@@ -25,6 +25,7 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
   for (const url of __testables.CONFIG.urls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   for (const url of __testables.CONFIG.bscRpcUrls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(content, /0x0000000000000000000000000000000000000001/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x0000000000000000000000000000000000000001/);
   assert.doesNotMatch(content, /隐藏金库|0x0000000000000000000000000000000000000002/);
   assert.match(content, /展示数量：1/);
   assert.doesNotMatch(content, /操作入口|更新时间：|CAStore 展示/);
@@ -752,6 +753,7 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   assert.match(notification.content, /指定一個 X 帳戶/);
   assert.match(notification.content, /<font color="green">新增金库<\/font>/);
   assert.equal(notification.launchUrl, "https://flap.sh/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003");
+  assert.match(notification.content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\)/);
   assert.match(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
@@ -1138,10 +1140,12 @@ test("site-wide asset card summarizes runtime resources without raw webpack frag
 });
 
 test("vault factory card summarizes counts before details", () => {
+  const addedFactory = "0x0000000000000000000000000000000000000001";
+  const modifiedFactory = "0x0000000000000000000000000000000000000002";
   const content = __testables.formatVaultFactoryChanges({
-    added: [{ name: "Gift Vault", factory: "0xabc", showInCAStore: true, ai: false, enabled: true, constraints: { min: 1 } }],
+    added: [{ name: "Gift Vault", factory: addedFactory, showInCAStore: true, ai: false, enabled: true, constraints: { min: 1 } }],
     removed: [],
-    modified: [{ name: "Old Vault", factory: "0xdef", diffs: ["enabled: true → false"] }],
+    modified: [{ name: "Old Vault", factory: modifiedFactory, diffs: ["enabled: true → false"] }],
   });
 
   assert(content.startsWith("- 新增 1 个 / 移除 0 个 / 修改 1 个"));
@@ -1149,6 +1153,19 @@ test("vault factory card summarizes counts before details", () => {
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
   assert.match(content, /enabled：<font color="red">true<\/font> → <font color="green">false<\/font>/);
+  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${addedFactory}`));
+  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${modifiedFactory}`));
+});
+
+test("hidden new vault factory also includes its Flap launch link", () => {
+  const factory = "0x0000000000000000000000000000000000000003";
+  const content = __testables.formatVaultFactoryChanges({
+    added: [{ name: "Hidden Vault", factory, showInCAStore: false, ai: false, enabled: true }],
+    removed: [],
+    modified: [],
+  });
+  assert.match(content, /新增隐藏金库工厂/);
+  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}`));
 });
 
 test("round vault factory aggregation stabilizes conflicting page snapshots", () => {
@@ -1215,7 +1232,10 @@ test("vault factory extraction resolves webpack aliases for visible CAStore vaul
   assert.match(title, /新增可见 1 \/ 下架 1/);
   assert.match(content, /IndexVault/);
   assert.match(content, /0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5/);
   assert.match(content, /StocksVault/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a/);
   assert.match(content, /showInCAStore/);
 });
 
@@ -1241,10 +1261,11 @@ test("registry log extraction detects on-chain registered vault address", () => 
   assert.match(content, /注册中心:/);
   assert.doesNotMatch(content, /证据详情/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
+  assert.match(content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5\)/);
   assert.match(content, /0x9e239cd0/);
   assert.equal(
     __testables.buildVaultFactoryLaunchUrl(addresses[0]),
-    "https://flap.sh/launch?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&lang=zh",
+    "https://flap.sh/launch?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5",
   );
 });
 

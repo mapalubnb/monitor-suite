@@ -39,6 +39,23 @@ function renderFourmemeStatus(snapshot) {
   }
 }
 
+function renderFlapStatus(snapshot) {
+  const source = extractHeredoc("fl-status");
+  const script = extractNodeEvalScripts(source).find(item => item.includes("vaultLink"));
+  assert.ok(script, "未找到 Flap 快照状态渲染器");
+  const dir = mkdtempSync(join(tmpdir(), "monitor-suite-flap-status-"));
+  const snapshotPath = join(dir, "snapshot.json");
+  try {
+    writeFileSync(snapshotPath, JSON.stringify(snapshot), "utf-8");
+    const runnable = script.replace("'$SNAP'", JSON.stringify(snapshotPath));
+    const result = spawnSync(process.execPath, ["-e", runnable], { encoding: "utf-8" });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 test("PM2 status parser accepts ANSI-prefixed JSON", () => {
   const helper = extractHeredoc("_pm2-proc-info", "HELPER_EOF").replace(/^#!.*\n/, "");
   const pm2Data = [{
@@ -74,6 +91,25 @@ test("embedded status command JavaScript is syntactically valid", () => {
       assert.doesNotThrow(() => new Function(script), `${name} 内嵌 JavaScript 语法错误`);
     }
   }
+});
+
+test("Flap status links current factories and registered vaults to launch pages", () => {
+  const factory = "0x0000000000000000000000000000000000000001";
+  const registered = "0x0000000000000000000000000000000000000002";
+  const output = renderFlapStatus({
+    pages: {},
+    vaultFactories: {
+      [factory]: { name: "Current Vault", factory, enabled: true, showInCAStore: true },
+    },
+    registryMonitor: {
+      lastBlock: 100,
+      safeLatestBlock: 100,
+      latestBlock: 100,
+      knownVaults: { [registered]: {} },
+    },
+  });
+  assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}`));
+  assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${registered}`));
 });
 
 test("Four.meme pool status keeps only the requested four fields", () => {

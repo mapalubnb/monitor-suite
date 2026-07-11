@@ -2495,6 +2495,8 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
   const primaryLines = [];
   for (const event of events) {
     primaryLines.push(`- Vault: ${addressLink(event.vault)}`);
+    const launchUrl = buildVaultFactoryLaunchUrl(event.vault);
+    if (launchUrl) primaryLines.push(`  金库链接: ${flapLink("打开金库", launchUrl)}`);
     primaryLines.push(`  交易: ${txLink(event.txHash)} / 区块: ${blockLink(event.blockNumber)}`);
     primaryLines.push("  状态: 链上已注册");
   }
@@ -2512,8 +2514,22 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
 
 function buildVaultFactoryLaunchUrl(factory) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(factory || ""))
-    ? `https://flap.sh/launch?vaultfactory=${factory}&lang=zh`
+    ? `https://flap.sh/launch?vaultfactory=${factory}`
     : "";
+}
+
+function vaultLaunchLink(factory, label = "打开金库") {
+  const url = buildVaultFactoryLaunchUrl(factory);
+  return url ? flapLink(label, url) : "";
+}
+
+function formatVaultContractLinks(value) {
+  return uniqueStrings(String(value || "").split(",").map(item => item.trim()).filter(Boolean))
+    .map((address) => {
+      const launch = vaultLaunchLink(address);
+      return launch ? `${addressLink(address)} / ${launch}` : addressLink(address);
+    })
+    .join(", ");
 }
 
 async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, titlePrefix = "" } = {}) {
@@ -3141,9 +3157,9 @@ function formatVaultFactoryChanges(changes) {
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
       primary.push(`- ${formatAddedLine(v.name).replace(/^- /, "")}`);
       primary.push(`  Factory: ${addressLink(v.factory)}`);
+      if (vaultLaunchLink(v.factory)) primary.push(`  金库链接: ${vaultLaunchLink(v.factory)}`);
       if (v.descriptionI18nKey) primary.push(`  描述键: ${cardText(v.descriptionI18nKey)}`);
       primary.push(`  状态: ${flags.join(" / ")}`);
-      primary.push(`  操作: ${flapLink("查看金库", `https://flap.sh/launch?vaultfactory=${v.factory}`)}`);
     }
   }
   if (hiddenAdded.length > 0) {
@@ -3157,6 +3173,7 @@ function formatVaultFactoryChanges(changes) {
       if (v.constraints) flags.push(`约束:${JSON.stringify(v.constraints)}`);
       details.push(`  ${formatAddedLine(v.name).replace(/^- /, "")}`);
       details.push(`    Factory: ${addressLink(v.factory)}`);
+      if (vaultLaunchLink(v.factory)) details.push(`    金库链接: ${vaultLaunchLink(v.factory)}`);
       if (v.descriptionI18nKey) details.push(`    描述键: ${cardText(v.descriptionI18nKey)}`);
       details.push(`    状态: ${flags.join(" / ")}`);
     }
@@ -3173,13 +3190,14 @@ function formatVaultFactoryChanges(changes) {
     for (const v of changes.modified) {
       primary.push(`  ${changedText(v.name)}`);
       primary.push(`    Factory: ${addressLink(v.factory)}`);
+      if (vaultLaunchLink(v.factory)) primary.push(`    金库链接: ${vaultLaunchLink(v.factory)}`);
       if (v.descriptionI18nKey) primary.push(`    描述键: ${cardText(v.descriptionI18nKey)}`);
       for (const d of v.diffs) {
         const pair = splitDiffPairText(d);
         if (pair) pushDiffPairLines(primary, pair.key, pair.oldVal, pair.newVal, "    ");
         else primary.push(`    ${d}`);
       }
-      if (v.legacyFactories) primary.push(`    legacy: ${v.legacyFactories}`);
+      if (v.legacyFactories) primary.push(`    legacy: ${formatVaultContractLinks(v.legacyFactories)}`);
     }
   }
   return buildFlapCardContent({
@@ -3712,12 +3730,6 @@ function isValidFactoryAddress(value) {
   return /^0x[a-fA-F0-9]{40}$/.test(String(value || ""));
 }
 
-function buildVaultLaunchUrl(factory) {
-  return isValidFactoryAddress(factory)
-    ? `https://flap.sh/launch?vaultfactory=${factory}`
-    : "";
-}
-
 function resolveCaStoreVaultFactory(change, vaultFactoryMap = {}) {
   const direct = change?.factory || change?.newFactory || change?.oldFactory;
   if (isValidFactoryAddress(direct)) return direct;
@@ -3777,7 +3789,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
   const name = getCaStoreVaultDisplayName(change);
   const copy = getCaStoreVaultCopy(change);
   const factory = resolveCaStoreVaultFactory(change, vaultFactoryMap);
-  const launchUrl = buildVaultLaunchUrl(factory);
+  const launchUrl = buildVaultFactoryLaunchUrl(factory);
   const typeLabel = caStoreVaultChangeLabel(change?.type);
   const typeText = change?.type === "removed"
     ? removedText(typeLabel)
@@ -3789,6 +3801,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
       `- 金库: ${cardText(name)}`,
       `- 类型: ${typeText}`,
       factory ? `- Factory: ${addressLink(factory)}` : "- Factory: 未匹配到",
+      launchUrl ? `- 金库链接: ${flapLink("打开金库", launchUrl)}` : "",
     ],
     primaryTitle: "金库文案",
     primary: [`- ${cardText(copy)}`],
@@ -4832,7 +4845,8 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
     ? factories.map((factory, index) => {
         const name = factory.name || factory.id || "未命名金库";
         const address = factory.factory || factory.address || "无地址";
-        return `${String(index + 1).padStart(2, "0")}　${name}｜状态 ${factory.enabled ? "已启用" : "未启用"}｜地址 ${addressLink(address)}`;
+        const launch = vaultLaunchLink(address, "打开金库");
+        return `${String(index + 1).padStart(2, "0")}　${name}｜状态 ${factory.enabled ? "已启用" : "未启用"}｜地址 ${addressLink(address)}${launch ? `｜金库 ${launch}` : ""}`;
       })
     : ["当前没有配置为 CAStore 展示的金库"];
   return [
