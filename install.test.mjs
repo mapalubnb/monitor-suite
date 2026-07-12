@@ -158,7 +158,9 @@ test("full Four.meme status keeps useful OpenFour content and removes repetitive
   });
 
   assert.match(output, /OpenFour：模板 2 个｜PUBLISHED 1 个｜模块 2 个｜presetIds 4 个/);
-  assert.match(output, /\*\*08｜OpenFour 模板\*\*/);
+  assert.match(output, /\*\*04｜性能指标\*\*/);
+  assert.match(output, /创建者扫描：等待指标｜快速跳过 0｜回退 0/);
+  assert.match(output, /\*\*09｜OpenFour 模板\*\*/);
   assert.match(output, /01　ID 101｜名称 Launch Agent｜状态 PUBLISHED｜标签 Agent/);
   assert.match(output, /02　ID 102｜名称 Trading Assistant｜状态 INIT｜标签 Trading/);
   assert.match(output, /模块：2 个｜presetIds 4 个/);

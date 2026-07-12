@@ -973,3 +973,14 @@ test("host limiter spaces same-host tasks without changing caller order", async 
   assert.equal(second, "second");
   assert.deepEqual(waits, [100]);
 });
+
+test("overdue module scheduling skips expired ticks without changing the configured interval", () => {
+  assert.equal(__testables.calculateNextModuleDueAt(1_000, 2_000, 2_500), 3_000);
+  assert.equal(__testables.calculateNextModuleDueAt(1_000, 2_000, 7_500), 9_000);
+});
+
+test("actor raw block prefilter detects watched addresses without parsing JSON", () => {
+  const actor = "0x0000000000000000000000000000000000000001";
+  assert.equal(__testables.rawRpcPayloadContainsActor(`{"result":{"transactions":[{"from":"${actor}"}]}}`, [actor]), true);
+  assert.equal(__testables.rawRpcPayloadContainsActor('{"result":{"transactions":[]}}', [actor]), false);
+});

@@ -286,7 +286,12 @@ echo "$PM2_JSON" | node -e "
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
-    const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
+    const fs=require('fs');
+    const s=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
+    const actorPath='$SNAP'.replace(/snapshot\.json$/,'actor-state.json');
+    const metricsPath='$SNAP'.replace(/snapshot\.json$/,'runtime-metrics.json');
+    try{if(fs.existsSync(actorPath)){const a=JSON.parse(fs.readFileSync(actorPath,'utf-8'));if(a.chainActorMonitor)s.chainActorMonitor=a.chainActorMonitor}}catch{}
+    let runtime={};try{if(fs.existsSync(metricsPath))runtime=JSON.parse(fs.readFileSync(metricsPath,'utf-8'))}catch{}
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const isAddr=(v)=>/^0x[a-fA-F0-9]{40}$/.test(String(v||''));
     const bscAddress=(addr,label)=>addr?mdLink(label||addr,'https://bscscan.com/address/'+addr):'-';
@@ -381,46 +386,55 @@ if [ -f "$SNAP" ]; then
     console.log('扫链：已扫 '+(am.lastBlock||'未知')+'｜确认 '+(am.safeLatestBlock||'未知')+'｜延迟 '+lag+' 块');
     console.log('');
 
-    console.log('**04｜底池配置**');
+    console.log('**04｜性能指标**');
+    const mem=runtime.memory||{};
+    console.log('进程内存：RSS '+(mem.rss?Math.round(mem.rss/1024/1024)+' MB':'未知')+'｜堆使用 '+(mem.heapUsed?Math.round(mem.heapUsed/1024/1024)+' MB':'未知'));
+    console.log('创建者扫描：'+(runtime.actorScanMode==='rawBlockPreFilter'?'原始区块快速过滤':runtime.actorScanMode==='rawBlockParsed'?'监听地址命中并完整解析':runtime.actorScanMode==='batchFallback'?'标准 RPC 兼容模式':'等待指标')+'｜快速跳过 '+(runtime.actorFastSkips??0)+'｜回退 '+(runtime.actorFallbacks??0));
+    const sw=runtime.snapshotWrites||{};
+    console.log('快照写入：主快照 '+(sw.writes??0)+' 次｜创建者小状态 '+(sw.actorWrites??0)+' 次｜平均 '+(sw.averageDurationMs??0)+'ms');
+    for(const [name,m] of Object.entries(runtime.modules||{})) console.log(name+'：间隔 '+((m.intervalMs||0)/1000)+'s｜最近 '+(m.lastDurationMs??0)+'ms｜平均 '+(m.avgDurationMs??0)+'ms｜请求 '+(m.requestCount??0)+'｜错误 '+(m.errorCount??0));
+    console.log('');
+
+    console.log('**05｜底池配置**');
     if(allPools.length===0) console.log('暂无底池');
     for(const [index,p] of allPools.entries()) console.log(String(index+1).padStart(2,'0')+'　符号 '+value(p.symbol||p.nativeSymbol)+'｜状态 '+value(p.status)+'｜地址 '+bscAddress(p.symbolAddress)+'｜募集总量 '+value(p.totalBAmount));
     console.log('');
 
-    console.log('**05｜前端页面**');
+    console.log('**06｜前端页面**');
     if(pageEntries.length===0) console.log('暂无页面快照');
     for(const [index,[k,p]] of pageEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(pageLabel(p.originalUrl||k),p.originalUrl||k)+'｜资源 '+((p.assetFiles||[]).length)+' 个｜已下载 '+Object.keys(p.assetContents||{}).length+' 个｜i18n '+Object.keys(p.i18nStrings||{}).length+' 键');
     console.log('');
 
-    console.log('**06｜公开 API**');
+    console.log('**07｜公开 API**');
     if(apiKeys.length===0) console.log('暂无 API 快照');
     for(const [index,k] of apiKeys.entries()) console.log(String(index+1).padStart(2,'0')+'　'+(apiLinks[k]?mdLink(apiLinks[k][0],apiLinks[k][1]):k));
     console.log('');
 
-    console.log('**07｜OpenFour 概览**');
+    console.log('**08｜OpenFour 概览**');
     console.log('Registry：'+bscAddress(ofm.registry||'0x912cef0c3ae9ab6eb3ec87cab69371cfb317ab94'));
     console.log('模板：'+templateKeys.length+' 个｜PUBLISHED '+published+' 个｜其他 '+Math.max(0,templateKeys.length-published)+' 个');
     console.log('模块：'+moduleEntries.length+' 个｜presetIds '+((ofm.presetIds||[]).length)+' 个');
     console.log('角色分布：'+(roleNames.length?roleNames.map(role=>role+' '+roleCounts[role]).join('｜'):'暂无'));
     console.log('');
 
-    console.log('**08｜OpenFour 模板**');
+    console.log('**09｜OpenFour 模板**');
     if(templateKeys.length===0) console.log('模板：暂无');
     for(const [index,id] of templateKeys.entries()){const t=templates[id]||{};console.log(String(index+1).padStart(2,'0')+'　ID '+id+'｜名称 '+value(t.name)+'｜状态 '+value(t.status)+'｜标签 '+value(t.tag))}
     console.log('');
 
-    console.log('**09｜合约与链上资产**');
+    console.log('**10｜合约与链上资产**');
     console.log('监控合约：'+fpKeys.length+' 个');
     console.log('合约名称：'+(fpKeys.length?fpKeys.join('、'):'暂无'));
     console.log('AgentNFT：'+value(op.agentNftCount??nfts.length)+' 个');
     console.log('');
 
-    console.log('**10｜创建者动作监听**');
+    console.log('**11｜创建者动作监听**');
     console.log('发现方式：'+modes.join(' + '));
     console.log('监听地址：'+actors.length+' 个｜缓存创建者 '+cachedCreators+' 个');
     for(const [index,addr] of actors.entries()){const item=allActors[addr]||{};const roles=(item.roles||[]).map(role=>role==='creator'?'创建者':role==='manual'?'手动配置':role);console.log(String(index+1).padStart(2,'0')+'　'+bscAddress(addr)+'｜角色 '+(roles.length?roles.join('、'):'未分类'))}
     console.log('');
 
-    console.log('**11｜GitHub 仓库**');
+    console.log('**12｜GitHub 仓库**');
     if(repoEntries.length===0) console.log('暂无仓库');
     for(const [index,repo] of repoEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(repo.full_name||repo.name,repo.html_url||('https://github.com/'+repo.full_name))+'｜默认分支 '+value(repo.default_branch)+'｜更新时间 '+value(repo.updated_at));
     console.log('');

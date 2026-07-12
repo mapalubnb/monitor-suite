@@ -157,6 +157,8 @@ const CONFIG = {
 
   // 快照文件
   snapshotFile: join(__dirname, "snapshot.json"),
+  actorStateFile: join(__dirname, "actor-state.json"),
+  runtimeMetricsFile: join(__dirname, "runtime-metrics.json"),
   frontendRouteDecisionsFile: join(__dirname, "frontend-route-decisions.json"),
 
   // ── 反风控 ──
@@ -455,6 +457,7 @@ function scheduleHostRequest(url, task) {
 }
 
 const moduleMetricContext = new AsyncLocalStorage();
+let runtimeMetricsTimer = null;
 
 function createModuleMetricsState() {
   return {};
@@ -486,7 +489,57 @@ function recordModuleMetric(metrics, name, sample = {}) {
   bucket.errorCount += Math.max(0, Math.round(Number(sample.errorCount) || 0));
   bucket.durations.push(durationMs);
   if (bucket.durations.length > 120) bucket.durations.splice(0, bucket.durations.length - 120);
+  scheduleRuntimeMetricsWrite();
   return summarizeModuleMetrics(metrics, name);
+}
+
+function scheduleRuntimeMetricsWrite() {
+  if (IS_TEST_MODE || runtimeMetricsTimer) return;
+  runtimeMetricsTimer = setTimeout(() => {
+    runtimeMetricsTimer = null;
+    const memory = process.memoryUsage();
+    const staleBefore = Date.now() - 2 * 60 * 60_000;
+    for (const cache of [frontendInfoLogState, i18nParseLogState, apiEmptyArrayLogState]) {
+      for (const [key, value] of cache) {
+        const lastAt = value?.lastLogAt || value?.lastAt || 0;
+        if (lastAt && lastAt < staleBefore) cache.delete(key);
+      }
+    }
+    const modulesSummary = {};
+    for (const name of Object.keys(moduleMetrics || {})) {
+      modulesSummary[name] = summarizeModuleMetrics(moduleMetrics, name);
+      modulesSummary[name].intervalMs = modules.find(item => item.name === name)?.intervalMs || 0;
+    }
+    const payload = {
+      updatedAt: new Date().toISOString(),
+      uptimeSeconds: Math.round(process.uptime()),
+      memory: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal },
+      modules: modulesSummary,
+      snapshotWrites: {
+        ...snapshotWriteMetrics,
+        averageDurationMs: snapshotWriteMetrics.writes
+          ? Math.round(snapshotWriteMetrics.totalDurationMs / snapshotWriteMetrics.writes)
+          : 0,
+      },
+      actorScanMode: actorRawScanState.lastMode || "rawBlockPreFilter",
+      actorFastSkips: actorRawScanState.fastSkips,
+      actorFallbacks: actorRawScanState.fallbacks,
+      frontend: {
+        pages: Object.keys(snapshot?.frontendPages || {}).length,
+        resources: Object.keys(snapshot?._frontendAssetStore || {}).length,
+      },
+    };
+    runtimeMetricsWriteQueue = runtimeMetricsWriteQueue.then(() => {
+      try {
+        const tmpFile = CONFIG.runtimeMetricsFile + ".tmp";
+        writeFileSync(tmpFile, JSON.stringify(payload), "utf-8");
+        renameSync(tmpFile, CONFIG.runtimeMetricsFile);
+      } catch (err) {
+        log(`[性能] 指标写入失败：${err.message}`);
+      }
+    });
+  }, 5_000);
+  runtimeMetricsTimer.unref?.();
 }
 
 function summarizeModuleMetrics(metrics, name) {
@@ -547,6 +600,12 @@ const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? nu
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
 const CURRENT_SCHEMA_VERSION = 9;
 let snapshotWriteQueue = Promise.resolve();
+let actorStateWriteQueue = Promise.resolve();
+let runtimeMetricsWriteQueue = Promise.resolve();
+let frontendSnapshotRevision = 0;
+let cachedFrontendDiskRevision = -1;
+let cachedFrontendDiskSections = null;
+const snapshotWriteMetrics = { writes: 0, actorWrites: 0, lastDurationMs: 0, totalDurationMs: 0 };
 
 const REMOVED_FRONTEND_URLS = new Set([
   "https://four.meme",
@@ -586,7 +645,16 @@ function loadSnapshot() {
   try {
     if (existsSync(CONFIG.snapshotFile)) {
       const data = JSON.parse(readFileSync(CONFIG.snapshotFile, "utf-8"));
-      return migrateSnapshot(data);
+      const migrated = migrateSnapshot(data);
+      try {
+        if (existsSync(CONFIG.actorStateFile)) {
+          const actorState = JSON.parse(readFileSync(CONFIG.actorStateFile, "utf-8"));
+          if (actorState?.chainActorMonitor) migrated.chainActorMonitor = actorState.chainActorMonitor;
+        }
+      } catch (err) {
+        earlyLog(`[创建者] 独立状态读取失败，沿用主快照：${err.message}`);
+      }
+      return migrated;
     }
   } catch { /* ignore */ }
   return null;
@@ -737,7 +805,9 @@ function mergeExternalFrontendRouteState(data = snapshot) {
 }
 
 function saveSnapshot(data) {
+  if (moduleMetricContext.getStore()?.moduleName === "frontend") frontendSnapshotRevision++;
   snapshotWriteQueue = snapshotWriteQueue.then(() => {
+    const startedAt = Date.now();
     try {
       mergeExternalFrontendRouteState(data);
       data._schemaVersion = CURRENT_SCHEMA_VERSION;
@@ -747,11 +817,32 @@ function saveSnapshot(data) {
       const tmpFile = CONFIG.snapshotFile + ".tmp";
       writeFileSync(tmpFile, serialized, "utf-8");
       renameSync(tmpFile, CONFIG.snapshotFile);
+      snapshotWriteMetrics.writes++;
     } catch (err) {
       log(`[快照] 写入失败：${err.message}`);
+    } finally {
+      const durationMs = Date.now() - startedAt;
+      snapshotWriteMetrics.lastDurationMs = durationMs;
+      snapshotWriteMetrics.totalDurationMs += durationMs;
     }
   });
   return snapshotWriteQueue;
+}
+
+function saveActorCheckpoint(data = snapshot) {
+  const actorState = data?.chainActorMonitor;
+  if (!actorState) return actorStateWriteQueue;
+  actorStateWriteQueue = actorStateWriteQueue.then(() => {
+    try {
+      const tmpFile = CONFIG.actorStateFile + ".tmp";
+      writeFileSync(tmpFile, JSON.stringify({ chainActorMonitor: actorState, updatedAt: ts() }), "utf-8");
+      renameSync(tmpFile, CONFIG.actorStateFile);
+      snapshotWriteMetrics.actorWrites++;
+    } catch (err) {
+      log(`[创建者] 独立状态写入失败：${err.message}`);
+    }
+  });
+  return actorStateWriteQueue;
 }
 
 /* ── 飞书消息（SDK 统一通道） ── */
@@ -2292,6 +2383,11 @@ function hydrateFrontendSnapshotAssets(data) {
 function compactFrontendSnapshotForDisk(data) {
   if (!data?.frontendPages) return data;
   const diskData = { ...data, frontendPages: {}, _frontendAssetStore: {} };
+  if (cachedFrontendDiskSections && cachedFrontendDiskRevision === frontendSnapshotRevision) {
+    diskData.frontendPages = cachedFrontendDiskSections.frontendPages;
+    diskData._frontendAssetStore = cachedFrontendDiskSections.assetStore;
+    return diskData;
+  }
   const sourceStore = data._frontendAssetStore || {};
 
   for (const [key, page] of Object.entries(data.frontendPages)) {
@@ -2304,6 +2400,12 @@ function compactFrontendSnapshotForDisk(data) {
     }
     diskData.frontendPages[key] = diskPage;
   }
+
+  cachedFrontendDiskRevision = frontendSnapshotRevision;
+  cachedFrontendDiskSections = {
+    frontendPages: diskData.frontendPages,
+    assetStore: diskData._frontendAssetStore,
+  };
 
   return diskData;
 }
@@ -4142,6 +4244,7 @@ function extractPageFeatures(html, url) {
     nextData: null,
     nextDataHash: null,
     html,             // 保留原始 HTML 供路由提取等用
+    htmlHash: md5(html),
   };
 
   // __NEXT_DATA__
@@ -4271,6 +4374,19 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
     if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
     const html = await res.text();
     if (html.length < 1000) throw new Error(`响应过短（${html.length} 字节），可能被拦截`);
+
+    const htmlHash = md5(html);
+    if (oldFeatures?.htmlHash && oldFeatures.htmlHash === htmlHash) {
+      return {
+        data: {
+          ...oldFeatures,
+          htmlEtag: res.headers.get("etag") || oldFeatures.htmlEtag || "",
+          htmlLastModified: res.headers.get("last-modified") || oldFeatures.htmlLastModified || "",
+          fetchMeta: { status: res.status, durationMs: Date.now() - startedAt, reused: true, reason: "htmlHash" },
+        },
+        error: null,
+      };
+    }
 
     // 第一层：纯解析
     features = extractPageFeatures(html, url);
@@ -7051,56 +7167,88 @@ async function fetchContractFingerprints() {
   const result = {};
   const bscContracts = await buildContractTargets();
 
-  // Phase 1: batch 获取所有合约的 code + storage slot
+  // 每轮先读取小体积 codeHash 和代理槽；只有哈希变化时才下载完整 bytecode。
   const calls = [];
   for (const c of bscContracts) {
-    calls.push({ method: "eth_getCode", params: [c.addr, "latest"] });
+    calls.push({ method: "eth_getProof", params: [c.addr, [], "latest"] });
     calls.push({ method: "eth_getStorageAt", params: [c.addr, CONFIG.eip1967Slot, "latest"] });
   }
-
   const batchResults = await bscRpcBatch(calls);
 
-  // Phase 2: 检查哪些合约有 implementation，收集需要再查 code 的 impl 地址
-  const implCalls = [];
-  const implMapping = []; // { label, implAddr }
+  const codeCalls = [];
+  const codeMappings = [];
   for (let i = 0; i < bscContracts.length; i++) {
     const c = bscContracts[i];
-    const code = batchResults[i * 2] || "0x";
+    const proof = batchResults[i * 2];
     const rawSlot = batchResults[i * 2 + 1] || "0x" + "0".repeat(64);
-
-    const codeSize = code ? Math.floor((code.length - 2) / 2) : 0;
-    result[c.label] = {
-      codeHash: md5(code),
-      codeSize,
+    const old = snapshot?.contractFingerprints?.[c.label];
+    const proofCodeHash = String(proof?.codeHash || "").toLowerCase();
+    const reusable = proofCodeHash
+      && old?.rpcCodeHash === proofCodeHash
+      && normalizeAddress(old.address) === normalizeAddress(c.addr);
+    result[c.label] = reusable ? { ...old } : {
+      codeHash: "",
+      codeSize: 0,
       address: c.addr,
-      source: c.source || "static",
-      networkCode: c.networkCode || CONFIG.networkCode,
-      selectors: extractSelectors(code),
+      selectors: [],
     };
+    result[c.label].address = c.addr;
+    result[c.label].source = c.source || "static";
+    result[c.label].networkCode = c.networkCode || CONFIG.networkCode;
+    if (proofCodeHash) result[c.label].rpcCodeHash = proofCodeHash;
     for (const field of ["discoveredVia", "linkedRegistry", "linkedCore", "linkedFeeRouter"]) {
       if (c[field]) result[c.label][field] = c[field];
+      else delete result[c.label][field];
     }
-
     const impl = "0x" + rawSlot.slice(26);
     const isProxy = impl !== "0x0000000000000000000000000000000000000000"
       && rawSlot !== "0x0000000000000000000000000000000000000000000000000000000000000000";
-
     if (isProxy) {
       result[c.label].implAddress = impl;
-      implCalls.push({ method: "eth_getCode", params: [impl, "latest"] });
-      implMapping.push({ label: c.label, implAddr: impl });
+    } else {
+      delete result[c.label].implAddress;
+      delete result[c.label].implCodeHash;
+      delete result[c.label].implCodeSize;
+      delete result[c.label].implSelectors;
+      delete result[c.label].implRpcCodeHash;
+    }
+    if (!reusable) {
+      codeCalls.push({ method: "eth_getCode", params: [c.addr, "latest"] });
+      codeMappings.push({ label: c.label, kind: "main" });
     }
   }
 
-  // Phase 3: batch 获取所有 implementation 的 code
-  if (implCalls.length > 0) {
-    const implResults = await bscRpcBatch(implCalls);
-    for (let i = 0; i < implMapping.length; i++) {
-      const implCode = implResults[i] || "0x";
-      const implSize = implCode ? Math.floor((implCode.length - 2) / 2) : 0;
-      result[implMapping[i].label].implCodeHash = md5(implCode);
-      result[implMapping[i].label].implCodeSize = implSize;
-      result[implMapping[i].label].implSelectors = extractSelectors(implCode);
+  const implItems = Object.entries(result).filter(([, item]) => item.implAddress);
+  const implProofs = implItems.length > 0
+    ? await bscRpcBatch(implItems.map(([, item]) => ({ method: "eth_getProof", params: [item.implAddress, [], "latest"] })))
+    : [];
+  for (let i = 0; i < implItems.length; i++) {
+    const [label, item] = implItems[i];
+    const old = snapshot?.contractFingerprints?.[label];
+    const proofCodeHash = String(implProofs[i]?.codeHash || "").toLowerCase();
+    const reusable = proofCodeHash
+      && old?.implRpcCodeHash === proofCodeHash
+      && normalizeAddress(old.implAddress) === normalizeAddress(item.implAddress);
+    if (proofCodeHash) item.implRpcCodeHash = proofCodeHash;
+    if (!reusable) {
+      codeCalls.push({ method: "eth_getCode", params: [item.implAddress, "latest"] });
+      codeMappings.push({ label, kind: "impl" });
+    }
+  }
+
+  const codes = codeCalls.length > 0 ? await bscRpcBatch(codeCalls) : [];
+  for (let i = 0; i < codeMappings.length; i++) {
+    const mapping = codeMappings[i];
+    const code = codes[i] || "0x";
+    const size = code ? Math.floor((code.length - 2) / 2) : 0;
+    if (mapping.kind === "main") {
+      result[mapping.label].codeHash = md5(code);
+      result[mapping.label].codeSize = size;
+      result[mapping.label].selectors = extractSelectors(code);
+    } else {
+      result[mapping.label].implCodeHash = md5(code);
+      result[mapping.label].implCodeSize = size;
+      result[mapping.label].implSelectors = extractSelectors(code);
     }
   }
 
@@ -7771,19 +7919,28 @@ async function fetchContractCreatorActors(contractEntries, state, options = {}) 
 }
 
 async function fetchActorContext(contractEntries, state, options = {}) {
+  const creatorMap = await fetchContractCreatorActors(contractEntries, state, options);
+  const signature = md5(JSON.stringify({
+    contracts: contractEntries.map(item => [item.address, item.labels, item.sources]),
+    creators: creatorMap,
+    extraActors: CONFIG.actorMonitor.extraActors,
+  }));
+  if (actorContextCache.signature === signature && actorContextCache.context) return actorContextCache.context;
+
   const actorMap = new Map();
   const contractMap = new Map();
   for (const c of contractEntries) addContractEntry(contractMap, c.labels?.[0] || "", c.address, c.sources?.[0] || "");
   for (const addr of CONFIG.actorMonitor.extraActors) addActorRole(actorMap, addr, "manual", "FOURMEME_WATCH_ACTORS", "env");
-
-  const creatorMap = await fetchContractCreatorActors(contractEntries, state, options);
   for (const c of contractEntries) {
     const creator = creatorMap[normalizeAddress(c.address)];
     if (creator?.creator) addActorRole(actorMap, creator.creator, "creator", c.labels.join("/"), "explorer");
   }
 
-  return { actors: actorMap, contracts: contractMap };
+  actorContextCache = { signature, context: { actors: actorMap, contracts: contractMap } };
+  return actorContextCache.context;
 }
+
+let actorContextCache = { signature: "", context: null };
 
 function decodeSafeExecTransaction(input) {
   if (txSelector(input) !== "0x6a761202") return null;
@@ -7865,12 +8022,69 @@ function classifyActorTx(tx, context) {
   };
 }
 
-async function fetchActorBlockActions(fromBlock, toBlock, context, state) {
+const actorRawScanState = { lastMode: "rawBlockPreFilter", fastSkips: 0, fallbacks: 0 };
+
+function rawRpcPayloadContainsActor(payload, actorAddresses) {
+  const addresses = (actorAddresses || []).map(address => String(address || "").trim()).filter(Boolean);
+  if (addresses.length === 0) return false;
+  const pattern = addresses.map(address => address.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  return new RegExp(pattern, "i").test(String(payload || ""));
+}
+
+async function fetchActorBlocksWithRawPrefilter(blockCalls, actorAddresses) {
+  if (actorAddresses.length === 0) return [];
+  let lastErr;
+  for (const rpcUrl of CONFIG.bscRpcUrls) {
+    try {
+      const payload = blockCalls.map((call, index) => ({
+        jsonrpc: "2.0",
+        id: index + 1,
+        method: call.method,
+        params: call.params,
+      }));
+      const res = await fetchSafe(rpcUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      }, 15_000);
+      const raw = await res.text();
+      if (!rawRpcPayloadContainsActor(raw, actorAddresses)) {
+        if (/"error"\s*:/i.test(raw) || !/"result"\s*:/i.test(raw)) {
+          throw new Error(`区块 RPC 返回异常：${raw.slice(0, 200)}`);
+        }
+        actorRawScanState.lastMode = "rawBlockPreFilter";
+        actorRawScanState.fastSkips++;
+        return [];
+      }
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed) || parsed.some(item => item?.error)) {
+        throw new Error(`区块 RPC 返回无效：${raw.slice(0, 200)}`);
+      }
+      parsed.sort((a, b) => a.id - b.id);
+      actorRawScanState.lastMode = "rawBlockParsed";
+      return parsed.map(item => item.result);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  actorRawScanState.lastMode = "batchFallback";
+  actorRawScanState.fallbacks++;
+  log(`[创建者] 原始区块预过滤不可用，回退标准 RPC 解析：${lastErr?.message || "未知错误"}`);
+  return bscRpcBatch(blockCalls);
+}
+
+async function fetchActorBlockActions(fromBlock, toBlock, context, state, rpcBatchFn = bscRpcBatch) {
   const blockCalls = [];
   for (let n = fromBlock; n <= toBlock; n++) {
     blockCalls.push({ method: "eth_getBlockByNumber", params: [blockTag(n), true] });
   }
-  const blocks = await bscRpcBatch(blockCalls);
+  const actorAddresses = [...context.actors.entries()]
+    .filter(([, actor]) => isCreatorActionActor(actor))
+    .map(([address]) => normalizeAddress(address))
+    .filter(Boolean);
+  const blocks = rpcBatchFn === bscRpcBatch
+    ? await fetchActorBlocksWithRawPrefilter(blockCalls, actorAddresses)
+    : await rpcBatchFn(blockCalls);
   const seen = new Set(state.seenTxs || []);
   const actions = [];
   for (const block of blocks) {
@@ -7886,7 +8100,7 @@ async function fetchActorBlockActions(fromBlock, toBlock, context, state) {
   }
 
   if (actions.length > 0) {
-    const receiptResults = await bscRpcBatch(actions.map(a => ({ method: "eth_getTransactionReceipt", params: [a.hash] })));
+    const receiptResults = await rpcBatchFn(actions.map(a => ({ method: "eth_getTransactionReceipt", params: [a.hash] })));
     for (let i = 0; i < actions.length; i++) {
       const receipt = receiptResults[i];
       actions[i].status = receipt?.status || "";
@@ -8221,7 +8435,7 @@ async function runActorCheck() {
     const shouldPersistProgress = actions.length > 0
       || Date.now() - lastActorProgressSaveAt >= 10_000;
     if (shouldPersistProgress) {
-      await saveSnapshot(snapshot);
+      await saveActorCheckpoint(snapshot);
       persistedActorStateSignature = JSON.stringify(state);
       lastActorProgressSaveAt = Date.now();
     }
@@ -8234,6 +8448,7 @@ async function runActorCheck() {
       appendHistory("actor", `链上创建者动作（${actions.length}项）`, content.slice(0, 300), content);
       const color = highCount > 0 ? "red" : "yellow";
       await sendNotificationMaybeAi({ title: `链上创建者动作（${actions.length}项）`, content, template: color, moduleContext: "Four.meme 合约创建者动作", url: `https://bscscan.com/block/${toBlock}` });
+      await saveSnapshot(snapshot);
     }
 
     if (Date.now() - runStart >= CONFIG.actorMonitor.maxRunMs && state.lastBlock < safeLatest) {
@@ -8271,7 +8486,7 @@ async function runActorCheck() {
   }
 
   const finalActorStateSignature = JSON.stringify(state);
-  if (persistedActorStateSignature !== finalActorStateSignature) await saveSnapshot(snapshot);
+  if (persistedActorStateSignature !== finalActorStateSignature) await saveActorCheckpoint(snapshot);
 
   if (anyActions) {
     try {
@@ -8524,7 +8739,9 @@ function recordModuleError(name, errMsg) {
   e.lastMsg = errMsg;
   e.lastFailTime = Date.now();
   // 记录最近 2 小时内的错误时间戳（用于状态汇总）
-  e.hourlyErrors.push(Date.now());
+  const now = Date.now();
+  e.hourlyErrors.push(now);
+  e.hourlyErrors = e.hourlyErrors.filter(time => now - time <= 2 * 60 * 60_000).slice(-2_000);
   if (e.consecutive >= ERROR_ALERT_THRESHOLD && !e.alerted) {
     e.alerted = true;
     log(`[告警] 模块 ${name} 连续失败 ${e.consecutive} 次：${errMsg}`);
@@ -8565,7 +8782,7 @@ function createModuleRunner(name, fn, intervalMs) {
     try {
       do {
         pending = false;
-        const metricSample = { durationMs: 0, requestCount: 0, backoffCount: 0, errorCount: 0 };
+        const metricSample = { moduleName: name, durationMs: 0, requestCount: 0, backoffCount: 0, errorCount: 0 };
         const startedAt = Date.now();
         try {
           await moduleMetricContext.run(metricSample, fn);
@@ -9274,6 +9491,15 @@ const modules = [
 ];
 const actorRunner = modules.find(m => m.name === "actor");
 
+function calculateNextModuleDueAt(nextDueAt, intervalMs, now = Date.now()) {
+  let next = nextDueAt + intervalMs;
+  if (next <= now) {
+    const missedTicks = Math.floor((now - next) / intervalMs) + 1;
+    next += missedTicks * intervalMs;
+  }
+  return next;
+}
+
 function buildStartupProgressContent() {
   const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
   return [
@@ -9313,6 +9539,11 @@ function buildStartupReadyContent() {
   const pendingRouteCount = Object.values(snapshot?._frontendPendingRoutes || {}).filter(route => route?.status === "pending").length;
   const approvedRouteCount = Object.values(snapshot?._frontendRouteApprovals || {}).filter(route => route?.status === "approved").length;
   const presetCount = snapshot?.openFourModules?.presetIds?.length || 0;
+  const memory = process.memoryUsage();
+  const performanceLines = modules.map((module) => {
+    const metric = summarizeModuleMetrics(moduleMetrics, module.name);
+    return `${module.name}：最近 ${metric.lastDurationMs}ms｜平均 ${metric.avgDurationMs}ms｜请求 ${metric.requestCount}`;
+  });
   return [
     `**01｜运行状态**`,
     `状态：监控运行中`,
@@ -9338,6 +9569,11 @@ function buildStartupReadyContent() {
     `异常资源复查：${formatDuration(CONFIG.frontendAssetJitter.quickConfirmDelayMs)}`,
     `请求策略：UA 轮换｜请求抖动｜同域限速｜条件请求｜失败退避`,
     `链上策略：tx.from 过滤｜确认块保护｜命中后合约复查`,
+    ``,
+    `**05｜性能基线**`,
+    `内存：RSS ${Math.round(memory.rss / 1024 / 1024)} MB｜堆使用 ${Math.round(memory.heapUsed / 1024 / 1024)} MB`,
+    `创建者扫描：完整区块原始文本预过滤｜无命中跳过 JSON 解析`,
+    ...performanceLines,
   ].join("\n");
 }
 
@@ -9406,8 +9642,7 @@ async function startAllModules() {
     function scheduleModule(delayMs = 0) {
       const timerId = setTimeout(async () => {
         await m.run();
-        nextDueAt += m.intervalMs;
-        if (nextDueAt <= Date.now()) nextDueAt = Date.now();
+        nextDueAt = calculateNextModuleDueAt(nextDueAt, m.intervalMs);
         const jitter = CONFIG.jitterMs > 0 ? Math.random() * CONFIG.jitterMs : 0;
         scheduleModule(Math.max(0, nextDueAt - Date.now()) + jitter);
       }, delayMs);
@@ -9472,7 +9707,11 @@ async function gracefulShutdown(signal) {
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   // 保存最终快照
-  try { await saveSnapshot(snapshot); } catch {}
+  try {
+    await saveActorCheckpoint(snapshot);
+    await saveSnapshot(snapshot);
+    await runtimeMetricsWriteQueue;
+  } catch {}
   process.exit(0);
 }
 if (!IS_TEST_MODE) {
@@ -9563,6 +9802,9 @@ export const __testables = {
   recordModuleMetric,
   summarizeModuleMetrics,
   createHostLimiter,
+  calculateNextModuleDueAt,
+  fetchActorBlockActions,
+  rawRpcPayloadContainsActor,
   buildStartupProgressContent,
   buildStartupReadyContent,
   diffApiStructures,

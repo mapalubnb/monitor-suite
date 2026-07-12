@@ -91,6 +91,12 @@ Four.meme 前端最低 `5` 秒，API 最低 `8` 秒；底池、OpenFour、合约
 
 `FLAP_POLL_INTERVAL_MS` 默认 `1000`，最低 `500`。遇到源站风控时可适当调高。
 
+## 性能优化
+
+Four.meme 监控在保持原有轮询间隔不变的前提下使用分层快速检测：创建者动作先在完整区块的原始响应文本中查找监听地址，无命中时跳过高成本 JSON 解析；合约每轮先比较链上代码哈希，代码变化后才下载 bytecode 和解析函数选择器；完全相同的前端 HTML 会直接复用结构化结果。创建者扫描游标单独保存到 `actor-state.json`，避免每个新区块重写包含全部前端资源的主快照。
+
+`fm-status` 会显示各模块最近耗时、平均耗时、累计请求、错误数、内存、快照写入耗时以及创建者扫描模式。原始区块预过滤或 `eth_getProof` 不可用时会自动回退原有完整检测，不降低监控覆盖。
+
 GitHub 等外部请求遇到 DNS、连接超时、连接重置或 IPv6 路由异常时会自动择优 IPv4/IPv6，并进行两次短间隔重试。最终失败日志会包含底层错误码、目标地址和原因，便于区分服务器网络问题与 GitHub API 错误。
 
 Flap 新金库通知、金库工厂变更和状态输出会同时提供 BscScan 合约链接与 `flap.sh/launch?vaultfactory=<地址>` 金库入口。页面监控同时覆盖 BNB CAstore 与 Robinhood 中文 CAstore；Robinhood 币股金库使用独立快照及带 `chain=robinhood&lang=zh` 的金库入口，不会并入 BSC 金库工厂状态。Flap 启动卡片与 `fl-status` 状态卡片都会同步显示 Robinhood 页面、币股模板、完整 Factory 和金库入口。

@@ -8,6 +8,10 @@ package-lock.json
 # 运行时数据
 snapshot.json
 snapshot.json.tmp
+actor-state.json
+actor-state.json.tmp
+runtime-metrics.json
+runtime-metrics.json.tmp
 lastpoll.txt
 history.jsonl
 diffs/

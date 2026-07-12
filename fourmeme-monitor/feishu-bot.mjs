@@ -316,6 +316,16 @@ function firstExistingPath(paths) {
   return paths.find(filePath => existsSync(filePath)) || "";
 }
 
+function mergeActorCheckpoint(snap, baseDir = CONFIG.monitorDir) {
+  try {
+    const actorPath = join(baseDir, "actor-state.json");
+    if (!existsSync(actorPath)) return snap;
+    const actor = JSON.parse(readFileSync(actorPath, "utf-8"));
+    if (actor?.chainActorMonitor) snap.chainActorMonitor = actor.chainActorMonitor;
+  } catch {}
+  return snap;
+}
+
 /**
  * 从快照文件构建监控上下文摘要（给 AI 参考）
  */
@@ -327,7 +337,7 @@ function buildMonitorContext() {
   if (existsSync(fmSnapPath)) {
     try {
       const stat = statSync(fmSnapPath);
-      const snap = JSON.parse(readFileSync(fmSnapPath, "utf-8"));
+      const snap = mergeActorCheckpoint(JSON.parse(readFileSync(fmSnapPath, "utf-8")), dirname(fmSnapPath));
       parts.push("=== Four.meme 监控快照 ===");
       parts.push(`更新时间: ${stat.mtime.toLocaleString("zh-CN", { hour12: false })}`);
 
@@ -979,7 +989,7 @@ function readFourmemeSnapshot() {
   const snapPath = join(CONFIG.monitorDir, "snapshot.json");
   if (!existsSync(snapPath)) return {};
   try {
-    return JSON.parse(readFileSync(snapPath, "utf-8"));
+    return mergeActorCheckpoint(JSON.parse(readFileSync(snapPath, "utf-8")), dirname(snapPath));
   } catch (err) {
     throw new Error(`读取 snapshot.json 失败：${err.message}`);
   }
