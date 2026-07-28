@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 2;
+export const FACTORY_POOL_SCHEMA_VERSION = 3;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -479,6 +479,12 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest" }) 
       lastTxHash: source.txHash || previous?.lastTxHash || "",
       lastSelector: source.selector || previous?.lastSelector || "",
       source: source.source || previous?.source || "",
+      name: previous?.name || "",
+      symbol: previous?.symbol || "",
+      metadataSource: previous?.metadataSource || "",
+      metadataUpdatedAt: previous?.metadataUpdatedAt || "",
+      metadataNextRetryAt: previous?.metadataNextRetryAt || "",
+      metadataError: previous?.metadataError || "",
     };
     state.assets[quoteToken] = next;
     if (!previous || previous.fingerprint !== next.fingerprint) {
@@ -730,10 +736,11 @@ export function buildFactoryPoolChangeLines(changes = []) {
   for (const change of changes) {
     const item = change.current;
     const label = change.type === "added" ? "新增" : change.type === "disabled" ? "停用" : "修改";
-    lines.push(`${label}底池: ${item.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : item.quoteToken}`);
+    const name = item.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : item.name || item.symbol || "名称待同步";
+    const symbol = item.symbol && item.symbol !== name ? ` (${item.symbol})` : "";
+    lines.push(`${label}底池: ${name}${symbol}`);
     lines.push(`  状态: ${item.enabled ? "已启用" : "未启用或已停用"}`);
     lines.push(`  quoteToken: ${item.quoteToken}`);
-    item.values.forEach((value, index) => lines.push(`  字段 ${index + 1}: ${value}`));
     if (item.lastTxHash) lines.push(`  交易: ${item.lastTxHash}`);
     if (item.lastSeenBlock != null) lines.push(`  区块: ${item.lastSeenBlock}`);
   }

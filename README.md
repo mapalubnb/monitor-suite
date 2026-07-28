@@ -90,6 +90,9 @@ FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS=10
 FLAP_FACTORY_HISTORY_BACKWARD_LOG_CHUNK_BLOCKS=2000
 FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS=50000
 FLAP_FACTORY_HISTORY_BACKWARD_BLOCK_CHUNK_BLOCKS=10
+FLAP_FACTORY_TOKEN_METADATA_API_URL=https://api.gopluslabs.io/api/v1/token_security/56
+FLAP_FACTORY_TOKEN_METADATA_TIMEOUT_MS=800
+FLAP_FACTORY_TOKEN_METADATA_RETRY_MS=300000
 ```
 
 `FOURMEME_HOST_REQUEST_MIN_DELAY_MS` 只错开 Four.meme 同 host 的请求，不改变各模块监控间隔；设为 `0` 可关闭。
@@ -116,7 +119,7 @@ Flap 同时会从 BSC 链上自动重建 Factory Proxy `0xe2cE6ab80874Fa9Fa2aAE6
 
 Factory 扫描采用确认块和独立调度：`headLastScannedBlock` 每秒只追踪最新确认块，保证连续补扫或历史 RPC 耗时较长时仍优先发现新资产；`lastScannedBlock` 负责补齐头部游标跳过的连续缺口。历史模块优先按已确认的底池配置事件 topic 大分块反向查询，同时保留从部署区块正向扫描、通用日志反向扫描和完整区块扫描，启动前已经存在的底池不必等待正向游标遍历数千万区块，也不会因只依赖单一事件而漏检。
 
-链上状态独立保存在 `flap-monitor/factory-pool-state.json`，并支持 RPC 自动切换、动态日志分块、短链重组检查、断点续扫和持久化待发送通知。首次全新安装只建立实时基线；已有游标的进程重启会继续检测停机期间的确认块，发送失败的待通知也不会被启动流程清空。`fl-status` 会分别显示实时头部延迟、连续缺口、正向历史和反向历史进度，以及 implementation、候选数量、启用/停用资产和五个完整配置字段。
+链上状态独立保存在 `flap-monitor/factory-pool-state.json`，并支持 RPC 自动切换、动态日志分块、短链重组检查、断点续扫和持久化待发送通知。首次全新安装只建立实时基线；已有游标的进程重启会继续检测停机期间的确认块，发送失败的待通知也不会被启动流程清空。底池名称和符号优先通过 GoPlus 免费免密 API 批量获取，API 超时或尚未收录时自动使用只读 RPC 调用 ERC-20 `name()`、`symbol()`，结果写入状态缓存且不影响链上配置判断。启动卡片、变更卡片和 `fl-status` 只显示名称、符号、状态和完整地址，不再展示五个内部配置字段。
 
 被风控时建议先把前端并发降到：
 

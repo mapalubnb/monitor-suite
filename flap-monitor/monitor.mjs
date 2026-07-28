@@ -109,6 +109,9 @@ const CONFIG = {
     historyBackwardBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BACKWARD_BLOCK_CHUNK_BLOCKS", 10, 1),
     deepHistoryBlockScan: process.env.FLAP_FACTORY_DEEP_HISTORY_BLOCK_SCAN !== "false",
     assetRefreshPerRun: readPositiveIntEnv("FLAP_FACTORY_ASSET_REFRESH_PER_RUN", 10, 1),
+    tokenMetadataApiUrl: process.env.FLAP_FACTORY_TOKEN_METADATA_API_URL || "https://api.gopluslabs.io/api/v1/token_security/56",
+    tokenMetadataTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_TOKEN_METADATA_TIMEOUT_MS", 800, 300),
+    tokenMetadataRetryMs: readPositiveIntEnv("FLAP_FACTORY_TOKEN_METADATA_RETRY_MS", 300_000, 10_000),
   },
 
   // 反风控
@@ -2511,6 +2514,150 @@ async function bscRpcBatch(calls = [], options = {}) {
   throw lastErr || new Error("所有 BSC RPC 节点 batch 均不可用");
 }
 
+const ERC20_NAME_SELECTOR = "0x06fdde03";
+const ERC20_SYMBOL_SELECTOR = "0x95d89b41";
+
+function cleanTokenMetadataText(value) {
+  return String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
+}
+
+function decodeErc20MetadataText(value) {
+  const hex = String(value || "").replace(/^0x/i, "");
+  if (!/^[a-fA-F0-9]{64,}$/.test(hex)) return "";
+  let dataHex = hex.slice(0, 64);
+  try {
+    const offset = Number(BigInt(`0x${hex.slice(0, 64)}`));
+    const lengthOffset = offset * 2;
+    if (Number.isSafeInteger(offset) && offset >= 0 && lengthOffset + 64 <= hex.length) {
+      const length = Number(BigInt(`0x${hex.slice(lengthOffset, lengthOffset + 64)}`));
+      const dataOffset = lengthOffset + 64;
+      if (Number.isSafeInteger(length) && length >= 0 && dataOffset + length * 2 <= hex.length) {
+        dataHex = hex.slice(dataOffset, dataOffset + length * 2);
+      }
+    }
+    const bytes = Uint8Array.from(dataHex.match(/.{2}/g) || [], byte => Number.parseInt(byte, 16));
+    return cleanTokenMetadataText(new TextDecoder().decode(bytes).replace(/\0+$/g, ""));
+  } catch {
+    return "";
+  }
+}
+
+function parseGoPlusTokenMetadata(payload, addresses = []) {
+  const result = payload?.result && typeof payload.result === "object" ? payload.result : {};
+  const metadata = {};
+  for (const address of addresses) {
+    const key = normalizeAddress(address);
+    const item = result[key] || result[address] || {};
+    const name = cleanTokenMetadataText(item.token_name);
+    const symbol = cleanTokenMetadataText(item.token_symbol);
+    if (name || symbol) metadata[key] = { name, symbol, source: "goplus" };
+  }
+  return metadata;
+}
+
+async function resolveErc20MetadataViaRpc(tokens, rpcBatchFn) {
+  const calls = tokens.flatMap(address => [
+    { method: "eth_call", params: [{ to: address, data: ERC20_NAME_SELECTOR }, "latest"] },
+    { method: "eth_call", params: [{ to: address, data: ERC20_SYMBOL_SELECTOR }, "latest"] },
+  ]);
+  const values = await rpcBatchFn(calls);
+  const metadata = {};
+  tokens.forEach((address, index) => {
+    const name = decodeErc20MetadataText(values[index * 2]);
+    const symbol = decodeErc20MetadataText(values[index * 2 + 1]);
+    if (name || symbol) metadata[address] = { name, symbol, source: "onchain" };
+  });
+  return metadata;
+}
+
+async function resolveFactoryPoolTokenMetadata(addresses, options = {}) {
+  const normalized = [...new Set(addresses.map(normalizeAddress).filter(Boolean))];
+  const metadata = {};
+  if (normalized.includes(BNB_QUOTE_TOKEN)) {
+    metadata[BNB_QUOTE_TOKEN] = { name: "BNB", symbol: "BNB", source: "native" };
+  }
+  const tokens = normalized.filter(address => address !== BNB_QUOTE_TOKEN);
+  if (tokens.length === 0) return { metadata, errors: [] };
+
+  const errors = [];
+  const fetchFn = options.fetchFn || fetch;
+  const rpcBatchFn = options.rpcBatchFn || (calls => bscRpcBatch(calls));
+  const apiUrl = options.apiUrl || CONFIG.factoryPoolMonitor.tokenMetadataApiUrl;
+  const timeoutMs = options.timeoutMs || CONFIG.factoryPoolMonitor.tokenMetadataTimeoutMs;
+  const onchainPromise = resolveErc20MetadataViaRpc(tokens, rpcBatchFn)
+    .then(value => ({ value, error: null }))
+    .catch(error => ({ value: {}, error }));
+  try {
+    const url = new URL(apiUrl);
+    url.searchParams.set("contract_addresses", tokens.join(","));
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchFn(url, { headers: { Accept: "application/json" }, signal: controller.signal });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      Object.assign(metadata, parseGoPlusTokenMetadata(await response.json(), tokens));
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (error) {
+    errors.push(`GoPlus: ${error.name === "AbortError" ? `超时 ${timeoutMs}ms` : error.message}`);
+  }
+
+  const unresolved = tokens.filter(address => !metadata[address]?.name || !metadata[address]?.symbol);
+  if (unresolved.length > 0) {
+    const onchain = await onchainPromise;
+    if (onchain.error) {
+      errors.push(`链上元数据: ${onchain.error.message}`);
+    } else {
+      for (const address of unresolved) {
+        const fallback = onchain.value[address];
+        if (!fallback) continue;
+        const current = metadata[address] || { name: "", symbol: "", source: "" };
+        metadata[address] = {
+          name: current.name || fallback.name,
+          symbol: current.symbol || fallback.symbol,
+          source: current.source ? `${current.source}+onchain` : "onchain",
+        };
+      }
+    }
+  }
+  return { metadata, errors };
+}
+
+async function enrichFactoryPoolTokenMetadata(state, preferredAddresses = []) {
+  const now = Date.now();
+  const preferred = preferredAddresses.map(normalizeAddress).filter(Boolean);
+  const remaining = Object.keys(state.assets || {}).sort();
+  const addresses = [...new Set([...preferred, ...remaining])]
+    .filter(address => {
+      const asset = state.assets?.[address];
+      if (!asset || (asset.name && asset.symbol)) return false;
+      const retryAt = Date.parse(asset.metadataNextRetryAt || "");
+      return !Number.isFinite(retryAt) || retryAt <= now;
+    })
+    .slice(0, 30);
+  if (addresses.length === 0) return;
+  const result = await resolveFactoryPoolTokenMetadata(addresses);
+  const updatedAt = new Date().toISOString();
+  const nextRetryAt = new Date(now + CONFIG.factoryPoolMonitor.tokenMetadataRetryMs).toISOString();
+  for (const address of addresses) {
+    const asset = state.assets[address];
+    if (!asset) continue;
+    const item = result.metadata[address];
+    if (item) {
+      asset.name = item.name || asset.name || "";
+      asset.symbol = item.symbol || asset.symbol || "";
+      asset.metadataSource = item.source;
+      asset.metadataUpdatedAt = updatedAt;
+      asset.metadataNextRetryAt = asset.name && asset.symbol ? "" : nextRetryAt;
+      asset.metadataError = "";
+    } else {
+      asset.metadataNextRetryAt = nextRetryAt;
+      asset.metadataError = result.errors.join("｜") || "免费 API 与链上调用均未返回名称";
+    }
+  }
+}
+
 function extractRegistryVaultAddressesFromLog(logEntry) {
   const registry = CONFIG.registryMonitor.address;
   if (normalizeAddress(logEntry?.address) !== registry) return [];
@@ -2640,8 +2787,9 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
   return { changed: true, sent: Boolean(messageId), events: newEvents };
 }
 
-function formatFactoryPoolAssetLabel(address) {
-  return address === BNB_QUOTE_TOKEN ? `BNB (${addressLink(address)})` : addressLink(address);
+function formatFactoryPoolAssetName(asset = {}) {
+  const name = asset.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : asset.name || asset.symbol || "名称待同步";
+  return asset.symbol && asset.symbol !== name ? `${name} (${asset.symbol})` : name;
 }
 
 function buildFactoryPoolMonitorContent(result) {
@@ -2659,9 +2807,9 @@ function buildFactoryPoolMonitorContent(result) {
   for (const change of result.changes) {
     const item = change.current;
     const label = change.type === "added" ? "新增" : change.type === "disabled" ? "停用" : "修改";
-    primary.push(`${label}底池: ${formatFactoryPoolAssetLabel(item.quoteToken)}`);
+    primary.push(`${label}底池: ${formatFactoryPoolAssetName(item)}`);
     primary.push(`  状态: ${item.enabled ? "已启用" : "未启用或已停用"}`);
-    item.values.forEach((value, index) => primary.push(`  字段 ${index + 1}: ${value}`));
+    primary.push(`  地址: ${addressLink(item.quoteToken)}`);
     if (item.lastTxHash) primary.push(`  交易: ${txLink(item.lastTxHash)}`);
     if (item.lastSeenBlock != null) primary.push(`  区块: ${blockLink(item.lastSeenBlock)}`);
   }
@@ -2694,9 +2842,14 @@ async function checkFlapFactoryPools(factoryPoolState, { sendCardFn = sendCardVi
     config: { ...CONFIG.factoryPoolMonitor, ...scanConfig },
     log,
   });
+  await enrichFactoryPoolTokenMetadata(factoryPoolState, result.changes.map(change => change.current.quoteToken));
   const deliver = async () => {
     if (!suppressNotifications) {
       factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
+      factoryPoolState.pendingChanges = factoryPoolState.pendingChanges.map(change => ({
+        ...change,
+        current: factoryPoolState.assets[change.current.quoteToken] || change.current,
+      }));
       if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
     }
     saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
@@ -4998,10 +5151,8 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
   const poolAssets = Object.values(factoryPoolState.assets || {}).sort((a, b) => a.quoteToken.localeCompare(b.quoteToken));
   const relatedSelectors = Object.values(factoryPoolState.relatedSelectors || {}).sort((a, b) => a.selector.localeCompare(b.selector));
   const poolAssetLines = poolAssets.length > 0
-    ? poolAssets.flatMap((asset, index) => [
-        `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetLabel(asset.quoteToken)}｜状态 ${asset.enabled ? "已启用" : "未启用或已停用"}`,
-        ...(asset.values || []).map((value, fieldIndex) => `字段 ${fieldIndex + 1}：${value}`),
-      ])
+    ? poolAssets.map((asset, index) =>
+        `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetName(asset)}｜状态 ${asset.enabled ? "已启用" : "未启用或已停用"}｜地址 ${addressLink(asset.quoteToken)}`)
     : ["尚未发现已配置的 Factory 底池资产"];
   return [
     "**01｜运行状态**",
@@ -5535,6 +5686,9 @@ export const __testables = {
   extractRegistryVaultAddressesFromLog,
   buildRegistryMonitorContent,
   buildFactoryPoolMonitorContent,
+  decodeErc20MetadataText,
+  parseGoPlusTokenMetadata,
+  resolveFactoryPoolTokenMetadata,
   buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,
   extractVaultFactories,

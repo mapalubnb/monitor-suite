@@ -122,6 +122,7 @@ test("Flap status links current factories and registered vaults to launch pages"
 
 test("Flap status shows complete Factory pool state", () => {
   const quoteToken = "0x0000000000000000000000000000000000000000";
+  const namedToken = "0x21caef8a43163eea865baee23b9c2e327696a3bf";
   const txHash = `0x${"ab".repeat(32)}`;
   const output = renderFlapStatus({ pages: {}, vaultFactories: {} }, {
     proxy: "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0",
@@ -140,7 +141,8 @@ test("Flap status shows complete Factory pool state", () => {
     historyBackwardBlockCursor: 90,
     candidates: { [quoteToken]: {} },
     assets: {
-      [quoteToken]: { quoteToken, enabled: true, values: ["1", "2", "3", "4", "5"], lastTxHash: txHash, lastSeenBlock: 99 },
+      [quoteToken]: { quoteToken, name: "BNB", symbol: "BNB", enabled: true, values: ["1", "2", "3", "4", "5"], lastTxHash: txHash, lastSeenBlock: 99 },
+      [namedToken]: { quoteToken: namedToken, name: "Tether Gold", symbol: "XAUt", enabled: true, values: ["1", "33", "33", "7", "0"] },
     },
   });
   assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
@@ -148,8 +150,9 @@ test("Flap status shows complete Factory pool state", () => {
   assert.match(output, /实时头部：100｜安全区块 100｜最新区块 105｜延迟 0 块/);
   assert.match(output, /历史反向：日志 95｜完整区块 90/);
   assert.match(output, /配置事件快速回溯：97/);
-  assert.match(output, /BNB｜地址 \[0x0000000000000000000000000000000000000000\]/);
-  for (let index = 1; index <= 5; index++) assert.match(output, new RegExp(`字段 ${index}：${index}`));
+  assert.match(output, /BNB｜状态 已启用｜地址 \[0x0000000000000000000000000000000000000000\]/);
+  assert.match(output, /Tether Gold \(XAUt\)｜状态 已启用｜地址 \[0x21caef8a43163eea865baee23b9c2e327696a3bf\]/);
+  assert.doesNotMatch(output, /字段 [1-5]：/);
   assert.match(output, new RegExp(txHash));
 });
 

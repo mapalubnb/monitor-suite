@@ -45,6 +45,12 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
     historyLastScannedBlock: 90,
     assets: {
       [BNB_QUOTE_TOKEN]: { quoteToken: BNB_QUOTE_TOKEN, enabled: true, values: ["1", "2", "3", "4", "5"] },
+      "0x21caef8a43163eea865baee23b9c2e327696a3bf": {
+        quoteToken: "0x21caef8a43163eea865baee23b9c2e327696a3bf",
+        name: "Tether Gold",
+        symbol: "XAUt",
+        enabled: true,
+      },
     },
   });
   for (const url of __testables.CONFIG.urls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -60,7 +66,10 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
   assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
   assert.match(content, /\*\*05｜Factory 底池资产\*\*/);
   assert.match(content, /部署区块：39980228/);
-  for (let index = 1; index <= 5; index++) assert.match(content, new RegExp(`字段 ${index}：${index}`));
+  assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
+  assert.match(content, /Tether Gold \(XAUt\)｜状态 已启用｜地址/);
+  assert.match(content, /0x21caef8a43163eea865baee23b9c2e327696a3bf/);
+  assert.doesNotMatch(content, /字段 [1-5]：/);
   assert.doesNotMatch(content, /操作入口|更新时间：|CAStore 展示/);
   assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
   assert.doesNotMatch(content, /(^|\n)-\s/m);
@@ -93,7 +102,7 @@ test("Factory transaction candidate parsing keeps BNB zero address", () => {
   assert.deepEqual(candidates.map(item => item.quoteToken), [BNB_QUOTE_TOKEN, token]);
 });
 
-test("Factory pool change card keeps full addresses hashes and five fields without bullets", () => {
+test("Factory pool change card keeps name full address and hash without internal fields", () => {
   const txHash = `0x${"12".repeat(32)}`;
   const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
   const content = __testables.buildFactoryPoolMonitorContent({
@@ -106,16 +115,52 @@ test("Factory pool change card keeps full addresses hashes and five fields witho
     },
     changes: [{
       type: "added",
-      current: { quoteToken: BNB_QUOTE_TOKEN, enabled: true, values: ["1", "20", "20", "0", "0"], lastTxHash: txHash, lastSeenBlock: 104 },
+      current: { quoteToken: BNB_QUOTE_TOKEN, name: "BNB", symbol: "BNB", enabled: true, values: ["1", "20", "20", "0", "0"], lastTxHash: txHash, lastSeenBlock: 104 },
     }],
     implementationChange: null,
   });
   assert.match(content, new RegExp(FLAP_FACTORY_PROXY));
   assert.match(content, new RegExp(implementation));
   assert.match(content, new RegExp(txHash));
-  for (let index = 1; index <= 5; index++) assert.match(content, new RegExp(`字段 ${index}:`));
+  assert.match(content, /新增底池: BNB/);
+  assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
+  assert.doesNotMatch(content, /字段 [1-5]:/);
   assert.doesNotMatch(content, /(^|\n)-\s/m);
   assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
+});
+
+test("Factory token metadata uses the free GoPlus API response", async () => {
+  const token = "0x3333333333333333333333333333333333333333";
+  const result = await __testables.resolveFactoryPoolTokenMetadata([token], {
+    apiUrl: "https://metadata.example/token",
+    fetchFn: async url => {
+      assert.match(String(url), new RegExp(token));
+      return {
+        ok: true,
+        json: async () => ({ result: { [token]: { token_name: "USD Pool", token_symbol: "USDP" } } }),
+      };
+    },
+    rpcBatchFn: async () => { throw new Error("并行链上结果不可用"); },
+  });
+  assert.deepEqual(result.metadata[token], { name: "USD Pool", symbol: "USDP", source: "goplus" });
+});
+
+test("Factory token metadata falls back to read-only ERC20 calls", async () => {
+  const token = "0x4444444444444444444444444444444444444444";
+  const encodeDynamicText = text => {
+    const value = Buffer.from(text, "utf8").toString("hex");
+    return `0x${32n.toString(16).padStart(64, "0")}${BigInt(value.length / 2).toString(16).padStart(64, "0")}${value.padEnd(64, "0")}`;
+  };
+  const result = await __testables.resolveFactoryPoolTokenMetadata([token], {
+    apiUrl: "https://metadata.example/token",
+    fetchFn: async () => ({ ok: false, status: 503 }),
+    rpcBatchFn: async calls => {
+      assert.equal(calls.length, 2);
+      return [encodeDynamicText("Chain Pool"), `0x${Buffer.from("CHAIN").toString("hex").padEnd(64, "0")}`];
+    },
+  });
+  assert.deepEqual(result.metadata[token], { name: "Chain Pool", symbol: "CHAIN", source: "onchain" });
+  assert.match(result.errors[0], /GoPlus: HTTP 503/);
 });
 
 test("Factory pending notification queue keeps unsent changes and deduplicates by address", () => {
@@ -198,8 +243,14 @@ test("Factory scanner resumes confirmed blocks, verifies assets and stays idempo
   assert.equal(state.assets[token].enabled, true);
   assert.deepEqual(state.assets[token].values, ["1", "2", "3", "4", "5"]);
   assert.equal(first.changes.length, 1);
+  state.assets[token].name = "Test Pool";
+  state.assets[token].symbol = "TEST";
+  state.assets[token].metadataSource = "goplus";
   const second = await runFactoryPoolScan({ state, rpcCall, config });
   assert.equal(second.changes.length, 0);
+  assert.equal(state.assets[token].name, "Test Pool");
+  assert.equal(state.assets[token].symbol, "TEST");
+  assert.equal(state.assets[token].metadataSource, "goplus");
   assert.equal(Object.keys(state.processedTransactions).length, 1);
   assert.equal(state.candidates[token].sources.length, 1);
   assert.ok(state.relatedSelectors["0x12345678"]);
