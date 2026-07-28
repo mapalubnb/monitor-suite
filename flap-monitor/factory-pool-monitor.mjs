@@ -763,7 +763,7 @@ export function buildFactoryPoolChangeLines(changes = []) {
   for (const change of changes) {
     const item = change.current;
     const label = change.type === "added" ? "新增" : change.type === "disabled" ? "停用" : "修改";
-    const name = item.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : item.name || item.symbol || "名称待同步";
+    const name = item.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : item.name || item.symbol || "名称同步中";
     const symbol = item.symbol && item.symbol !== name ? ` (${item.symbol})` : "";
     lines.push(`${label}底池: ${name}${symbol}`);
     lines.push(`  状态: ${item.enabled ? "已启用" : "未启用或已停用"}`);

@@ -618,7 +618,7 @@ if [ -f "$SNAP" ]; then
     if(poolAssets.length===0) console.log('尚未发现已配置的 Factory 底池资产');
     for(const [index,v] of poolAssets.entries()){
       const address=v.quoteToken||'';
-      const name=address==='0x0000000000000000000000000000000000000000'?'BNB':(v.name||v.symbol||'名称待同步');
+      const name=address==='0x0000000000000000000000000000000000000000'?'BNB':(v.name||v.symbol||'名称同步中');
       const label=v.symbol&&v.symbol!==name?name+' ('+v.symbol+')':name;
       console.log(String(index+1).padStart(2,'0')+'　'+label+'｜状态 '+(v.enabled?'已启用':'未启用或已停用')+'｜地址 '+mdLink(address,'https://bscscan.com/address/'+address));
       if(v.lastTxHash) console.log('交易：'+mdLink(v.lastTxHash,'https://bscscan.com/tx/'+v.lastTxHash));

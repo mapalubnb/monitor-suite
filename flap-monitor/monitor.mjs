@@ -858,7 +858,7 @@ async function patchCardViaApi(messageId, title, content, template = "red", diff
 
 const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
   const n = Number(process.env.FEISHU_CARD_CHUNK_LIMIT || 3500);
-  return Number.isFinite(n) && n >= 500 ? Math.floor(n) : 3500;
+  return Number.isFinite(n) && n >= 500 ? Math.floor(n) - 40 : 3460;
 })();
 
 function isTooLongForSingleCard(content) {
@@ -2790,7 +2790,7 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
 }
 
 function formatFactoryPoolAssetName(asset = {}) {
-  const name = asset.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : asset.name || asset.symbol || "名称待同步";
+  const name = asset.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : asset.name || asset.symbol || "名称同步中";
   return asset.symbol && asset.symbol !== name ? `${name} (${asset.symbol})` : name;
 }
 
@@ -2834,17 +2834,83 @@ function buildFactoryPoolMonitorContent(result) {
 }
 
 let factoryPoolDeliveryQueue = Promise.resolve();
+let factoryPoolMetadataQueue = Promise.resolve();
 
-async function checkFlapFactoryPools(factoryPoolState, { sendCardFn = sendCardViaApi, titlePrefix = "", suppressNotifications = false, scanConfig = {} } = {}) {
+function factoryPoolMetadataFingerprint(asset = {}) {
+  return `${asset.name || ""}\u0000${asset.symbol || ""}\u0000${asset.metadataSource || ""}`;
+}
+
+async function enrichFactoryPoolMetadataAfterSend({
+  state,
+  result,
+  messageId = "",
+  title = "",
+  template = "red",
+  initialContent = "",
+  enrichFn = enrichFactoryPoolTokenMetadata,
+  patchFn = patchCardViaApi,
+  saveFn = saveFactoryPoolState,
+  stateFile = CONFIG.factoryPoolMonitor.stateFile,
+} = {}) {
+  const changes = result?.changes || [];
+  const addresses = [...new Set(changes.map(change => normalizeAddress(change.current?.quoteToken)).filter(Boolean))];
+  const before = new Map(addresses.map(address => [address, factoryPoolMetadataFingerprint(state.assets?.[address])]));
+  await enrichFn(state, addresses);
+  saveFn(stateFile, state);
+
+  const metadataChanged = addresses.some(address =>
+    before.get(address) !== factoryPoolMetadataFingerprint(state.assets?.[address]));
+  if (!messageId || !metadataChanged) return { patched: false, metadataChanged };
+
+  const enrichedResult = {
+    ...result,
+    state,
+    changes: changes.map(change => ({
+      ...change,
+      current: state.assets?.[change.current.quoteToken] || change.current,
+    })),
+  };
+  const enrichedContent = buildFactoryPoolMonitorContent(enrichedResult);
+  if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
+    log(`[Flap Factory 名称] ${title} 为分段卡片，仅更新名称缓存`);
+    return { patched: false, metadataChanged };
+  }
+  await patchFn(messageId, title, enrichedContent, template);
+  log(`[Flap Factory 名称] 已更新原卡片 ${messageId}`);
+  return { patched: true, metadataChanged };
+}
+
+function scheduleFactoryPoolMetadataEnrichment(options) {
+  const job = factoryPoolMetadataQueue.then(
+    () => enrichFactoryPoolMetadataAfterSend(options),
+    () => enrichFactoryPoolMetadataAfterSend(options),
+  );
+  const handled = job.catch(error => {
+    log(`[Flap Factory 名称] 异步同步失败：${error.message}`);
+    return { patched: false, metadataChanged: false, error };
+  });
+  factoryPoolMetadataQueue = handled.then(() => undefined);
+  return handled;
+}
+
+async function checkFlapFactoryPools(factoryPoolState, {
+  sendCardFn = sendCardViaApi,
+  titlePrefix = "",
+  suppressNotifications = false,
+  scanConfig = {},
+  scanFn = runFactoryPoolScan,
+  saveStateFn = saveFactoryPoolState,
+  pinFn = pinMessage,
+  scheduleMetadataFn = scheduleFactoryPoolMetadataEnrichment,
+} = {}) {
   if (!CONFIG.factoryPoolMonitor.enabled) return { changed: false, sent: false, state: factoryPoolState };
-  const result = await runFactoryPoolScan({
+  const result = await scanFn({
     state: factoryPoolState,
     rpcCall: bscRpcCall,
     rpcBatch: calls => bscRpcBatch(calls, { requireAllResults: true }),
     config: { ...CONFIG.factoryPoolMonitor, ...scanConfig },
     log,
   });
-  await enrichFactoryPoolTokenMetadata(factoryPoolState, result.changes.map(change => change.current.quoteToken));
   const deliver = async () => {
     if (!suppressNotifications) {
       factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
@@ -2854,22 +2920,39 @@ async function checkFlapFactoryPools(factoryPoolState, { sendCardFn = sendCardVi
       }));
       if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
     }
-    saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
-    if (suppressNotifications) return { ...result, sent: false };
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    if (suppressNotifications) {
+      void scheduleMetadataFn({ state: factoryPoolState, result });
+      return { ...result, sent: false };
+    }
     const shouldNotify = factoryPoolState.pendingChanges.length > 0 || Boolean(factoryPoolState.pendingImplementationChange?.previous);
-    if (!shouldNotify) return { ...result, sent: false };
+    if (!shouldNotify) {
+      void scheduleMetadataFn({ state: factoryPoolState, result });
+      return { ...result, sent: false };
+    }
     const pendingResult = {
       ...result,
       changes: factoryPoolState.pendingChanges,
       implementationChange: factoryPoolState.pendingImplementationChange,
     };
     const title = `${titlePrefix}Flap Factory 底池资产链上变更`;
-    const messageId = await sendCardFn(title, buildFactoryPoolMonitorContent(pendingResult), "red");
-    if (!messageId) return { ...result, sent: false };
+    const initialContent = buildFactoryPoolMonitorContent(pendingResult);
+    const messageId = await sendCardFn(title, initialContent, "red");
+    if (!messageId) {
+      void scheduleMetadataFn({ state: factoryPoolState, result: pendingResult });
+      return { ...result, sent: false };
+    }
     factoryPoolState.pendingChanges = [];
     factoryPoolState.pendingImplementationChange = null;
-    saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
-    try { await pinMessage(messageId); } catch (err) { log(`[Flap Factory] 卡片置顶失败：${err.message}`); }
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    void scheduleMetadataFn({
+      state: factoryPoolState,
+      result: pendingResult,
+      messageId,
+      title,
+      initialContent,
+    });
+    try { await pinFn(messageId); } catch (err) { log(`[Flap Factory] 卡片置顶失败：${err.message}`); }
     return { ...result, sent: true };
   };
   const delivery = factoryPoolDeliveryQueue.then(deliver, deliver);
@@ -5718,6 +5801,9 @@ export const __testables = {
   extractRegistryVaultAddressesFromLog,
   buildRegistryMonitorContent,
   buildFactoryPoolMonitorContent,
+  checkFlapFactoryPools,
+  enrichFactoryPoolMetadataAfterSend,
+  scheduleFactoryPoolMetadataEnrichment,
   decodeErc20MetadataText,
   parseGoPlusTokenMetadata,
   resolveFactoryPoolTokenMetadata,

@@ -133,6 +133,118 @@ test("Factory pool change card keeps name full address and hash without internal
   assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
 });
 
+test("Factory pool change card sends immediately with full address while name is syncing", () => {
+  const token = "0x5555555555555555555555555555555555555555";
+  const content = __testables.buildFactoryPoolMonitorContent({
+    state: {
+      proxy: FLAP_FACTORY_PROXY,
+      currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
+      headLastScannedBlock: 200,
+      safeLatestBlock: 200,
+      assets: { [token]: { quoteToken: token, enabled: true } },
+    },
+    changes: [{ type: "added", current: { quoteToken: token, enabled: true, lastSeenBlock: 199 } }],
+    implementationChange: null,
+  });
+  assert.match(content, /新增底池: 名称同步中/);
+  assert.match(content, new RegExp(token));
+});
+
+test("Factory metadata enrichment patches the original card after first delivery", async () => {
+  const token = "0x6666666666666666666666666666666666666666";
+  const state = {
+    proxy: FLAP_FACTORY_PROXY,
+    currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
+    headLastScannedBlock: 300,
+    safeLatestBlock: 300,
+    assets: { [token]: { quoteToken: token, enabled: true } },
+  };
+  const result = {
+    state,
+    changes: [{ type: "added", current: state.assets[token] }],
+    implementationChange: null,
+  };
+  let patched = null;
+  let saved = false;
+  const outcome = await __testables.enrichFactoryPoolMetadataAfterSend({
+    state,
+    result,
+    messageId: "om_test",
+    title: "Flap Factory 底池资产链上变更",
+    initialContent: "名称同步中",
+    enrichFn: async targetState => {
+      targetState.assets[token].name = "Fast Pool";
+      targetState.assets[token].symbol = "FAST";
+      targetState.assets[token].metadataSource = "onchain";
+    },
+    patchFn: async (...args) => { patched = args; },
+    saveFn: () => { saved = true; },
+  });
+  assert.equal(outcome.patched, true);
+  assert.equal(saved, true);
+  assert.equal(patched[0], "om_test");
+  assert.match(patched[2], /Fast Pool \(FAST\)/);
+  assert.match(patched[2], new RegExp(token));
+  assert.doesNotMatch(patched[2], /名称同步中/);
+});
+
+test("Factory asynchronous metadata failure does not patch or reject delivery flow", async () => {
+  const token = "0x7777777777777777777777777777777777777777";
+  const state = { assets: { [token]: { quoteToken: token, enabled: true } } };
+  let patchCalls = 0;
+  const outcome = await __testables.scheduleFactoryPoolMetadataEnrichment({
+    state,
+    result: { state, changes: [{ type: "added", current: state.assets[token] }] },
+    messageId: "om_test",
+    title: "test",
+    enrichFn: async () => { throw new Error("metadata unavailable"); },
+    patchFn: async () => { patchCalls++; },
+    saveFn: () => {},
+  });
+  assert.equal(outcome.patched, false);
+  assert.equal(outcome.error.message, "metadata unavailable");
+  assert.equal(patchCalls, 0);
+});
+
+test("Factory first delivery does not await metadata enrichment", async () => {
+  const token = "0x8888888888888888888888888888888888888888";
+  const asset = { quoteToken: token, enabled: true, lastSeenBlock: 400 };
+  const state = {
+    proxy: FLAP_FACTORY_PROXY,
+    currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
+    headLastScannedBlock: 400,
+    safeLatestBlock: 400,
+    assets: { [token]: asset },
+    pendingChanges: [],
+    pendingImplementationChange: null,
+  };
+  let metadataScheduled = false;
+  const delivery = __testables.checkFlapFactoryPools(state, {
+    scanFn: async () => ({
+      changed: true,
+      changes: [{ type: "added", current: asset }],
+      implementationChange: null,
+      state,
+    }),
+    sendCardFn: async (_title, content) => {
+      assert.match(content, /名称同步中/);
+      return "om_fast";
+    },
+    saveStateFn: () => {},
+    pinFn: async () => {},
+    scheduleMetadataFn: () => {
+      metadataScheduled = true;
+      return new Promise(() => {});
+    },
+  });
+  const outcome = await Promise.race([
+    delivery,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("首发等待了名称任务")), 50)),
+  ]);
+  assert.equal(outcome.sent, true);
+  assert.equal(metadataScheduled, true);
+});
+
 test("Factory token metadata uses the free GoPlus API response", async () => {
   const token = "0x3333333333333333333333333333333333333333";
   const result = await __testables.resolveFactoryPoolTokenMetadata([token], {
