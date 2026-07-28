@@ -128,12 +128,16 @@ test("Flap status shows complete Factory pool state", () => {
     currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
     deploymentBlock: 39980228,
     deploymentDetection: "eth_getCode-binary-search",
+    headLastScannedBlock: 100,
     lastScannedBlock: 100,
     safeLatestBlock: 100,
     latestBlock: 105,
     historyLogLastScannedBlock: 90,
     historyBlockLastScannedBlock: 80,
     historyLastScannedBlock: 80,
+    historyBackwardLogCursor: 95,
+    historyConfigEventCursor: 97,
+    historyBackwardBlockCursor: 90,
     candidates: { [quoteToken]: {} },
     assets: {
       [quoteToken]: { quoteToken, enabled: true, values: ["1", "2", "3", "4", "5"], lastTxHash: txHash, lastSeenBlock: 99 },
@@ -141,6 +145,9 @@ test("Flap status shows complete Factory pool state", () => {
   });
   assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
   assert.match(output, /部署区块：39980228/);
+  assert.match(output, /实时头部：100｜安全区块 100｜最新区块 105｜延迟 0 块/);
+  assert.match(output, /历史反向：日志 95｜完整区块 90/);
+  assert.match(output, /配置事件快速回溯：97/);
   assert.match(output, /BNB｜地址 \[0x0000000000000000000000000000000000000000\]/);
   for (let index = 1; index <= 5; index++) assert.match(output, new RegExp(`字段 ${index}：${index}`));
   assert.match(output, new RegExp(txHash));

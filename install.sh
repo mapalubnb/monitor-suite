@@ -604,8 +604,13 @@ if [ -f "$SNAP" ]; then
     console.log('部署区块：'+(fp.deploymentBlock??'尚未定位')+'｜定位方式 '+(fp.deploymentDetection||'尚未建立'));
     console.log('部署交易：'+(fp.deploymentTxHash?mdLink(fp.deploymentTxHash,'https://bscscan.com/tx/'+fp.deploymentTxHash):'尚未定位'));
     console.log('部署者：'+(fp.deployer?mdLink(fp.deployer,'https://bscscan.com/address/'+fp.deployer):'尚未定位'));
-    console.log('实时扫描：'+(fp.lastScannedBlock??'尚未建立')+'｜安全区块 '+(fp.safeLatestBlock??'尚未建立')+'｜最新区块 '+(fp.latestBlock??'尚未建立'));
-    console.log('历史日志：'+(fp.historyLogLastScannedBlock??'尚未建立')+'｜历史完整区块：'+(fp.historyBlockLastScannedBlock??'尚未建立')+'｜完整进度：'+(fp.historyLastScannedBlock??'尚未建立'));
+    const headLag=Number.isFinite(Number(fp.safeLatestBlock))&&Number.isFinite(Number(fp.headLastScannedBlock))?Math.max(0,Number(fp.safeLatestBlock)-Number(fp.headLastScannedBlock)):'-';
+    const catchupLag=Number.isFinite(Number(fp.headLastScannedBlock))&&Number.isFinite(Number(fp.lastScannedBlock))?Math.max(0,Number(fp.headLastScannedBlock)-Number(fp.lastScannedBlock)):'-';
+    console.log('实时头部：'+(fp.headLastScannedBlock??'尚未建立')+'｜安全区块 '+(fp.safeLatestBlock??'尚未建立')+'｜最新区块 '+(fp.latestBlock??'尚未建立')+'｜延迟 '+headLag+' 块');
+    console.log('连续补扫：'+(fp.lastScannedBlock??'尚未建立')+'｜缺口 '+catchupLag+' 块');
+    console.log('历史正向：日志 '+(fp.historyLogLastScannedBlock??'尚未建立')+'｜完整区块 '+(fp.historyBlockLastScannedBlock??'尚未建立'));
+    console.log('配置事件快速回溯：'+(fp.historyConfigEventCursor??'尚未建立'));
+    console.log('历史反向：日志 '+(fp.historyBackwardLogCursor??'尚未建立')+'｜完整区块 '+(fp.historyBackwardBlockCursor??'尚未建立'));
     console.log('候选：'+Object.keys(fp.candidates||{}).length+' 个｜已配置 '+poolAssets.length+' 个｜启用 '+enabledPoolAssets+' 个｜未启用或停用 '+Math.max(0,poolAssets.length-enabledPoolAssets)+' 个');
     console.log('待发送通知：'+((fp.pendingChanges||[]).length+(fp.pendingImplementationChange?1:0))+' 个');
     console.log('已识别相关调用：'+relatedSelectors.length+' 个'+(relatedSelectors.length?'｜'+relatedSelectors.map(v=>v.selector).join('、'):''));

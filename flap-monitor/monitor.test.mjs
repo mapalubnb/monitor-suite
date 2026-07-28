@@ -7,10 +7,12 @@ const { __testables } = await import("./monitor.mjs");
 const {
   BNB_QUOTE_TOKEN,
   FLAP_FACTORY_PROXY,
+  QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC,
   buildQuoteTokenConfigurationCall,
   createFactoryPoolState,
   decodeQuoteTokenConfiguration,
   extractBytecodeSelectors,
+  extractFactoryLogCandidates,
   extractFactoryTransactionCandidates,
   mergePendingFactoryPoolChanges,
   runFactoryPoolScan,
@@ -37,6 +39,7 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
     proxy: FLAP_FACTORY_PROXY,
     currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
     deploymentBlock: 39980228,
+    headLastScannedBlock: 105,
     lastScannedBlock: 100,
     safeLatestBlock: 105,
     historyLastScannedBlock: 90,
@@ -124,6 +127,21 @@ test("Factory pending notification queue keeps unsent changes and deduplicates b
   assert.equal(pending[0].type, "added");
   assert.equal(pending[0].current.fingerprint, "second");
   assert.equal(pending[0].previous, null);
+});
+
+test("Factory configuration event extracts the complete quote token address", () => {
+  const token = "0x21caef8a43163eea865baee23b9c2e327696a3bf";
+  const candidates = extractFactoryLogCandidates({
+    address: FLAP_FACTORY_PROXY,
+    topics: [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC],
+    data: `0x${token.slice(2).padStart(64, "0")}${1n.toString(16).padStart(64, "0")}`,
+    transactionHash: `0x${"12".repeat(32)}`,
+    blockNumber: "0x6b616fa",
+    logIndex: "0x1",
+  });
+  assert.equal(candidates.length, 1);
+  assert.equal(candidates[0].quoteToken, token);
+  assert.equal(candidates[0].topic0, QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC);
 });
 
 test("Factory scanner resumes confirmed blocks, verifies assets and stays idempotent", async () => {
@@ -221,6 +239,114 @@ test("Factory scanner locates deployment block and creation transaction automati
   assert.equal(state.deploymentDetection, "eth_getCode-binary-search");
   assert.equal(state.deploymentTxHash, creationHash);
   assert.equal(state.deployer, deployer);
+});
+
+test("Factory realtime head scans newest confirmed blocks before an old catchup cursor", async () => {
+  const token = "0x7777777777777777777777777777777777777777";
+  const implementation = "0x8888888888888888888888888888888888888888";
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    currentImplementation: implementation,
+    lastScannedBlock: 100,
+  });
+  const requestedBlocks = [];
+  const getterResult = `0x${[1n, 9n, 8n, 7n, 6n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x3ed";
+    if (method === "eth_getStorageAt") return `0x${"0".repeat(24)}${implementation.slice(2)}`;
+    if (method === "eth_getLogs") return [];
+    if (method === "eth_call") return getterResult;
+    if (method === "eth_getBlockByNumber") {
+      const blockNumber = Number.parseInt(params[0], 16);
+      requestedBlocks.push(blockNumber);
+      return {
+        hash: `0x${blockNumber.toString(16).padStart(64, "0")}`,
+        transactions: params[1] && blockNumber === 1000 ? [{
+          to: FLAP_FACTORY_PROXY,
+          input: `0xabcdef01${"0".repeat(24)}${token.slice(2)}`,
+          hash: `0x${"34".repeat(32)}`,
+          blockNumber: params[0],
+        }] : [],
+      };
+    }
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const result = await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: { confirmations: 5, scanRealtime: true, scanHistory: false, realtimeMaxBlocksPerRun: 20, assetRefreshPerRun: 1 },
+  });
+  assert.equal(state.headLastScannedBlock, 1000);
+  assert.equal(state.lastScannedBlock, 100);
+  assert.equal(state.assets[token].enabled, true);
+  assert.equal(result.changes.length, 1);
+  assert.ok(requestedBlocks.includes(1000));
+  assert.ok(!requestedBlocks.includes(101));
+});
+
+test("Factory reverse history discovers assets configured before monitor startup", async () => {
+  const token = "0x9999999999999999999999999999999999999999";
+  const txHash = `0x${"56".repeat(32)}`;
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    headLastScannedBlock: 1000,
+    lastScannedBlock: 1000,
+    historyLogLastScannedBlock: 0,
+    historyBlockLastScannedBlock: 0,
+  });
+  const transaction = {
+    to: FLAP_FACTORY_PROXY,
+    input: `0x13572468${"0".repeat(24)}${token.slice(2)}`,
+    hash: txHash,
+    blockNumber: "0x384",
+  };
+  const getterResult = `0x${[1n, 4n, 3n, 2n, 1n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const requestedLogFilters = [];
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x3ed";
+    if (method === "eth_getLogs") {
+      requestedLogFilters.push(params[0]);
+      const from = Number.parseInt(params[0].fromBlock, 16);
+      const to = Number.parseInt(params[0].toBlock, 16);
+      return from <= 900 && to >= 900 ? [{
+        address: FLAP_FACTORY_PROXY,
+        topics: [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC],
+        data: `0x${token.slice(2).padStart(64, "0")}${1n.toString(16).padStart(64, "0")}`,
+        transactionHash: txHash,
+        blockNumber: "0x384",
+        logIndex: "0x0",
+      }] : [];
+    }
+    if (method === "eth_getTransactionByHash") return transaction;
+    if (method === "eth_call") return getterResult;
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const result = await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: {
+      confirmations: 5,
+      scanRealtime: false,
+      scanHistory: true,
+      historyBackwardLogChunkBlocks: 200,
+      historyConfigEventChunkBlocks: 200,
+      historyLogChunkBlocks: 10,
+      deepHistoryBlockScan: false,
+    },
+  });
+  assert.equal(state.historyBackwardLogCursor, 801);
+  assert.equal(state.historyConfigEventCursor, 801);
+  assert.equal(state.assets[token].enabled, true);
+  assert.equal(result.changes.length, 1);
+  assert.ok(requestedLogFilters.some(filter => filter.topics?.[0] === QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC));
 });
 
 test("shared Flap asset-only page changes are summarized into one site-wide notification", () => {

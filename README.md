@@ -82,9 +82,14 @@ FOURMEME_ACTOR_HTTP_FALLBACK_MS=8000
 OPENFOUR_REGISTRY_DISCOVERY_DEBOUNCE_MS=1000
 FLAP_POLL_INTERVAL_MS=1000
 FLAP_FACTORY_POOL_INTERVAL_MS=1000
+FLAP_FACTORY_HISTORY_INTERVAL_MS=1000
 FLAP_FACTORY_POOL_CONFIRMATIONS=5
+FLAP_FACTORY_CATCHUP_MAX_BLOCKS=100
 FLAP_FACTORY_HISTORY_LOG_CHUNK_BLOCKS=2000
 FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS=10
+FLAP_FACTORY_HISTORY_BACKWARD_LOG_CHUNK_BLOCKS=2000
+FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS=50000
+FLAP_FACTORY_HISTORY_BACKWARD_BLOCK_CHUNK_BLOCKS=10
 ```
 
 `FOURMEME_HOST_REQUEST_MIN_DELAY_MS` 只错开 Four.meme 同 host 的请求，不改变各模块监控间隔；设为 `0` 可关闭。
@@ -109,7 +114,9 @@ Flap 同时会从 BSC 链上自动重建 Factory Proxy `0xe2cE6ab80874Fa9Fa2aAE6
 
 当前 Proxy 已通过只读历史状态确认部署于区块 `39980228`，创建交易为 `0x9f6935c97b662a10a8c4ea725e172e8a13fd37beb9fe76a9100ee97619639d00`。程序仍会在首次运行时自行定位并保存结果，不依赖这段文档作为运行时数据源。
 
-Factory 扫描采用确认块、实时优先双游标、历史日志快速回溯、完整区块低优先级回溯、RPC 自动切换、动态日志分块、短链重组检查和断点续扫。独立状态保存在 `flap-monitor/factory-pool-state.json`：`lastScannedBlock` 是实时确认块游标，`historyLogLastScannedBlock` 是事件及相关交易回溯进度，`historyBlockLastScannedBlock` 是逐区块完整交易回溯进度。启动卡片和 `fl-status` 会完整显示 implementation、部署区块、扫描进度、候选数量、启用/停用资产及五个配置字段。
+Factory 扫描采用确认块和独立调度：`headLastScannedBlock` 每秒只追踪最新确认块，保证连续补扫或历史 RPC 耗时较长时仍优先发现新资产；`lastScannedBlock` 负责补齐头部游标跳过的连续缺口。历史模块优先按已确认的底池配置事件 topic 大分块反向查询，同时保留从部署区块正向扫描、通用日志反向扫描和完整区块扫描，启动前已经存在的底池不必等待正向游标遍历数千万区块，也不会因只依赖单一事件而漏检。
+
+链上状态独立保存在 `flap-monitor/factory-pool-state.json`，并支持 RPC 自动切换、动态日志分块、短链重组检查、断点续扫和持久化待发送通知。首次全新安装只建立实时基线；已有游标的进程重启会继续检测停机期间的确认块，发送失败的待通知也不会被启动流程清空。`fl-status` 会分别显示实时头部延迟、连续缺口、正向历史和反向历史进度，以及 implementation、候选数量、启用/停用资产和五个完整配置字段。
 
 被风控时建议先把前端并发降到：
 

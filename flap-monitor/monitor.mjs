@@ -96,12 +96,17 @@ const CONFIG = {
     proxy: (process.env.FLAP_FACTORY_PROXY || FLAP_FACTORY_PROXY).toLowerCase(),
     stateFile: join(__dirname, "factory-pool-state.json"),
     intervalMs: readPositiveIntEnv("FLAP_FACTORY_POOL_INTERVAL_MS", 1_000, 500),
+    historyIntervalMs: readPositiveIntEnv("FLAP_FACTORY_HISTORY_INTERVAL_MS", 1_000, 500),
     confirmations: readPositiveIntEnv("FLAP_FACTORY_POOL_CONFIRMATIONS", 5, 1),
     deploymentBlock: Number.parseInt(process.env.FLAP_FACTORY_DEPLOYMENT_BLOCK || "0", 10),
     realtimeBootstrapBlocks: readPositiveIntEnv("FLAP_FACTORY_REALTIME_BOOTSTRAP_BLOCKS", 20, 1),
     realtimeMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_REALTIME_MAX_BLOCKS", 20, 1),
+    catchupMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_CATCHUP_MAX_BLOCKS", 100, 1),
     historyLogChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_LOG_CHUNK_BLOCKS", 2_000, 1),
     historyBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS", 10, 1),
+    historyBackwardLogChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BACKWARD_LOG_CHUNK_BLOCKS", 2_000, 1),
+    historyConfigEventChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS", 50_000, 1),
+    historyBackwardBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BACKWARD_BLOCK_CHUNK_BLOCKS", 10, 1),
     deepHistoryBlockScan: process.env.FLAP_FACTORY_DEEP_HISTORY_BLOCK_SCAN !== "false",
     assetRefreshPerRun: readPositiveIntEnv("FLAP_FACTORY_ASSET_REFRESH_PER_RUN", 10, 1),
   },
@@ -2648,7 +2653,7 @@ function buildFactoryPoolMonitorContent(result) {
     `Factory Proxy: ${addressLink(state.proxy)}`,
     `Implementation: ${addressLink(state.currentImplementation)}`,
     `当前资产: 启用 ${enabledCount} 个 / 未启用或停用 ${disabledCount} 个`,
-    `实时扫描: ${state.lastScannedBlock ?? "未建立"} / 安全区块 ${state.safeLatestBlock ?? "未建立"}`,
+    `实时头部: ${state.headLastScannedBlock ?? "未建立"} / 安全区块 ${state.safeLatestBlock ?? "未建立"} / 延迟 ${Math.max(0, (state.safeLatestBlock || 0) - (state.headLastScannedBlock || 0))} 块`,
   ];
   const primary = [];
   for (const change of result.changes) {
@@ -2678,37 +2683,43 @@ function buildFactoryPoolMonitorContent(result) {
   });
 }
 
-async function checkFlapFactoryPools(factoryPoolState, { sendCardFn = sendCardViaApi, titlePrefix = "", suppressNotifications = false } = {}) {
+let factoryPoolDeliveryQueue = Promise.resolve();
+
+async function checkFlapFactoryPools(factoryPoolState, { sendCardFn = sendCardViaApi, titlePrefix = "", suppressNotifications = false, scanConfig = {} } = {}) {
   if (!CONFIG.factoryPoolMonitor.enabled) return { changed: false, sent: false, state: factoryPoolState };
   const result = await runFactoryPoolScan({
     state: factoryPoolState,
     rpcCall: bscRpcCall,
     rpcBatch: calls => bscRpcBatch(calls, { requireAllResults: true }),
-    config: CONFIG.factoryPoolMonitor,
+    config: { ...CONFIG.factoryPoolMonitor, ...scanConfig },
     log,
   });
-  factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
-  if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
-  if (suppressNotifications) {
+  const deliver = async () => {
+    if (!suppressNotifications) {
+      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
+      if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
+    }
+    saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    if (suppressNotifications) return { ...result, sent: false };
+    const shouldNotify = factoryPoolState.pendingChanges.length > 0 || Boolean(factoryPoolState.pendingImplementationChange?.previous);
+    if (!shouldNotify) return { ...result, sent: false };
+    const pendingResult = {
+      ...result,
+      changes: factoryPoolState.pendingChanges,
+      implementationChange: factoryPoolState.pendingImplementationChange,
+    };
+    const title = `${titlePrefix}Flap Factory 底池资产链上变更`;
+    const messageId = await sendCardFn(title, buildFactoryPoolMonitorContent(pendingResult), "red");
+    if (!messageId) return { ...result, sent: false };
     factoryPoolState.pendingChanges = [];
     factoryPoolState.pendingImplementationChange = null;
-  }
-  saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
-  const shouldNotify = factoryPoolState.pendingChanges.length > 0 || Boolean(factoryPoolState.pendingImplementationChange?.previous);
-  if (!shouldNotify) return { ...result, sent: false };
-  const pendingResult = {
-    ...result,
-    changes: factoryPoolState.pendingChanges,
-    implementationChange: factoryPoolState.pendingImplementationChange,
+    saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    try { await pinMessage(messageId); } catch (err) { log(`[Flap Factory] 卡片置顶失败：${err.message}`); }
+    return { ...result, sent: true };
   };
-  const title = `${titlePrefix}Flap Factory 底池资产链上变更`;
-  const messageId = await sendCardFn(title, buildFactoryPoolMonitorContent(pendingResult), "red");
-  if (!messageId) return { ...result, sent: false };
-  factoryPoolState.pendingChanges = [];
-  factoryPoolState.pendingImplementationChange = null;
-  saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
-  try { await pinMessage(messageId); } catch (err) { log(`[Flap Factory] 卡片置顶失败：${err.message}`); }
-  return { ...result, sent: true };
+  const delivery = factoryPoolDeliveryQueue.then(deliver, deliver);
+  factoryPoolDeliveryQueue = delivery.catch(() => {});
+  return await delivery;
 }
 
 function extractStrings(content, ext) {
@@ -5019,7 +5030,11 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     `部署交易：${factoryPoolState.deploymentTxHash ? txLink(factoryPoolState.deploymentTxHash) : "尚未定位"}`,
     `部署者：${factoryPoolState.deployer ? addressLink(factoryPoolState.deployer) : "尚未定位"}`,
     `资产数量：${poolAssets.length}｜启用 ${poolAssets.filter(asset => asset.enabled).length}｜未启用或停用 ${poolAssets.filter(asset => !asset.enabled).length}`,
-    `实时扫描：${factoryPoolState.lastScannedBlock ?? "尚未建立"}｜安全区块 ${factoryPoolState.safeLatestBlock ?? "尚未建立"}｜历史完整扫描 ${factoryPoolState.historyLastScannedBlock ?? "尚未建立"}`,
+    `实时头部：${factoryPoolState.headLastScannedBlock ?? "尚未建立"}｜安全区块 ${factoryPoolState.safeLatestBlock ?? "尚未建立"}｜延迟 ${Math.max(0, (factoryPoolState.safeLatestBlock || 0) - (factoryPoolState.headLastScannedBlock || 0))} 块`,
+    `连续补扫：${factoryPoolState.lastScannedBlock ?? "尚未建立"}｜缺口 ${Math.max(0, (factoryPoolState.headLastScannedBlock || 0) - (factoryPoolState.lastScannedBlock || 0))} 块`,
+    `历史正向日志：${factoryPoolState.historyLogLastScannedBlock ?? "尚未建立"}｜完整区块 ${factoryPoolState.historyBlockLastScannedBlock ?? "尚未建立"}`,
+    `配置事件快速回溯：${factoryPoolState.historyConfigEventCursor ?? "尚未建立"}`,
+    `历史反向日志：${factoryPoolState.historyBackwardLogCursor ?? "尚未建立"}｜完整区块 ${factoryPoolState.historyBackwardBlockCursor ?? "尚未建立"}`,
     `已识别相关调用：${relatedSelectors.length} 个${relatedSelectors.length ? `｜${relatedSelectors.map(item => item.selector).join("、")}` : ""}`,
     ...poolAssetLines,
     "",
@@ -5098,7 +5113,12 @@ async function startMonitor() {
 
   if (CONFIG.factoryPoolMonitor.enabled) {
     try {
-      await checkFlapFactoryPools(factoryPoolState, { suppressNotifications: true });
+      const hasFactoryBaseline = Number.isFinite(factoryPoolState.headLastScannedBlock)
+        || Number.isFinite(factoryPoolState.lastScannedBlock);
+      await checkFlapFactoryPools(factoryPoolState, {
+        suppressNotifications: !hasFactoryBaseline,
+        scanConfig: { scanRealtime: true, scanHistory: false },
+      });
     } catch (err) {
       factoryPoolState.lastError = err.message;
       factoryPoolState.lastRunAt = ts();
@@ -5113,29 +5133,53 @@ async function startMonitor() {
     "blue"
   );
 
-  let isFactoryPoolScanning = false;
-  async function factoryPoolPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryPoolScanning) return;
-    isFactoryPoolScanning = true;
+  let isFactoryRealtimeScanning = false;
+  let isFactoryHistoryScanning = false;
+  async function factoryPoolRealtimePoll() {
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryRealtimeScanning) return;
+    isFactoryRealtimeScanning = true;
     try {
-      await checkFlapFactoryPools(factoryPoolState);
+      await checkFlapFactoryPools(factoryPoolState, { scanConfig: { scanRealtime: true, scanHistory: false } });
     } catch (err) {
       factoryPoolState.lastError = err.message;
       factoryPoolState.lastRunAt = ts();
       try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
-      log(`[Flap Factory] 检测失败：${err.message}`);
+      log(`[Flap Factory 实时] 检测失败：${err.message}`);
     } finally {
-      isFactoryPoolScanning = false;
+      isFactoryRealtimeScanning = false;
     }
   }
 
-  function scheduleFactoryPoolNext() {
+  async function factoryPoolHistoryPoll() {
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryHistoryScanning) return;
+    isFactoryHistoryScanning = true;
+    try {
+      await checkFlapFactoryPools(factoryPoolState, { scanConfig: { scanRealtime: false, scanHistory: true } });
+    } catch (err) {
+      factoryPoolState.lastError = err.message;
+      factoryPoolState.lastRunAt = ts();
+      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      log(`[Flap Factory 历史] 检测失败：${err.message}`);
+    } finally {
+      isFactoryHistoryScanning = false;
+    }
+  }
+
+  function scheduleFactoryRealtimeNext() {
     setTimeout(async () => {
-      await factoryPoolPoll();
-      scheduleFactoryPoolNext();
+      await factoryPoolRealtimePoll();
+      scheduleFactoryRealtimeNext();
     }, CONFIG.factoryPoolMonitor.intervalMs);
   }
-  scheduleFactoryPoolNext();
+
+  function scheduleFactoryHistoryNext() {
+    setTimeout(async () => {
+      await factoryPoolHistoryPoll();
+      scheduleFactoryHistoryNext();
+    }, CONFIG.factoryPoolMonitor.historyIntervalMs);
+  }
+  scheduleFactoryRealtimeNext();
+  scheduleFactoryHistoryNext();
 
   // 轮询函数：并行检测所有页面
   let pendingPoll = false;
@@ -5397,7 +5441,8 @@ async function startMonitor() {
 
   // SIGUSR1 信号
   process.on("SIGUSR1", () => {
-    factoryPoolPoll().catch(err => log(`[SIGUSR1] Factory 检测异常：${err.message}`));
+    factoryPoolRealtimePoll().catch(err => log(`[SIGUSR1] Factory 实时检测异常：${err.message}`));
+    factoryPoolHistoryPoll().catch(err => log(`[SIGUSR1] Factory 历史检测异常：${err.message}`));
     if (isPolling) {
       pendingPoll = true;  // 利用 pendingPoll 机制，当前轮询结束后自动触发
       log("收到 SIGUSR1，当前正在轮询，将在本轮结束后立即执行");
