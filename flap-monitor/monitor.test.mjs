@@ -21,6 +21,10 @@ const {
 test("default Flap polling interval remains fast and configurable", () => {
   assert.equal(__testables.CONFIG.pollIntervalMs, 1_000);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.intervalMs, 1_000);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.catchupIntervalMs, 1_000);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.catchupMaxBlocksPerRun, 2_000);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.historyConfigEventChunkBlocks, 5_000);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.historyConfigEventChunksPerRun, 5);
 });
 
 test("Flap startup card is complete and uses no emoji or bullet list markers", () => {
@@ -329,7 +333,7 @@ test("Factory realtime head scans newest confirmed blocks before an old catchup 
   const result = await runFactoryPoolScan({
     state,
     rpcCall,
-    config: { confirmations: 5, scanRealtime: true, scanHistory: false, realtimeMaxBlocksPerRun: 20, assetRefreshPerRun: 1 },
+    config: { confirmations: 5, scanRealtime: true, scanCatchup: false, scanHistory: false, realtimeMaxBlocksPerRun: 20, assetRefreshPerRun: 1 },
   });
   assert.equal(state.headLastScannedBlock, 1000);
   assert.equal(state.lastScannedBlock, 100);
@@ -339,7 +343,53 @@ test("Factory realtime head scans newest confirmed blocks before an old catchup 
   assert.ok(!requestedBlocks.includes(101));
 });
 
-test("Factory reverse history discovers assets configured before monitor startup", async () => {
+test("Factory catchup advances with only configuration events and no full blocks", async () => {
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    headLastScannedBlock: 1000,
+    lastScannedBlock: 100,
+    historyConfigEventCursor: 1,
+  });
+  const logRanges = [];
+  let fullBlockRequests = 0;
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x3ed";
+    if (method === "eth_getLogs") {
+      logRanges.push({
+        from: Number.parseInt(params[0].fromBlock, 16),
+        to: Number.parseInt(params[0].toBlock, 16),
+        topics: params[0].topics,
+      });
+      return [];
+    }
+    if (method === "eth_getBlockByNumber") {
+      fullBlockRequests++;
+      throw new Error("配置事件连续补扫不应读取完整区块");
+    }
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: {
+      confirmations: 5,
+      scanRealtime: false,
+      scanCatchup: true,
+      scanHistory: false,
+      catchupMaxBlocksPerRun: 200,
+    },
+  });
+  assert.equal(state.lastScannedBlock, 300);
+  assert.deepEqual(logRanges, [{ from: 101, to: 300, topics: [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC] }]);
+  assert.equal(fullBlockRequests, 0);
+  assert.ok(state.lastCatchupRunAt);
+});
+
+test("Factory fast configuration and generic reverse scans discover startup history", async () => {
   const token = "0x9999999999999999999999999999999999999999";
   const txHash = `0x${"56".repeat(32)}`;
   const state = createFactoryPoolState();
@@ -386,9 +436,11 @@ test("Factory reverse history discovers assets configured before monitor startup
     config: {
       confirmations: 5,
       scanRealtime: false,
+      scanCatchup: true,
       scanHistory: true,
       historyBackwardLogChunkBlocks: 200,
       historyConfigEventChunkBlocks: 200,
+      historyConfigEventChunksPerRun: 1,
       historyLogChunkBlocks: 10,
       deepHistoryBlockScan: false,
     },

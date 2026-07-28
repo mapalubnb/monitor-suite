@@ -96,16 +96,18 @@ const CONFIG = {
     proxy: (process.env.FLAP_FACTORY_PROXY || FLAP_FACTORY_PROXY).toLowerCase(),
     stateFile: join(__dirname, "factory-pool-state.json"),
     intervalMs: readPositiveIntEnv("FLAP_FACTORY_POOL_INTERVAL_MS", 1_000, 500),
+    catchupIntervalMs: readPositiveIntEnv("FLAP_FACTORY_CATCHUP_INTERVAL_MS", 1_000, 500),
     historyIntervalMs: readPositiveIntEnv("FLAP_FACTORY_HISTORY_INTERVAL_MS", 1_000, 500),
     confirmations: readPositiveIntEnv("FLAP_FACTORY_POOL_CONFIRMATIONS", 5, 1),
     deploymentBlock: Number.parseInt(process.env.FLAP_FACTORY_DEPLOYMENT_BLOCK || "0", 10),
     realtimeBootstrapBlocks: readPositiveIntEnv("FLAP_FACTORY_REALTIME_BOOTSTRAP_BLOCKS", 20, 1),
     realtimeMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_REALTIME_MAX_BLOCKS", 20, 1),
-    catchupMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_CATCHUP_MAX_BLOCKS", 100, 1),
+    catchupMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_CATCHUP_MAX_BLOCKS", 2_000, 1),
     historyLogChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_LOG_CHUNK_BLOCKS", 2_000, 1),
     historyBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS", 10, 1),
     historyBackwardLogChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BACKWARD_LOG_CHUNK_BLOCKS", 2_000, 1),
-    historyConfigEventChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS", 50_000, 1),
+    historyConfigEventChunkBlocks: Math.min(5_000, readPositiveIntEnv("FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS", 5_000, 1)),
+    historyConfigEventChunksPerRun: readPositiveIntEnv("FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNKS_PER_RUN", 5, 1),
     historyBackwardBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BACKWARD_BLOCK_CHUNK_BLOCKS", 10, 1),
     deepHistoryBlockScan: process.env.FLAP_FACTORY_DEEP_HISTORY_BLOCK_SCAN !== "false",
     assetRefreshPerRun: readPositiveIntEnv("FLAP_FACTORY_ASSET_REFRESH_PER_RUN", 10, 1),
@@ -5182,7 +5184,7 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     `部署者：${factoryPoolState.deployer ? addressLink(factoryPoolState.deployer) : "尚未定位"}`,
     `资产数量：${poolAssets.length}｜启用 ${poolAssets.filter(asset => asset.enabled).length}｜未启用或停用 ${poolAssets.filter(asset => !asset.enabled).length}`,
     `实时头部：${factoryPoolState.headLastScannedBlock ?? "尚未建立"}｜安全区块 ${factoryPoolState.safeLatestBlock ?? "尚未建立"}｜延迟 ${Math.max(0, (factoryPoolState.safeLatestBlock || 0) - (factoryPoolState.headLastScannedBlock || 0))} 块`,
-    `连续补扫：${factoryPoolState.lastScannedBlock ?? "尚未建立"}｜缺口 ${Math.max(0, (factoryPoolState.headLastScannedBlock || 0) - (factoryPoolState.lastScannedBlock || 0))} 块`,
+    `配置事件连续补扫：${factoryPoolState.lastScannedBlock ?? "尚未建立"}｜缺口 ${Math.max(0, (factoryPoolState.headLastScannedBlock || 0) - (factoryPoolState.lastScannedBlock || 0))} 块`,
     `历史正向日志：${factoryPoolState.historyLogLastScannedBlock ?? "尚未建立"}｜完整区块 ${factoryPoolState.historyBlockLastScannedBlock ?? "尚未建立"}`,
     `配置事件快速回溯：${factoryPoolState.historyConfigEventCursor ?? "尚未建立"}`,
     `历史反向日志：${factoryPoolState.historyBackwardLogCursor ?? "尚未建立"}｜完整区块 ${factoryPoolState.historyBackwardBlockCursor ?? "尚未建立"}`,
@@ -5268,7 +5270,7 @@ async function startMonitor() {
         || Number.isFinite(factoryPoolState.lastScannedBlock);
       await checkFlapFactoryPools(factoryPoolState, {
         suppressNotifications: !hasFactoryBaseline,
-        scanConfig: { scanRealtime: true, scanHistory: false },
+        scanConfig: { scanRealtime: true, scanCatchup: false, scanHistory: false },
       });
     } catch (err) {
       factoryPoolState.lastError = err.message;
@@ -5285,12 +5287,15 @@ async function startMonitor() {
   );
 
   let isFactoryRealtimeScanning = false;
+  let isFactoryCatchupScanning = false;
   let isFactoryHistoryScanning = false;
   async function factoryPoolRealtimePoll() {
     if (!CONFIG.factoryPoolMonitor.enabled || isFactoryRealtimeScanning) return;
     isFactoryRealtimeScanning = true;
     try {
-      await checkFlapFactoryPools(factoryPoolState, { scanConfig: { scanRealtime: true, scanHistory: false } });
+      await checkFlapFactoryPools(factoryPoolState, {
+        scanConfig: { scanRealtime: true, scanCatchup: false, scanHistory: false },
+      });
     } catch (err) {
       factoryPoolState.lastError = err.message;
       factoryPoolState.lastRunAt = ts();
@@ -5301,11 +5306,30 @@ async function startMonitor() {
     }
   }
 
+  async function factoryPoolCatchupPoll() {
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryCatchupScanning) return;
+    isFactoryCatchupScanning = true;
+    try {
+      await checkFlapFactoryPools(factoryPoolState, {
+        scanConfig: { scanRealtime: false, scanCatchup: true, scanHistory: false },
+      });
+    } catch (err) {
+      factoryPoolState.lastError = err.message;
+      factoryPoolState.lastRunAt = ts();
+      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      log(`[Flap Factory 补扫] 检测失败：${err.message}`);
+    } finally {
+      isFactoryCatchupScanning = false;
+    }
+  }
+
   async function factoryPoolHistoryPoll() {
     if (!CONFIG.factoryPoolMonitor.enabled || isFactoryHistoryScanning) return;
     isFactoryHistoryScanning = true;
     try {
-      await checkFlapFactoryPools(factoryPoolState, { scanConfig: { scanRealtime: false, scanHistory: true } });
+      await checkFlapFactoryPools(factoryPoolState, {
+        scanConfig: { scanRealtime: false, scanCatchup: false, scanHistory: true },
+      });
     } catch (err) {
       factoryPoolState.lastError = err.message;
       factoryPoolState.lastRunAt = ts();
@@ -5329,7 +5353,14 @@ async function startMonitor() {
       scheduleFactoryHistoryNext();
     }, CONFIG.factoryPoolMonitor.historyIntervalMs);
   }
+  function scheduleFactoryCatchupNext() {
+    setTimeout(async () => {
+      await factoryPoolCatchupPoll();
+      scheduleFactoryCatchupNext();
+    }, CONFIG.factoryPoolMonitor.catchupIntervalMs);
+  }
   scheduleFactoryRealtimeNext();
+  scheduleFactoryCatchupNext();
   scheduleFactoryHistoryNext();
 
   // 轮询函数：并行检测所有页面
@@ -5593,6 +5624,7 @@ async function startMonitor() {
   // SIGUSR1 信号
   process.on("SIGUSR1", () => {
     factoryPoolRealtimePoll().catch(err => log(`[SIGUSR1] Factory 实时检测异常：${err.message}`));
+    factoryPoolCatchupPoll().catch(err => log(`[SIGUSR1] Factory 补扫异常：${err.message}`));
     factoryPoolHistoryPoll().catch(err => log(`[SIGUSR1] Factory 历史检测异常：${err.message}`));
     if (isPolling) {
       pendingPoll = true;  // 利用 pendingPoll 机制，当前轮询结束后自动触发

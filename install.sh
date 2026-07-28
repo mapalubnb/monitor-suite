@@ -607,7 +607,7 @@ if [ -f "$SNAP" ]; then
     const headLag=Number.isFinite(Number(fp.safeLatestBlock))&&Number.isFinite(Number(fp.headLastScannedBlock))?Math.max(0,Number(fp.safeLatestBlock)-Number(fp.headLastScannedBlock)):'-';
     const catchupLag=Number.isFinite(Number(fp.headLastScannedBlock))&&Number.isFinite(Number(fp.lastScannedBlock))?Math.max(0,Number(fp.headLastScannedBlock)-Number(fp.lastScannedBlock)):'-';
     console.log('实时头部：'+(fp.headLastScannedBlock??'尚未建立')+'｜安全区块 '+(fp.safeLatestBlock??'尚未建立')+'｜最新区块 '+(fp.latestBlock??'尚未建立')+'｜延迟 '+headLag+' 块');
-    console.log('连续补扫：'+(fp.lastScannedBlock??'尚未建立')+'｜缺口 '+catchupLag+' 块');
+    console.log('配置事件连续补扫：'+(fp.lastScannedBlock??'尚未建立')+'｜缺口 '+catchupLag+' 块');
     console.log('历史正向：日志 '+(fp.historyLogLastScannedBlock??'尚未建立')+'｜完整区块 '+(fp.historyBlockLastScannedBlock??'尚未建立'));
     console.log('配置事件快速回溯：'+(fp.historyConfigEventCursor??'尚未建立'));
     console.log('历史反向：日志 '+(fp.historyBackwardLogCursor??'尚未建立')+'｜完整区块 '+(fp.historyBackwardBlockCursor??'尚未建立'));

@@ -148,6 +148,7 @@ test("Flap status shows complete Factory pool state", () => {
   assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
   assert.match(output, /部署区块：39980228/);
   assert.match(output, /实时头部：100｜安全区块 100｜最新区块 105｜延迟 0 块/);
+  assert.match(output, /配置事件连续补扫：100｜缺口 0 块/);
   assert.match(output, /历史反向：日志 95｜完整区块 90/);
   assert.match(output, /配置事件快速回溯：97/);
   assert.match(output, /BNB｜状态 已启用｜地址 \[0x0000000000000000000000000000000000000000\]/);

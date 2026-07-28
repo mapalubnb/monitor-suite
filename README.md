@@ -82,13 +82,15 @@ FOURMEME_ACTOR_HTTP_FALLBACK_MS=8000
 OPENFOUR_REGISTRY_DISCOVERY_DEBOUNCE_MS=1000
 FLAP_POLL_INTERVAL_MS=1000
 FLAP_FACTORY_POOL_INTERVAL_MS=1000
+FLAP_FACTORY_CATCHUP_INTERVAL_MS=1000
 FLAP_FACTORY_HISTORY_INTERVAL_MS=1000
 FLAP_FACTORY_POOL_CONFIRMATIONS=5
-FLAP_FACTORY_CATCHUP_MAX_BLOCKS=100
+FLAP_FACTORY_CATCHUP_MAX_BLOCKS=2000
 FLAP_FACTORY_HISTORY_LOG_CHUNK_BLOCKS=2000
 FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS=10
 FLAP_FACTORY_HISTORY_BACKWARD_LOG_CHUNK_BLOCKS=2000
-FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS=50000
+FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS=5000
+FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNKS_PER_RUN=5
 FLAP_FACTORY_HISTORY_BACKWARD_BLOCK_CHUNK_BLOCKS=10
 FLAP_FACTORY_TOKEN_METADATA_API_URL=https://api.gopluslabs.io/api/v1/token_security/56
 FLAP_FACTORY_TOKEN_METADATA_TIMEOUT_MS=800
@@ -117,7 +119,7 @@ Flap 同时会从 BSC 链上自动重建 Factory Proxy `0xe2cE6ab80874Fa9Fa2aAE6
 
 当前 Proxy 已通过只读历史状态确认部署于区块 `39980228`，创建交易为 `0x9f6935c97b662a10a8c4ea725e172e8a13fd37beb9fe76a9100ee97619639d00`。程序仍会在首次运行时自行定位并保存结果，不依赖这段文档作为运行时数据源。
 
-Factory 扫描采用确认块和独立调度：`headLastScannedBlock` 每秒只追踪最新确认块，保证连续补扫或历史 RPC 耗时较长时仍优先发现新资产；`lastScannedBlock` 负责补齐头部游标跳过的连续缺口。历史模块优先按已确认的底池配置事件 topic 大分块反向查询，同时保留从部署区块正向扫描、通用日志反向扫描和完整区块扫描，启动前已经存在的底池不必等待正向游标遍历数千万区块，也不会因只依赖单一事件而漏检。
+Factory 扫描采用三个独立调度器：`headLastScannedBlock` 每秒追踪最新确认块，优先发现新资产；快速补扫调度器使用已验证的底池配置事件 topic，向前连续补缺口时每轮最多推进 2000 块，同时从当前区块向部署区块反向处理 5 个 5000 块区间，不再下载同区块内数万条无关 Factory 日志。配置事件单段范围在运行时钳制为 5000，即使旧 `.env` 保留更大的值也不会反复触发公共 RPC 超范围错误。深度历史模块独立执行通用日志、交易 calldata 和完整区块正反向扫描，继续覆盖 `newTokenV6` 等没有可识别配置事件的历史调用。启动前已经存在的底池会优先由配置事件反向通道发现，不必等待正向游标遍历数千万区块，也不会因只依赖单一事件而漏检。
 
 链上状态独立保存在 `flap-monitor/factory-pool-state.json`，并支持 RPC 自动切换、动态日志分块、短链重组检查、断点续扫和持久化待发送通知。首次全新安装只建立实时基线；已有游标的进程重启会继续检测停机期间的确认块，发送失败的待通知也不会被启动流程清空。底池名称和符号优先通过 GoPlus 免费免密 API 批量获取，API 超时或尚未收录时自动使用只读 RPC 调用 ERC-20 `name()`、`symbol()`，结果写入状态缓存且不影响链上配置判断。启动卡片、变更卡片和 `fl-status` 只显示名称、符号、状态和完整地址，不再展示五个内部配置字段。
 
