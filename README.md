@@ -81,6 +81,10 @@ FOURMEME_FRONTEND_ROUTE_REMOVAL_CONFIRM_RUNS=2
 FOURMEME_ACTOR_HTTP_FALLBACK_MS=8000
 OPENFOUR_REGISTRY_DISCOVERY_DEBOUNCE_MS=1000
 FLAP_POLL_INTERVAL_MS=1000
+FLAP_FACTORY_POOL_INTERVAL_MS=1000
+FLAP_FACTORY_POOL_CONFIRMATIONS=5
+FLAP_FACTORY_HISTORY_LOG_CHUNK_BLOCKS=2000
+FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS=10
 ```
 
 `FOURMEME_HOST_REQUEST_MIN_DELAY_MS` 只错开 Four.meme 同 host 的请求，不改变各模块监控间隔；设为 `0` 可关闭。
@@ -100,6 +104,12 @@ Four.meme 监控在保持原有轮询间隔不变的前提下使用分层快速�
 GitHub 等外部请求遇到 DNS、连接超时、连接重置或 IPv6 路由异常时会自动择优 IPv4/IPv6，并进行两次短间隔重试。最终失败日志会包含底层错误码、目标地址和原因，便于区分服务器网络问题与 GitHub API 错误。
 
 Flap 新金库通知、金库工厂变更和状态输出会同时提供 BscScan 合约链接与 `flap.sh/launch?vaultfactory=<地址>` 金库入口。页面监控同时覆盖 BNB CAstore 与 Robinhood 中文 CAstore；Robinhood 币股金库使用独立快照及带 `chain=robinhood&lang=zh` 的金库入口，不会并入 BSC 金库工厂状态。Flap 启动卡片与 `fl-status` 状态卡片都会同步显示 Robinhood 页面、币股模板、完整 Factory 和金库入口。
+
+Flap 同时会从 BSC 链上自动重建 Factory Proxy `0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0` 的 quoteToken 候选集合。扫描器处理 Factory 事件、管理配置调用、`newTokenV6` 等实际发射交易和完整区块交易；所有 ABI 对齐地址字段都会进入复核流程，因此 implementation 升级后即使方法选择器变化也不会只依赖旧 ABI。每个候选地址最终通过 `getQuoteTokenConfiguration(address)` 复核五个返回字段，第一字段为 `1` 时视为启用，BNB 使用零地址。
+
+当前 Proxy 已通过只读历史状态确认部署于区块 `39980228`，创建交易为 `0x9f6935c97b662a10a8c4ea725e172e8a13fd37beb9fe76a9100ee97619639d00`。程序仍会在首次运行时自行定位并保存结果，不依赖这段文档作为运行时数据源。
+
+Factory 扫描采用确认块、实时优先双游标、历史日志快速回溯、完整区块低优先级回溯、RPC 自动切换、动态日志分块、短链重组检查和断点续扫。独立状态保存在 `flap-monitor/factory-pool-state.json`：`lastScannedBlock` 是实时确认块游标，`historyLogLastScannedBlock` 是事件及相关交易回溯进度，`historyBlockLastScannedBlock` 是逐区块完整交易回溯进度。启动卡片和 `fl-status` 会完整显示 implementation、部署区块、扫描进度、候选数量、启用/停用资产及五个配置字段。
 
 被风控时建议先把前端并发降到：
 

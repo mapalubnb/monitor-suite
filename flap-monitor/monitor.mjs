@@ -20,6 +20,16 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rea
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { sendCard, sendCardQueued, patchCard, pinMessage, waitQueueDrain } from "../shared/feishu-client.mjs";
+import {
+  BNB_QUOTE_TOKEN,
+  FLAP_FACTORY_PROXY,
+  buildFactoryPoolChangeLines,
+  createFactoryPoolState,
+  loadFactoryPoolState,
+  mergePendingFactoryPoolChanges,
+  runFactoryPoolScan,
+  saveFactoryPoolState,
+} from "./factory-pool-monitor.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
@@ -67,8 +77,9 @@ const CONFIG = {
     minAssetFiles: 2,
   },
   assetStringLimit: 300,
-  bscRpcUrls: (process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com,https://bsc-dataseed.binance.org/")
-    .split(",").map(s => s.trim()).filter(Boolean),
+  bscRpcUrls: [...new Set((process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com,https://bsc-dataseed.binance.org/")
+    .split(",").map(s => s.trim()).filter(Boolean)
+    .concat(process.env.FLAP_FACTORY_ARCHIVE_RPC_URL || "https://bsc-mainnet.public.blastapi.io"))],
   registryMonitor: {
     enabled: process.env.FLAP_REGISTRY_MONITOR !== "false",
     address: (process.env.FLAP_REGISTRY_ADDRESS || "0x90497450f2a706f1951b5bdda52b4e5d16f34c06").toLowerCase(),
@@ -79,6 +90,20 @@ const CONFIG = {
       "0xd8cf270eb9827992a063745f0afaa72431f8c63fc46736f8b484862dcc709787",
       "0x566b7414cab715cde3c8bcc93daec35325367d6c648327d19a1867d1006af3b3",
     ]),
+  },
+  factoryPoolMonitor: {
+    enabled: process.env.FLAP_FACTORY_POOL_MONITOR !== "false",
+    proxy: (process.env.FLAP_FACTORY_PROXY || FLAP_FACTORY_PROXY).toLowerCase(),
+    stateFile: join(__dirname, "factory-pool-state.json"),
+    intervalMs: readPositiveIntEnv("FLAP_FACTORY_POOL_INTERVAL_MS", 1_000, 500),
+    confirmations: readPositiveIntEnv("FLAP_FACTORY_POOL_CONFIRMATIONS", 5, 1),
+    deploymentBlock: Number.parseInt(process.env.FLAP_FACTORY_DEPLOYMENT_BLOCK || "0", 10),
+    realtimeBootstrapBlocks: readPositiveIntEnv("FLAP_FACTORY_REALTIME_BOOTSTRAP_BLOCKS", 20, 1),
+    realtimeMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_REALTIME_MAX_BLOCKS", 20, 1),
+    historyLogChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_LOG_CHUNK_BLOCKS", 2_000, 1),
+    historyBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS", 10, 1),
+    deepHistoryBlockScan: process.env.FLAP_FACTORY_DEEP_HISTORY_BLOCK_SCAN !== "false",
+    assetRefreshPerRun: readPositiveIntEnv("FLAP_FACTORY_ASSET_REFRESH_PER_RUN", 10, 1),
   },
 
   // 反风控
@@ -922,13 +947,13 @@ function addressLink(address, type = "address") {
   const value = String(address || "");
   if (!/^0x[a-fA-F0-9]{40}$/.test(value)) return value || "-";
   const path = type === "tx" ? "tx" : "address";
-  return flapLink(shortHash(value, 8, 4), `https://bscscan.com/${path}/${value}`);
+  return flapLink(value, `https://bscscan.com/${path}/${value}`);
 }
 
 function txLink(txHash) {
   const value = String(txHash || "");
   if (!/^0x[a-fA-F0-9]{64}$/.test(value)) return value || "-";
-  return flapLink(shortHash(value, 10, 6), `https://bscscan.com/tx/${value}`);
+  return flapLink(value, `https://bscscan.com/tx/${value}`);
 }
 
 function blockLink(blockNumber) {
@@ -2424,9 +2449,13 @@ function numberToHex(value) {
   return `0x${Math.max(0, Number(value) || 0).toString(16)}`;
 }
 
-async function bscRpcCall(method, params = []) {
+let preferredBscRpcIndex = 0;
+
+async function bscRpcCall(method, params = [], options = {}) {
   let lastErr = null;
-  for (const rpcUrl of CONFIG.bscRpcUrls) {
+  for (let attempt = 0; attempt < CONFIG.bscRpcUrls.length; attempt++) {
+    const index = (preferredBscRpcIndex + attempt) % CONFIG.bscRpcUrls.length;
+    const rpcUrl = CONFIG.bscRpcUrls[index];
     try {
       const res = await fetchSafe(rpcUrl, {
         method: "POST",
@@ -2435,6 +2464,8 @@ async function bscRpcCall(method, params = []) {
       });
       const json = await res.json();
       if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
+      if (options.requireResult && json.result == null) throw new Error(`${method} 返回空结果`);
+      preferredBscRpcIndex = index;
       return json.result;
     } catch (err) {
       lastErr = err;
@@ -2443,12 +2474,14 @@ async function bscRpcCall(method, params = []) {
   throw lastErr || new Error("所有 BSC RPC 节点均不可用");
 }
 
-async function bscRpcBatch(calls = []) {
+async function bscRpcBatch(calls = [], options = {}) {
   if (calls.length === 0) return [];
-  if (calls.length === 1) return [await bscRpcCall(calls[0].method, calls[0].params)];
+  if (calls.length === 1) return [await bscRpcCall(calls[0].method, calls[0].params, { requireResult: options.requireAllResults })];
   let lastErr = null;
   const payload = calls.map((call, i) => ({ jsonrpc: "2.0", id: i + 1, method: call.method, params: call.params || [] }));
-  for (const rpcUrl of CONFIG.bscRpcUrls) {
+  for (let attempt = 0; attempt < CONFIG.bscRpcUrls.length; attempt++) {
+    const index = (preferredBscRpcIndex + attempt) % CONFIG.bscRpcUrls.length;
+    const rpcUrl = CONFIG.bscRpcUrls[index];
     try {
       const res = await fetchSafe(rpcUrl, {
         method: "POST",
@@ -2458,11 +2491,14 @@ async function bscRpcBatch(calls = []) {
       const json = await res.json();
       if (!Array.isArray(json)) throw new Error("Batch RPC 返回非数组");
       const byId = new Map(json.map(item => [item.id, item]));
-      return payload.map(item => {
+      const results = payload.map(item => {
         const r = byId.get(item.id);
         if (!r || r.error) return null;
         return r.result;
       });
+      if (options.requireAllResults && results.some(result => result == null)) throw new Error("Batch RPC 存在空结果");
+      preferredBscRpcIndex = index;
+      return results;
     } catch (err) {
       lastErr = err;
     }
@@ -2597,6 +2633,82 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
   const messageId = await sendCardFn(title, content, "red");
   if (messageId) await pinMessage(messageId);
   return { changed: true, sent: Boolean(messageId), events: newEvents };
+}
+
+function formatFactoryPoolAssetLabel(address) {
+  return address === BNB_QUOTE_TOKEN ? `BNB (${addressLink(address)})` : addressLink(address);
+}
+
+function buildFactoryPoolMonitorContent(result) {
+  const state = result.state || {};
+  const enabledCount = Object.values(state.assets || {}).filter(item => item?.enabled).length;
+  const disabledCount = Object.values(state.assets || {}).filter(item => item && !item.enabled).length;
+  const summary = [
+    `本轮新增/修改/停用 ${result.changes.length} 个底池资产`,
+    `Factory Proxy: ${addressLink(state.proxy)}`,
+    `Implementation: ${addressLink(state.currentImplementation)}`,
+    `当前资产: 启用 ${enabledCount} 个 / 未启用或停用 ${disabledCount} 个`,
+    `实时扫描: ${state.lastScannedBlock ?? "未建立"} / 安全区块 ${state.safeLatestBlock ?? "未建立"}`,
+  ];
+  const primary = [];
+  for (const change of result.changes) {
+    const item = change.current;
+    const label = change.type === "added" ? "新增" : change.type === "disabled" ? "停用" : "修改";
+    primary.push(`${label}底池: ${formatFactoryPoolAssetLabel(item.quoteToken)}`);
+    primary.push(`  状态: ${item.enabled ? "已启用" : "未启用或已停用"}`);
+    item.values.forEach((value, index) => primary.push(`  字段 ${index + 1}: ${value}`));
+    if (item.lastTxHash) primary.push(`  交易: ${txLink(item.lastTxHash)}`);
+    if (item.lastSeenBlock != null) primary.push(`  区块: ${blockLink(item.lastSeenBlock)}`);
+  }
+  if (result.implementationChange?.previous) {
+    const upgrade = result.implementationChange;
+    primary.push("Factory implementation 发生变化");
+    primary.push(`  原地址: ${addressLink(upgrade.previous)}`);
+    primary.push(`  新地址: ${addressLink(upgrade.current)}`);
+    primary.push(`  检测区块: ${blockLink(upgrade.detectedBlock)}`);
+    if (upgrade.txHash) primary.push(`  升级交易: ${txLink(upgrade.txHash)}`);
+    if (upgrade.upgradeBlock != null) primary.push(`  升级区块: ${blockLink(upgrade.upgradeBlock)}`);
+    primary.push(`  已重新识别函数选择器: ${upgrade.selectors.length} 个`);
+    for (const selector of upgrade.selectors) primary.push(`  ${selector}`);
+  }
+  return buildFlapCardContent({
+    summary,
+    primaryTitle: "Factory 底池资产链上变更",
+    primary: primary.length > 0 ? primary : buildFactoryPoolChangeLines(result.changes),
+  });
+}
+
+async function checkFlapFactoryPools(factoryPoolState, { sendCardFn = sendCardViaApi, titlePrefix = "", suppressNotifications = false } = {}) {
+  if (!CONFIG.factoryPoolMonitor.enabled) return { changed: false, sent: false, state: factoryPoolState };
+  const result = await runFactoryPoolScan({
+    state: factoryPoolState,
+    rpcCall: bscRpcCall,
+    rpcBatch: calls => bscRpcBatch(calls, { requireAllResults: true }),
+    config: CONFIG.factoryPoolMonitor,
+    log,
+  });
+  factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
+  if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
+  if (suppressNotifications) {
+    factoryPoolState.pendingChanges = [];
+    factoryPoolState.pendingImplementationChange = null;
+  }
+  saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+  const shouldNotify = factoryPoolState.pendingChanges.length > 0 || Boolean(factoryPoolState.pendingImplementationChange?.previous);
+  if (!shouldNotify) return { ...result, sent: false };
+  const pendingResult = {
+    ...result,
+    changes: factoryPoolState.pendingChanges,
+    implementationChange: factoryPoolState.pendingImplementationChange,
+  };
+  const title = `${titlePrefix}Flap Factory 底池资产链上变更`;
+  const messageId = await sendCardFn(title, buildFactoryPoolMonitorContent(pendingResult), "red");
+  if (!messageId) return { ...result, sent: false };
+  factoryPoolState.pendingChanges = [];
+  factoryPoolState.pendingImplementationChange = null;
+  saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+  try { await pinMessage(messageId); } catch (err) { log(`[Flap Factory] 卡片置顶失败：${err.message}`); }
+  return { ...result, sent: true };
 }
 
 function extractStrings(content, ext) {
@@ -4814,6 +4926,14 @@ async function runCheck() {
   } catch (err) {
     log(`[Flap 注册中心] 手动检测失败：${err.message}`);
   }
+  try {
+    const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
+    const factoryResult = await checkFlapFactoryPools(factoryPoolState, { titlePrefix: "手动检测 — " });
+    if (factoryResult.changed) hasDetectedChange = true;
+    if (factoryResult.sent) hasNotifiedChange = true;
+  } catch (err) {
+    log(`[Flap Factory] 手动检测失败：${err.message}`);
+  }
 
   for (const n of coalesceFlapNotifications(notifications, { titlePrefix: "手动检测 — " })) {
     for (const diff of getStandaloneCaStoreVaultDiffs(n)) {
@@ -4845,7 +4965,7 @@ async function runCheck() {
    持续监控模式（主循环）
    ══════════════════════════════════════════ */
 
-function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
+function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPoolState = createFactoryPoolState(CONFIG.factoryPoolMonitor.proxy)) {
   const pages = Object.values(snapshot.pages || {});
   const factories = Object.values(snapshot.vaultFactories || {}).filter(factory => factory?.showInCAStore === true);
   const registry = snapshot.registryMonitor || {};
@@ -4864,6 +4984,14 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
       })
     : ["当前没有配置为 CAStore 展示的金库"];
   const robinhoodLaunchUrl = buildVaultFactoryLaunchUrl(ROBINHOOD_INDEX_VAULT_FACTORY, { chain: "robinhood" });
+  const poolAssets = Object.values(factoryPoolState.assets || {}).sort((a, b) => a.quoteToken.localeCompare(b.quoteToken));
+  const relatedSelectors = Object.values(factoryPoolState.relatedSelectors || {}).sort((a, b) => a.selector.localeCompare(b.selector));
+  const poolAssetLines = poolAssets.length > 0
+    ? poolAssets.flatMap((asset, index) => [
+        `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetLabel(asset.quoteToken)}｜状态 ${asset.enabled ? "已启用" : "未启用或已停用"}`,
+        ...(asset.values || []).map((value, fieldIndex) => `字段 ${fieldIndex + 1}：${value}`),
+      ])
+    : ["尚未发现已配置的 Factory 底池资产"];
   return [
     "**01｜运行状态**",
     "状态：监控运行中",
@@ -4884,7 +5012,18 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
     `Factory：${flapLink(ROBINHOOD_INDEX_VAULT_FACTORY, robinhoodLaunchUrl)}`,
     `金库入口：${flapLink(robinhoodLaunchUrl, robinhoodLaunchUrl)}`,
     "",
-    "**05｜链上注册中心**",
+    "**05｜Factory 底池资产**",
+    `Factory Proxy：${addressLink(factoryPoolState.proxy || CONFIG.factoryPoolMonitor.proxy)}`,
+    `Implementation：${factoryPoolState.currentImplementation ? addressLink(factoryPoolState.currentImplementation) : "尚未建立"}`,
+    `部署区块：${factoryPoolState.deploymentBlock ?? "尚未定位"}`,
+    `部署交易：${factoryPoolState.deploymentTxHash ? txLink(factoryPoolState.deploymentTxHash) : "尚未定位"}`,
+    `部署者：${factoryPoolState.deployer ? addressLink(factoryPoolState.deployer) : "尚未定位"}`,
+    `资产数量：${poolAssets.length}｜启用 ${poolAssets.filter(asset => asset.enabled).length}｜未启用或停用 ${poolAssets.filter(asset => !asset.enabled).length}`,
+    `实时扫描：${factoryPoolState.lastScannedBlock ?? "尚未建立"}｜安全区块 ${factoryPoolState.safeLatestBlock ?? "尚未建立"}｜历史完整扫描 ${factoryPoolState.historyLastScannedBlock ?? "尚未建立"}`,
+    `已识别相关调用：${relatedSelectors.length} 个${relatedSelectors.length ? `｜${relatedSelectors.map(item => item.selector).join("、")}` : ""}`,
+    ...poolAssetLines,
+    "",
+    "**06｜链上注册中心**",
     `注册中心：${addressLink(CONFIG.registryMonitor.address)}`,
     `确认块：${CONFIG.registryMonitor.confirmations}`,
     `启动回溯：${CONFIG.registryMonitor.bootstrapLookbackBlocks} 块`,
@@ -4892,13 +5031,14 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知") {
     `已扫描区块：${registry.lastBlock ?? "尚未建立"}｜安全区块 ${registry.safeLatestBlock ?? "尚未建立"}｜最新区块 ${registry.latestBlock ?? "尚未建立"}`,
     `已知链上金库：${Object.keys(registry.knownVaults || {}).length} 个`,
     "",
-    "**06｜RPC 节点**",
+    "**07｜RPC 节点**",
     ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
   ].join("\n");
 }
 
 async function startMonitor() {
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
+  const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
   // failCounts 改为对象结构，记录失败次数、最近错误信息和时间
   const failCounts = {};  // key -> { count, lastMsg, lastFailTime, hourlyErrors }
   const backoffSkips = {};  // key -> number of polls skipped due to domain backoff
@@ -4956,11 +5096,46 @@ async function startMonitor() {
     saveSnapshot(snapshot);
   }
 
+  if (CONFIG.factoryPoolMonitor.enabled) {
+    try {
+      await checkFlapFactoryPools(factoryPoolState, { suppressNotifications: true });
+    } catch (err) {
+      factoryPoolState.lastError = err.message;
+      factoryPoolState.lastRunAt = ts();
+      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      log(`[Flap Factory] 启动检测失败：${err.message}`);
+    }
+  }
+
   await sendFeishu(
     "Flap 监控 v2 已启动",
-    buildFlapStartupContent(snapshot, (await import("node:os")).hostname()),
+    buildFlapStartupContent(snapshot, (await import("node:os")).hostname(), factoryPoolState),
     "blue"
   );
+
+  let isFactoryPoolScanning = false;
+  async function factoryPoolPoll() {
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryPoolScanning) return;
+    isFactoryPoolScanning = true;
+    try {
+      await checkFlapFactoryPools(factoryPoolState);
+    } catch (err) {
+      factoryPoolState.lastError = err.message;
+      factoryPoolState.lastRunAt = ts();
+      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      log(`[Flap Factory] 检测失败：${err.message}`);
+    } finally {
+      isFactoryPoolScanning = false;
+    }
+  }
+
+  function scheduleFactoryPoolNext() {
+    setTimeout(async () => {
+      await factoryPoolPoll();
+      scheduleFactoryPoolNext();
+    }, CONFIG.factoryPoolMonitor.intervalMs);
+  }
+  scheduleFactoryPoolNext();
 
   // 轮询函数：并行检测所有页面
   let pendingPoll = false;
@@ -5222,6 +5397,7 @@ async function startMonitor() {
 
   // SIGUSR1 信号
   process.on("SIGUSR1", () => {
+    factoryPoolPoll().catch(err => log(`[SIGUSR1] Factory 检测异常：${err.message}`));
     if (isPolling) {
       pendingPoll = true;  // 利用 pendingPoll 机制，当前轮询结束后自动触发
       log("收到 SIGUSR1，当前正在轮询，将在本轮结束后立即执行");
@@ -5313,6 +5489,7 @@ export const __testables = {
   normalizeAddress,
   extractRegistryVaultAddressesFromLog,
   buildRegistryMonitorContent,
+  buildFactoryPoolMonitorContent,
   buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,
   extractVaultFactories,

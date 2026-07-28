@@ -1,7 +1,7 @@
 {
   "name": "flap-monitor",
-  "version": "1.1.1",
-  "description": "Flap.sh 页面监控（前端/i18n/API/路由）",
+  "version": "1.2.0",
+  "description": "Flap.sh 页面、金库和 Factory 底池资产链上监控",
   "type": "module",
   "private": true,
   "scripts": {

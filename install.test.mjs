@@ -39,15 +39,19 @@ function renderFourmemeStatus(snapshot) {
   }
 }
 
-function renderFlapStatus(snapshot) {
+function renderFlapStatus(snapshot, factoryState = {}) {
   const source = extractHeredoc("fl-status");
   const script = extractNodeEvalScripts(source).find(item => item.includes("vaultLink"));
   assert.ok(script, "未找到 Flap 快照状态渲染器");
   const dir = mkdtempSync(join(tmpdir(), "monitor-suite-flap-status-"));
   const snapshotPath = join(dir, "snapshot.json");
+  const factoryStatePath = join(dir, "factory-pool-state.json");
   try {
     writeFileSync(snapshotPath, JSON.stringify(snapshot), "utf-8");
-    const runnable = script.replace("'$SNAP'", JSON.stringify(snapshotPath));
+    writeFileSync(factoryStatePath, JSON.stringify(factoryState), "utf-8");
+    const runnable = script
+      .replaceAll("'$SNAP'", JSON.stringify(snapshotPath))
+      .replaceAll("'$FACTORY_STATE'", JSON.stringify(factoryStatePath));
     const result = spawnSync(process.execPath, ["-e", runnable], { encoding: "utf-8" });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
@@ -114,6 +118,32 @@ test("Flap status links current factories and registered vaults to launch pages"
   assert.match(output, /https:\/\/flap\.sh\/robinhood\/CAstore\?lang=zh/);
   assert.match(output, /币股（IndexVault）｜状态 监控中/);
   assert.match(output, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
+});
+
+test("Flap status shows complete Factory pool state", () => {
+  const quoteToken = "0x0000000000000000000000000000000000000000";
+  const txHash = `0x${"ab".repeat(32)}`;
+  const output = renderFlapStatus({ pages: {}, vaultFactories: {} }, {
+    proxy: "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0",
+    currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
+    deploymentBlock: 39980228,
+    deploymentDetection: "eth_getCode-binary-search",
+    lastScannedBlock: 100,
+    safeLatestBlock: 100,
+    latestBlock: 105,
+    historyLogLastScannedBlock: 90,
+    historyBlockLastScannedBlock: 80,
+    historyLastScannedBlock: 80,
+    candidates: { [quoteToken]: {} },
+    assets: {
+      [quoteToken]: { quoteToken, enabled: true, values: ["1", "2", "3", "4", "5"], lastTxHash: txHash, lastSeenBlock: 99 },
+    },
+  });
+  assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
+  assert.match(output, /部署区块：39980228/);
+  assert.match(output, /BNB｜地址 \[0x0000000000000000000000000000000000000000\]/);
+  for (let index = 1; index <= 5; index++) assert.match(output, new RegExp(`字段 ${index}：${index}`));
+  assert.match(output, new RegExp(txHash));
 });
 
 test("Four.meme pool status keeps only the requested four fields", () => {

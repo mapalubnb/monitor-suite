@@ -512,10 +512,14 @@ pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor
 # 快照摘要（兼容两种部署路径）
 SNAP="/root/monitor-suite/flap-monitor/snapshot.json"
 [ -f "$SNAP" ] || SNAP="/root/flap-monitor/snapshot.json"
+FACTORY_STATE="/root/monitor-suite/flap-monitor/factory-pool-state.json"
+[ -f "$FACTORY_STATE" ] || FACTORY_STATE="/root/flap-monitor/factory-pool-state.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
-    const s=JSON.parse(require('fs').readFileSync('$SNAP','utf-8'));
+    const fs=require('fs');
+    const s=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
+    const fp=fs.existsSync('$FACTORY_STATE')?JSON.parse(fs.readFileSync('$FACTORY_STATE','utf-8')):{};
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+(chain==='robinhood'?'&chain=robinhood&lang=zh':''));
     const robinhoodPage='https://flap.sh/robinhood/CAstore?lang=zh';
@@ -531,6 +535,9 @@ if [ -f "$SNAP" ]; then
     const visibleFactories=visibleFactoryItems.length;
     const enabledVisibleFactories=visibleFactoryItems.filter(v=>v&&v.enabled).length;
     const registry=s.registryMonitor||{};
+    const poolAssets=Object.values(fp.assets||{}).sort((a,b)=>String(a.quoteToken||'').localeCompare(String(b.quoteToken||'')));
+    const enabledPoolAssets=poolAssets.filter(v=>v&&v.enabled).length;
+    const relatedSelectors=Object.values(fp.relatedSelectors||{}).sort((a,b)=>String(a.selector||'').localeCompare(String(b.selector||'')));
     const registryAddress=registry.address||'0x90497450f2a706f1951b5bdda52b4e5d16f34c06';
     const knownVaults=Object.keys(registry.knownVaults||{});
     const safeLatest=registry.safeLatestBlock??'-';
@@ -565,6 +572,7 @@ if [ -f "$SNAP" ]; then
     console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
     console.log('页面：'+keys.length+' 个｜资源 '+totalAssets+' 个｜文案 '+totalText+' 字｜i18n '+totalI18n+' 键');
     console.log('金库工厂：总数 '+factoryItems.length+' 个｜CAStore 可见 '+visibleFactories+' 个｜已启用 '+enabledVisibleFactories+' 个｜链上金库 '+knownVaults.length+' 个');
+    console.log('Factory 底池：已配置 '+poolAssets.length+' 个｜启用 '+enabledPoolAssets+' 个｜未启用或停用 '+Math.max(0,poolAssets.length-enabledPoolAssets)+' 个');
     console.log('');
 
     console.log('**03｜页面监控**');
@@ -590,7 +598,30 @@ if [ -f "$SNAP" ]; then
     console.log('金库入口：'+mdLink(robinhoodLaunch,robinhoodLaunch));
     console.log('');
 
-    console.log('**06｜链上注册中心**');
+    console.log('**06｜Factory 底池资产**');
+    console.log('Factory Proxy：'+mdLink(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0','https://bscscan.com/address/'+(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0')));
+    console.log('Implementation：'+(fp.currentImplementation?mdLink(fp.currentImplementation,'https://bscscan.com/address/'+fp.currentImplementation):'尚未建立'));
+    console.log('部署区块：'+(fp.deploymentBlock??'尚未定位')+'｜定位方式 '+(fp.deploymentDetection||'尚未建立'));
+    console.log('部署交易：'+(fp.deploymentTxHash?mdLink(fp.deploymentTxHash,'https://bscscan.com/tx/'+fp.deploymentTxHash):'尚未定位'));
+    console.log('部署者：'+(fp.deployer?mdLink(fp.deployer,'https://bscscan.com/address/'+fp.deployer):'尚未定位'));
+    console.log('实时扫描：'+(fp.lastScannedBlock??'尚未建立')+'｜安全区块 '+(fp.safeLatestBlock??'尚未建立')+'｜最新区块 '+(fp.latestBlock??'尚未建立'));
+    console.log('历史日志：'+(fp.historyLogLastScannedBlock??'尚未建立')+'｜历史完整区块：'+(fp.historyBlockLastScannedBlock??'尚未建立')+'｜完整进度：'+(fp.historyLastScannedBlock??'尚未建立'));
+    console.log('候选：'+Object.keys(fp.candidates||{}).length+' 个｜已配置 '+poolAssets.length+' 个｜启用 '+enabledPoolAssets+' 个｜未启用或停用 '+Math.max(0,poolAssets.length-enabledPoolAssets)+' 个');
+    console.log('待发送通知：'+((fp.pendingChanges||[]).length+(fp.pendingImplementationChange?1:0))+' 个');
+    console.log('已识别相关调用：'+relatedSelectors.length+' 个'+(relatedSelectors.length?'｜'+relatedSelectors.map(v=>v.selector).join('、'):''));
+    if(fp.lastError) console.log('最近错误：'+fp.lastError);
+    if(poolAssets.length===0) console.log('尚未发现已配置的 Factory 底池资产');
+    for(const [index,v] of poolAssets.entries()){
+      const address=v.quoteToken||'';
+      const label=address==='0x0000000000000000000000000000000000000000'?'BNB':address;
+      console.log(String(index+1).padStart(2,'0')+'　'+label+'｜地址 '+mdLink(address,'https://bscscan.com/address/'+address)+'｜状态 '+(v.enabled?'已启用':'未启用或已停用'));
+      for(const [fieldIndex,value] of (v.values||[]).entries()) console.log('字段 '+(fieldIndex+1)+'：'+value);
+      if(v.lastTxHash) console.log('交易：'+mdLink(v.lastTxHash,'https://bscscan.com/tx/'+v.lastTxHash));
+      if(v.lastSeenBlock!=null) console.log('区块：'+mdLink(String(v.lastSeenBlock),'https://bscscan.com/block/'+v.lastSeenBlock));
+    }
+    console.log('');
+
+    console.log('**07｜链上注册中心**');
     console.log('注册中心：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
     console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
     console.log('已知链上金库：'+knownVaults.length+' 个');

@@ -4,9 +4,21 @@ import assert from "node:assert/strict";
 process.env.FLAP_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
+const {
+  BNB_QUOTE_TOKEN,
+  FLAP_FACTORY_PROXY,
+  buildQuoteTokenConfigurationCall,
+  createFactoryPoolState,
+  decodeQuoteTokenConfiguration,
+  extractBytecodeSelectors,
+  extractFactoryTransactionCandidates,
+  mergePendingFactoryPoolChanges,
+  runFactoryPoolScan,
+} = await import("./factory-pool-monitor.mjs");
 
 test("default Flap polling interval remains fast and configurable", () => {
   assert.equal(__testables.CONFIG.pollIntervalMs, 1_000);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.intervalMs, 1_000);
 });
 
 test("Flap startup card is complete and uses no emoji or bullet list markers", () => {
@@ -21,7 +33,17 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
       hidden: { name: "隐藏金库", factory: "0x0000000000000000000000000000000000000002", enabled: true, showInCAStore: false },
     },
     registryMonitor: { lastBlock: 100, safeLatestBlock: 105, latestBlock: 110, knownVaults: { one: {} } },
-  }, "monitor-host");
+  }, "monitor-host", {
+    proxy: FLAP_FACTORY_PROXY,
+    currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
+    deploymentBlock: 39980228,
+    lastScannedBlock: 100,
+    safeLatestBlock: 105,
+    historyLastScannedBlock: 90,
+    assets: {
+      [BNB_QUOTE_TOKEN]: { quoteToken: BNB_QUOTE_TOKEN, enabled: true, values: ["1", "2", "3", "4", "5"] },
+    },
+  });
   for (const url of __testables.CONFIG.urls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   for (const url of __testables.CONFIG.bscRpcUrls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(content, /0x0000000000000000000000000000000000000001/);
@@ -33,9 +55,172 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
   assert.match(content, /币股（IndexVault）｜状态 监控中/);
   assert.match(content, /0xe6ca297D1d963b6F00d5b216986123CAeB883AF6/);
   assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
+  assert.match(content, /\*\*05｜Factory 底池资产\*\*/);
+  assert.match(content, /部署区块：39980228/);
+  for (let index = 1; index <= 5; index++) assert.match(content, new RegExp(`字段 ${index}：${index}`));
   assert.doesNotMatch(content, /操作入口|更新时间：|CAStore 展示/);
   assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
   assert.doesNotMatch(content, /(^|\n)-\s/m);
+});
+
+test("Factory getter call and five-word response preserve complete values", () => {
+  const token = "0x1111111111111111111111111111111111111111";
+  assert.equal(buildQuoteTokenConfigurationCall(token), `0x26ef20d5${"0".repeat(24)}${token.slice(2)}`);
+  const words = [1n, 2n, 3n, 4n, (1n << 255n) + 9n].map(value => value.toString(16).padStart(64, "0"));
+  const decoded = decodeQuoteTokenConfiguration(`0x${words.join("")}`);
+  assert.equal(decoded.enabled, true);
+  assert.equal(decoded.configured, true);
+  assert.deepEqual(decoded.values, ["1", "2", "3", "4", ((1n << 255n) + 9n).toString()]);
+  assert.equal(decoded.fields.length, 5);
+});
+
+test("Factory implementation selector extraction ignores PUSH4 data constants", () => {
+  assert.deepEqual(extractBytecodeSelectors("0x806326ef20d51461010063deadbeef00"), ["0x26ef20d5"]);
+});
+
+test("Factory transaction candidate parsing keeps BNB zero address", () => {
+  const token = "0x2222222222222222222222222222222222222222";
+  const input = `0x12345678${"0".repeat(64)}${"0".repeat(24)}${token.slice(2)}`;
+  const candidates = extractFactoryTransactionCandidates({
+    to: FLAP_FACTORY_PROXY,
+    input,
+    hash: `0x${"ab".repeat(32)}`,
+    blockNumber: "0x64",
+  });
+  assert.deepEqual(candidates.map(item => item.quoteToken), [BNB_QUOTE_TOKEN, token]);
+});
+
+test("Factory pool change card keeps full addresses hashes and five fields without bullets", () => {
+  const txHash = `0x${"12".repeat(32)}`;
+  const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
+  const content = __testables.buildFactoryPoolMonitorContent({
+    state: {
+      proxy: FLAP_FACTORY_PROXY,
+      currentImplementation: implementation,
+      lastScannedBlock: 105,
+      safeLatestBlock: 105,
+      assets: { [BNB_QUOTE_TOKEN]: { enabled: true } },
+    },
+    changes: [{
+      type: "added",
+      current: { quoteToken: BNB_QUOTE_TOKEN, enabled: true, values: ["1", "20", "20", "0", "0"], lastTxHash: txHash, lastSeenBlock: 104 },
+    }],
+    implementationChange: null,
+  });
+  assert.match(content, new RegExp(FLAP_FACTORY_PROXY));
+  assert.match(content, new RegExp(implementation));
+  assert.match(content, new RegExp(txHash));
+  for (let index = 1; index <= 5; index++) assert.match(content, new RegExp(`字段 ${index}:`));
+  assert.doesNotMatch(content, /(^|\n)-\s/m);
+  assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
+});
+
+test("Factory pending notification queue keeps unsent changes and deduplicates by address", () => {
+  const token = "0x6666666666666666666666666666666666666666";
+  const added = { type: "added", previous: null, current: { quoteToken: token, fingerprint: "first", enabled: true } };
+  const modified = { type: "modified", previous: added.current, current: { quoteToken: token, fingerprint: "second", enabled: true } };
+  const pending = mergePendingFactoryPoolChanges([added], [modified]);
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].type, "added");
+  assert.equal(pending[0].current.fingerprint, "second");
+  assert.equal(pending[0].previous, null);
+});
+
+test("Factory scanner resumes confirmed blocks, verifies assets and stays idempotent", async () => {
+  const token = "0x3333333333333333333333333333333333333333";
+  const txHash = `0x${"cd".repeat(32)}`;
+  const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 100,
+    deploymentDetection: "test",
+    lastScannedBlock: 104,
+    historyLogLastScannedBlock: 104,
+    historyBlockLastScannedBlock: 104,
+  });
+  const getterResult = `0x${[1n, 2n, 3n, 4n, 5n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const transaction = {
+    to: FLAP_FACTORY_PROXY,
+    input: `0x12345678${"0".repeat(24)}${token.slice(2)}`,
+    hash: txHash,
+    blockNumber: "0x69",
+  };
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x70";
+    if (method === "eth_getStorageAt") return `0x${"0".repeat(24)}${implementation.slice(2)}`;
+    if (method === "eth_getCode") return "0x8063aabbccdd146100";
+    if (method === "eth_getLogs") {
+      const filter = params[0];
+      const from = Number.parseInt(filter.fromBlock, 16);
+      const to = Number.parseInt(filter.toBlock, 16);
+      return from <= 105 && to >= 105 ? [{
+        address: FLAP_FACTORY_PROXY,
+        topics: [`0x${"99".repeat(32)}`],
+        data: `0x${"0".repeat(24)}${token.slice(2)}`,
+        transactionHash: txHash,
+        blockNumber: "0x69",
+        logIndex: "0x0",
+      }] : [];
+    }
+    if (method === "eth_call") return getterResult;
+    if (method === "eth_getBlockByNumber") {
+      const blockNumber = Number.parseInt(params[0], 16);
+      return {
+        hash: `0x${blockNumber.toString(16).padStart(64, "0")}`,
+        transactions: params[1] && blockNumber === 105 ? [transaction] : [],
+      };
+    }
+    if (method === "eth_getTransactionByHash") return transaction;
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const config = { confirmations: 5, realtimeMaxBlocksPerRun: 20, historyLogChunkBlocks: 20, historyBlockChunkBlocks: 2, assetRefreshPerRun: 10 };
+  const first = await runFactoryPoolScan({ state, rpcCall, config });
+  assert.equal(state.lastScannedBlock, 107);
+  assert.equal(state.assets[token].enabled, true);
+  assert.deepEqual(state.assets[token].values, ["1", "2", "3", "4", "5"]);
+  assert.equal(first.changes.length, 1);
+  const second = await runFactoryPoolScan({ state, rpcCall, config });
+  assert.equal(second.changes.length, 0);
+  assert.equal(Object.keys(state.processedTransactions).length, 1);
+  assert.equal(state.candidates[token].sources.length, 1);
+  assert.ok(state.relatedSelectors["0x12345678"]);
+});
+
+test("Factory scanner locates deployment block and creation transaction automatically", async () => {
+  const state = createFactoryPoolState();
+  const creationHash = `0x${"ef".repeat(32)}`;
+  const deployer = "0x4444444444444444444444444444444444444444";
+  const implementation = "0x5555555555555555555555555555555555555555";
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x70";
+    if (method === "eth_getCode") {
+      if (params[0].toLowerCase() === implementation) return "0x8063aabbccdd146100";
+      return Number.parseInt(params[1], 16) >= 100 ? "0x6000" : "0x";
+    }
+    if (method === "eth_getStorageAt") return `0x${"0".repeat(24)}${implementation.slice(2)}`;
+    if (method === "eth_getLogs") return [];
+    if (method === "eth_getBlockByNumber") {
+      const blockNumber = Number.parseInt(params[0], 16);
+      return {
+        hash: `0x${blockNumber.toString(16).padStart(64, "0")}`,
+        transactions: params[1] && blockNumber === 100 ? [{ hash: creationHash, from: deployer, to: null, input: "0x" }] : [],
+      };
+    }
+    if (method === "eth_getTransactionReceipt") return { contractAddress: FLAP_FACTORY_PROXY };
+    if (method === "eth_getTransactionByHash") return null;
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: { confirmations: 5, deepHistoryBlockScan: false, historyLogChunkBlocks: 20, assetRefreshPerRun: 1 },
+  });
+  assert.equal(state.deploymentBlock, 100);
+  assert.equal(state.deploymentDetection, "eth_getCode-binary-search");
+  assert.equal(state.deploymentTxHash, creationHash);
+  assert.equal(state.deployer, deployer);
 });
 
 test("shared Flap asset-only page changes are summarized into one site-wide notification", () => {
