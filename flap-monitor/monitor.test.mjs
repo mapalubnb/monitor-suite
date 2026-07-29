@@ -69,7 +69,8 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
   assert.match(content, /0xe6ca297D1d963b6F00d5b216986123CAeB883AF6/);
   assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
   assert.match(content, /\*\*05｜Factory 底池资产\*\*/);
-  assert.match(content, /部署区块：39980228/);
+  assert.match(content, /监控状态：运行正常/);
+  assert.match(content, /资产数量：2｜启用 2｜未启用或停用 0/);
   assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
   assert.match(content, /Tether Gold \(XAUt\)｜状态 已启用｜地址/);
   assert.match(content, /0x21caef8a43163eea865baee23b9c2e327696a3bf/);
@@ -106,7 +107,7 @@ test("Factory transaction candidate parsing keeps BNB zero address", () => {
   assert.deepEqual(candidates.map(item => item.quoteToken), [BNB_QUOTE_TOKEN, token]);
 });
 
-test("Factory pool change card keeps name full address and hash without internal fields", () => {
+test("Factory pool change card keeps only readable asset status and full address", () => {
   const txHash = `0x${"12".repeat(32)}`;
   const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
   const content = __testables.buildFactoryPoolMonitorContent({
@@ -123,11 +124,12 @@ test("Factory pool change card keeps name full address and hash without internal
     }],
     implementationChange: null,
   });
-  assert.match(content, new RegExp(FLAP_FACTORY_PROXY));
-  assert.match(content, new RegExp(implementation));
-  assert.match(content, new RegExp(txHash));
-  assert.match(content, /新增底池: BNB/);
+  assert.match(content, /新增底池：BNB/);
   assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
+  assert.doesNotMatch(content, new RegExp(FLAP_FACTORY_PROXY));
+  assert.doesNotMatch(content, new RegExp(implementation));
+  assert.doesNotMatch(content, new RegExp(txHash));
+  assert.doesNotMatch(content, /区块|交易|Implementation|选择器/);
   assert.doesNotMatch(content, /字段 [1-5]:/);
   assert.doesNotMatch(content, /(^|\n)-\s/m);
   assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
@@ -146,7 +148,7 @@ test("Factory pool change card sends immediately with full address while name is
     changes: [{ type: "added", current: { quoteToken: token, enabled: true, lastSeenBlock: 199 } }],
     implementationChange: null,
   });
-  assert.match(content, /新增底池: 名称同步中/);
+  assert.match(content, /新增底池：名称同步中/);
   assert.match(content, new RegExp(token));
 });
 
@@ -206,6 +208,22 @@ test("Factory asynchronous metadata failure does not patch or reject delivery fl
   assert.equal(patchCalls, 0);
 });
 
+test("Factory metadata enrichment skips completed assets without queue work or state writes", async () => {
+  const token = "0x7979797979797979797979797979797979797979";
+  const state = { assets: { [token]: { quoteToken: token, name: "Ready Pool", symbol: "READY", enabled: true } } };
+  let enrichCalls = 0;
+  let saveCalls = 0;
+  const outcome = await __testables.scheduleFactoryPoolMetadataEnrichment({
+    state,
+    result: { state, changes: [] },
+    enrichFn: async () => { enrichCalls++; },
+    saveFn: () => { saveCalls++; },
+  });
+  assert.deepEqual(outcome, { patched: false, metadataChanged: false });
+  assert.equal(enrichCalls, 0);
+  assert.equal(saveCalls, 0);
+});
+
 test("Factory first delivery does not await metadata enrichment", async () => {
   const token = "0x8888888888888888888888888888888888888888";
   const asset = { quoteToken: token, enabled: true, lastSeenBlock: 400 };
@@ -219,6 +237,7 @@ test("Factory first delivery does not await metadata enrichment", async () => {
     pendingImplementationChange: null,
   };
   let metadataScheduled = false;
+  const deliveryOrder = [];
   const delivery = __testables.checkFlapFactoryPools(state, {
     scanFn: async () => ({
       changed: true,
@@ -227,10 +246,11 @@ test("Factory first delivery does not await metadata enrichment", async () => {
       state,
     }),
     sendCardFn: async (_title, content) => {
+      deliveryOrder.push("send");
       assert.match(content, /名称同步中/);
       return "om_fast";
     },
-    saveStateFn: () => {},
+    saveStateFn: () => { deliveryOrder.push("save"); },
     pinFn: async () => {},
     scheduleMetadataFn: () => {
       metadataScheduled = true;
@@ -243,6 +263,7 @@ test("Factory first delivery does not await metadata enrichment", async () => {
   ]);
   assert.equal(outcome.sent, true);
   assert.equal(metadataScheduled, true);
+  assert.deepEqual(deliveryOrder, ["send", "save"]);
 });
 
 test("Factory token metadata uses the free GoPlus API response", async () => {
@@ -367,8 +388,8 @@ test("Factory scanner resumes confirmed blocks, verifies assets and stays idempo
   assert.equal(state.assets[token].name, "Test Pool");
   assert.equal(state.assets[token].symbol, "TEST");
   assert.equal(state.assets[token].metadataSource, "goplus");
-  assert.equal(Object.keys(state.processedTransactions).length, 1);
-  assert.equal(state.candidates[token].sources.length, 1);
+  assert.equal("processedTransactions" in state, false);
+  assert.ok(state.candidates[token].sources.length >= 1);
   assert.ok(state.relatedSelectors["0x12345678"]);
 });
 
@@ -408,7 +429,7 @@ test("Factory scanner locates deployment block and creation transaction automati
   assert.equal(state.deployer, deployer);
 });
 
-test("Factory realtime head scans newest confirmed blocks before an old catchup cursor", async () => {
+test("Factory realtime fast path scans configuration events without full blocks or transactions", async () => {
   const token = "0x7777777777777777777777777777777777777777";
   const implementation = "0x8888888888888888888888888888888888888888";
   const state = createFactoryPoolState();
@@ -425,21 +446,23 @@ test("Factory realtime head scans newest confirmed blocks before an old catchup 
     if (method === "eth_chainId") return "0x38";
     if (method === "eth_blockNumber") return "0x3ed";
     if (method === "eth_getStorageAt") return `0x${"0".repeat(24)}${implementation.slice(2)}`;
-    if (method === "eth_getLogs") return [];
+    if (method === "eth_getLogs") {
+      assert.deepEqual(params[0].topics, [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC]);
+      return [{
+        address: FLAP_FACTORY_PROXY,
+        topics: [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC],
+        data: `0x${token.slice(2).padStart(64, "0")}${1n.toString(16).padStart(64, "0")}`,
+        transactionHash: `0x${"34".repeat(32)}`,
+        blockNumber: "0x3e8",
+        logIndex: "0x0",
+      }];
+    }
     if (method === "eth_call") return getterResult;
     if (method === "eth_getBlockByNumber") {
-      const blockNumber = Number.parseInt(params[0], 16);
-      requestedBlocks.push(blockNumber);
-      return {
-        hash: `0x${blockNumber.toString(16).padStart(64, "0")}`,
-        transactions: params[1] && blockNumber === 1000 ? [{
-          to: FLAP_FACTORY_PROXY,
-          input: `0xabcdef01${"0".repeat(24)}${token.slice(2)}`,
-          hash: `0x${"34".repeat(32)}`,
-          blockNumber: params[0],
-        }] : [],
-      };
+      requestedBlocks.push(Number.parseInt(params[0], 16));
+      throw new Error("实时快通道不应读取完整区块");
     }
+    if (method === "eth_getTransactionByHash") throw new Error("实时快通道不应读取关联交易");
     throw new Error(`unexpected RPC method ${method}`);
   };
   const result = await runFactoryPoolScan({
@@ -451,8 +474,62 @@ test("Factory realtime head scans newest confirmed blocks before an old catchup 
   assert.equal(state.lastScannedBlock, 100);
   assert.equal(state.assets[token].enabled, true);
   assert.equal(result.changes.length, 1);
-  assert.ok(requestedBlocks.includes(1000));
-  assert.ok(!requestedBlocks.includes(101));
+  assert.deepEqual(requestedBlocks, []);
+});
+
+test("Factory fallback path discovers transaction candidates and stays deduplicated after fast delivery", async () => {
+  const token = "0x1212121212121212121212121212121212121212";
+  const implementation = "0x3434343434343434343434343434343434343434";
+  const txHash = `0x${"56".repeat(32)}`;
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    currentImplementation: implementation,
+    headLastScannedBlock: 100,
+    fallbackLastScannedBlock: 99,
+    lastScannedBlock: 100,
+  });
+  const getterResult = `0x${[1n, 2n, 3n, 4n, 5n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const transaction = {
+    to: FLAP_FACTORY_PROXY,
+    input: `0xabcdef01${"0".repeat(24)}${token.slice(2)}`,
+    hash: txHash,
+    blockNumber: "0x64",
+  };
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x69";
+    if (method === "eth_getLogs") return [];
+    if (method === "eth_call") return getterResult;
+    if (method === "eth_getBlockByNumber") {
+      const blockNumber = Number.parseInt(params[0], 16);
+      return {
+        hash: `0x${blockNumber.toString(16).padStart(64, "0")}`,
+        transactions: params[1] && blockNumber === 100 ? [transaction] : [],
+      };
+    }
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const config = {
+    confirmations: 5,
+    scanRealtime: false,
+    scanFallback: true,
+    scanCatchup: false,
+    scanHistory: false,
+    realtimeMaxBlocksPerRun: 20,
+    assetRefreshPerRun: 0,
+  };
+  const first = await runFactoryPoolScan({ state, rpcCall, config });
+  assert.equal(first.changes.length, 1);
+  assert.equal(state.assets[token].enabled, true);
+  assert.equal(state.fallbackLastScannedBlock, 100);
+
+  state.fallbackLastScannedBlock = 99;
+  const second = await runFactoryPoolScan({ state, rpcCall, config });
+  assert.equal(second.changes.length, 0);
+  assert.equal(state.candidates[token].sources.length, 1);
 });
 
 test("Factory catchup advances with only configuration events and no full blocks", async () => {
@@ -510,7 +587,7 @@ test("Factory fast configuration and generic reverse scans discover startup hist
     deploymentTxChecked: true,
     deploymentDetection: "test",
     headLastScannedBlock: 1000,
-    lastScannedBlock: 1000,
+    lastScannedBlock: 100,
     historyLogLastScannedBlock: 0,
     historyBlockLastScannedBlock: 0,
   });
@@ -550,6 +627,7 @@ test("Factory fast configuration and generic reverse scans discover startup hist
       scanRealtime: false,
       scanCatchup: true,
       scanHistory: true,
+      catchupMaxBlocksPerRun: 100,
       historyBackwardLogChunkBlocks: 200,
       historyConfigEventChunkBlocks: 200,
       historyConfigEventChunksPerRun: 1,
@@ -562,6 +640,36 @@ test("Factory fast configuration and generic reverse scans discover startup hist
   assert.equal(state.assets[token].enabled, true);
   assert.equal(result.changes.length, 1);
   assert.ok(requestedLogFilters.some(filter => filter.topics?.[0] === QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC));
+});
+
+test("Factory bidirectional history stops when forward and reverse cursors meet", async () => {
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    headLastScannedBlock: 100,
+    lastScannedBlock: 100,
+    historyLogLastScannedBlock: 50,
+    historyBlockLastScannedBlock: 50,
+    historyBackwardLogCursor: 51,
+    historyBackwardBlockCursor: 51,
+  });
+  let historyRequests = 0;
+  const rpcCall = async method => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x69";
+    if (method === "eth_getLogs" || method === "eth_getBlockByNumber") historyRequests++;
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: { confirmations: 5, scanRealtime: false, scanCatchup: false, scanHistory: true, deepHistoryBlockScan: true },
+  });
+  assert.equal(historyRequests, 0);
+  assert.equal(state.historyLogLastScannedBlock, 50);
+  assert.equal(state.historyBackwardLogCursor, 51);
 });
 
 test("shared Flap asset-only page changes are summarized into one site-wide notification", () => {

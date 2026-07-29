@@ -115,7 +115,9 @@ GitHub 等外部请求遇到 DNS、连接超时、连接重置或 IPv6 路由异
 
 Flap 新金库通知、金库工厂变更和状态输出会同时提供 BscScan 合约链接与 `flap.sh/launch?vaultfactory=<地址>` 金库入口。页面监控同时覆盖 BNB CAstore 与 Robinhood 中文 CAstore；Robinhood 币股金库使用独立快照及带 `chain=robinhood&lang=zh` 的金库入口，不会并入 BSC 金库工厂状态。Flap 启动卡片与 `fl-status` 状态卡片都会同步显示 Robinhood 页面、币股模板、完整 Factory 和金库入口。
 
-Flap 同时会从 BSC 链上自动重建 Factory Proxy `0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0` 的 quoteToken 候选集合。扫描器处理 Factory 事件、管理配置调用、`newTokenV6` 等实际发射交易和完整区块交易；所有 ABI 对齐地址字段都会进入复核流程，因此 implementation 升级后即使方法选择器变化也不会只依赖旧 ABI。每个候选地址最终通过 `getQuoteTokenConfiguration(address)` 复核五个返回字段，第一字段为 `1` 时视为启用，BNB 使用零地址。
+Flap 同时会从 BSC 链上自动重建 Factory Proxy `0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0` 的 quoteToken 候选集合。实时快通道只读取已验证的配置事件并立即调用 `getQuoteTokenConfiguration(address)` 复核，不等待完整区块或名称接口；通用日志、管理配置调用、`newTokenV6` 等实际发射交易和完整区块交易由独立漏检通道持续补齐，并通过资产指纹避免重复通知。所有 ABI 对齐地址字段都会进入复核流程，因此 implementation 升级后即使方法选择器变化也不会只依赖旧 ABI。第一返回字段为 `1` 时视为启用，BNB 使用零地址。
+
+Factory 的变更卡片只显示变更类型、名称或符号、状态和完整可点击地址；启动卡片与 `fl-status` 只显示 Factory Proxy、监控状态、资产统计和资产列表，不再展示区块、交易、部署游标或函数选择器。代币名称继续使用免费 API 和链上只读调用异步补全，不会阻塞首次推送。
 
 当前 Proxy 已通过只读历史状态确认部署于区块 `39980228`，创建交易为 `0x9f6935c97b662a10a8c4ea725e172e8a13fd37beb9fe76a9100ee97619639d00`。程序仍会在首次运行时自行定位并保存结果，不依赖这段文档作为运行时数据源。
 

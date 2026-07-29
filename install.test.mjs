@@ -120,7 +120,7 @@ test("Flap status links current factories and registered vaults to launch pages"
   assert.match(output, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
 });
 
-test("Flap status shows complete Factory pool state", () => {
+test("Flap status shows concise Factory pool state", () => {
   const quoteToken = "0x0000000000000000000000000000000000000000";
   const namedToken = "0x21caef8a43163eea865baee23b9c2e327696a3bf";
   const txHash = `0x${"ab".repeat(32)}`;
@@ -146,15 +146,13 @@ test("Flap status shows complete Factory pool state", () => {
     },
   });
   assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
-  assert.match(output, /部署区块：39980228/);
-  assert.match(output, /实时头部：100｜安全区块 100｜最新区块 105｜延迟 0 块/);
-  assert.match(output, /配置事件连续补扫：100｜缺口 0 块/);
-  assert.match(output, /历史反向：日志 95｜完整区块 90/);
-  assert.match(output, /配置事件快速回溯：97/);
+  assert.match(output, /监控状态：<font color="green">运行正常<\/font>/);
+  assert.match(output, /资产数量：2 个｜启用 2 个｜未启用或停用 0 个/);
   assert.match(output, /BNB｜状态 已启用｜地址 \[0x0000000000000000000000000000000000000000\]/);
   assert.match(output, /Tether Gold \(XAUt\)｜状态 已启用｜地址 \[0x21caef8a43163eea865baee23b9c2e327696a3bf\]/);
   assert.doesNotMatch(output, /字段 [1-5]：/);
-  assert.match(output, new RegExp(txHash));
+  assert.doesNotMatch(output, new RegExp(txHash));
+  assert.doesNotMatch(output, /部署区块|实时头部|配置事件连续补扫|历史反向|配置事件快速回溯|Implementation|选择器/);
 });
 
 test("Four.meme pool status keeps only the requested four fields", () => {

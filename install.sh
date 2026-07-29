@@ -537,7 +537,6 @@ if [ -f "$SNAP" ]; then
     const registry=s.registryMonitor||{};
     const poolAssets=Object.values(fp.assets||{}).sort((a,b)=>String(a.quoteToken||'').localeCompare(String(b.quoteToken||'')));
     const enabledPoolAssets=poolAssets.filter(v=>v&&v.enabled).length;
-    const relatedSelectors=Object.values(fp.relatedSelectors||{}).sort((a,b)=>String(a.selector||'').localeCompare(String(b.selector||'')));
     const registryAddress=registry.address||'0x90497450f2a706f1951b5bdda52b4e5d16f34c06';
     const knownVaults=Object.keys(registry.knownVaults||{});
     const safeLatest=registry.safeLatestBlock??'-';
@@ -600,29 +599,15 @@ if [ -f "$SNAP" ]; then
 
     console.log('**06｜Factory 底池资产**');
     console.log('Factory Proxy：'+mdLink(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0','https://bscscan.com/address/'+(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0')));
-    console.log('Implementation：'+(fp.currentImplementation?mdLink(fp.currentImplementation,'https://bscscan.com/address/'+fp.currentImplementation):'尚未建立'));
-    console.log('部署区块：'+(fp.deploymentBlock??'尚未定位')+'｜定位方式 '+(fp.deploymentDetection||'尚未建立'));
-    console.log('部署交易：'+(fp.deploymentTxHash?mdLink(fp.deploymentTxHash,'https://bscscan.com/tx/'+fp.deploymentTxHash):'尚未定位'));
-    console.log('部署者：'+(fp.deployer?mdLink(fp.deployer,'https://bscscan.com/address/'+fp.deployer):'尚未定位'));
     const headLag=Number.isFinite(Number(fp.safeLatestBlock))&&Number.isFinite(Number(fp.headLastScannedBlock))?Math.max(0,Number(fp.safeLatestBlock)-Number(fp.headLastScannedBlock)):'-';
-    const catchupLag=Number.isFinite(Number(fp.headLastScannedBlock))&&Number.isFinite(Number(fp.lastScannedBlock))?Math.max(0,Number(fp.headLastScannedBlock)-Number(fp.lastScannedBlock)):'-';
-    console.log('实时头部：'+(fp.headLastScannedBlock??'尚未建立')+'｜安全区块 '+(fp.safeLatestBlock??'尚未建立')+'｜最新区块 '+(fp.latestBlock??'尚未建立')+'｜延迟 '+headLag+' 块');
-    console.log('配置事件连续补扫：'+(fp.lastScannedBlock??'尚未建立')+'｜缺口 '+catchupLag+' 块');
-    console.log('历史正向：日志 '+(fp.historyLogLastScannedBlock??'尚未建立')+'｜完整区块 '+(fp.historyBlockLastScannedBlock??'尚未建立'));
-    console.log('配置事件快速回溯：'+(fp.historyConfigEventCursor??'尚未建立'));
-    console.log('历史反向：日志 '+(fp.historyBackwardLogCursor??'尚未建立')+'｜完整区块 '+(fp.historyBackwardBlockCursor??'尚未建立'));
-    console.log('候选：'+Object.keys(fp.candidates||{}).length+' 个｜已配置 '+poolAssets.length+' 个｜启用 '+enabledPoolAssets+' 个｜未启用或停用 '+Math.max(0,poolAssets.length-enabledPoolAssets)+' 个');
-    console.log('待发送通知：'+((fp.pendingChanges||[]).length+(fp.pendingImplementationChange?1:0))+' 个');
-    console.log('已识别相关调用：'+relatedSelectors.length+' 个'+(relatedSelectors.length?'｜'+relatedSelectors.map(v=>v.selector).join('、'):''));
-    if(fp.lastError) console.log('最近错误：'+fp.lastError);
+    console.log('监控状态：'+(fp.lastError?warn('需要关注'):(typeof headLag==='number'&&headLag>20?warn('存在延迟'):ok('运行正常'))));
+    console.log('资产数量：'+poolAssets.length+' 个｜启用 '+enabledPoolAssets+' 个｜未启用或停用 '+Math.max(0,poolAssets.length-enabledPoolAssets)+' 个');
     if(poolAssets.length===0) console.log('尚未发现已配置的 Factory 底池资产');
     for(const [index,v] of poolAssets.entries()){
       const address=v.quoteToken||'';
       const name=address==='0x0000000000000000000000000000000000000000'?'BNB':(v.name||v.symbol||'名称同步中');
       const label=v.symbol&&v.symbol!==name?name+' ('+v.symbol+')':name;
       console.log(String(index+1).padStart(2,'0')+'　'+label+'｜状态 '+(v.enabled?'已启用':'未启用或已停用')+'｜地址 '+mdLink(address,'https://bscscan.com/address/'+address));
-      if(v.lastTxHash) console.log('交易：'+mdLink(v.lastTxHash,'https://bscscan.com/tx/'+v.lastTxHash));
-      if(v.lastSeenBlock!=null) console.log('区块：'+mdLink(String(v.lastSeenBlock),'https://bscscan.com/block/'+v.lastSeenBlock));
     }
     console.log('');
 

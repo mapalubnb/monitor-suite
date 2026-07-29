@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 4;
+export const FACTORY_POOL_SCHEMA_VERSION = 5;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -154,6 +154,7 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     latestBlock: null,
     safeLatestBlock: null,
     headLastScannedBlock: null,
+    fallbackLastScannedBlock: null,
     lastScannedBlock: null,
     historyLogLastScannedBlock: null,
     historyBlockLastScannedBlock: null,
@@ -168,7 +169,6 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     candidates: {},
     assets: {},
     relatedSelectors: {},
-    processedTransactions: {},
     blockCheckpoints: {},
     assetRefreshCursor: 0,
     pendingChanges: [],
@@ -187,9 +187,13 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
   state.schemaVersion = FACTORY_POOL_SCHEMA_VERSION;
   state.chainId = BSC_CHAIN_ID;
   state.proxy = normalizeAddress(proxy);
-  for (const key of ["candidates", "assets", "relatedSelectors", "processedTransactions", "blockCheckpoints"]) {
+  for (const key of ["candidates", "assets", "relatedSelectors", "blockCheckpoints"]) {
     if (!state[key] || typeof state[key] !== "object" || Array.isArray(state[key])) state[key] = {};
   }
+  if (!Number.isFinite(state.fallbackLastScannedBlock) && Number.isFinite(state.headLastScannedBlock)) {
+    state.fallbackLastScannedBlock = state.headLastScannedBlock;
+  }
+  delete state.processedTransactions;
   if (!Array.isArray(state.implementationHistory)) state.implementationHistory = [];
   if (!Array.isArray(state.proxyUpgradeEvents)) state.proxyUpgradeEvents = [];
   if (!Array.isArray(state.implementationSelectors)) state.implementationSelectors = [];
@@ -212,7 +216,6 @@ export function saveFactoryPoolState(path, state) {
 }
 
 function candidateKey(item) {
-  if (item.txHash) return `tx:${item.txHash}:${item.quoteToken}`;
   return `${item.source || "unknown"}:${item.txHash || ""}:${item.logIndex ?? ""}:${item.selector || item.topic0 || ""}:${item.quoteToken}`;
 }
 
@@ -259,7 +262,6 @@ function rememberCandidate(state, item) {
     if (!related.quoteTokens.includes(quoteToken)) related.quoteTokens.push(quoteToken);
     state.relatedSelectors[selector] = related;
   }
-  if (item.txHash) state.processedTransactions[item.txHash] = item.blockNumber || 0;
   return true;
 }
 
@@ -516,7 +518,11 @@ async function refreshKnownAssets({ state, rpcCall, limit, blockTag }) {
 
 async function rollbackReorgIfNeeded({ state, rpcCall, log }) {
   const blocks = Object.keys(state.blockCheckpoints).map(Number).filter(Number.isFinite).sort((a, b) => b - a);
-  const highestCursor = Math.max(state.headLastScannedBlock || 0, state.lastScannedBlock || 0);
+  const highestCursor = Math.max(
+    state.headLastScannedBlock || 0,
+    state.fallbackLastScannedBlock || 0,
+    state.lastScannedBlock || 0,
+  );
   for (const blockNumber of blocks) {
     if (blockNumber > highestCursor) continue;
     const block = await rpcCall("eth_getBlockByNumber", [numberToHex(blockNumber), false], { requireResult: true });
@@ -525,6 +531,7 @@ async function rollbackReorgIfNeeded({ state, rpcCall, log }) {
     if (actual && actual === expected) return null;
     const rollbackTo = Math.max(state.deploymentBlock - 1, blockNumber - 1);
     if ((state.headLastScannedBlock || 0) >= blockNumber) state.headLastScannedBlock = rollbackTo;
+    if ((state.fallbackLastScannedBlock || 0) >= blockNumber) state.fallbackLastScannedBlock = rollbackTo;
     if ((state.lastScannedBlock || 0) >= blockNumber) state.lastScannedBlock = rollbackTo;
     for (const key of Object.keys(state.blockCheckpoints)) {
       if (Number(key) >= blockNumber) delete state.blockCheckpoints[key];
@@ -541,15 +548,13 @@ function dedupeChanges(changes) {
   return [...byAddress.values()];
 }
 
-async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag, includeFullBlocks = true }) {
+async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag }) {
   if (fromBlock > toBlock) return { changes: [], toBlock: fromBlock - 1, checkpoints: {} };
   const logRange = await fetchRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
   const scannedTo = logRange.toBlock;
   recordProxyUpgradeEvents(state, logRange.logs);
   const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
-  const fullBlocks = includeFullBlocks
-    ? await scanFullBlockRange(rpcCall, state.proxy, fromBlock, scannedTo, rpcBatch)
-    : { items: [], checkpoints: {} };
+  const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, scannedTo, rpcBatch);
   const items = [
     ...collectCandidatesFromLogsAndTransactions(logRange.logs, transactions, state.proxy),
     ...fullBlocks.items,
@@ -588,6 +593,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     confirmations: 5,
     deploymentBlock: 0,
     scanRealtime: true,
+    scanFallback: false,
     scanCatchup: true,
     scanHistory: true,
     realtimeBootstrapBlocks: 20,
@@ -603,9 +609,13 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     assetRefreshPerRun: 10,
     ...config,
   };
-  const chainId = hexToNumber(await rpcCall("eth_chainId", []));
+  const [chainIdHex, latestHex] = await Promise.all([
+    rpcCall("eth_chainId", []),
+    rpcCall("eth_blockNumber", []),
+  ]);
+  const chainId = hexToNumber(chainIdHex);
   if (chainId !== BSC_CHAIN_ID) throw new Error(`Factory RPC chainId 错误：${chainId}，期望 ${BSC_CHAIN_ID}`);
-  const latest = hexToNumber(await rpcCall("eth_blockNumber", []));
+  const latest = hexToNumber(latestHex);
   const safeLatest = Math.max(0, latest - cfg.confirmations);
   state.latestBlock = latest;
   state.safeLatestBlock = safeLatest;
@@ -634,7 +644,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
   if (!Number.isFinite(state.historyLogLastScannedBlock)) state.historyLogLastScannedBlock = state.deploymentBlock - 1;
   if (!Number.isFinite(state.historyBlockLastScannedBlock)) state.historyBlockLastScannedBlock = state.deploymentBlock - 1;
 
-  const implementationChange = cfg.scanRealtime ? await refreshImplementation({ state, rpcCall, log }) : null;
+  let implementationChange = null;
   const allChanges = [];
   const safeBlockTag = numberToHex(safeLatest);
   let reorg = null;
@@ -644,19 +654,38 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       state.headLastScannedBlock = Math.max(state.deploymentBlock - 1, safeLatest - cfg.realtimeBootstrapBlocks);
     }
     if (!Number.isFinite(state.lastScannedBlock)) state.lastScannedBlock = state.headLastScannedBlock;
-    reorg = await rollbackReorgIfNeeded({ state, rpcCall, log });
     if (state.headLastScannedBlock < safeLatest) {
       const desiredFrom = state.headLastScannedBlock + 1;
       const fromBlock = Math.max(desiredFrom, safeLatest - cfg.realtimeMaxBlocksPerRun + 1);
-      const range = await scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock: safeLatest, blockTag: safeBlockTag });
+      const [range, detectedImplementationChange] = await Promise.all([
+        scanConfigurationEventRange({ state, rpcCall, fromBlock, toBlock: safeLatest, blockTag: safeBlockTag }),
+        refreshImplementation({ state, rpcCall, log }),
+      ]);
+      implementationChange = detectedImplementationChange;
       allChanges.push(...range.changes);
       state.headLastScannedBlock = range.toBlock;
       if (state.lastScannedBlock >= fromBlock - 1) state.lastScannedBlock = Math.max(state.lastScannedBlock, range.toBlock);
+    } else if (!state.currentImplementation) {
+      implementationChange = await refreshImplementation({ state, rpcCall, log });
+    }
+    state.lastRealtimeRunAt = nowText();
+  }
+
+  if (cfg.scanFallback) {
+    if (!Number.isFinite(state.fallbackLastScannedBlock)) {
+      state.fallbackLastScannedBlock = Math.max(state.deploymentBlock - 1, safeLatest - cfg.realtimeBootstrapBlocks);
+    }
+    reorg = await rollbackReorgIfNeeded({ state, rpcCall, log });
+    if (state.fallbackLastScannedBlock < safeLatest) {
+      const fromBlock = state.fallbackLastScannedBlock + 1;
+      const toBlock = Math.min(safeLatest, fromBlock + cfg.realtimeMaxBlocksPerRun - 1);
+      const range = await scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag: safeBlockTag });
+      allChanges.push(...range.changes);
+      state.fallbackLastScannedBlock = range.toBlock;
       Object.assign(state.blockCheckpoints, range.checkpoints);
       trimBlockCheckpoints(state, cfg.confirmations);
     }
     allChanges.push(...await refreshKnownAssets({ state, rpcCall, limit: cfg.assetRefreshPerRun, blockTag: safeBlockTag }));
-    state.lastRealtimeRunAt = nowText();
   }
 
   if (cfg.scanCatchup) {
@@ -678,9 +707,11 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       state.lastScannedBlock = Math.max(state.lastScannedBlock, range.toBlock);
     }
     if (!Number.isFinite(state.historyConfigEventCursor)) state.historyConfigEventCursor = safeLatest + 1;
-    for (let index = 0; index < cfg.historyConfigEventChunksPerRun && state.historyConfigEventCursor > state.deploymentBlock; index++) {
+    for (let index = 0; index < cfg.historyConfigEventChunksPerRun; index++) {
+      const historyConfigFloor = Math.max(state.deploymentBlock, state.lastScannedBlock + 1);
+      if (state.historyConfigEventCursor <= historyConfigFloor) break;
       const toBlock = state.historyConfigEventCursor - 1;
-      const fromBlock = Math.max(state.deploymentBlock, toBlock - cfg.historyConfigEventChunkBlocks + 1);
+      const fromBlock = Math.max(historyConfigFloor, toBlock - cfg.historyConfigEventChunkBlocks + 1);
       const logRange = await fetchReverseRangeLogs(
         rpcCall,
         state.proxy,
@@ -697,9 +728,10 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
 
   if (cfg.scanHistory) {
     if (!Number.isFinite(state.historyBackwardLogCursor)) state.historyBackwardLogCursor = safeLatest + 1;
-    if (state.historyBackwardLogCursor > state.deploymentBlock) {
+    const backwardLogFloor = Math.max(state.deploymentBlock, state.historyLogLastScannedBlock + 1);
+    if (state.historyBackwardLogCursor > backwardLogFloor) {
       const toBlock = state.historyBackwardLogCursor - 1;
-      const fromBlock = Math.max(state.deploymentBlock, toBlock - cfg.historyBackwardLogChunkBlocks + 1);
+      const fromBlock = Math.max(backwardLogFloor, toBlock - cfg.historyBackwardLogChunkBlocks + 1);
       const logRange = await fetchReverseRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
       recordProxyUpgradeEvents(state, logRange.logs);
       const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
@@ -710,18 +742,20 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
 
     if (cfg.deepHistoryBlockScan) {
       if (!Number.isFinite(state.historyBackwardBlockCursor)) state.historyBackwardBlockCursor = safeLatest + 1;
-      if (state.historyBackwardBlockCursor > state.deploymentBlock) {
+      const backwardBlockFloor = Math.max(state.deploymentBlock, state.historyBlockLastScannedBlock + 1);
+      if (state.historyBackwardBlockCursor > backwardBlockFloor) {
         const toBlock = state.historyBackwardBlockCursor - 1;
-        const fromBlock = Math.max(state.deploymentBlock, toBlock - cfg.historyBackwardBlockChunkBlocks + 1);
+        const fromBlock = Math.max(backwardBlockFloor, toBlock - cfg.historyBackwardBlockChunkBlocks + 1);
         const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, toBlock, rpcBatch);
         allChanges.push(...await verifyCandidates({ state, rpcCall, items: fullBlocks.items, blockTag: safeBlockTag }));
         state.historyBackwardBlockCursor = fromBlock;
       }
     }
 
-    if (state.historyLogLastScannedBlock < Math.min(safeLatest, state.lastScannedBlock)) {
+    const forwardLogTarget = Math.min(safeLatest, state.lastScannedBlock, state.historyBackwardLogCursor - 1);
+    if (state.historyLogLastScannedBlock < forwardLogTarget) {
       const fromBlock = state.historyLogLastScannedBlock + 1;
-      const toBlock = Math.min(state.lastScannedBlock, fromBlock + cfg.historyLogChunkBlocks - 1);
+      const toBlock = Math.min(forwardLogTarget, fromBlock + cfg.historyLogChunkBlocks - 1);
       const logRange = await fetchRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
       recordProxyUpgradeEvents(state, logRange.logs);
       const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
@@ -730,20 +764,15 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       state.historyLogLastScannedBlock = logRange.toBlock;
     }
 
-    if (cfg.deepHistoryBlockScan && state.historyBlockLastScannedBlock < Math.min(safeLatest, state.lastScannedBlock)) {
+    const forwardBlockTarget = Math.min(safeLatest, state.lastScannedBlock, (state.historyBackwardBlockCursor ?? safeLatest + 1) - 1);
+    if (cfg.deepHistoryBlockScan && state.historyBlockLastScannedBlock < forwardBlockTarget) {
       const fromBlock = state.historyBlockLastScannedBlock + 1;
-      const toBlock = Math.min(state.lastScannedBlock, fromBlock + cfg.historyBlockChunkBlocks - 1);
+      const toBlock = Math.min(forwardBlockTarget, fromBlock + cfg.historyBlockChunkBlocks - 1);
       const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, toBlock, rpcBatch);
       allChanges.push(...await verifyCandidates({ state, rpcCall, items: fullBlocks.items, blockTag: safeBlockTag }));
       state.historyBlockLastScannedBlock = toBlock;
     }
     state.lastHistoryRunAt = nowText();
-  }
-
-  const processedEntries = Object.entries(state.processedTransactions);
-  if (processedEntries.length > 5_000) {
-    processedEntries.sort((a, b) => Number(b[1]) - Number(a[1]));
-    state.processedTransactions = Object.fromEntries(processedEntries.slice(0, 5_000));
   }
 
   updateHistoryFloor(state);
@@ -756,22 +785,6 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     reorg,
     state,
   };
-}
-
-export function buildFactoryPoolChangeLines(changes = []) {
-  const lines = [];
-  for (const change of changes) {
-    const item = change.current;
-    const label = change.type === "added" ? "新增" : change.type === "disabled" ? "停用" : "修改";
-    const name = item.quoteToken === BNB_QUOTE_TOKEN ? "BNB" : item.name || item.symbol || "名称同步中";
-    const symbol = item.symbol && item.symbol !== name ? ` (${item.symbol})` : "";
-    lines.push(`${label}底池: ${name}${symbol}`);
-    lines.push(`  状态: ${item.enabled ? "已启用" : "未启用或已停用"}`);
-    lines.push(`  quoteToken: ${item.quoteToken}`);
-    if (item.lastTxHash) lines.push(`  交易: ${item.lastTxHash}`);
-    if (item.lastSeenBlock != null) lines.push(`  区块: ${item.lastSeenBlock}`);
-  }
-  return lines;
 }
 
 export function mergePendingFactoryPoolChanges(pending = [], changes = []) {

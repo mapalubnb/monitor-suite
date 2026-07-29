@@ -23,7 +23,6 @@ import { sendCard, sendCardQueued, patchCard, pinMessage, waitQueueDrain } from 
 import {
   BNB_QUOTE_TOKEN,
   FLAP_FACTORY_PROXY,
-  buildFactoryPoolChangeLines,
   createFactoryPoolState,
   loadFactoryPoolState,
   mergePendingFactoryPoolChanges,
@@ -2628,16 +2627,7 @@ async function resolveFactoryPoolTokenMetadata(addresses, options = {}) {
 
 async function enrichFactoryPoolTokenMetadata(state, preferredAddresses = []) {
   const now = Date.now();
-  const preferred = preferredAddresses.map(normalizeAddress).filter(Boolean);
-  const remaining = Object.keys(state.assets || {}).sort();
-  const addresses = [...new Set([...preferred, ...remaining])]
-    .filter(address => {
-      const asset = state.assets?.[address];
-      if (!asset || (asset.name && asset.symbol)) return false;
-      const retryAt = Date.parse(asset.metadataNextRetryAt || "");
-      return !Number.isFinite(retryAt) || retryAt <= now;
-    })
-    .slice(0, 30);
+  const addresses = getFactoryPoolMetadataWorkAddresses(state, preferredAddresses);
   if (addresses.length === 0) return;
   const result = await resolveFactoryPoolTokenMetadata(addresses);
   const updatedAt = new Date().toISOString();
@@ -2798,38 +2788,30 @@ function buildFactoryPoolMonitorContent(result) {
   const state = result.state || {};
   const enabledCount = Object.values(state.assets || {}).filter(item => item?.enabled).length;
   const disabledCount = Object.values(state.assets || {}).filter(item => item && !item.enabled).length;
+  const changeCounts = { added: 0, modified: 0, disabled: 0 };
+  for (const change of result.changes || []) changeCounts[change.type] = (changeCounts[change.type] || 0) + 1;
   const summary = [
-    `本轮新增/修改/停用 ${result.changes.length} 个底池资产`,
-    `Factory Proxy: ${addressLink(state.proxy)}`,
-    `Implementation: ${addressLink(state.currentImplementation)}`,
-    `当前资产: 启用 ${enabledCount} 个 / 未启用或停用 ${disabledCount} 个`,
-    `实时头部: ${state.headLastScannedBlock ?? "未建立"} / 安全区块 ${state.safeLatestBlock ?? "未建立"} / 延迟 ${Math.max(0, (state.safeLatestBlock || 0) - (state.headLastScannedBlock || 0))} 块`,
+    `本次变更：新增 ${changeCounts.added} 个｜修改 ${changeCounts.modified} 个｜停用 ${changeCounts.disabled} 个`,
+    `当前资产：启用 ${enabledCount} 个｜未启用或停用 ${disabledCount} 个`,
   ];
   const primary = [];
   for (const change of result.changes) {
     const item = change.current;
     const label = change.type === "added" ? "新增" : change.type === "disabled" ? "停用" : "修改";
-    primary.push(`${label}底池: ${formatFactoryPoolAssetName(item)}`);
-    primary.push(`  状态: ${item.enabled ? "已启用" : "未启用或已停用"}`);
-    primary.push(`  地址: ${addressLink(item.quoteToken)}`);
-    if (item.lastTxHash) primary.push(`  交易: ${txLink(item.lastTxHash)}`);
-    if (item.lastSeenBlock != null) primary.push(`  区块: ${blockLink(item.lastSeenBlock)}`);
+    primary.push(`${label}底池：${formatFactoryPoolAssetName(item)}`);
+    primary.push(`状态：${item.enabled ? "已启用" : "未启用或已停用"}`);
+    primary.push(`地址：${addressLink(item.quoteToken)}`);
   }
   if (result.implementationChange?.previous) {
     const upgrade = result.implementationChange;
-    primary.push("Factory implementation 发生变化");
-    primary.push(`  原地址: ${addressLink(upgrade.previous)}`);
-    primary.push(`  新地址: ${addressLink(upgrade.current)}`);
-    primary.push(`  检测区块: ${blockLink(upgrade.detectedBlock)}`);
-    if (upgrade.txHash) primary.push(`  升级交易: ${txLink(upgrade.txHash)}`);
-    if (upgrade.upgradeBlock != null) primary.push(`  升级区块: ${blockLink(upgrade.upgradeBlock)}`);
-    primary.push(`  已重新识别函数选择器: ${upgrade.selectors.length} 个`);
-    for (const selector of upgrade.selectors) primary.push(`  ${selector}`);
+    primary.push("Factory 已升级");
+    primary.push(`原地址：${addressLink(upgrade.previous)}`);
+    primary.push(`新地址：${addressLink(upgrade.current)}`);
   }
   return buildFlapCardContent({
     summary,
     primaryTitle: "Factory 底池资产链上变更",
-    primary: primary.length > 0 ? primary : buildFactoryPoolChangeLines(result.changes),
+    primary,
   });
 }
 
@@ -2838,6 +2820,28 @@ let factoryPoolMetadataQueue = Promise.resolve();
 
 function factoryPoolMetadataFingerprint(asset = {}) {
   return `${asset.name || ""}\u0000${asset.symbol || ""}\u0000${asset.metadataSource || ""}`;
+}
+
+function factoryPoolMetadataStateFingerprint(asset = {}) {
+  return [
+    factoryPoolMetadataFingerprint(asset),
+    asset.metadataUpdatedAt || "",
+    asset.metadataNextRetryAt || "",
+    asset.metadataError || "",
+  ].join("\u0000");
+}
+
+function getFactoryPoolMetadataWorkAddresses(state, preferredAddresses = []) {
+  const now = Date.now();
+  const preferred = preferredAddresses.map(normalizeAddress).filter(Boolean);
+  return [...new Set([...preferred, ...Object.keys(state.assets || {}).sort()])]
+    .filter(address => {
+      const asset = state.assets?.[address];
+      if (!asset || (asset.name && asset.symbol)) return false;
+      const retryAt = Date.parse(asset.metadataNextRetryAt || "");
+      return !Number.isFinite(retryAt) || retryAt <= now;
+    })
+    .slice(0, 30);
 }
 
 async function enrichFactoryPoolMetadataAfterSend({
@@ -2854,12 +2858,17 @@ async function enrichFactoryPoolMetadataAfterSend({
 } = {}) {
   const changes = result?.changes || [];
   const addresses = [...new Set(changes.map(change => normalizeAddress(change.current?.quoteToken)).filter(Boolean))];
-  const before = new Map(addresses.map(address => [address, factoryPoolMetadataFingerprint(state.assets?.[address])]));
-  await enrichFn(state, addresses);
-  saveFn(stateFile, state);
+  const workAddresses = getFactoryPoolMetadataWorkAddresses(state, addresses);
+  if (workAddresses.length === 0) return { patched: false, metadataChanged: false };
+  const before = new Map(workAddresses.map(address => [address, factoryPoolMetadataStateFingerprint(state.assets?.[address])]));
+  const beforeCard = new Map(addresses.map(address => [address, factoryPoolMetadataFingerprint(state.assets?.[address])]));
+  await enrichFn(state, workAddresses);
+  const stateChanged = workAddresses.some(address =>
+    before.get(address) !== factoryPoolMetadataStateFingerprint(state.assets?.[address]));
+  if (stateChanged) saveFn(stateFile, state);
 
   const metadataChanged = addresses.some(address =>
-    before.get(address) !== factoryPoolMetadataFingerprint(state.assets?.[address]));
+    beforeCard.get(address) !== factoryPoolMetadataFingerprint(state.assets?.[address]));
   if (!messageId || !metadataChanged) return { patched: false, metadataChanged };
 
   const enrichedResult = {
@@ -2881,6 +2890,10 @@ async function enrichFactoryPoolMetadataAfterSend({
 }
 
 function scheduleFactoryPoolMetadataEnrichment(options) {
+  const preferred = (options?.result?.changes || []).map(change => change.current?.quoteToken);
+  if (getFactoryPoolMetadataWorkAddresses(options?.state || {}, preferred).length === 0) {
+    return Promise.resolve({ patched: false, metadataChanged: false });
+  }
   const job = factoryPoolMetadataQueue.then(
     () => enrichFactoryPoolMetadataAfterSend(options),
     () => enrichFactoryPoolMetadataAfterSend(options),
@@ -2920,13 +2933,14 @@ async function checkFlapFactoryPools(factoryPoolState, {
       }));
       if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
     }
-    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
     if (suppressNotifications) {
+      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
       void scheduleMetadataFn({ state: factoryPoolState, result });
       return { ...result, sent: false };
     }
     const shouldNotify = factoryPoolState.pendingChanges.length > 0 || Boolean(factoryPoolState.pendingImplementationChange?.previous);
     if (!shouldNotify) {
+      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
       void scheduleMetadataFn({ state: factoryPoolState, result });
       return { ...result, sent: false };
     }
@@ -2939,6 +2953,7 @@ async function checkFlapFactoryPools(factoryPoolState, {
     const initialContent = buildFactoryPoolMonitorContent(pendingResult);
     const messageId = await sendCardFn(title, initialContent, "red");
     if (!messageId) {
+      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
       void scheduleMetadataFn({ state: factoryPoolState, result: pendingResult });
       return { ...result, sent: false };
     }
@@ -5234,7 +5249,7 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     : ["当前没有配置为 CAStore 展示的金库"];
   const robinhoodLaunchUrl = buildVaultFactoryLaunchUrl(ROBINHOOD_INDEX_VAULT_FACTORY, { chain: "robinhood" });
   const poolAssets = Object.values(factoryPoolState.assets || {}).sort((a, b) => a.quoteToken.localeCompare(b.quoteToken));
-  const relatedSelectors = Object.values(factoryPoolState.relatedSelectors || {}).sort((a, b) => a.selector.localeCompare(b.selector));
+  const factoryRealtimeLag = Math.max(0, (factoryPoolState.safeLatestBlock || 0) - (factoryPoolState.headLastScannedBlock || 0));
   const poolAssetLines = poolAssets.length > 0
     ? poolAssets.map((asset, index) =>
         `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetName(asset)}｜状态 ${asset.enabled ? "已启用" : "未启用或已停用"}｜地址 ${addressLink(asset.quoteToken)}`)
@@ -5261,17 +5276,8 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     "",
     "**05｜Factory 底池资产**",
     `Factory Proxy：${addressLink(factoryPoolState.proxy || CONFIG.factoryPoolMonitor.proxy)}`,
-    `Implementation：${factoryPoolState.currentImplementation ? addressLink(factoryPoolState.currentImplementation) : "尚未建立"}`,
-    `部署区块：${factoryPoolState.deploymentBlock ?? "尚未定位"}`,
-    `部署交易：${factoryPoolState.deploymentTxHash ? txLink(factoryPoolState.deploymentTxHash) : "尚未定位"}`,
-    `部署者：${factoryPoolState.deployer ? addressLink(factoryPoolState.deployer) : "尚未定位"}`,
+    `监控状态：${factoryPoolState.lastError ? "需要关注" : factoryRealtimeLag > CONFIG.factoryPoolMonitor.realtimeMaxBlocksPerRun ? "存在延迟" : "运行正常"}`,
     `资产数量：${poolAssets.length}｜启用 ${poolAssets.filter(asset => asset.enabled).length}｜未启用或停用 ${poolAssets.filter(asset => !asset.enabled).length}`,
-    `实时头部：${factoryPoolState.headLastScannedBlock ?? "尚未建立"}｜安全区块 ${factoryPoolState.safeLatestBlock ?? "尚未建立"}｜延迟 ${Math.max(0, (factoryPoolState.safeLatestBlock || 0) - (factoryPoolState.headLastScannedBlock || 0))} 块`,
-    `配置事件连续补扫：${factoryPoolState.lastScannedBlock ?? "尚未建立"}｜缺口 ${Math.max(0, (factoryPoolState.headLastScannedBlock || 0) - (factoryPoolState.lastScannedBlock || 0))} 块`,
-    `历史正向日志：${factoryPoolState.historyLogLastScannedBlock ?? "尚未建立"}｜完整区块 ${factoryPoolState.historyBlockLastScannedBlock ?? "尚未建立"}`,
-    `配置事件快速回溯：${factoryPoolState.historyConfigEventCursor ?? "尚未建立"}`,
-    `历史反向日志：${factoryPoolState.historyBackwardLogCursor ?? "尚未建立"}｜完整区块 ${factoryPoolState.historyBackwardBlockCursor ?? "尚未建立"}`,
-    `已识别相关调用：${relatedSelectors.length} 个${relatedSelectors.length ? `｜${relatedSelectors.map(item => item.selector).join("、")}` : ""}`,
     ...poolAssetLines,
     "",
     "**06｜链上注册中心**",
@@ -5370,6 +5376,7 @@ async function startMonitor() {
   );
 
   let isFactoryRealtimeScanning = false;
+  let isFactoryFallbackScanning = false;
   let isFactoryCatchupScanning = false;
   let isFactoryHistoryScanning = false;
   async function factoryPoolRealtimePoll() {
@@ -5386,6 +5393,23 @@ async function startMonitor() {
       log(`[Flap Factory 实时] 检测失败：${err.message}`);
     } finally {
       isFactoryRealtimeScanning = false;
+    }
+  }
+
+  async function factoryPoolFallbackPoll() {
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryFallbackScanning) return;
+    isFactoryFallbackScanning = true;
+    try {
+      await checkFlapFactoryPools(factoryPoolState, {
+        scanConfig: { scanRealtime: false, scanFallback: true, scanCatchup: false, scanHistory: false },
+      });
+    } catch (err) {
+      factoryPoolState.lastError = err.message;
+      factoryPoolState.lastRunAt = ts();
+      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      log(`[Flap Factory 漏检] 检测失败：${err.message}`);
+    } finally {
+      isFactoryFallbackScanning = false;
     }
   }
 
@@ -5436,6 +5460,12 @@ async function startMonitor() {
       scheduleFactoryHistoryNext();
     }, CONFIG.factoryPoolMonitor.historyIntervalMs);
   }
+  function scheduleFactoryFallbackNext() {
+    setTimeout(async () => {
+      await factoryPoolFallbackPoll();
+      scheduleFactoryFallbackNext();
+    }, CONFIG.factoryPoolMonitor.intervalMs);
+  }
   function scheduleFactoryCatchupNext() {
     setTimeout(async () => {
       await factoryPoolCatchupPoll();
@@ -5443,6 +5473,7 @@ async function startMonitor() {
     }, CONFIG.factoryPoolMonitor.catchupIntervalMs);
   }
   scheduleFactoryRealtimeNext();
+  scheduleFactoryFallbackNext();
   scheduleFactoryCatchupNext();
   scheduleFactoryHistoryNext();
 
@@ -5707,6 +5738,7 @@ async function startMonitor() {
   // SIGUSR1 信号
   process.on("SIGUSR1", () => {
     factoryPoolRealtimePoll().catch(err => log(`[SIGUSR1] Factory 实时检测异常：${err.message}`));
+    factoryPoolFallbackPoll().catch(err => log(`[SIGUSR1] Factory 漏检检测异常：${err.message}`));
     factoryPoolCatchupPoll().catch(err => log(`[SIGUSR1] Factory 补扫异常：${err.message}`));
     factoryPoolHistoryPoll().catch(err => log(`[SIGUSR1] Factory 历史检测异常：${err.message}`));
     if (isPolling) {
