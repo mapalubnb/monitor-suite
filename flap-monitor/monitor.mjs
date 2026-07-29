@@ -2784,22 +2784,36 @@ function formatFactoryPoolAssetName(asset = {}) {
   return asset.symbol && asset.symbol !== name ? `${name} (${asset.symbol})` : name;
 }
 
+function formatFactoryPoolAssetStatus(asset = {}) {
+  if (!asset.configured) return "已停用";
+  if (asset.creationDisabled) return "暂停创建";
+  return "支持创建";
+}
+
 function buildFactoryPoolMonitorContent(result) {
   const state = result.state || {};
-  const enabledCount = Object.values(state.assets || {}).filter(item => item?.enabled).length;
-  const disabledCount = Object.values(state.assets || {}).filter(item => item && !item.enabled).length;
-  const changeCounts = { added: 0, modified: 0, disabled: 0 };
+  const assets = Object.values(state.assets || {});
+  const enabledCount = assets.filter(item => item?.effectiveEnabled).length;
+  const pausedCount = assets.filter(item => item?.configured && item?.creationDisabled).length;
+  const disabledCount = assets.filter(item => item && !item.configured).length;
+  const changeCounts = { added: 0, modified: 0, paused: 0, resumed: 0, disabled: 0 };
   for (const change of result.changes || []) changeCounts[change.type] = (changeCounts[change.type] || 0) + 1;
   const summary = [
-    `本次变更：新增 ${changeCounts.added} 个｜修改 ${changeCounts.modified} 个｜停用 ${changeCounts.disabled} 个`,
-    `当前资产：启用 ${enabledCount} 个｜未启用或停用 ${disabledCount} 个`,
+    `本次变更：新增支持 ${changeCounts.added} 个｜配置修改 ${changeCounts.modified} 个｜暂停 ${changeCounts.paused} 个｜恢复 ${changeCounts.resumed} 个｜停用 ${changeCounts.disabled} 个`,
+    `当前资产：支持创建 ${enabledCount} 个｜暂停创建 ${pausedCount} 个｜已停用 ${disabledCount} 个`,
   ];
   const primary = [];
   for (const change of result.changes) {
     const item = change.current;
-    const label = change.type === "added" ? "新增" : change.type === "disabled" ? "停用" : "修改";
-    primary.push(`${label}底池：${formatFactoryPoolAssetName(item)}`);
-    primary.push(`状态：${item.enabled ? "已启用" : "未启用或已停用"}`);
+    const label = {
+      added: "新增支持",
+      modified: "配置修改",
+      paused: "暂停创建",
+      resumed: "恢复创建",
+      disabled: "停用",
+    }[change.type] || "配置修改";
+    primary.push(`${label}：${formatFactoryPoolAssetName(item)}`);
+    primary.push(`状态：${formatFactoryPoolAssetStatus(item)}`);
     primary.push(`地址：${addressLink(item.quoteToken)}`);
   }
   if (result.implementationChange?.previous) {
@@ -5252,7 +5266,7 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
   const factoryRealtimeLag = Math.max(0, (factoryPoolState.safeLatestBlock || 0) - (factoryPoolState.headLastScannedBlock || 0));
   const poolAssetLines = poolAssets.length > 0
     ? poolAssets.map((asset, index) =>
-        `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetName(asset)}｜状态 ${asset.enabled ? "已启用" : "未启用或已停用"}｜地址 ${addressLink(asset.quoteToken)}`)
+        `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetName(asset)}｜状态 ${formatFactoryPoolAssetStatus(asset)}｜地址 ${addressLink(asset.quoteToken)}`)
     : ["尚未发现已配置的 Factory 底池资产"];
   return [
     "**01｜运行状态**",
@@ -5277,7 +5291,7 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     "**05｜Factory 底池资产**",
     `Factory Proxy：${addressLink(factoryPoolState.proxy || CONFIG.factoryPoolMonitor.proxy)}`,
     `监控状态：${factoryPoolState.lastError ? "需要关注" : factoryRealtimeLag > CONFIG.factoryPoolMonitor.realtimeMaxBlocksPerRun ? "存在延迟" : "运行正常"}`,
-    `资产数量：${poolAssets.length}｜启用 ${poolAssets.filter(asset => asset.enabled).length}｜未启用或停用 ${poolAssets.filter(asset => !asset.enabled).length}`,
+    `资产数量：${poolAssets.length}｜支持创建 ${poolAssets.filter(asset => asset.effectiveEnabled).length}｜暂停创建 ${poolAssets.filter(asset => asset.configured && asset.creationDisabled).length}｜已停用 ${poolAssets.filter(asset => !asset.configured).length}`,
     ...poolAssetLines,
     "",
     "**06｜链上注册中心**",

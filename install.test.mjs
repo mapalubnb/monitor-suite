@@ -137,19 +137,19 @@ test("Flap status shows concise Factory pool state", () => {
     historyBlockLastScannedBlock: 80,
     historyLastScannedBlock: 80,
     historyBackwardLogCursor: 95,
-    historyConfigEventCursor: 97,
+    historyStateEventCursor: 97,
     historyBackwardBlockCursor: 90,
     candidates: { [quoteToken]: {} },
     assets: {
-      [quoteToken]: { quoteToken, name: "BNB", symbol: "BNB", enabled: true, values: ["1", "2", "3", "4", "5"], lastTxHash: txHash, lastSeenBlock: 99 },
-      [namedToken]: { quoteToken: namedToken, name: "Tether Gold", symbol: "XAUt", enabled: true, values: ["1", "33", "33", "7", "0"] },
+      [quoteToken]: { quoteToken, name: "BNB", symbol: "BNB", configured: true, creationDisabled: false, effectiveEnabled: true, values: ["1", "2", "3", "4", "5"], lastTxHash: txHash, lastSeenBlock: 99 },
+      [namedToken]: { quoteToken: namedToken, name: "Tether Gold", symbol: "XAUt", configured: true, creationDisabled: true, effectiveEnabled: false, values: ["1", "33", "33", "7", "0"] },
     },
   });
   assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
   assert.match(output, /监控状态：<font color="green">运行正常<\/font>/);
-  assert.match(output, /资产数量：2 个｜启用 2 个｜未启用或停用 0 个/);
-  assert.match(output, /BNB｜状态 已启用｜地址 \[0x0000000000000000000000000000000000000000\]/);
-  assert.match(output, /Tether Gold \(XAUt\)｜状态 已启用｜地址 \[0x21caef8a43163eea865baee23b9c2e327696a3bf\]/);
+  assert.match(output, /资产数量：2 个｜支持创建 1 个｜暂停创建 1 个｜已停用 0 个/);
+  assert.match(output, /BNB｜状态 支持创建｜地址 \[0x0000000000000000000000000000000000000000\]/);
+  assert.match(output, /Tether Gold \(XAUt\)｜状态 暂停创建｜地址 \[0x21caef8a43163eea865baee23b9c2e327696a3bf\]/);
   assert.doesNotMatch(output, /字段 [1-5]：/);
   assert.doesNotMatch(output, new RegExp(txHash));
   assert.doesNotMatch(output, /部署区块|实时头部|配置事件连续补扫|历史反向|配置事件快速回溯|Implementation|选择器/);

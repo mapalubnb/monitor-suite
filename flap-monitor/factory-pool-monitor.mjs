@@ -1,14 +1,22 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 5;
+export const FACTORY_POOL_SCHEMA_VERSION = 6;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
 export const QUOTE_CONFIG_SELECTOR = "0x26ef20d5";
+export const QUOTE_TOKEN_CREATION_DISABLED_SELECTOR = "0x80718181";
 export const EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
-export const UPGRADED_EVENT_TOPIC = "0xbc7cd75a20ee27fd9adebab32041f75521455e56b11f8c68e9c7f1bdb3e0f2c";
+export const UPGRADED_EVENT_TOPIC = "0xbc7cd75a20ee27fd9adebab32041f755214dbc6bffa90cc0225b39da2e5c2d3b";
 export const QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC = "0x7c4631d6e19bd6f974dc94a65d6b5e91d7b1b472d5d206bd8c61309aa849d518";
+export const QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC = "0x9a1f38e55c729ebf0c45d240a00b09f0a79a715df7cfd6e8942bd3f8da839199";
+export const QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC = "0xe5b8809453111201d2eac9f84326f432b0227317d947894494170516ed3e68b7";
+export const FACTORY_POOL_STATE_EVENT_TOPICS = [
+  QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC,
+  QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC,
+  QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC,
+];
 
 const ZERO_WORD = "0".repeat(64);
 
@@ -47,16 +55,29 @@ export function buildQuoteTokenConfigurationCall(quoteToken) {
   return `${QUOTE_CONFIG_SELECTOR}${address.slice(2).padStart(64, "0")}`;
 }
 
+export function buildQuoteTokenCreationDisabledCall(quoteToken) {
+  const address = normalizeAddress(quoteToken);
+  if (!address) throw new Error(`无效 quoteToken 地址：${quoteToken}`);
+  return `${QUOTE_TOKEN_CREATION_DISABLED_SELECTOR}${address.slice(2).padStart(64, "0")}`;
+}
+
+export function decodeBooleanResult(result) {
+  const hex = String(result || "").replace(/^0x/i, "").toLowerCase();
+  if (!/^[a-f0-9]{64,}$/.test(hex)) throw new Error(`布尔返回长度无效：${Math.floor(hex.length / 2)} bytes`);
+  return BigInt(`0x${hex.slice(0, 64)}`) !== 0n;
+}
+
 export function decodeQuoteTokenConfiguration(result) {
   const hex = String(result || "").replace(/^0x/i, "").toLowerCase();
   if (!/^[a-f0-9]{320,}$/.test(hex)) throw new Error(`底池配置返回长度无效：${Math.floor(hex.length / 2)} bytes`);
   const fields = Array.from({ length: 5 }, (_, index) => `0x${hex.slice(index * 64, (index + 1) * 64)}`);
   const values = fields.map(field => BigInt(field).toString());
+  const configured = BigInt(fields[0]) === 1n;
   return {
     fields,
     values,
-    enabled: BigInt(fields[0]) === 1n,
-    configured: fields.some(field => field !== `0x${ZERO_WORD}`),
+    configured,
+    configurationPresent: fields.some(field => field !== `0x${ZERO_WORD}`),
     fingerprint: hashValue(fields.join(":")),
   };
 }
@@ -93,7 +114,7 @@ export function extractFactoryTransactionCandidates(transaction, proxy = FLAP_FA
 export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY) {
   if (normalizeAddress(logEntry?.address) !== normalizeAddress(proxy)) return [];
   const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
-  if (topic0 === QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC) {
+  if (topic0 === QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC || topic0 === QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC) {
     const data = String(logEntry?.data || "").replace(/^0x/i, "");
     const quoteToken = /^[a-fA-F0-9]{64,}$/.test(data)
       ? normalizeAddress(`0x${data.slice(24, 64)}`)
@@ -101,6 +122,20 @@ export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY
     return quoteToken ? [{
       quoteToken,
       selector: "",
+      topic0,
+      txHash: String(logEntry?.transactionHash || "").toLowerCase(),
+      blockNumber: hexToNumber(logEntry?.blockNumber),
+      logIndex: hexToNumber(logEntry?.logIndex),
+      source: "event",
+    }] : [];
+  }
+  if (topic0 === QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC) {
+    const quoteToken = extractAddressWords(logEntry?.topics?.[1] || "")[0]
+      || extractAddressWords(logEntry?.data || "")[0]
+      || "";
+    return quoteToken ? [{
+      quoteToken,
+      selector: QUOTE_TOKEN_CREATION_DISABLED_SELECTOR,
       topic0,
       txHash: String(logEntry?.transactionHash || "").toLowerCase(),
       blockNumber: hexToNumber(logEntry?.blockNumber),
@@ -141,6 +176,31 @@ export function extractBytecodeSelectors(bytecode) {
   return [...selectors].sort();
 }
 
+function migrateFactoryPoolAsset(asset = {}) {
+  const values = Array.isArray(asset.values) ? asset.values.map(String) : [];
+  const fields = Array.isArray(asset.fields) ? asset.fields : [];
+  const configurationPresent = typeof asset.configurationPresent === "boolean"
+    ? asset.configurationPresent
+    : values.length > 0
+      ? values.some(value => value !== "0")
+      : Boolean(asset.configured ?? asset.enabled);
+  const configured = values.length > 0 ? values[0] === "1" : Boolean(asset.configured ?? asset.enabled);
+  const creationDisabled = Boolean(asset.creationDisabled);
+  const configurationFingerprint = asset.configurationFingerprint
+    || (fields.length > 0 ? hashValue(fields.join(":")) : asset.fingerprint || "");
+  const migrated = {
+    ...asset,
+    configured,
+    configurationPresent,
+    creationDisabled,
+    effectiveEnabled: configured && !creationDisabled,
+    configurationFingerprint,
+    fingerprint: hashValue(`${configurationFingerprint}:${creationDisabled ? 1 : 0}`),
+  };
+  delete migrated.enabled;
+  return migrated;
+}
+
 export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
   return {
     schemaVersion: FACTORY_POOL_SCHEMA_VERSION,
@@ -159,7 +219,7 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     historyLogLastScannedBlock: null,
     historyBlockLastScannedBlock: null,
     historyBackwardLogCursor: null,
-    historyConfigEventCursor: null,
+    historyStateEventCursor: null,
     historyBackwardBlockCursor: null,
     historyLastScannedBlock: null,
     currentImplementation: "",
@@ -183,6 +243,7 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
 
 export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
   const base = createFactoryPoolState(proxy);
+  const previousSchemaVersion = Number(raw?.schemaVersion) || 0;
   const state = raw && typeof raw === "object" ? { ...base, ...raw } : base;
   state.schemaVersion = FACTORY_POOL_SCHEMA_VERSION;
   state.chainId = BSC_CHAIN_ID;
@@ -193,6 +254,17 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
   if (!Number.isFinite(state.fallbackLastScannedBlock) && Number.isFinite(state.headLastScannedBlock)) {
     state.fallbackLastScannedBlock = state.headLastScannedBlock;
   }
+  state.assets = Object.fromEntries(Object.entries(state.assets).map(([address, asset]) => [address, migrateFactoryPoolAsset(asset)]));
+  for (const candidate of Object.values(state.candidates)) {
+    if (!candidate || typeof candidate !== "object") continue;
+    delete candidate.enabled;
+    if (typeof candidate.creationDisabled !== "boolean") candidate.creationDisabled = false;
+    if (typeof candidate.effectiveEnabled !== "boolean") {
+      candidate.effectiveEnabled = Boolean(candidate.configured) && !candidate.creationDisabled;
+    }
+  }
+  if (previousSchemaVersion < 6) state.historyStateEventCursor = null;
+  delete state.historyConfigEventCursor;
   delete state.processedTransactions;
   if (!Array.isArray(state.implementationHistory)) state.implementationHistory = [];
   if (!Array.isArray(state.proxyUpgradeEvents)) state.proxyUpgradeEvents = [];
@@ -441,6 +513,15 @@ async function scanFullBlockRange(rpcCall, proxy, fromBlock, toBlock, rpcBatch) 
   return { items, checkpoints };
 }
 
+export function classifyFactoryPoolChange(previous, current) {
+  if (!previous) return current.configured ? "added" : "disabled";
+  if (!previous.configured && current.configured) return "added";
+  if (previous.configured && !current.configured) return "disabled";
+  if (current.configured && !previous.creationDisabled && current.creationDisabled) return "paused";
+  if (current.configured && previous.creationDisabled && !current.creationDisabled) return "resumed";
+  return "modified";
+}
+
 async function verifyCandidates({ state, rpcCall, items, blockTag = "latest" }) {
   const unique = new Map();
   for (const item of items) {
@@ -452,34 +533,44 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest" }) 
   const changes = [];
   for (const [quoteToken, source] of unique) {
     let decoded;
+    let creationDisabled;
     try {
-      const raw = await rpcCall("eth_call", [{ to: state.proxy, data: buildQuoteTokenConfigurationCall(quoteToken) }, blockTag], { requireResult: true });
-      decoded = decodeQuoteTokenConfiguration(raw);
+      const [configurationRaw, creationDisabledRaw] = await Promise.all([
+        rpcCall("eth_call", [{ to: state.proxy, data: buildQuoteTokenConfigurationCall(quoteToken) }, blockTag], { requireResult: true }),
+        rpcCall("eth_call", [{ to: state.proxy, data: buildQuoteTokenCreationDisabledCall(quoteToken) }, blockTag], { requireResult: true }),
+      ]);
+      decoded = decodeQuoteTokenConfiguration(configurationRaw);
+      creationDisabled = decodeBooleanResult(creationDisabledRaw);
     } catch (error) {
       const candidate = state.candidates[quoteToken];
       if (candidate) candidate.lastVerifyError = error.message;
       continue;
     }
     const previous = state.assets[quoteToken];
-    if (!decoded.configured && !previous && !state.candidates[quoteToken]) continue;
     if (source.source !== "periodic-refresh" || !state.candidates[quoteToken]) rememberCandidate(state, { ...source, quoteToken });
     const candidate = state.candidates[quoteToken];
     candidate.lastVerifiedAt = nowText();
     candidate.lastVerifyError = "";
     candidate.configured = decoded.configured;
-    candidate.enabled = decoded.enabled;
-    if (!decoded.configured && !previous) continue;
+    candidate.creationDisabled = creationDisabled;
+    candidate.effectiveEnabled = decoded.configured && !creationDisabled;
+    if (!decoded.configurationPresent && !previous) continue;
+
+    const fingerprint = hashValue(`${decoded.fingerprint}:${creationDisabled ? 1 : 0}`);
 
     const next = {
       quoteToken,
-      enabled: decoded.enabled,
       configured: decoded.configured,
+      configurationPresent: decoded.configurationPresent,
+      creationDisabled,
+      effectiveEnabled: decoded.configured && !creationDisabled,
       fields: decoded.fields,
       values: decoded.values,
-      fingerprint: decoded.fingerprint,
+      configurationFingerprint: decoded.fingerprint,
+      fingerprint,
       firstSeenAt: previous?.firstSeenAt || nowText(),
       firstSeenBlock: previous?.firstSeenBlock ?? source.blockNumber ?? null,
-      lastChangedAt: previous?.fingerprint === decoded.fingerprint ? previous.lastChangedAt : nowText(),
+      lastChangedAt: previous?.fingerprint === fingerprint ? previous.lastChangedAt : nowText(),
       lastSeenBlock: source.blockNumber ?? previous?.lastSeenBlock ?? null,
       lastTxHash: source.txHash || previous?.lastTxHash || "",
       lastSelector: source.selector || previous?.lastSelector || "",
@@ -493,7 +584,7 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest" }) 
     };
     state.assets[quoteToken] = next;
     if (!previous || previous.fingerprint !== next.fingerprint) {
-      changes.push({ type: !previous ? "added" : next.enabled ? "modified" : "disabled", previous: previous || null, current: next });
+      changes.push({ type: classifyFactoryPoolChange(previous, next), previous: previous || null, current: next });
     }
   }
   return changes;
@@ -566,14 +657,14 @@ async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, 
   };
 }
 
-async function scanConfigurationEventRange({ state, rpcCall, fromBlock, toBlock, blockTag }) {
+async function scanStateEventRange({ state, rpcCall, fromBlock, toBlock, blockTag }) {
   if (fromBlock > toBlock) return { changes: [], toBlock: fromBlock - 1 };
   const logRange = await fetchRangeLogs(
     rpcCall,
     state.proxy,
     fromBlock,
     toBlock,
-    [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC],
+    [FACTORY_POOL_STATE_EVENT_TOPICS],
   );
   const items = (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
   return {
@@ -658,7 +749,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       const desiredFrom = state.headLastScannedBlock + 1;
       const fromBlock = Math.max(desiredFrom, safeLatest - cfg.realtimeMaxBlocksPerRun + 1);
       const [range, detectedImplementationChange] = await Promise.all([
-        scanConfigurationEventRange({ state, rpcCall, fromBlock, toBlock: safeLatest, blockTag: safeBlockTag }),
+        scanStateEventRange({ state, rpcCall, fromBlock, toBlock: safeLatest, blockTag: safeBlockTag }),
         refreshImplementation({ state, rpcCall, log }),
       ]);
       implementationChange = detectedImplementationChange;
@@ -696,7 +787,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     if (state.lastScannedBlock < catchupTarget) {
       const fromBlock = state.lastScannedBlock + 1;
       const toBlock = Math.min(catchupTarget, fromBlock + cfg.catchupMaxBlocksPerRun - 1);
-      const range = await scanConfigurationEventRange({
+      const range = await scanStateEventRange({
         state,
         rpcCall,
         fromBlock,
@@ -706,22 +797,21 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       allChanges.push(...range.changes);
       state.lastScannedBlock = Math.max(state.lastScannedBlock, range.toBlock);
     }
-    if (!Number.isFinite(state.historyConfigEventCursor)) state.historyConfigEventCursor = safeLatest + 1;
+    if (!Number.isFinite(state.historyStateEventCursor)) state.historyStateEventCursor = safeLatest + 1;
     for (let index = 0; index < cfg.historyConfigEventChunksPerRun; index++) {
-      const historyConfigFloor = Math.max(state.deploymentBlock, state.lastScannedBlock + 1);
-      if (state.historyConfigEventCursor <= historyConfigFloor) break;
-      const toBlock = state.historyConfigEventCursor - 1;
-      const fromBlock = Math.max(historyConfigFloor, toBlock - cfg.historyConfigEventChunkBlocks + 1);
+      if (state.historyStateEventCursor <= state.deploymentBlock) break;
+      const toBlock = state.historyStateEventCursor - 1;
+      const fromBlock = Math.max(state.deploymentBlock, toBlock - cfg.historyConfigEventChunkBlocks + 1);
       const logRange = await fetchReverseRangeLogs(
         rpcCall,
         state.proxy,
         fromBlock,
         toBlock,
-        [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC],
+        [FACTORY_POOL_STATE_EVENT_TOPICS],
       );
       const items = (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
       allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag }));
-      state.historyConfigEventCursor = logRange.fromBlock;
+      state.historyStateEventCursor = logRange.fromBlock;
     }
     state.lastCatchupRunAt = nowText();
   }

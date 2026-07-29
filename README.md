@@ -5,7 +5,7 @@
 ## ✨ 主要功能
 
 - **Four.meme**：底池、前端页面、公开 API、OpenFour 模板、GitHub、合约及链上参数。
-- **Flap.sh**：BNB CAStore、Robinhood CAStore、金库工厂、链上金库注册和 Factory 底池资产。
+- **Flap.sh**：BNB CAStore、Robinhood CAStore、金库工厂、链上金库注册，以及 Factory 底池的新增、配置修改、暂停、恢复和停用。
 - **飞书卡片**：规则结果优先发送，AI 摘要异步补充；长文案、URL、地址和交易哈希完整保留。
 - **稳定低延迟**：支持 PM2、RPC 切换、重试、断点续扫和去重；Factory 名称查询不阻塞首次推送。
 
@@ -76,7 +76,7 @@ pm2 status
 | Four.meme | 创建者链上动作 | WebSocket 实时，HTTP 8 秒兜底 |
 | Four.meme | GitHub 提交 | 有 Token 30 秒，无 Token 90 秒 |
 | Flap.sh | 页面与链上注册中心 | 1 秒 |
-| Flap.sh | Factory 新底池快通道 | 1 秒 |
+| Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | 1 秒 |
 | Flap.sh | Factory 缺口与历史补扫 | 独立后台运行 |
 
 前端或 API 遇到 `403`、`429`、Cloudflare 或网络异常时会自动退避和重试，不会把请求失败误判为业务变更。
@@ -93,7 +93,7 @@ pm2 status
 - 变更会先发送规则化结果，AI 分析完成后再更新原卡片。
 - 文案、i18n、URL、地址和交易哈希不会截断；超长内容自动拆分为连续卡片。
 - 普通卡片不显示操作按钮，仅在存在完整 DIFF 文件时显示下载按钮。
-- Factory 底池卡片只显示变更数量、名称或符号、状态和完整可点击地址。
+- Factory 底池使用“支持创建 / 暂停创建 / 已停用”三种状态；卡片只显示变更数量、名称或符号、状态和完整可点击地址。
 - 启动卡片与状态卡片使用精简信息，不显示扫描区块、交易和内部配置字段。
 
 ## 🧭 路由管理

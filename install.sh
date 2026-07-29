@@ -536,7 +536,12 @@ if [ -f "$SNAP" ]; then
     const enabledVisibleFactories=visibleFactoryItems.filter(v=>v&&v.enabled).length;
     const registry=s.registryMonitor||{};
     const poolAssets=Object.values(fp.assets||{}).sort((a,b)=>String(a.quoteToken||'').localeCompare(String(b.quoteToken||'')));
-    const enabledPoolAssets=poolAssets.filter(v=>v&&v.enabled).length;
+    const poolConfigured=v=>Boolean(v&&(v.configured??v.enabled));
+    const poolPaused=v=>poolConfigured(v)&&Boolean(v.creationDisabled);
+    const poolEffective=v=>Boolean(v&&(v.effectiveEnabled??(poolConfigured(v)&&!v.creationDisabled)));
+    const enabledPoolAssets=poolAssets.filter(poolEffective).length;
+    const pausedPoolAssets=poolAssets.filter(poolPaused).length;
+    const disabledPoolAssets=poolAssets.filter(v=>v&&!poolConfigured(v)).length;
     const registryAddress=registry.address||'0x90497450f2a706f1951b5bdda52b4e5d16f34c06';
     const knownVaults=Object.keys(registry.knownVaults||{});
     const safeLatest=registry.safeLatestBlock??'-';
@@ -571,7 +576,7 @@ if [ -f "$SNAP" ]; then
     console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
     console.log('页面：'+keys.length+' 个｜资源 '+totalAssets+' 个｜文案 '+totalText+' 字｜i18n '+totalI18n+' 键');
     console.log('金库工厂：总数 '+factoryItems.length+' 个｜CAStore 可见 '+visibleFactories+' 个｜已启用 '+enabledVisibleFactories+' 个｜链上金库 '+knownVaults.length+' 个');
-    console.log('Factory 底池：已配置 '+poolAssets.length+' 个｜启用 '+enabledPoolAssets+' 个｜未启用或停用 '+Math.max(0,poolAssets.length-enabledPoolAssets)+' 个');
+    console.log('Factory 底池：资产 '+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
     console.log('');
 
     console.log('**03｜页面监控**');
@@ -601,13 +606,14 @@ if [ -f "$SNAP" ]; then
     console.log('Factory Proxy：'+mdLink(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0','https://bscscan.com/address/'+(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0')));
     const headLag=Number.isFinite(Number(fp.safeLatestBlock))&&Number.isFinite(Number(fp.headLastScannedBlock))?Math.max(0,Number(fp.safeLatestBlock)-Number(fp.headLastScannedBlock)):'-';
     console.log('监控状态：'+(fp.lastError?warn('需要关注'):(typeof headLag==='number'&&headLag>20?warn('存在延迟'):ok('运行正常'))));
-    console.log('资产数量：'+poolAssets.length+' 个｜启用 '+enabledPoolAssets+' 个｜未启用或停用 '+Math.max(0,poolAssets.length-enabledPoolAssets)+' 个');
+    console.log('资产数量：'+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
     if(poolAssets.length===0) console.log('尚未发现已配置的 Factory 底池资产');
     for(const [index,v] of poolAssets.entries()){
       const address=v.quoteToken||'';
       const name=address==='0x0000000000000000000000000000000000000000'?'BNB':(v.name||v.symbol||'名称同步中');
       const label=v.symbol&&v.symbol!==name?name+' ('+v.symbol+')':name;
-      console.log(String(index+1).padStart(2,'0')+'　'+label+'｜状态 '+(v.enabled?'已启用':'未启用或已停用')+'｜地址 '+mdLink(address,'https://bscscan.com/address/'+address));
+      const status=!poolConfigured(v)?'已停用':poolPaused(v)?'暂停创建':'支持创建';
+      console.log(String(index+1).padStart(2,'0')+'　'+label+'｜状态 '+status+'｜地址 '+mdLink(address,'https://bscscan.com/address/'+address));
     }
     console.log('');
 
