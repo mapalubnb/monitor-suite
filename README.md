@@ -76,7 +76,7 @@ pm2 status
 | Four.meme | 创建者链上动作 | WebSocket 实时，HTTP 8 秒兜底 |
 | Four.meme | GitHub 提交 | 有 Token 30 秒，无 Token 90 秒 |
 | Flap.sh | 页面与链上注册中心 | 1 秒 |
-| Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | 1 秒 |
+| Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | 1 秒，不等待确认块 |
 | Flap.sh | Factory 缺口与历史补扫 | 独立后台运行 |
 
 前端或 API 遇到 `403`、`429`、Cloudflare 或网络异常时会自动退避和重试，不会把请求失败误判为业务变更。

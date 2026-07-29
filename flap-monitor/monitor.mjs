@@ -97,7 +97,7 @@ const CONFIG = {
     intervalMs: readPositiveIntEnv("FLAP_FACTORY_POOL_INTERVAL_MS", 1_000, 500),
     catchupIntervalMs: readPositiveIntEnv("FLAP_FACTORY_CATCHUP_INTERVAL_MS", 1_000, 500),
     historyIntervalMs: readPositiveIntEnv("FLAP_FACTORY_HISTORY_INTERVAL_MS", 1_000, 500),
-    confirmations: readPositiveIntEnv("FLAP_FACTORY_POOL_CONFIRMATIONS", 5, 1),
+    confirmations: 0,
     deploymentBlock: Number.parseInt(process.env.FLAP_FACTORY_DEPLOYMENT_BLOCK || "0", 10),
     realtimeBootstrapBlocks: readPositiveIntEnv("FLAP_FACTORY_REALTIME_BOOTSTRAP_BLOCKS", 20, 1),
     realtimeMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_REALTIME_MAX_BLOCKS", 20, 1),

@@ -681,7 +681,7 @@ function trimBlockCheckpoints(state, confirmations) {
 export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}, log } = {}) {
   if (!state || typeof rpcCall !== "function") throw new Error("Factory 扫描缺少 state 或 rpcCall");
   const cfg = {
-    confirmations: 5,
+    confirmations: 0,
     deploymentBlock: 0,
     scanRealtime: true,
     scanFallback: false,

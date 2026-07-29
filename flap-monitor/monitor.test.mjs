@@ -40,6 +40,7 @@ function factoryGetterResult(method, params, configurationResult, creationDisabl
 test("default Flap polling interval remains fast and configurable", () => {
   assert.equal(__testables.CONFIG.pollIntervalMs, 1_000);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.intervalMs, 1_000);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.confirmations, 0);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.catchupIntervalMs, 1_000);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.catchupMaxBlocksPerRun, 2_000);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.historyConfigEventChunkBlocks, 5_000);
