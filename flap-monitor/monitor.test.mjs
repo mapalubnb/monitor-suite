@@ -153,7 +153,6 @@ test("Factory pool change card keeps only readable asset status and full address
   assert.match(content, /新增支持：BNB/);
   assert.match(content, /状态：支持创建/);
   assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
-  assert.ok(content.includes("复制地址：\n```text\n" + BNB_QUOTE_TOKEN + "\n```"));
   assert.doesNotMatch(content, new RegExp(FLAP_FACTORY_PROXY));
   assert.doesNotMatch(content, new RegExp(implementation));
   assert.doesNotMatch(content, new RegExp(txHash));
@@ -570,6 +569,51 @@ test("Factory realtime fast path scans configuration events without full blocks 
   assert.deepEqual(requestedBlocks, []);
 });
 
+test("Factory realtime fast path rescans the latest blocks without duplicate changes", async () => {
+  const implementation = "0x8888888888888888888888888888888888888888";
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    currentImplementation: implementation,
+    headLastScannedBlock: 1000,
+    lastScannedBlock: 1000,
+  });
+  const logRanges = [];
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x3e8";
+    if (method === "eth_getStorageAt") return `0x${"0".repeat(24)}${implementation.slice(2)}`;
+    if (method === "eth_getLogs") {
+      logRanges.push({
+        from: Number.parseInt(params[0].fromBlock, 16),
+        to: Number.parseInt(params[0].toBlock, 16),
+      });
+      return [];
+    }
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const result = await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: {
+      confirmations: 0,
+      scanRealtime: true,
+      scanFallback: false,
+      scanCatchup: false,
+      scanHistory: false,
+      realtimeMaxBlocksPerRun: 20,
+      realtimeRescanBlocks: 5,
+      assetRefreshPerRun: 0,
+    },
+  });
+  assert.deepEqual(logRanges, [{ from: 996, to: 1000 }]);
+  assert.equal(state.headLastScannedBlock, 1000);
+  assert.deepEqual(result.changes, []);
+  assert.equal(result.changed, false);
+});
+
 test("Factory realtime state event discovers paused QQQB with its current on-chain configuration", async () => {
   const token = "0x205812cdbed920aff76c6580abd681a46d11efc7";
   const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
@@ -670,6 +714,99 @@ test("Factory fallback path discovers transaction candidates and stays deduplica
   const second = await runFactoryPoolScan({ state, rpcCall, config });
   assert.equal(second.changes.length, 0);
   assert.equal(state.candidates[token].sources.length, 1);
+});
+
+test("Factory fallback refreshes a paused Apple asset before a later scan failure", async () => {
+  const token = "0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a";
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    headLastScannedBlock: 1000,
+    fallbackLastScannedBlock: 999,
+    lastScannedBlock: 1000,
+    assets: {
+      [token]: {
+        quoteToken: token,
+        configured: true,
+        creationDisabled: true,
+        effectiveEnabled: false,
+        values: ["1", "34", "34", "7", "0"],
+        configurationFingerprint: "apple-config",
+        fingerprint: "paused",
+      },
+    },
+  });
+  const getterResult = `0x${[1n, 34n, 34n, 7n, 0n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x3e8";
+    if (method === "eth_call") return factoryGetterResult(method, params, getterResult, BOOLEAN_FALSE_RESULT);
+    if (method === "eth_getLogs") throw new Error("fallback logs unavailable");
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  await assert.rejects(runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: {
+      confirmations: 0,
+      scanRealtime: false,
+      scanFallback: true,
+      scanCatchup: false,
+      scanHistory: false,
+      assetRefreshPerRun: 1,
+    },
+  }), /fallback logs unavailable/);
+  assert.equal(state.assets[token].creationDisabled, false);
+  assert.equal(state.assets[token].effectiveEnabled, true);
+});
+
+test("Factory partial scan failure preserves and later sends an Apple resume notification", async () => {
+  const token = "0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a";
+  const paused = {
+    quoteToken: token,
+    configured: true,
+    creationDisabled: true,
+    effectiveEnabled: false,
+    values: ["1", "34", "34", "7", "0"],
+  };
+  const resumed = { ...paused, creationDisabled: false, effectiveEnabled: true };
+  const state = {
+    ...createFactoryPoolState(),
+    assets: { [token]: paused },
+    pendingChanges: [],
+    pendingImplementationChange: null,
+  };
+  let saveCalls = 0;
+  await assert.rejects(__testables.checkFlapFactoryPools(state, {
+    scanFn: async ({ state: targetState }) => {
+      targetState.assets[token] = resumed;
+      throw new Error("later fallback failed");
+    },
+    saveStateFn: () => { saveCalls++; },
+    scheduleMetadataFn: async () => ({ patched: false }),
+  }), /later fallback failed/);
+  assert.equal(saveCalls, 1);
+  assert.equal(state.pendingChanges.length, 1);
+  assert.equal(state.pendingChanges[0].type, "resumed");
+
+  let sentContent = "";
+  const result = await __testables.checkFlapFactoryPools(state, {
+    scanFn: async () => ({ changed: false, changes: [], implementationChange: null, state }),
+    sendCardFn: async (_title, content) => {
+      sentContent = content;
+      return "om_apple_resume";
+    },
+    saveStateFn: () => { saveCalls++; },
+    pinFn: async () => {},
+    scheduleMetadataFn: async () => ({ patched: false }),
+  });
+  assert.equal(result.sent, true);
+  assert.match(sentContent, /恢复创建：名称同步中/);
+  assert.match(sentContent, /状态：支持创建/);
+  assert.match(sentContent, new RegExp(token));
+  assert.deepEqual(state.pendingChanges, []);
 });
 
 test("Factory catchup advances with only configuration events and no full blocks", async () => {

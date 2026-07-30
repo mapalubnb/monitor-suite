@@ -23,6 +23,7 @@ import { sendCard, sendCardQueued, patchCard, pinMessage, waitQueueDrain } from 
 import {
   BNB_QUOTE_TOKEN,
   FLAP_FACTORY_PROXY,
+  classifyFactoryPoolChange,
   createFactoryPoolState,
   loadFactoryPoolState,
   mergePendingFactoryPoolChanges,
@@ -2790,6 +2791,34 @@ function formatFactoryPoolAssetStatus(asset = {}) {
   return "支持创建";
 }
 
+function snapshotFactoryPoolAssets(state) {
+  return new Map(Object.entries(state.assets || {}));
+}
+
+function factoryPoolAssetStateFingerprint(asset = {}) {
+  if (asset.fingerprint) return asset.fingerprint;
+  return JSON.stringify({
+    configured: Boolean(asset.configured),
+    creationDisabled: Boolean(asset.creationDisabled),
+    configurationFingerprint: asset.configurationFingerprint || "",
+    values: asset.values || [],
+  });
+}
+
+function collectFactoryPoolStateChanges(previousAssets, state) {
+  const changes = [];
+  for (const [quoteToken, current] of Object.entries(state.assets || {})) {
+    const previous = previousAssets.get(quoteToken);
+    if (previous && factoryPoolAssetStateFingerprint(previous) === factoryPoolAssetStateFingerprint(current)) continue;
+    changes.push({
+      type: classifyFactoryPoolChange(previous, current),
+      previous: previous || null,
+      current,
+    });
+  }
+  return changes;
+}
+
 function buildFactoryPoolMonitorContent(result) {
   const state = result.state || {};
   const assets = Object.values(state.assets || {});
@@ -2815,7 +2844,6 @@ function buildFactoryPoolMonitorContent(result) {
     primary.push(`${label}：${formatFactoryPoolAssetName(item)}`);
     primary.push(`状态：${formatFactoryPoolAssetStatus(item)}`);
     primary.push(`地址：${addressLink(item.quoteToken)}`);
-    primary.push(`复制地址：\n\`\`\`text\n${item.quoteToken}\n\`\`\``);
   }
   if (result.implementationChange?.previous) {
     const upgrade = result.implementationChange;
@@ -2932,13 +2960,33 @@ async function checkFlapFactoryPools(factoryPoolState, {
   scheduleMetadataFn = scheduleFactoryPoolMetadataEnrichment,
 } = {}) {
   if (!CONFIG.factoryPoolMonitor.enabled) return { changed: false, sent: false, state: factoryPoolState };
-  const result = await scanFn({
-    state: factoryPoolState,
-    rpcCall: bscRpcCall,
-    rpcBatch: calls => bscRpcBatch(calls, { requireAllResults: true }),
-    config: { ...CONFIG.factoryPoolMonitor, ...scanConfig },
-    log,
-  });
+  const previousAssets = snapshotFactoryPoolAssets(factoryPoolState);
+  const previousImplementation = factoryPoolState.currentImplementation || "";
+  let result;
+  try {
+    result = await scanFn({
+      state: factoryPoolState,
+      rpcCall: bscRpcCall,
+      rpcBatch: calls => bscRpcBatch(calls, { requireAllResults: true }),
+      config: { ...CONFIG.factoryPoolMonitor, ...scanConfig },
+      log,
+    });
+  } catch (error) {
+    if (!suppressNotifications) {
+      const partialChanges = collectFactoryPoolStateChanges(previousAssets, factoryPoolState);
+      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, partialChanges);
+      if (previousImplementation && factoryPoolState.currentImplementation !== previousImplementation) {
+        factoryPoolState.pendingImplementationChange = [...(factoryPoolState.implementationHistory || [])].reverse()
+          .find(change => change.previous === previousImplementation && change.current === factoryPoolState.currentImplementation)
+          || { previous: previousImplementation, current: factoryPoolState.currentImplementation };
+      }
+      if (partialChanges.length > 0 || factoryPoolState.pendingImplementationChange) {
+        saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+        log(`[Flap Factory] 扫描后续步骤失败，已保留 ${partialChanges.length} 个待发送状态变更`);
+      }
+    }
+    throw error;
+  }
   const deliver = async () => {
     if (!suppressNotifications) {
       factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);

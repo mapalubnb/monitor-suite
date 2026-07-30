@@ -689,6 +689,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     scanHistory: true,
     realtimeBootstrapBlocks: 20,
     realtimeMaxBlocksPerRun: 20,
+    realtimeRescanBlocks: 5,
     catchupMaxBlocksPerRun: 2_000,
     historyLogChunkBlocks: 2_000,
     historyBlockChunkBlocks: 10,
@@ -745,16 +746,20 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       state.headLastScannedBlock = Math.max(state.deploymentBlock - 1, safeLatest - cfg.realtimeBootstrapBlocks);
     }
     if (!Number.isFinite(state.lastScannedBlock)) state.lastScannedBlock = state.headLastScannedBlock;
-    if (state.headLastScannedBlock < safeLatest) {
-      const desiredFrom = state.headLastScannedBlock + 1;
-      const fromBlock = Math.max(desiredFrom, safeLatest - cfg.realtimeMaxBlocksPerRun + 1);
+    if (state.headLastScannedBlock <= safeLatest) {
+      const frontierBlock = Math.min(safeLatest, state.headLastScannedBlock + 1);
+      const fromBlock = Math.max(
+        state.deploymentBlock,
+        safeLatest - cfg.realtimeMaxBlocksPerRun + 1,
+        frontierBlock - cfg.realtimeRescanBlocks + 1,
+      );
       const [range, detectedImplementationChange] = await Promise.all([
         scanStateEventRange({ state, rpcCall, fromBlock, toBlock: safeLatest, blockTag: safeBlockTag }),
         refreshImplementation({ state, rpcCall, log }),
       ]);
       implementationChange = detectedImplementationChange;
       allChanges.push(...range.changes);
-      state.headLastScannedBlock = range.toBlock;
+      state.headLastScannedBlock = Math.max(state.headLastScannedBlock, range.toBlock);
       if (state.lastScannedBlock >= fromBlock - 1) state.lastScannedBlock = Math.max(state.lastScannedBlock, range.toBlock);
     } else if (!state.currentImplementation) {
       implementationChange = await refreshImplementation({ state, rpcCall, log });
@@ -766,6 +771,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     if (!Number.isFinite(state.fallbackLastScannedBlock)) {
       state.fallbackLastScannedBlock = Math.max(state.deploymentBlock - 1, safeLatest - cfg.realtimeBootstrapBlocks);
     }
+    allChanges.push(...await refreshKnownAssets({ state, rpcCall, limit: cfg.assetRefreshPerRun, blockTag: safeBlockTag }));
     reorg = await rollbackReorgIfNeeded({ state, rpcCall, log });
     if (state.fallbackLastScannedBlock < safeLatest) {
       const fromBlock = state.fallbackLastScannedBlock + 1;
@@ -776,7 +782,6 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       Object.assign(state.blockCheckpoints, range.checkpoints);
       trimBlockCheckpoints(state, cfg.confirmations);
     }
-    allChanges.push(...await refreshKnownAssets({ state, rpcCall, limit: cfg.assetRefreshPerRun, blockTag: safeBlockTag }));
   }
 
   if (cfg.scanCatchup) {
