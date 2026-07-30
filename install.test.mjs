@@ -147,6 +147,7 @@ test("Flap status shows concise Factory pool state", () => {
   });
   assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
   assert.match(output, /监控状态：<font color="green">运行正常<\/font>/);
+  assert.match(output, /扫描进度：已扫 100｜最新 105｜延迟 5 块/);
   assert.match(output, /资产数量：2 个｜支持创建 1 个｜暂停创建 1 个｜已停用 0 个/);
   assert.match(output, /BNB｜状态 支持创建｜地址 \[0x0000000000000000000000000000000000000000\]/);
   assert.match(output, /Tether Gold \(XAUt\)｜状态 暂停创建｜地址 \[0x21caef8a43163eea865baee23b9c2e327696a3bf\]/);

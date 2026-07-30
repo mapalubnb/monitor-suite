@@ -604,8 +604,11 @@ if [ -f "$SNAP" ]; then
 
     console.log('**06｜Factory 底池资产**');
     console.log('Factory Proxy：'+mdLink(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0','https://bscscan.com/address/'+(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0')));
-    const headLag=Number.isFinite(Number(fp.safeLatestBlock))&&Number.isFinite(Number(fp.headLastScannedBlock))?Math.max(0,Number(fp.safeLatestBlock)-Number(fp.headLastScannedBlock)):'-';
+    const factoryLatest=fp.latestBlock??fp.safeLatestBlock??'-';
+    const factoryScanned=fp.headLastScannedBlock??'-';
+    const headLag=Number.isFinite(Number(factoryLatest))&&Number.isFinite(Number(factoryScanned))?Math.max(0,Number(factoryLatest)-Number(factoryScanned)):'-';
     console.log('监控状态：'+(fp.lastError?warn('需要关注'):(typeof headLag==='number'&&headLag>20?warn('存在延迟'):ok('运行正常'))));
+    console.log('扫描进度：已扫 '+factoryScanned+'｜最新 '+factoryLatest+'｜延迟 '+headLag+' 块');
     console.log('资产数量：'+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
     if(poolAssets.length===0) console.log('尚未发现已配置的 Factory 底池资产');
     for(const [index,v] of poolAssets.entries()){

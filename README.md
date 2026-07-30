@@ -61,7 +61,7 @@ pm2 status
 | `fm-status` | 查看 Four.meme 状态 |
 | `fm-log [N]` | 查看 Four.meme 日志 |
 | `fm-check` | 立即执行 Four.meme 检测 |
-| `fl-status` | 查看 Flap.sh、金库和 Factory 资产状态 |
+| `fl-status` | 查看 Flap.sh、金库、Factory 资产及当前扫描区块 |
 | `fl-log [N]` | 查看 Flap.sh 日志 |
 | `bot-status` | 查看飞书 Bot 状态 |
 | `bot-log [N]` | 查看飞书 Bot 日志 |
