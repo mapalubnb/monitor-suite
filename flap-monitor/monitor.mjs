@@ -2815,6 +2815,7 @@ function buildFactoryPoolMonitorContent(result) {
     primary.push(`${label}：${formatFactoryPoolAssetName(item)}`);
     primary.push(`状态：${formatFactoryPoolAssetStatus(item)}`);
     primary.push(`地址：${addressLink(item.quoteToken)}`);
+    primary.push(`复制地址：\n\`\`\`text\n${item.quoteToken}\n\`\`\``);
   }
   if (result.implementationChange?.previous) {
     const upgrade = result.implementationChange;

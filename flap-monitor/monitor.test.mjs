@@ -153,6 +153,7 @@ test("Factory pool change card keeps only readable asset status and full address
   assert.match(content, /新增支持：BNB/);
   assert.match(content, /状态：支持创建/);
   assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
+  assert.ok(content.includes("复制地址：\n```text\n" + BNB_QUOTE_TOKEN + "\n```"));
   assert.doesNotMatch(content, new RegExp(FLAP_FACTORY_PROXY));
   assert.doesNotMatch(content, new RegExp(implementation));
   assert.doesNotMatch(content, new RegExp(txHash));
@@ -276,6 +277,7 @@ test("Factory first delivery does not await metadata enrichment", async () => {
     sendCardFn: async (_title, content) => {
       deliveryOrder.push("send");
       assert.match(content, /名称同步中/);
+      assert.match(content, new RegExp(token));
       return "om_fast";
     },
     saveStateFn: () => { deliveryOrder.push("save"); },
