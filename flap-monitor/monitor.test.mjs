@@ -716,6 +716,60 @@ test("Factory fallback path discovers transaction candidates and stays deduplica
   assert.equal(state.candidates[token].sources.length, 1);
 });
 
+test("Factory fallback full-block path avoids redundant transaction lookups", async () => {
+  const token = "0x2323232323232323232323232323232323232323";
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    headLastScannedBlock: 100,
+    fallbackLastScannedBlock: 99,
+    lastScannedBlock: 100,
+  });
+  const getterResult = `0x${[1n, 2n, 3n, 4n, 5n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const transaction = {
+    to: FLAP_FACTORY_PROXY,
+    input: `0xabcdef01${"0".repeat(24)}${token.slice(2)}`,
+    hash: `0x${"67".repeat(32)}`,
+    blockNumber: "0x64",
+  };
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x69";
+    if (method === "eth_getLogs") return [{
+      address: FLAP_FACTORY_PROXY,
+      topics: [QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC],
+      data: `0x${token.slice(2).padStart(64, "0")}${1n.toString(16).padStart(64, "0")}`,
+      transactionHash: transaction.hash,
+      blockNumber: "0x64",
+      logIndex: "0x0",
+    }];
+    if (method === "eth_call") return factoryGetterResult(method, params, getterResult);
+    if (method === "eth_getBlockByNumber") return {
+      hash: `0x${Number.parseInt(params[0], 16).toString(16).padStart(64, "0")}`,
+      transactions: params[1] ? [transaction] : [],
+    };
+    if (method === "eth_getTransactionByHash") throw new Error("完整区块漏检路径不应重复读取日志交易");
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const result = await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: {
+      confirmations: 5,
+      scanRealtime: false,
+      scanFallback: true,
+      scanCatchup: false,
+      scanHistory: false,
+      realtimeMaxBlocksPerRun: 20,
+      assetRefreshPerRun: 0,
+    },
+  });
+  assert.equal(result.changes.length, 1);
+  assert.equal(state.assets[token].effectiveEnabled, true);
+});
+
 test("Factory fallback refreshes a paused Apple asset before a later scan failure", async () => {
   const token = "0x431a3bee82e2ca41e49895cbece5bb0f76a89b7a";
   const state = createFactoryPoolState();

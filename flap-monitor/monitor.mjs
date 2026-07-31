@@ -2459,12 +2459,27 @@ function numberToHex(value) {
   return `0x${Math.max(0, Number(value) || 0).toString(16)}`;
 }
 
-let preferredBscRpcIndex = 0;
+const preferredBscRpcIndexByKey = new Map();
+
+function bscRpcPreferenceKey(method) {
+  if (method === "eth_call") return "eth_call";
+  if (method === "eth_getLogs") return "eth_getLogs";
+  if (method === "eth_getBlockByNumber" || method === "eth_getTransactionByHash" || method === "eth_getTransactionReceipt") return "block_data";
+  if (method === "eth_getCode" || method === "eth_getStorageAt") return "contract_state";
+  return method || "default";
+}
+
+function bscRpcBatchPreferenceKey(calls = []) {
+  const methods = [...new Set(calls.map(call => call?.method || "unknown"))].sort();
+  return `batch:${methods.join("+") || "empty"}`;
+}
 
 async function bscRpcCall(method, params = [], options = {}) {
   let lastErr = null;
+  const preferenceKey = bscRpcPreferenceKey(method);
+  const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey) || 0;
   for (let attempt = 0; attempt < CONFIG.bscRpcUrls.length; attempt++) {
-    const index = (preferredBscRpcIndex + attempt) % CONFIG.bscRpcUrls.length;
+    const index = (preferredIndex + attempt) % CONFIG.bscRpcUrls.length;
     const rpcUrl = CONFIG.bscRpcUrls[index];
     try {
       const res = await fetchSafe(rpcUrl, {
@@ -2475,7 +2490,7 @@ async function bscRpcCall(method, params = [], options = {}) {
       const json = await res.json();
       if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
       if (options.requireResult && json.result == null) throw new Error(`${method} 返回空结果`);
-      preferredBscRpcIndex = index;
+      preferredBscRpcIndexByKey.set(preferenceKey, index);
       return json.result;
     } catch (err) {
       lastErr = err;
@@ -2489,8 +2504,10 @@ async function bscRpcBatch(calls = [], options = {}) {
   if (calls.length === 1) return [await bscRpcCall(calls[0].method, calls[0].params, { requireResult: options.requireAllResults })];
   let lastErr = null;
   const payload = calls.map((call, i) => ({ jsonrpc: "2.0", id: i + 1, method: call.method, params: call.params || [] }));
+  const preferenceKey = bscRpcBatchPreferenceKey(calls);
+  const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey) || 0;
   for (let attempt = 0; attempt < CONFIG.bscRpcUrls.length; attempt++) {
-    const index = (preferredBscRpcIndex + attempt) % CONFIG.bscRpcUrls.length;
+    const index = (preferredIndex + attempt) % CONFIG.bscRpcUrls.length;
     const rpcUrl = CONFIG.bscRpcUrls[index];
     try {
       const res = await fetchSafe(rpcUrl, {
@@ -2507,7 +2524,7 @@ async function bscRpcBatch(calls = [], options = {}) {
         return r.result;
       });
       if (options.requireAllResults && results.some(result => result == null)) throw new Error("Batch RPC 存在空结果");
-      preferredBscRpcIndex = index;
+      preferredBscRpcIndexByKey.set(preferenceKey, index);
       return results;
     } catch (err) {
       lastErr = err;
@@ -5442,6 +5459,15 @@ async function startMonitor() {
   let isFactoryFallbackScanning = false;
   let isFactoryCatchupScanning = false;
   let isFactoryHistoryScanning = false;
+  let isFactoryBackgroundScanning = false;
+  function getFactoryRealtimeLag() {
+    const latest = Number(factoryPoolState.latestBlock);
+    const scanned = Number(factoryPoolState.headLastScannedBlock);
+    return Number.isFinite(latest) && Number.isFinite(scanned) ? Math.max(0, latest - scanned) : 0;
+  }
+  function shouldDeferFactoryBackgroundScan() {
+    return isFactoryRealtimeScanning || getFactoryRealtimeLag() > CONFIG.factoryPoolMonitor.realtimeMaxBlocksPerRun;
+  }
   async function factoryPoolRealtimePoll() {
     if (!CONFIG.factoryPoolMonitor.enabled || isFactoryRealtimeScanning) return;
     isFactoryRealtimeScanning = true;
@@ -5460,8 +5486,9 @@ async function startMonitor() {
   }
 
   async function factoryPoolFallbackPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryFallbackScanning) return;
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryFallbackScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
     isFactoryFallbackScanning = true;
+    isFactoryBackgroundScanning = true;
     try {
       await checkFlapFactoryPools(factoryPoolState, {
         scanConfig: { scanRealtime: false, scanFallback: true, scanCatchup: false, scanHistory: false },
@@ -5473,12 +5500,14 @@ async function startMonitor() {
       log(`[Flap Factory 漏检] 检测失败：${err.message}`);
     } finally {
       isFactoryFallbackScanning = false;
+      isFactoryBackgroundScanning = false;
     }
   }
 
   async function factoryPoolCatchupPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryCatchupScanning) return;
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryCatchupScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
     isFactoryCatchupScanning = true;
+    isFactoryBackgroundScanning = true;
     try {
       await checkFlapFactoryPools(factoryPoolState, {
         scanConfig: { scanRealtime: false, scanCatchup: true, scanHistory: false },
@@ -5490,12 +5519,14 @@ async function startMonitor() {
       log(`[Flap Factory 补扫] 检测失败：${err.message}`);
     } finally {
       isFactoryCatchupScanning = false;
+      isFactoryBackgroundScanning = false;
     }
   }
 
   async function factoryPoolHistoryPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryHistoryScanning) return;
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryHistoryScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
     isFactoryHistoryScanning = true;
+    isFactoryBackgroundScanning = true;
     try {
       await checkFlapFactoryPools(factoryPoolState, {
         scanConfig: { scanRealtime: false, scanCatchup: false, scanHistory: true },
@@ -5507,6 +5538,7 @@ async function startMonitor() {
       log(`[Flap Factory 历史] 检测失败：${err.message}`);
     } finally {
       isFactoryHistoryScanning = false;
+      isFactoryBackgroundScanning = false;
     }
   }
 

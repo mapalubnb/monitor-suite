@@ -644,10 +644,9 @@ async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, 
   const logRange = await fetchRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
   const scannedTo = logRange.toBlock;
   recordProxyUpgradeEvents(state, logRange.logs);
-  const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
   const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, scannedTo, rpcBatch);
   const items = [
-    ...collectCandidatesFromLogsAndTransactions(logRange.logs, transactions, state.proxy),
+    ...collectCandidatesFromLogsAndTransactions(logRange.logs, [], state.proxy),
     ...fullBlocks.items,
   ];
   return {
