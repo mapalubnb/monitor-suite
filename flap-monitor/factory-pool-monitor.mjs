@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 6;
+export const FACTORY_POOL_SCHEMA_VERSION = 7;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -233,6 +233,8 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     assetRefreshCursor: 0,
     pendingChanges: [],
     pendingImplementationChange: null,
+    sendingChanges: [],
+    sendingImplementationChange: null,
     lastRealtimeRunAt: "",
     lastCatchupRunAt: "",
     lastHistoryRunAt: "",
@@ -263,13 +265,23 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
       candidate.effectiveEnabled = Boolean(candidate.configured) && !candidate.creationDisabled;
     }
   }
-  if (previousSchemaVersion < 6) state.historyStateEventCursor = null;
+  // v7 重放轻量状态事件历史，让错过实时窗口的实例无需完整扫块即可重建候选。
+  if (previousSchemaVersion < 7) state.historyStateEventCursor = null;
   delete state.historyConfigEventCursor;
   delete state.processedTransactions;
   if (!Array.isArray(state.implementationHistory)) state.implementationHistory = [];
   if (!Array.isArray(state.proxyUpgradeEvents)) state.proxyUpgradeEvents = [];
   if (!Array.isArray(state.implementationSelectors)) state.implementationSelectors = [];
   if (!Array.isArray(state.pendingChanges)) state.pendingChanges = [];
+  if (!Array.isArray(state.sendingChanges)) state.sendingChanges = [];
+  if (state.sendingChanges.length > 0) {
+    state.pendingChanges = mergePendingFactoryPoolChanges(state.sendingChanges, state.pendingChanges);
+    state.sendingChanges = [];
+  }
+  if (state.sendingImplementationChange?.previous && !state.pendingImplementationChange?.previous) {
+    state.pendingImplementationChange = state.sendingImplementationChange;
+  }
+  state.sendingImplementationChange = null;
   return state;
 }
 
@@ -634,9 +646,20 @@ async function rollbackReorgIfNeeded({ state, rpcCall, log }) {
 }
 
 function dedupeChanges(changes) {
-  const byAddress = new Map();
-  for (const change of changes) byAddress.set(change.current.quoteToken, change);
-  return [...byAddress.values()];
+  const seen = new Set();
+  const unique = [];
+  for (const change of changes) {
+    const key = [
+      change.current?.quoteToken || "",
+      change.type || "",
+      change.previous?.fingerprint || "",
+      change.current?.fingerprint || "",
+    ].join(":");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push(change);
+  }
+  return unique;
 }
 
 async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag }) {
@@ -656,7 +679,59 @@ async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, 
   };
 }
 
-async function scanStateEventRange({ state, rpcCall, fromBlock, toBlock, blockTag }) {
+function applyStateEventToAsset(asset, logEntry) {
+  const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
+  if (topic0 === QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC) {
+    const creationDisabled = decodeBooleanResult(logEntry.data);
+    return {
+      ...asset,
+      creationDisabled,
+      effectiveEnabled: Boolean(asset.configured) && !creationDisabled,
+      fingerprint: hashValue(`${asset.configurationFingerprint}:${creationDisabled ? 1 : 0}`),
+    };
+  }
+  if (topic0 !== QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC && topic0 !== QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC) return null;
+  const data = String(logEntry?.data || "").replace(/^0x/i, "");
+  if (!/^[a-fA-F0-9]{384,}$/.test(data)) return null;
+  const decoded = decodeQuoteTokenConfiguration(`0x${data.slice(64, 384)}`);
+  return {
+    ...asset,
+    configured: decoded.configured,
+    configurationPresent: decoded.configurationPresent,
+    fields: decoded.fields,
+    values: decoded.values,
+    configurationFingerprint: decoded.fingerprint,
+    effectiveEnabled: decoded.configured && !asset.creationDisabled,
+    fingerprint: hashValue(`${decoded.fingerprint}:${asset.creationDisabled ? 1 : 0}`),
+  };
+}
+
+function deriveRealtimeStateEventChanges(logs, previousAssets, finalAssets, proxy) {
+  const changes = [];
+  const transientAssets = new Map();
+  const orderedLogs = [...(logs || [])].sort((left, right) =>
+    hexToNumber(left.blockNumber) - hexToNumber(right.blockNumber)
+    || hexToNumber(left.transactionIndex) - hexToNumber(right.transactionIndex)
+    || hexToNumber(left.logIndex) - hexToNumber(right.logIndex));
+  for (const logEntry of orderedLogs) {
+    const candidate = extractFactoryLogCandidates(logEntry, proxy)[0];
+    const quoteToken = candidate?.quoteToken;
+    if (!quoteToken || !previousAssets.has(quoteToken)) continue;
+    const previous = transientAssets.get(quoteToken) || previousAssets.get(quoteToken);
+    const current = applyStateEventToAsset(previous, logEntry);
+    if (!current || previous.fingerprint === current.fingerprint) continue;
+    changes.push({ type: classifyFactoryPoolChange(previous, current), previous, current });
+    transientAssets.set(quoteToken, current);
+  }
+  for (const [quoteToken, transient] of transientAssets) {
+    const finalAsset = finalAssets[quoteToken];
+    if (!finalAsset || finalAsset.fingerprint === transient.fingerprint) continue;
+    changes.push({ type: classifyFactoryPoolChange(transient, finalAsset), previous: transient, current: finalAsset });
+  }
+  return { changes, addresses: new Set(transientAssets.keys()) };
+}
+
+async function scanStateEventRange({ state, rpcCall, fromBlock, toBlock, blockTag, preserveTransitions = false }) {
   if (fromBlock > toBlock) return { changes: [], toBlock: fromBlock - 1 };
   const logRange = await fetchRangeLogs(
     rpcCall,
@@ -666,8 +741,21 @@ async function scanStateEventRange({ state, rpcCall, fromBlock, toBlock, blockTa
     [FACTORY_POOL_STATE_EVENT_TOPICS],
   );
   const items = (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
+  const previousAssets = preserveTransitions
+    ? new Map([...new Set(items.map(item => item.quoteToken))]
+        .filter(quoteToken => state.assets[quoteToken])
+        .map(quoteToken => [quoteToken, { ...state.assets[quoteToken] }]))
+    : new Map();
+  const verifiedChanges = await verifyCandidates({ state, rpcCall, items, blockTag });
+  if (!preserveTransitions || previousAssets.size === 0) {
+    return { changes: verifiedChanges, toBlock: logRange.toBlock };
+  }
+  const derived = deriveRealtimeStateEventChanges(logRange.logs, previousAssets, state.assets, state.proxy);
   return {
-    changes: await verifyCandidates({ state, rpcCall, items, blockTag }),
+    changes: [
+      ...derived.changes,
+      ...verifiedChanges.filter(change => !derived.addresses.has(change.current.quoteToken)),
+    ],
     toBlock: logRange.toBlock,
   };
 }
@@ -753,7 +841,14 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
         frontierBlock - cfg.realtimeRescanBlocks + 1,
       );
       const [range, detectedImplementationChange] = await Promise.all([
-        scanStateEventRange({ state, rpcCall, fromBlock, toBlock: safeLatest, blockTag: safeBlockTag }),
+        scanStateEventRange({
+          state,
+          rpcCall,
+          fromBlock,
+          toBlock: safeLatest,
+          blockTag: safeBlockTag,
+          preserveTransitions: true,
+        }),
         refreshImplementation({ state, rpcCall, log }),
       ]);
       implementationChange = detectedImplementationChange;
@@ -802,21 +897,35 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       state.lastScannedBlock = Math.max(state.lastScannedBlock, range.toBlock);
     }
     if (!Number.isFinite(state.historyStateEventCursor)) state.historyStateEventCursor = safeLatest + 1;
+    const stateEventRanges = [];
+    let stateEventCursor = state.historyStateEventCursor;
     for (let index = 0; index < cfg.historyConfigEventChunksPerRun; index++) {
-      if (state.historyStateEventCursor <= state.deploymentBlock) break;
-      const toBlock = state.historyStateEventCursor - 1;
+      if (stateEventCursor <= state.deploymentBlock) break;
+      const toBlock = stateEventCursor - 1;
       const fromBlock = Math.max(state.deploymentBlock, toBlock - cfg.historyConfigEventChunkBlocks + 1);
-      const logRange = await fetchReverseRangeLogs(
+      stateEventRanges.push({ fromBlock, toBlock });
+      stateEventCursor = fromBlock;
+    }
+    const stateEventResults = await Promise.all(stateEventRanges.map(async range => ({
+      range,
+      result: await fetchReverseRangeLogs(
         rpcCall,
         state.proxy,
-        fromBlock,
-        toBlock,
+        range.fromBlock,
+        range.toBlock,
         [FACTORY_POOL_STATE_EVENT_TOPICS],
-      );
-      const items = (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
-      allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag }));
-      state.historyStateEventCursor = logRange.fromBlock;
+      ),
+    })));
+    const stateEventItems = stateEventResults.flatMap(({ result: logRange }) =>
+      (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy)));
+    allChanges.push(...await verifyCandidates({ state, rpcCall, items: stateEventItems, blockTag: safeBlockTag }));
+    let contiguousCursor = state.historyStateEventCursor;
+    for (const { range, result: logRange } of stateEventResults) {
+      if (range.toBlock !== contiguousCursor - 1) break;
+      contiguousCursor = logRange.fromBlock;
+      if (logRange.fromBlock !== range.fromBlock) break;
     }
+    state.historyStateEventCursor = contiguousCursor;
     state.lastCatchupRunAt = nowText();
   }
 
@@ -882,12 +991,25 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
 }
 
 export function mergePendingFactoryPoolChanges(pending = [], changes = []) {
-  const byAddress = new Map((pending || []).map(change => [change.current.quoteToken, change]));
+  const merged = [...(pending || [])];
   for (const change of changes || []) {
-    const previousPending = byAddress.get(change.current.quoteToken);
-    byAddress.set(change.current.quoteToken, previousPending?.type === "added"
-      ? { ...change, type: "added", previous: previousPending.previous }
-      : change);
+    const address = change.current?.quoteToken;
+    if (!address) continue;
+    const duplicateIndex = merged.findIndex(item =>
+      item.current?.quoteToken === address
+      && item.type === change.type
+      && item.current?.fingerprint === change.current?.fingerprint);
+    if (duplicateIndex >= 0) {
+      merged[duplicateIndex] = change;
+      continue;
+    }
+    const previousIndex = merged.findLastIndex(item => item.current?.quoteToken === address);
+    const previousPending = previousIndex >= 0 ? merged[previousIndex] : null;
+    if (previousPending?.type === "added" && change.type === "modified") {
+      merged[previousIndex] = { ...change, type: "added", previous: previousPending.previous };
+      continue;
+    }
+    merged.push(change);
   }
-  return [...byAddress.values()];
+  return merged;
 }

@@ -1,6 +1,6 @@
 {
   "name": "flap-monitor",
-  "version": "1.2.11",
+  "version": "1.2.12",
   "description": "Flap.sh 页面、金库和 Factory 底池资产链上监控",
   "type": "module",
   "private": true,

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 
 process.env.FLAP_MONITOR_TEST = "1";
 
@@ -45,6 +46,36 @@ test("default Flap polling interval remains fast and configurable", () => {
   assert.equal(__testables.CONFIG.factoryPoolMonitor.catchupMaxBlocksPerRun, 2_000);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.historyConfigEventChunkBlocks, 5_000);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.historyConfigEventChunksPerRun, 5);
+  assert.deepEqual(__testables.FACTORY_BACKGROUND_TASK_ORDER, ["catchup", "fallback", "catchup", "history"]);
+});
+
+test("Factory RPC hedging uses the first valid low-latency node", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrls = __testables.CONFIG.bscRpcUrls;
+  const originalHedgeDelay = __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs;
+  __testables.CONFIG.bscRpcUrls = ["https://slow.rpc", "https://fast.rpc"];
+  __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs = 50;
+  __testables.resetBscRpcHealth();
+  globalThis.fetch = async url => {
+    const slow = String(url).includes("slow");
+    await new Promise(resolve => setTimeout(resolve, slow ? 200 : 5));
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ jsonrpc: "2.0", id: 1, result: slow ? "0x1" : "0x2" }),
+    };
+  };
+  try {
+    const startedAt = Date.now();
+    const result = await __testables.bscRpcCall("eth_blockNumber", [], { requireResult: true });
+    assert.equal(result, "0x2");
+    assert.ok(Date.now() - startedAt < 180);
+  } finally {
+    globalThis.fetch = originalFetch;
+    __testables.CONFIG.bscRpcUrls = originalUrls;
+    __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs = originalHedgeDelay;
+    __testables.resetBscRpcHealth();
+  }
 });
 
 test("Flap startup card is complete and uses no emoji or bullet list markers", () => {
@@ -292,7 +323,7 @@ test("Factory first delivery does not await metadata enrichment", async () => {
   ]);
   assert.equal(outcome.sent, true);
   assert.equal(metadataScheduled, true);
-  assert.deepEqual(deliveryOrder, ["send", "save"]);
+  assert.deepEqual(deliveryOrder, ["save", "save", "send", "save"]);
 });
 
 test("Factory token metadata uses the free GoPlus API response", async () => {
@@ -338,6 +369,53 @@ test("Factory pending notification queue keeps unsent changes and deduplicates b
   assert.equal(pending[0].type, "added");
   assert.equal(pending[0].current.fingerprint, "second");
   assert.equal(pending[0].previous, null);
+});
+
+test("Factory pending notification queue preserves pause and resume transitions", () => {
+  const token = "0x6666666666666666666666666666666666666666";
+  const active = { quoteToken: token, fingerprint: "active", configured: true, creationDisabled: false, effectiveEnabled: true };
+  const paused = { ...active, fingerprint: "paused", creationDisabled: true, effectiveEnabled: false };
+  const pending = mergePendingFactoryPoolChanges(
+    [{ type: "paused", previous: active, current: paused }],
+    [{ type: "resumed", previous: paused, current: active }],
+  );
+  assert.deepEqual(pending.map(change => change.type), ["paused", "resumed"]);
+});
+
+test("Factory realtime scan does not wait for Feishu delivery", async () => {
+  const token = "0x6767676767676767676767676767676767676767";
+  const asset = {
+    quoteToken: token,
+    fingerprint: "active",
+    configured: true,
+    creationDisabled: false,
+    effectiveEnabled: true,
+  };
+  const state = {
+    proxy: FLAP_FACTORY_PROXY,
+    assets: { [token]: asset },
+    pendingChanges: [],
+    pendingImplementationChange: null,
+  };
+  let finishDelivery;
+  const outcome = await __testables.checkFlapFactoryPools(state, {
+    scanFn: async () => ({
+      changed: true,
+      changes: [{ type: "added", previous: null, current: asset }],
+      implementationChange: null,
+      state,
+    }),
+    sendCardFn: () => new Promise(resolve => { finishDelivery = resolve; }),
+    saveStateFn: () => {},
+    pinFn: async () => {},
+    scheduleMetadataFn: async () => ({ patched: false }),
+    awaitDelivery: false,
+  });
+  assert.equal(outcome.deliveryQueued, true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(state.pendingChanges.length + state.sendingChanges.length, 1);
+  finishDelivery("om_async");
+  await new Promise(resolve => setImmediate(resolve));
 });
 
 test("Factory configuration event extracts the complete quote token address", () => {
@@ -390,12 +468,18 @@ test("Factory change classifier distinguishes all five business states", () => {
   assert.equal(classifyFactoryPoolChange(null, disabled), "disabled");
 });
 
-test("Factory schema migration preserves old assets and resets state-event history", () => {
+test("Factory schema migration replays state-event history and preserves assets", () => {
   const token = "0x205812cdbed920aff76c6580abd681a46d11efc7";
   const migrated = migrateFactoryPoolState({
-    schemaVersion: 5,
+    schemaVersion: 6,
     headLastScannedBlock: 100,
+    historyStateEventCursor: 1,
     historyConfigEventCursor: 1,
+    sendingChanges: [{
+      type: "added",
+      previous: null,
+      current: { quoteToken: token, fingerprint: "legacy", configured: true },
+    }],
     assets: {
       [token]: {
         quoteToken: token,
@@ -407,9 +491,11 @@ test("Factory schema migration preserves old assets and resets state-event histo
       },
     },
   });
-  assert.equal(migrated.schemaVersion, 6);
+  assert.equal(migrated.schemaVersion, 7);
   assert.equal(migrated.historyStateEventCursor, null);
   assert.equal("historyConfigEventCursor" in migrated, false);
+  assert.equal(migrated.pendingChanges.length, 1);
+  assert.deepEqual(migrated.sendingChanges, []);
   assert.equal(migrated.assets[token].configured, true);
   assert.equal(migrated.assets[token].creationDisabled, false);
   assert.equal(migrated.assets[token].effectiveEnabled, true);
@@ -659,6 +745,106 @@ test("Factory realtime state event discovers paused QQQB with its current on-cha
   assert.equal(state.assets[token].configured, true);
   assert.equal(state.assets[token].creationDisabled, true);
   assert.equal(state.assets[token].effectiveEnabled, false);
+});
+
+test("Factory realtime path preserves rapid pause and resume events", async () => {
+  const token = "0x7070707070707070707070707070707070707070";
+  const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
+  const state = createFactoryPoolState();
+  const fields = [1n, 20n, 20n, 0n, 0n].map(value => `0x${value.toString(16).padStart(64, "0")}`);
+  const configurationFingerprint = createHash("sha256").update(fields.join(":")).digest("hex");
+  const activeFingerprint = createHash("sha256").update(`${configurationFingerprint}:0`).digest("hex");
+  state.assets[token] = {
+    quoteToken: token,
+    configured: true,
+    configurationPresent: true,
+    creationDisabled: false,
+    effectiveEnabled: true,
+    fields,
+    values: ["1", "20", "20", "0", "0"],
+    configurationFingerprint,
+    fingerprint: activeFingerprint,
+  };
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    currentImplementation: implementation,
+    headLastScannedBlock: 999,
+    lastScannedBlock: 999,
+  });
+  const getterResult = `0x${[1n, 20n, 20n, 0n, 0n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return "0x3e8";
+    if (method === "eth_getStorageAt") return `0x${"0".repeat(24)}${implementation.slice(2)}`;
+    if (method === "eth_getLogs") return [BOOLEAN_TRUE_RESULT, BOOLEAN_FALSE_RESULT].map((data, index) => ({
+      address: FLAP_FACTORY_PROXY,
+      topics: [QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC, `0x${token.slice(2).padStart(64, "0")}`],
+      data,
+      transactionHash: `0x${"72".repeat(32)}`,
+      transactionIndex: "0x1",
+      blockNumber: "0x3e8",
+      logIndex: `0x${index.toString(16)}`,
+    }));
+    if (method === "eth_call") return factoryGetterResult(method, params, getterResult, BOOLEAN_FALSE_RESULT);
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const result = await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: { confirmations: 0, scanRealtime: true, scanCatchup: false, scanHistory: false, assetRefreshPerRun: 0 },
+  });
+  assert.deepEqual(result.changes.map(change => change.type), ["paused", "resumed"]);
+  assert.equal(state.assets[token].effectiveEnabled, true);
+});
+
+test("Factory reverse state-event scan discovers active TSLAB without hardcoded assets", async () => {
+  const token = "0x5b1910eaad6450e50f816082aa078c41f10c292f";
+  const implementation = "0x9d0189c94090e5aa9ad9d47f16cf2159a6b87e68";
+  const eventBlock = 113153082;
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 39980228,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    currentImplementation: implementation,
+    headLastScannedBlock: eventBlock,
+    lastScannedBlock: eventBlock,
+    historyStateEventCursor: eventBlock + 1,
+  });
+  const getterResult = `0x${[1n, 37n, 37n, 7n, 0n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return `0x${eventBlock.toString(16)}`;
+    if (method === "eth_getLogs") return [{
+      address: FLAP_FACTORY_PROXY,
+      topics: [QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC],
+      data: `0x${token.slice(2).padStart(64, "0")}${[1n, 37n, 37n, 7n, 0n].map(value => value.toString(16).padStart(64, "0")).join("")}`,
+      transactionHash: `0x${"91".repeat(32)}`,
+      blockNumber: `0x${eventBlock.toString(16)}`,
+      logIndex: "0x0",
+    }];
+    if (method === "eth_call") return factoryGetterResult(method, params, getterResult, BOOLEAN_FALSE_RESULT);
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const result = await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config: {
+      confirmations: 0,
+      scanRealtime: false,
+      scanCatchup: true,
+      scanHistory: false,
+      historyConfigEventChunkBlocks: 1,
+      historyConfigEventChunksPerRun: 1,
+      assetRefreshPerRun: 0,
+    },
+  });
+  assert.equal(result.changes.length, 1);
+  assert.equal(result.changes[0].type, "added");
+  assert.equal(state.assets[token].effectiveEnabled, true);
+  assert.deepEqual(state.assets[token].values, ["1", "37", "37", "7", "0"]);
 });
 
 test("Factory fallback path discovers transaction candidates and stays deduplicated after fast delivery", async () => {

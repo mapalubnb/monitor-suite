@@ -114,6 +114,9 @@ const CONFIG = {
     tokenMetadataApiUrl: process.env.FLAP_FACTORY_TOKEN_METADATA_API_URL || "https://api.gopluslabs.io/api/v1/token_security/56",
     tokenMetadataTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_TOKEN_METADATA_TIMEOUT_MS", 800, 300),
     tokenMetadataRetryMs: readPositiveIntEnv("FLAP_FACTORY_TOKEN_METADATA_RETRY_MS", 300_000, 10_000),
+    rpcTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_RPC_TIMEOUT_MS", 2_000, 500),
+    rpcHistoryTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_RPC_HISTORY_TIMEOUT_MS", 8_000, 1_000),
+    rpcHedgeDelayMs: readPositiveIntEnv("FLAP_FACTORY_RPC_HEDGE_DELAY_MS", 120, 50),
   },
 
   // 反风控
@@ -317,6 +320,8 @@ const UI_STYLE_CATEGORY_META = {
     evidence: "CSS utility",
   },
 };
+
+const FACTORY_BACKGROUND_TASK_ORDER = Object.freeze(["catchup", "fallback", "catchup", "history"]);
 
 const ROBINHOOD_INDEX_VAULT_FACTORY = "0xe6ca297D1d963b6F00d5b216986123CAeB883AF6";
 
@@ -2460,10 +2465,16 @@ function numberToHex(value) {
 }
 
 const preferredBscRpcIndexByKey = new Map();
+const bscRpcHealthByKey = new Map();
 
-function bscRpcPreferenceKey(method) {
+function bscRpcPreferenceKey(method, params = []) {
   if (method === "eth_call") return "eth_call";
-  if (method === "eth_getLogs") return "eth_getLogs";
+  if (method === "eth_getLogs") {
+    const filter = params[0] || {};
+    const from = hexToNumber(filter.fromBlock);
+    const to = hexToNumber(filter.toBlock);
+    return from > 0 && to > 0 && to - from > 100 ? "eth_getLogs:history" : "eth_getLogs:realtime";
+  }
   if (method === "eth_getBlockByNumber" || method === "eth_getTransactionByHash" || method === "eth_getTransactionReceipt") return "block_data";
   if (method === "eth_getCode" || method === "eth_getStorageAt") return "contract_state";
   return method || "default";
@@ -2474,63 +2485,138 @@ function bscRpcBatchPreferenceKey(calls = []) {
   return `batch:${methods.join("+") || "empty"}`;
 }
 
-async function bscRpcCall(method, params = [], options = {}) {
-  let lastErr = null;
-  const preferenceKey = bscRpcPreferenceKey(method);
-  const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey) || 0;
-  for (let attempt = 0; attempt < CONFIG.bscRpcUrls.length; attempt++) {
-    const index = (preferredIndex + attempt) % CONFIG.bscRpcUrls.length;
-    const rpcUrl = CONFIG.bscRpcUrls[index];
+function bscRpcTimeoutMs(method, params = []) {
+  if (method === "eth_getLogs") {
+    const filter = params[0] || {};
+    const from = hexToNumber(filter.fromBlock);
+    const to = hexToNumber(filter.toBlock);
+    if (from > 0 && to > 0 && to - from > 100) return CONFIG.factoryPoolMonitor.rpcHistoryTimeoutMs;
+  }
+  if (method === "eth_getBlockByNumber" && params[1]) return CONFIG.factoryPoolMonitor.rpcHistoryTimeoutMs;
+  return CONFIG.factoryPoolMonitor.rpcTimeoutMs;
+}
+
+function orderedBscRpcIndexes(preferenceKey) {
+  const health = bscRpcHealthByKey.get(preferenceKey) || new Map();
+  const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey);
+  return CONFIG.bscRpcUrls.map((_, index) => index).sort((left, right) => {
+    const leftHealth = health.get(left);
+    const rightHealth = health.get(right);
+    const leftLatency = leftHealth?.failedAt && Date.now() - leftHealth.failedAt > 60_000 ? null : leftHealth?.latencyMs;
+    const rightLatency = rightHealth?.failedAt && Date.now() - rightHealth.failedAt > 60_000 ? null : rightHealth?.latencyMs;
+    const leftScore = leftLatency ?? (left === preferredIndex ? 250 : 1_000 + left * 10);
+    const rightScore = rightLatency ?? (right === preferredIndex ? 250 : 1_000 + right * 10);
+    return leftScore - rightScore;
+  });
+}
+
+function updateBscRpcHealth(preferenceKey, index, latencyMs, failed = false) {
+  const health = bscRpcHealthByKey.get(preferenceKey) || new Map();
+  const previous = health.get(index) || {};
+  health.set(index, failed
+    ? {
+        ...previous,
+        failures: (previous.failures || 0) + 1,
+        failedAt: Date.now(),
+        latencyMs: Math.max(previous.latencyMs || 0, 5_000),
+      }
+    : {
+        failures: 0,
+        failedAt: 0,
+        latencyMs: previous.latencyMs == null ? latencyMs : Math.round(previous.latencyMs * 0.7 + latencyMs * 0.3),
+      });
+  bscRpcHealthByKey.set(preferenceKey, health);
+}
+
+function resetBscRpcHealth() {
+  preferredBscRpcIndexByKey.clear();
+  bscRpcHealthByKey.clear();
+}
+
+async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null) {
+  const indexes = orderedBscRpcIndexes(preferenceKey);
+  const controllers = [];
+  let settled = false;
+  const attempts = indexes.map((index, position) => (async () => {
+    if (position > 0) await sleep(CONFIG.factoryPoolMonitor.rpcHedgeDelayMs * position);
+    if (settled) throw new Error("RPC 请求已由更快节点完成");
+    const controller = new AbortController();
+    controllers.push(controller);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const startedAt = Date.now();
     try {
-      const res = await fetchSafe(rpcUrl, {
+      const response = await fetch(CONFIG.bscRpcUrls[index], {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+        body: JSON.stringify(payload),
+        signal: controller.signal,
       });
-      const json = await res.json();
-      if (json.error) throw new Error(json.error.message || JSON.stringify(json.error));
-      if (options.requireResult && json.result == null) throw new Error(`${method} 返回空结果`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const json = await response.json();
+      if (!Array.isArray(json) && json?.error) throw new Error(json.error.message || JSON.stringify(json.error));
+      if (validateResponse) validateResponse(json);
+      if (settled) throw new Error("RPC 请求已由更快节点完成");
+      settled = true;
+      const latencyMs = Math.max(1, Date.now() - startedAt);
       preferredBscRpcIndexByKey.set(preferenceKey, index);
-      return json.result;
-    } catch (err) {
-      lastErr = err;
+      updateBscRpcHealth(preferenceKey, index, latencyMs);
+      for (const other of controllers) if (other !== controller) other.abort();
+      return json;
+    } catch (error) {
+      if (!settled) updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt, true);
+      throw error;
+    } finally {
+      clearTimeout(timer);
     }
+  })());
+  try {
+    return await Promise.any(attempts);
+  } catch (error) {
+    const messages = (error?.errors || []).map(item => item?.message).filter(message => message && !message.includes("更快节点完成"));
+    throw new Error(messages.at(-1) || error?.message || "所有 BSC RPC 节点均不可用");
+  } finally {
+    settled = true;
+    for (const controller of controllers) controller.abort();
   }
-  throw lastErr || new Error("所有 BSC RPC 节点均不可用");
+}
+
+async function bscRpcCall(method, params = [], options = {}) {
+  const preferenceKey = bscRpcPreferenceKey(method, params);
+  const json = await executeBscRpcRequest(
+    { jsonrpc: "2.0", id: 1, method, params },
+    preferenceKey,
+    bscRpcTimeoutMs(method, params),
+    json => {
+      if (json?.error) throw new Error(json.error.message || JSON.stringify(json.error));
+      if (options.requireResult && json?.result == null) throw new Error(`${method} 返回空结果`);
+    },
+  );
+  return json.result;
 }
 
 async function bscRpcBatch(calls = [], options = {}) {
   if (calls.length === 0) return [];
   if (calls.length === 1) return [await bscRpcCall(calls[0].method, calls[0].params, { requireResult: options.requireAllResults })];
-  let lastErr = null;
   const payload = calls.map((call, i) => ({ jsonrpc: "2.0", id: i + 1, method: call.method, params: call.params || [] }));
   const preferenceKey = bscRpcBatchPreferenceKey(calls);
-  const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey) || 0;
-  for (let attempt = 0; attempt < CONFIG.bscRpcUrls.length; attempt++) {
-    const index = (preferredIndex + attempt) % CONFIG.bscRpcUrls.length;
-    const rpcUrl = CONFIG.bscRpcUrls[index];
-    try {
-      const res = await fetchSafe(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const json = await res.json();
-      if (!Array.isArray(json)) throw new Error("Batch RPC 返回非数组");
-      const byId = new Map(json.map(item => [item.id, item]));
-      const results = payload.map(item => {
-        const r = byId.get(item.id);
-        if (!r || r.error) return null;
-        return r.result;
-      });
-      if (options.requireAllResults && results.some(result => result == null)) throw new Error("Batch RPC 存在空结果");
-      preferredBscRpcIndexByKey.set(preferenceKey, index);
-      return results;
-    } catch (err) {
-      lastErr = err;
+  const timeoutMs = Math.max(...calls.map(call => bscRpcTimeoutMs(call.method, call.params || [])));
+  const json = await executeBscRpcRequest(payload, preferenceKey, timeoutMs, response => {
+    if (!Array.isArray(response)) throw new Error("Batch RPC 返回非数组");
+    if (!options.requireAllResults) return;
+    const byId = new Map(response.map(item => [item.id, item]));
+    if (payload.some(item => !byId.get(item.id) || byId.get(item.id).error || byId.get(item.id).result == null)) {
+      throw new Error("Batch RPC 存在空结果");
     }
-  }
-  throw lastErr || new Error("所有 BSC RPC 节点 batch 均不可用");
+  });
+  if (!Array.isArray(json)) throw new Error("Batch RPC 返回非数组");
+  const byId = new Map(json.map(item => [item.id, item]));
+  const results = payload.map(item => {
+    const result = byId.get(item.id);
+    if (!result || result.error) return null;
+    return result.result;
+  });
+  if (options.requireAllResults && results.some(result => result == null)) throw new Error("Batch RPC 存在空结果");
+  return results;
 }
 
 const ERC20_NAME_SELECTOR = "0x06fdde03";
@@ -2975,6 +3061,7 @@ async function checkFlapFactoryPools(factoryPoolState, {
   saveStateFn = saveFactoryPoolState,
   pinFn = pinMessage,
   scheduleMetadataFn = scheduleFactoryPoolMetadataEnrichment,
+  awaitDelivery = true,
 } = {}) {
   if (!CONFIG.factoryPoolMonitor.enabled) return { changed: false, sent: false, state: factoryPoolState };
   const previousAssets = snapshotFactoryPoolAssets(factoryPoolState);
@@ -3004,41 +3091,73 @@ async function checkFlapFactoryPools(factoryPoolState, {
     }
     throw error;
   }
+  if (suppressNotifications) {
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    void scheduleMetadataFn({ state: factoryPoolState, result });
+    return { ...result, sent: false };
+  }
+
+  factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
+  if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
+  saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+
+  const changeDeliveryKey = change => [
+    change.current?.quoteToken || "",
+    change.type || "",
+    change.previous?.fingerprint || "",
+    change.current?.fingerprint || "",
+  ].join(":");
   const deliver = async () => {
-    if (!suppressNotifications) {
-      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
-      factoryPoolState.pendingChanges = factoryPoolState.pendingChanges.map(change => ({
-        ...change,
-        current: factoryPoolState.assets[change.current.quoteToken] || change.current,
-      }));
-      if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
-    }
-    if (suppressNotifications) {
-      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
-      void scheduleMetadataFn({ state: factoryPoolState, result });
-      return { ...result, sent: false };
-    }
-    const shouldNotify = factoryPoolState.pendingChanges.length > 0 || Boolean(factoryPoolState.pendingImplementationChange?.previous);
+    const changesToSend = [...factoryPoolState.pendingChanges];
+    const implementationToSend = factoryPoolState.pendingImplementationChange;
+    const shouldNotify = changesToSend.length > 0 || Boolean(implementationToSend?.previous);
     if (!shouldNotify) {
-      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
       void scheduleMetadataFn({ state: factoryPoolState, result });
       return { ...result, sent: false };
     }
+    const sendingKeys = new Set(changesToSend.map(changeDeliveryKey));
+    factoryPoolState.sendingChanges = changesToSend;
+    factoryPoolState.sendingImplementationChange = implementationToSend;
+    factoryPoolState.pendingChanges = factoryPoolState.pendingChanges
+      .filter(change => !sendingKeys.has(changeDeliveryKey(change)));
+    if (factoryPoolState.pendingImplementationChange?.previous === implementationToSend?.previous
+      && factoryPoolState.pendingImplementationChange?.current === implementationToSend?.current) {
+      factoryPoolState.pendingImplementationChange = null;
+    }
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
     const pendingResult = {
       ...result,
-      changes: factoryPoolState.pendingChanges,
-      implementationChange: factoryPoolState.pendingImplementationChange,
+      changes: changesToSend,
+      implementationChange: implementationToSend,
     };
     const title = `${titlePrefix}Flap Factory 底池资产链上变更`;
     const initialContent = buildFactoryPoolMonitorContent(pendingResult);
-    const messageId = await sendCardFn(title, initialContent, "red");
+    let messageId;
+    try {
+      messageId = await sendCardFn(title, initialContent, "red");
+    } catch (error) {
+      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(changesToSend, factoryPoolState.pendingChanges);
+      if (!factoryPoolState.pendingImplementationChange?.previous) {
+        factoryPoolState.pendingImplementationChange = implementationToSend;
+      }
+      factoryPoolState.sendingChanges = [];
+      factoryPoolState.sendingImplementationChange = null;
+      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      throw error;
+    }
     if (!messageId) {
+      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(changesToSend, factoryPoolState.pendingChanges);
+      if (!factoryPoolState.pendingImplementationChange?.previous) {
+        factoryPoolState.pendingImplementationChange = implementationToSend;
+      }
+      factoryPoolState.sendingChanges = [];
+      factoryPoolState.sendingImplementationChange = null;
       saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
       void scheduleMetadataFn({ state: factoryPoolState, result: pendingResult });
       return { ...result, sent: false };
     }
-    factoryPoolState.pendingChanges = [];
-    factoryPoolState.pendingImplementationChange = null;
+    factoryPoolState.sendingChanges = [];
+    factoryPoolState.sendingImplementationChange = null;
     saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
     void scheduleMetadataFn({
       state: factoryPoolState,
@@ -3047,12 +3166,16 @@ async function checkFlapFactoryPools(factoryPoolState, {
       title,
       initialContent,
     });
-    try { await pinFn(messageId); } catch (err) { log(`[Flap Factory] 卡片置顶失败：${err.message}`); }
+    void Promise.resolve(pinFn(messageId)).catch(err => log(`[Flap Factory] 卡片置顶失败：${err.message}`));
     return { ...result, sent: true };
   };
   const delivery = factoryPoolDeliveryQueue.then(deliver, deliver);
-  factoryPoolDeliveryQueue = delivery.catch(() => {});
-  return await delivery;
+  factoryPoolDeliveryQueue = delivery.catch(error => {
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    log(`[Flap Factory] 待发送通知保留，异步发送失败：${error.message}`);
+  });
+  if (awaitDelivery) return await delivery;
+  return { ...result, sent: false, deliveryQueued: true };
 }
 
 function extractStrings(content, ext) {
@@ -5474,6 +5597,7 @@ async function startMonitor() {
     try {
       await checkFlapFactoryPools(factoryPoolState, {
         scanConfig: { scanRealtime: true, scanCatchup: false, scanHistory: false },
+        awaitDelivery: false,
       });
     } catch (err) {
       factoryPoolState.lastError = err.message;
@@ -5492,6 +5616,7 @@ async function startMonitor() {
     try {
       await checkFlapFactoryPools(factoryPoolState, {
         scanConfig: { scanRealtime: false, scanFallback: true, scanCatchup: false, scanHistory: false },
+        awaitDelivery: false,
       });
     } catch (err) {
       factoryPoolState.lastError = err.message;
@@ -5511,6 +5636,7 @@ async function startMonitor() {
     try {
       await checkFlapFactoryPools(factoryPoolState, {
         scanConfig: { scanRealtime: false, scanCatchup: true, scanHistory: false },
+        awaitDelivery: false,
       });
     } catch (err) {
       factoryPoolState.lastError = err.message;
@@ -5530,6 +5656,7 @@ async function startMonitor() {
     try {
       await checkFlapFactoryPools(factoryPoolState, {
         scanConfig: { scanRealtime: false, scanCatchup: false, scanHistory: true },
+        awaitDelivery: false,
       });
     } catch (err) {
       factoryPoolState.lastError = err.message;
@@ -5542,35 +5669,41 @@ async function startMonitor() {
     }
   }
 
-  function scheduleFactoryRealtimeNext() {
+  function scheduleFactoryRealtimeNext(delayMs = CONFIG.factoryPoolMonitor.intervalMs) {
     setTimeout(async () => {
+      const startedAt = Date.now();
       await factoryPoolRealtimePoll();
-      scheduleFactoryRealtimeNext();
-    }, CONFIG.factoryPoolMonitor.intervalMs);
+      const elapsed = Date.now() - startedAt;
+      scheduleFactoryRealtimeNext(Math.max(0, CONFIG.factoryPoolMonitor.intervalMs - elapsed));
+    }, delayMs);
   }
 
-  function scheduleFactoryHistoryNext() {
-    setTimeout(async () => {
-      await factoryPoolHistoryPoll();
-      scheduleFactoryHistoryNext();
-    }, CONFIG.factoryPoolMonitor.historyIntervalMs);
+  const factoryBackgroundTasks = {
+    catchup: factoryPoolCatchupPoll,
+    fallback: factoryPoolFallbackPoll,
+    history: factoryPoolHistoryPoll,
+  };
+  let factoryBackgroundTaskIndex = 0;
+  const factoryBackgroundTickMs = Math.max(250, Math.floor(Math.min(
+    CONFIG.factoryPoolMonitor.intervalMs,
+    CONFIG.factoryPoolMonitor.catchupIntervalMs,
+    CONFIG.factoryPoolMonitor.historyIntervalMs,
+  ) / 2));
+  async function factoryPoolBackgroundPoll() {
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
+    const taskName = FACTORY_BACKGROUND_TASK_ORDER[factoryBackgroundTaskIndex];
+    const task = factoryBackgroundTasks[taskName];
+    factoryBackgroundTaskIndex = (factoryBackgroundTaskIndex + 1) % FACTORY_BACKGROUND_TASK_ORDER.length;
+    await task();
   }
-  function scheduleFactoryFallbackNext() {
+  function scheduleFactoryBackgroundNext() {
     setTimeout(async () => {
-      await factoryPoolFallbackPoll();
-      scheduleFactoryFallbackNext();
-    }, CONFIG.factoryPoolMonitor.intervalMs);
-  }
-  function scheduleFactoryCatchupNext() {
-    setTimeout(async () => {
-      await factoryPoolCatchupPoll();
-      scheduleFactoryCatchupNext();
-    }, CONFIG.factoryPoolMonitor.catchupIntervalMs);
+      await factoryPoolBackgroundPoll();
+      scheduleFactoryBackgroundNext();
+    }, factoryBackgroundTickMs);
   }
   scheduleFactoryRealtimeNext();
-  scheduleFactoryFallbackNext();
-  scheduleFactoryCatchupNext();
-  scheduleFactoryHistoryNext();
+  scheduleFactoryBackgroundNext();
 
   // 轮询函数：并行检测所有页面
   let pendingPoll = false;
@@ -5833,9 +5966,7 @@ async function startMonitor() {
   // SIGUSR1 信号
   process.on("SIGUSR1", () => {
     factoryPoolRealtimePoll().catch(err => log(`[SIGUSR1] Factory 实时检测异常：${err.message}`));
-    factoryPoolFallbackPoll().catch(err => log(`[SIGUSR1] Factory 漏检检测异常：${err.message}`));
-    factoryPoolCatchupPoll().catch(err => log(`[SIGUSR1] Factory 补扫异常：${err.message}`));
-    factoryPoolHistoryPoll().catch(err => log(`[SIGUSR1] Factory 历史检测异常：${err.message}`));
+    factoryPoolBackgroundPoll().catch(err => log(`[SIGUSR1] Factory 后台检测异常：${err.message}`));
     if (isPolling) {
       pendingPoll = true;  // 利用 pendingPoll 机制，当前轮询结束后自动触发
       log("收到 SIGUSR1，当前正在轮询，将在本轮结束后立即执行");
@@ -5903,6 +6034,7 @@ if (!IS_TEST_MODE) {
 
 export const __testables = {
   CONFIG,
+  FACTORY_BACKGROUND_TASK_ORDER,
   emptyFlapChangeMeta,
   isFlapAssetOnlyNotification,
   buildSiteWideAssetNotification,
@@ -5934,6 +6066,9 @@ export const __testables = {
   decodeErc20MetadataText,
   parseGoPlusTokenMetadata,
   resolveFactoryPoolTokenMetadata,
+  bscRpcCall,
+  bscRpcBatch,
+  resetBscRpcHealth,
   buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,
   extractVaultFactories,
