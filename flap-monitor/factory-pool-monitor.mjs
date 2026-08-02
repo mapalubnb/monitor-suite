@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 8;
+export const FACTORY_POOL_SCHEMA_VERSION = 9;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -17,6 +17,9 @@ export const FACTORY_POOL_STATE_EVENT_TOPICS = [
   QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC,
   QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC,
 ];
+const FACTORY_POOL_STATE_EVENT_TOPIC_SET = new Set(FACTORY_POOL_STATE_EVENT_TOPICS);
+const MAX_FACTORY_POOL_CANDIDATES = 5_000;
+const MAX_FACTORY_POOL_STATE_BYTES = 16 * 1024 * 1024;
 
 const ZERO_WORD = "0".repeat(64);
 
@@ -97,20 +100,6 @@ export function extractAddressWords(data, { includeZero = true } = {}) {
   return [...addresses];
 }
 
-export function extractFactoryTransactionCandidates(transaction, proxy = FLAP_FACTORY_PROXY) {
-  if (normalizeAddress(transaction?.to) !== normalizeAddress(proxy)) return [];
-  const input = String(transaction?.input || transaction?.data || "");
-  if (!/^0x[a-fA-F0-9]{8,}$/.test(input)) return [];
-  const selector = input.slice(0, 10).toLowerCase();
-  return extractAddressWords(input).map(quoteToken => ({
-    quoteToken,
-    selector,
-    txHash: String(transaction?.hash || "").toLowerCase(),
-    blockNumber: hexToNumber(transaction?.blockNumber),
-    source: "transaction",
-  }));
-}
-
 export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY) {
   if (normalizeAddress(logEntry?.address) !== normalizeAddress(proxy)) return [];
   const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
@@ -143,20 +132,7 @@ export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY
       source: "event",
     }] : [];
   }
-  const addresses = new Set();
-  for (const topic of (logEntry?.topics || []).slice(1)) {
-    for (const address of extractAddressWords(topic)) addresses.add(address);
-  }
-  for (const address of extractAddressWords(logEntry?.data || "")) addresses.add(address);
-  return [...addresses].map(quoteToken => ({
-    quoteToken,
-    selector: "",
-    topic0,
-    txHash: String(logEntry?.transactionHash || "").toLowerCase(),
-    blockNumber: hexToNumber(logEntry?.blockNumber),
-    logIndex: hexToNumber(logEntry?.logIndex),
-    source: "event",
-  }));
+  return [];
 }
 
 export function extractImplementationAddress(storageValue) {
@@ -214,22 +190,12 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     latestBlock: null,
     safeLatestBlock: null,
     headLastScannedBlock: null,
-    fallbackLastScannedBlock: null,
     lastScannedBlock: null,
-    historyLogLastScannedBlock: null,
-    historyBlockLastScannedBlock: null,
-    historyBackwardLogCursor: null,
-    historyStateEventCursor: null,
-    historyBackwardBlockCursor: null,
-    historyLastScannedBlock: null,
     currentImplementation: "",
     implementationSelectors: [],
     implementationHistory: [],
-    proxyUpgradeEvents: [],
     candidates: {},
     assets: {},
-    relatedSelectors: {},
-    blockCheckpoints: {},
     assetRefreshCursor: 0,
     pendingChanges: [],
     pendingImplementationChange: null,
@@ -245,7 +211,6 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     },
     lastRealtimeRunAt: "",
     lastCatchupRunAt: "",
-    lastHistoryRunAt: "",
     lastRunAt: "",
     lastError: "",
   };
@@ -253,16 +218,12 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
 
 export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
   const base = createFactoryPoolState(proxy);
-  const previousSchemaVersion = Number(raw?.schemaVersion) || 0;
   const state = raw && typeof raw === "object" ? { ...base, ...raw } : base;
   state.schemaVersion = FACTORY_POOL_SCHEMA_VERSION;
   state.chainId = BSC_CHAIN_ID;
   state.proxy = normalizeAddress(proxy);
-  for (const key of ["candidates", "assets", "relatedSelectors", "blockCheckpoints"]) {
+  for (const key of ["candidates", "assets"]) {
     if (!state[key] || typeof state[key] !== "object" || Array.isArray(state[key])) state[key] = {};
-  }
-  if (!Number.isFinite(state.fallbackLastScannedBlock) && Number.isFinite(state.headLastScannedBlock)) {
-    state.fallbackLastScannedBlock = state.headLastScannedBlock;
   }
   state.assets = Object.fromEntries(Object.entries(state.assets).map(([address, asset]) => [address, migrateFactoryPoolAsset(asset)]));
   for (const candidate of Object.values(state.candidates)) {
@@ -280,12 +241,19 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
     if (!Number.isFinite(candidate.lastVerifyAttemptAtMs)) candidate.lastVerifyAttemptAtMs = 0;
     if (!Number.isFinite(candidate.lastVerifyBlock)) candidate.lastVerifyBlock = 0;
   }
-  // v7 重放轻量状态事件历史，让错过实时窗口的实例无需完整扫块即可重建候选。
-  if (previousSchemaVersion < 7) state.historyStateEventCursor = null;
-  delete state.historyConfigEventCursor;
+  state.candidates = Object.fromEntries(Object.entries(state.candidates)
+    .filter(([address, candidate]) => state.assets[address]
+      || candidate?.sources?.some(source => FACTORY_POOL_STATE_EVENT_TOPIC_SET.has(String(source.topic0 || "").toLowerCase())))
+    .sort(([, left], [, right]) => (right.lastSeenBlock || 0) - (left.lastSeenBlock || 0))
+    .slice(0, MAX_FACTORY_POOL_CANDIDATES));
+  for (const key of [
+    "fallbackLastScannedBlock", "historyLogLastScannedBlock", "historyBlockLastScannedBlock",
+    "historyBackwardLogCursor", "historyStateEventCursor", "historyBackwardBlockCursor",
+    "historyLastScannedBlock", "historyConfigEventCursor", "lastHistoryRunAt", "relatedSelectors",
+    "proxyUpgradeEvents", "blockCheckpoints",
+  ]) delete state[key];
   delete state.processedTransactions;
   if (!Array.isArray(state.implementationHistory)) state.implementationHistory = [];
-  if (!Array.isArray(state.proxyUpgradeEvents)) state.proxyUpgradeEvents = [];
   if (!Array.isArray(state.implementationSelectors)) state.implementationSelectors = [];
   if (!Array.isArray(state.pendingChanges)) state.pendingChanges = [];
   if (!Array.isArray(state.sendingChanges)) state.sendingChanges = [];
@@ -305,16 +273,22 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
 }
 
 export function loadFactoryPoolState(path, proxy = FLAP_FACTORY_PROXY) {
+  if (!existsSync(path)) return createFactoryPoolState(proxy);
+  const size = statSync(path).size;
+  if (size > MAX_FACTORY_POOL_STATE_BYTES) {
+    throw new Error(`Factory 状态文件过大（${Math.ceil(size / 1024 / 1024)}MB），请先运行 npm run repair:flap-factory-state -- "${path}"`);
+  }
   try {
-    if (existsSync(path)) return migrateFactoryPoolState(JSON.parse(readFileSync(path, "utf-8")), proxy);
-  } catch {}
-  return createFactoryPoolState(proxy);
+    return migrateFactoryPoolState(JSON.parse(readFileSync(path, "utf-8")), proxy);
+  } catch (error) {
+    throw new Error(`Factory 状态文件解析失败：${error.message}`);
+  }
 }
 
 export function saveFactoryPoolState(path, state) {
   const tmp = `${path}.tmp`;
   state.schemaVersion = FACTORY_POOL_SCHEMA_VERSION;
-  writeFileSync(tmp, JSON.stringify(state, null, 2), "utf-8");
+  writeFileSync(tmp, JSON.stringify(state), "utf-8");
   renameSync(tmp, path);
 }
 
@@ -356,23 +330,8 @@ function rememberCandidate(state, item) {
     logIndex: item.logIndex ?? null,
   });
   current.sourceCount = (current.sourceCount || 0) + 1;
-  if (current.sources.length > 20) current.sources.splice(1, current.sources.length - 20);
+  if (current.sources.length > 3) current.sources.splice(0, current.sources.length - 3);
   state.candidates[quoteToken] = current;
-  if (/^0x[a-f0-9]{8}$/.test(item.selector || "")) {
-    const selector = item.selector.toLowerCase();
-    const related = state.relatedSelectors[selector] || {
-      selector,
-      firstSeenBlock: item.blockNumber || null,
-      lastSeenBlock: item.blockNumber || null,
-      count: 0,
-      quoteTokens: [],
-    };
-    related.lastSeenBlock = Math.max(related.lastSeenBlock || 0, item.blockNumber || 0) || null;
-    related.count++;
-    related.implementation = state.currentImplementation || related.implementation || "";
-    if (!related.quoteTokens.includes(quoteToken)) related.quoteTokens.push(quoteToken);
-    state.relatedSelectors[selector] = related;
-  }
   return true;
 }
 
@@ -397,10 +356,21 @@ function refreshCandidateVerificationHealth(state) {
   return state.verificationHealth;
 }
 
-function updateHistoryFloor(state) {
-  const values = [state.historyLogLastScannedBlock, state.historyBlockLastScannedBlock]
-    .filter(value => Number.isFinite(value));
-  state.historyLastScannedBlock = values.length > 0 ? Math.min(...values) : null;
+function pruneFactoryPoolCandidates(state) {
+  const expiryBlock = Math.max(0, (state.safeLatestBlock || 0) - 100);
+  for (const [address, candidate] of Object.entries(state.candidates || {})) {
+    if (state.assets[address] || candidate?.pendingVerification) continue;
+    if ((candidate.lastSeenBlock || 0) < expiryBlock) delete state.candidates[address];
+  }
+  const entries = Object.entries(state.candidates || {});
+  if (entries.length <= MAX_FACTORY_POOL_CANDIDATES) return;
+  const removable = entries
+    .filter(([address, candidate]) => !state.assets[address] && !candidate?.pendingVerification)
+    .sort(([, left], [, right]) => (left.lastSeenBlock || 0) - (right.lastSeenBlock || 0));
+  for (const [address] of removable) {
+    if (Object.keys(state.candidates).length <= MAX_FACTORY_POOL_CANDIDATES) break;
+    delete state.candidates[address];
+  }
 }
 
 async function findDeploymentBlockByCode(rpcCall, proxy, safeLatest) {
@@ -479,98 +449,6 @@ async function fetchRangeLogs(rpcCall, proxy, fromBlock, toBlock, topics) {
     }
   }
   throw lastError || new Error(`无法读取 Factory 日志：${fromBlock}-${toBlock}`);
-}
-
-async function fetchReverseRangeLogs(rpcCall, proxy, fromBlock, toBlock, topics) {
-  if (fromBlock > toBlock) return { logs: [], fromBlock };
-  let start = fromBlock;
-  let lastError;
-  while (start <= toBlock) {
-    try {
-      const filter = {
-        address: proxy,
-        fromBlock: numberToHex(start),
-        toBlock: numberToHex(toBlock),
-      };
-      if (topics) filter.topics = topics;
-      const logs = await rpcCall("eth_getLogs", [filter]);
-      return { logs: logs || [], fromBlock: start };
-    } catch (error) {
-      lastError = error;
-      if (start === toBlock) break;
-      start = toBlock - Math.floor((toBlock - start) / 2);
-    }
-  }
-  throw lastError || new Error(`无法反向读取 Factory 日志：${fromBlock}-${toBlock}`);
-}
-
-async function collectTransactionsForLogs(rpcCall, logs, rpcBatch) {
-  const hashes = [...new Set((logs || []).map(log => String(log.transactionHash || "").toLowerCase()).filter(Boolean))];
-  if (typeof rpcBatch === "function") {
-    const transactions = [];
-    for (let offset = 0; offset < hashes.length; offset += 50) {
-      const chunk = hashes.slice(offset, offset + 50);
-      const results = await rpcBatch(chunk.map(hash => ({ method: "eth_getTransactionByHash", params: [hash] })));
-      transactions.push(...results.filter(Boolean));
-    }
-    return transactions;
-  }
-  const transactions = [];
-  for (const hash of hashes) {
-    const transaction = await rpcCall("eth_getTransactionByHash", [hash], { requireResult: true });
-    if (transaction) transactions.push(transaction);
-  }
-  return transactions;
-}
-
-function collectCandidatesFromLogsAndTransactions(logs, transactions, proxy) {
-  const items = [];
-  for (const logEntry of logs || []) items.push(...extractFactoryLogCandidates(logEntry, proxy));
-  for (const transaction of transactions || []) items.push(...extractFactoryTransactionCandidates(transaction, proxy));
-  return items;
-}
-
-function recordProxyUpgradeEvents(state, logs) {
-  for (const logEntry of logs || []) {
-    if (String(logEntry?.topics?.[0] || "").toLowerCase() !== UPGRADED_EVENT_TOPIC) continue;
-    const implementation = extractAddressWords(logEntry.topics?.[1] || "", { includeZero: false })[0] || "";
-    if (!implementation) continue;
-    const event = {
-      key: `${String(logEntry.transactionHash || "").toLowerCase()}:${hexToNumber(logEntry.logIndex)}`,
-      implementation,
-      txHash: String(logEntry.transactionHash || "").toLowerCase(),
-      blockNumber: hexToNumber(logEntry.blockNumber),
-      logIndex: hexToNumber(logEntry.logIndex),
-    };
-    if (state.proxyUpgradeEvents.some(existing => existing.key === event.key)) continue;
-    state.proxyUpgradeEvents.push(event);
-    if (state.proxyUpgradeEvents.length > 100) state.proxyUpgradeEvents.splice(0, state.proxyUpgradeEvents.length - 100);
-    const history = [...state.implementationHistory].reverse().find(item => item.current === implementation && !item.txHash);
-    if (history) {
-      history.txHash = event.txHash;
-      history.upgradeBlock = event.blockNumber;
-    }
-  }
-}
-
-async function scanFullBlockRange(rpcCall, proxy, fromBlock, toBlock, rpcBatch) {
-  const items = [];
-  const checkpoints = {};
-  const blockNumbers = [];
-  for (let blockNumber = fromBlock; blockNumber <= toBlock; blockNumber++) blockNumbers.push(blockNumber);
-  const blocks = typeof rpcBatch === "function"
-    ? await rpcBatch(blockNumbers.map(blockNumber => ({ method: "eth_getBlockByNumber", params: [numberToHex(blockNumber), true] })))
-    : await Promise.all(blockNumbers.map(blockNumber => rpcCall("eth_getBlockByNumber", [numberToHex(blockNumber), true], { requireResult: true })));
-  for (let index = 0; index < blockNumbers.length; index++) {
-    const blockNumber = blockNumbers[index];
-    const block = blocks[index];
-    if (!block) throw new Error(`区块 ${blockNumber} 返回为空`);
-    checkpoints[blockNumber] = String(block.hash || "").toLowerCase();
-    for (const transaction of block.transactions || []) {
-      items.push(...extractFactoryTransactionCandidates(transaction, proxy));
-    }
-  }
-  return { items, checkpoints };
 }
 
 export function classifyFactoryPoolChange(previous, current) {
@@ -678,6 +556,7 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
   if (health.failingCount === 0) {
     state.verificationHealth.lastSuccessAt = nowText();
   }
+  pruneFactoryPoolCandidates(state);
   return changes;
 }
 
@@ -700,32 +579,6 @@ async function refreshKnownAssets({ state, rpcCall, limit, blockTag, persistStat
   });
 }
 
-async function rollbackReorgIfNeeded({ state, rpcCall, log }) {
-  const blocks = Object.keys(state.blockCheckpoints).map(Number).filter(Number.isFinite).sort((a, b) => b - a);
-  const highestCursor = Math.max(
-    state.headLastScannedBlock || 0,
-    state.fallbackLastScannedBlock || 0,
-    state.lastScannedBlock || 0,
-  );
-  for (const blockNumber of blocks) {
-    if (blockNumber > highestCursor) continue;
-    const block = await rpcCall("eth_getBlockByNumber", [numberToHex(blockNumber), false], { requireResult: true });
-    const actual = String(block?.hash || "").toLowerCase();
-    const expected = String(state.blockCheckpoints[blockNumber] || "").toLowerCase();
-    if (actual && actual === expected) return null;
-    const rollbackTo = Math.max(state.deploymentBlock - 1, blockNumber - 1);
-    if ((state.headLastScannedBlock || 0) >= blockNumber) state.headLastScannedBlock = rollbackTo;
-    if ((state.fallbackLastScannedBlock || 0) >= blockNumber) state.fallbackLastScannedBlock = rollbackTo;
-    if ((state.lastScannedBlock || 0) >= blockNumber) state.lastScannedBlock = rollbackTo;
-    for (const key of Object.keys(state.blockCheckpoints)) {
-      if (Number(key) >= blockNumber) delete state.blockCheckpoints[key];
-    }
-    log?.(`[Flap Factory] 检测到确认链重组，相关游标回退至 ${rollbackTo}`);
-    return { blockNumber, expected, actual, rollbackTo };
-  }
-  return null;
-}
-
 function dedupeChanges(changes) {
   const seen = new Set();
   const unique = [];
@@ -741,23 +594,6 @@ function dedupeChanges(changes) {
     unique.push(change);
   }
   return unique;
-}
-
-async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag, persistState, log }) {
-  if (fromBlock > toBlock) return { changes: [], toBlock: fromBlock - 1, checkpoints: {} };
-  const logRange = await fetchRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
-  const scannedTo = logRange.toBlock;
-  recordProxyUpgradeEvents(state, logRange.logs);
-  const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, scannedTo, rpcBatch);
-  const items = [
-    ...collectCandidatesFromLogsAndTransactions(logRange.logs, [], state.proxy),
-    ...fullBlocks.items,
-  ];
-  return {
-    changes: await verifyCandidates({ state, rpcCall, items, blockTag, persistState, log }),
-    toBlock: scannedTo,
-    checkpoints: fullBlocks.checkpoints,
-  };
 }
 
 function applyStateEventToAsset(asset, logEntry) {
@@ -862,31 +698,18 @@ async function scanStateEventRange({
   };
 }
 
-function trimBlockCheckpoints(state, confirmations) {
-  const blocks = Object.keys(state.blockCheckpoints).map(Number).sort((a, b) => a - b);
-  while (blocks.length > Math.max(40, confirmations * 8)) delete state.blockCheckpoints[blocks.shift()];
-}
-
-export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, persistState, config = {}, log } = {}) {
+export async function runFactoryPoolScan({ state, rpcCall, persistState, config = {}, log } = {}) {
   if (!state || typeof rpcCall !== "function") throw new Error("Factory 扫描缺少 state 或 rpcCall");
   const cfg = {
     confirmations: 0,
     deploymentBlock: 0,
     scanRealtime: true,
-    scanFallback: false,
     scanCatchup: true,
-    scanHistory: true,
+    scanAssets: false,
     realtimeBootstrapBlocks: 20,
     realtimeMaxBlocksPerRun: 20,
     realtimeRescanBlocks: 5,
     catchupMaxBlocksPerRun: 2_000,
-    historyLogChunkBlocks: 2_000,
-    historyBlockChunkBlocks: 10,
-    historyBackwardLogChunkBlocks: 2_000,
-    historyConfigEventChunkBlocks: 5_000,
-    historyConfigEventChunksPerRun: 5,
-    historyBackwardBlockChunkBlocks: 10,
-    deepHistoryBlockScan: true,
     assetRefreshPerRun: 10,
     ...config,
   };
@@ -909,8 +732,6 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, persistStat
       state.deploymentBlock = await findDeploymentBlockByCode(rpcCall, state.proxy, safeLatest);
       state.deploymentDetection = "eth_getCode-binary-search";
     }
-    state.historyLogLastScannedBlock = state.deploymentBlock - 1;
-    state.historyBlockLastScannedBlock = state.deploymentBlock - 1;
     log?.(`[Flap Factory] 定位部署区块 ${state.deploymentBlock}（${state.deploymentDetection}）`);
   }
   if (!state.deploymentTxHash && !state.deploymentTxChecked) {
@@ -922,13 +743,9 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, persistStat
       log?.(`[Flap Factory] 定位部署交易 ${creation.txHash}`);
     }
   }
-  if (!Number.isFinite(state.historyLogLastScannedBlock)) state.historyLogLastScannedBlock = state.deploymentBlock - 1;
-  if (!Number.isFinite(state.historyBlockLastScannedBlock)) state.historyBlockLastScannedBlock = state.deploymentBlock - 1;
-
   let implementationChange = null;
   const allChanges = [];
   const safeBlockTag = numberToHex(safeLatest);
-  let reorg = null;
 
   if (cfg.scanRealtime) {
     if (!Number.isFinite(state.headLastScannedBlock)) {
@@ -966,39 +783,6 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, persistStat
     state.lastRealtimeRunAt = nowText();
   }
 
-  if (cfg.scanFallback) {
-    if (!Number.isFinite(state.fallbackLastScannedBlock)) {
-      state.fallbackLastScannedBlock = Math.max(state.deploymentBlock - 1, safeLatest - cfg.realtimeBootstrapBlocks);
-    }
-    allChanges.push(...await refreshKnownAssets({
-      state,
-      rpcCall,
-      limit: cfg.assetRefreshPerRun,
-      blockTag: safeBlockTag,
-      persistState,
-      log,
-    }));
-    reorg = await rollbackReorgIfNeeded({ state, rpcCall, log });
-    if (state.fallbackLastScannedBlock < safeLatest) {
-      const fromBlock = state.fallbackLastScannedBlock + 1;
-      const toBlock = Math.min(safeLatest, fromBlock + cfg.realtimeMaxBlocksPerRun - 1);
-      const range = await scanForwardRange({
-        state,
-        rpcCall,
-        rpcBatch,
-        fromBlock,
-        toBlock,
-        blockTag: safeBlockTag,
-        persistState,
-        log,
-      });
-      allChanges.push(...range.changes);
-      state.fallbackLastScannedBlock = range.toBlock;
-      Object.assign(state.blockCheckpoints, range.checkpoints);
-      trimBlockCheckpoints(state, cfg.confirmations);
-    }
-  }
-
   if (cfg.scanCatchup) {
     if (!Number.isFinite(state.lastScannedBlock)) {
       state.lastScannedBlock = Math.max(state.deploymentBlock - 1, safeLatest - cfg.realtimeBootstrapBlocks);
@@ -1019,110 +803,19 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, persistStat
       allChanges.push(...range.changes);
       state.lastScannedBlock = Math.max(state.lastScannedBlock, range.toBlock);
     }
-    if (!Number.isFinite(state.historyStateEventCursor)) state.historyStateEventCursor = safeLatest + 1;
-    const stateEventRanges = [];
-    let stateEventCursor = state.historyStateEventCursor;
-    for (let index = 0; index < cfg.historyConfigEventChunksPerRun; index++) {
-      if (stateEventCursor <= state.deploymentBlock) break;
-      const toBlock = stateEventCursor - 1;
-      const fromBlock = Math.max(state.deploymentBlock, toBlock - cfg.historyConfigEventChunkBlocks + 1);
-      stateEventRanges.push({ fromBlock, toBlock });
-      stateEventCursor = fromBlock;
-    }
-    const stateEventResults = await Promise.all(stateEventRanges.map(async range => ({
-      range,
-      result: await fetchReverseRangeLogs(
-        rpcCall,
-        state.proxy,
-        range.fromBlock,
-        range.toBlock,
-        [FACTORY_POOL_STATE_EVENT_TOPICS],
-      ),
-    })));
-    const stateEventItems = stateEventResults.flatMap(({ result: logRange }) =>
-      (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy)));
-    allChanges.push(...await verifyCandidates({
+    state.lastCatchupRunAt = nowText();
+  }
+
+  if (cfg.scanAssets) {
+    allChanges.push(...await refreshKnownAssets({
       state,
       rpcCall,
-      items: stateEventItems,
+      limit: cfg.assetRefreshPerRun,
       blockTag: safeBlockTag,
       persistState,
       log,
     }));
-    let contiguousCursor = state.historyStateEventCursor;
-    for (const { range, result: logRange } of stateEventResults) {
-      if (range.toBlock !== contiguousCursor - 1) break;
-      contiguousCursor = logRange.fromBlock;
-      if (logRange.fromBlock !== range.fromBlock) break;
-    }
-    state.historyStateEventCursor = contiguousCursor;
-    state.lastCatchupRunAt = nowText();
   }
-
-  if (cfg.scanHistory) {
-    if (!Number.isFinite(state.historyBackwardLogCursor)) state.historyBackwardLogCursor = safeLatest + 1;
-    const backwardLogFloor = Math.max(state.deploymentBlock, state.historyLogLastScannedBlock + 1);
-    if (state.historyBackwardLogCursor > backwardLogFloor) {
-      const toBlock = state.historyBackwardLogCursor - 1;
-      const fromBlock = Math.max(backwardLogFloor, toBlock - cfg.historyBackwardLogChunkBlocks + 1);
-      const logRange = await fetchReverseRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
-      recordProxyUpgradeEvents(state, logRange.logs);
-      const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
-      const items = collectCandidatesFromLogsAndTransactions(logRange.logs, transactions, state.proxy);
-      allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag, persistState, log }));
-      state.historyBackwardLogCursor = logRange.fromBlock;
-    }
-
-    if (cfg.deepHistoryBlockScan) {
-      if (!Number.isFinite(state.historyBackwardBlockCursor)) state.historyBackwardBlockCursor = safeLatest + 1;
-      const backwardBlockFloor = Math.max(state.deploymentBlock, state.historyBlockLastScannedBlock + 1);
-      if (state.historyBackwardBlockCursor > backwardBlockFloor) {
-        const toBlock = state.historyBackwardBlockCursor - 1;
-        const fromBlock = Math.max(backwardBlockFloor, toBlock - cfg.historyBackwardBlockChunkBlocks + 1);
-        const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, toBlock, rpcBatch);
-        allChanges.push(...await verifyCandidates({
-          state,
-          rpcCall,
-          items: fullBlocks.items,
-          blockTag: safeBlockTag,
-          persistState,
-          log,
-        }));
-        state.historyBackwardBlockCursor = fromBlock;
-      }
-    }
-
-    const forwardLogTarget = Math.min(safeLatest, state.lastScannedBlock, state.historyBackwardLogCursor - 1);
-    if (state.historyLogLastScannedBlock < forwardLogTarget) {
-      const fromBlock = state.historyLogLastScannedBlock + 1;
-      const toBlock = Math.min(forwardLogTarget, fromBlock + cfg.historyLogChunkBlocks - 1);
-      const logRange = await fetchRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
-      recordProxyUpgradeEvents(state, logRange.logs);
-      const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
-      const items = collectCandidatesFromLogsAndTransactions(logRange.logs, transactions, state.proxy);
-      allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag, persistState, log }));
-      state.historyLogLastScannedBlock = logRange.toBlock;
-    }
-
-    const forwardBlockTarget = Math.min(safeLatest, state.lastScannedBlock, (state.historyBackwardBlockCursor ?? safeLatest + 1) - 1);
-    if (cfg.deepHistoryBlockScan && state.historyBlockLastScannedBlock < forwardBlockTarget) {
-      const fromBlock = state.historyBlockLastScannedBlock + 1;
-      const toBlock = Math.min(forwardBlockTarget, fromBlock + cfg.historyBlockChunkBlocks - 1);
-      const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, toBlock, rpcBatch);
-      allChanges.push(...await verifyCandidates({
-        state,
-        rpcCall,
-        items: fullBlocks.items,
-        blockTag: safeBlockTag,
-        persistState,
-        log,
-      }));
-      state.historyBlockLastScannedBlock = toBlock;
-    }
-    state.lastHistoryRunAt = nowText();
-  }
-
-  updateHistoryFloor(state);
   state.lastRunAt = nowText();
   const verificationHealth = refreshCandidateVerificationHealth(state);
   state.lastError = verificationHealth.failingCount > 0
@@ -1132,7 +825,6 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, persistStat
     changed: allChanges.length > 0 || Boolean(implementationChange),
     changes: dedupeChanges(allChanges),
     implementationChange,
-    reorg,
     state,
   };
 }

@@ -97,25 +97,17 @@ const CONFIG = {
     stateFile: join(__dirname, "factory-pool-state.json"),
     intervalMs: readPositiveIntEnv("FLAP_FACTORY_POOL_INTERVAL_MS", 1_000, 500),
     catchupIntervalMs: readPositiveIntEnv("FLAP_FACTORY_CATCHUP_INTERVAL_MS", 1_000, 500),
-    historyIntervalMs: readPositiveIntEnv("FLAP_FACTORY_HISTORY_INTERVAL_MS", 1_000, 500),
     confirmations: 0,
     deploymentBlock: Number.parseInt(process.env.FLAP_FACTORY_DEPLOYMENT_BLOCK || "0", 10),
     realtimeBootstrapBlocks: readPositiveIntEnv("FLAP_FACTORY_REALTIME_BOOTSTRAP_BLOCKS", 20, 1),
     realtimeMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_REALTIME_MAX_BLOCKS", 20, 1),
     catchupMaxBlocksPerRun: readPositiveIntEnv("FLAP_FACTORY_CATCHUP_MAX_BLOCKS", 2_000, 1),
-    historyLogChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_LOG_CHUNK_BLOCKS", 2_000, 1),
-    historyBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BLOCK_CHUNK_BLOCKS", 10, 1),
-    historyBackwardLogChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BACKWARD_LOG_CHUNK_BLOCKS", 2_000, 1),
-    historyConfigEventChunkBlocks: Math.min(5_000, readPositiveIntEnv("FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNK_BLOCKS", 5_000, 1)),
-    historyConfigEventChunksPerRun: readPositiveIntEnv("FLAP_FACTORY_HISTORY_CONFIG_EVENT_CHUNKS_PER_RUN", 5, 1),
-    historyBackwardBlockChunkBlocks: readPositiveIntEnv("FLAP_FACTORY_HISTORY_BACKWARD_BLOCK_CHUNK_BLOCKS", 10, 1),
-    deepHistoryBlockScan: process.env.FLAP_FACTORY_DEEP_HISTORY_BLOCK_SCAN !== "false",
     assetRefreshPerRun: readPositiveIntEnv("FLAP_FACTORY_ASSET_REFRESH_PER_RUN", 10, 1),
     tokenMetadataApiUrl: process.env.FLAP_FACTORY_TOKEN_METADATA_API_URL || "https://api.gopluslabs.io/api/v1/token_security/56",
     tokenMetadataTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_TOKEN_METADATA_TIMEOUT_MS", 800, 300),
     tokenMetadataRetryMs: readPositiveIntEnv("FLAP_FACTORY_TOKEN_METADATA_RETRY_MS", 300_000, 10_000),
     rpcTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_RPC_TIMEOUT_MS", 2_000, 500),
-    rpcHistoryTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_RPC_HISTORY_TIMEOUT_MS", 8_000, 1_000),
+    rpcCatchupTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_RPC_CATCHUP_TIMEOUT_MS", 8_000, 1_000),
     rpcHedgeDelayMs: readPositiveIntEnv("FLAP_FACTORY_RPC_HEDGE_DELAY_MS", 120, 50),
   },
 
@@ -321,7 +313,7 @@ const UI_STYLE_CATEGORY_META = {
   },
 };
 
-const FACTORY_BACKGROUND_TASK_ORDER = Object.freeze(["catchup", "fallback", "catchup", "history"]);
+const FACTORY_BACKGROUND_TASK_ORDER = Object.freeze(["catchup", "assets"]);
 
 const ROBINHOOD_INDEX_VAULT_FACTORY = "0xe6ca297D1d963b6F00d5b216986123CAeB883AF6";
 
@@ -797,18 +789,73 @@ function saveSnapshot(data) {
 
 /* ── 飞书消息（SDK 统一通道） ── */
 
+const feishuDeliveryCircuit = {
+  authFailures: 0,
+  nextAttemptAt: 0,
+  lastWarningAt: 0,
+};
+
+function isPlaceholderCredential(value) {
+  return !value || /(?:xxxx|your[_-]|example|placeholder|\.\.\.)/i.test(String(value));
+}
+
+function hasUsableFeishuCredentials() {
+  return !isPlaceholderCredential(CONFIG.feishuAppId)
+    && !isPlaceholderCredential(CONFIG.feishuAppSecret)
+    && !isPlaceholderCredential(CONFIG.feishuChatId);
+}
+
+function isFeishuAuthError(error) {
+  return /tenant_access_token|invalid param|code[=：:]?\s*10003|飞书凭证|app[_ ]?(?:id|secret)/i
+    .test(String(error?.message || error || ""));
+}
+
+function canAttemptFeishuDelivery() {
+  if (!hasUsableFeishuCredentials()) return false;
+  return Date.now() >= feishuDeliveryCircuit.nextAttemptAt;
+}
+
+function warnFeishuUnavailable(message) {
+  if (Date.now() - feishuDeliveryCircuit.lastWarningAt < 60_000) return;
+  feishuDeliveryCircuit.lastWarningAt = Date.now();
+  log(`[飞书] ${message}`);
+}
+
+function openFeishuAuthCircuit(error) {
+  feishuDeliveryCircuit.authFailures++;
+  const delayMs = Math.min(3_600_000, 300_000 * (2 ** Math.min(3, feishuDeliveryCircuit.authFailures - 1)));
+  feishuDeliveryCircuit.nextAttemptAt = Date.now() + delayMs;
+  warnFeishuUnavailable(`凭证认证失败，暂停推送 ${Math.round(delayMs / 60_000)} 分钟：${error.message}`);
+}
+
+function closeFeishuAuthCircuit() {
+  feishuDeliveryCircuit.authFailures = 0;
+  feishuDeliveryCircuit.nextAttemptAt = 0;
+}
+
 /**
  * 带重试的卡片发送（兼容旧接口 sendFeishu）
  */
 async function sendFeishu(title, content, template = "red", _retries = 2) {
+  if (!canAttemptFeishuDelivery()) {
+    warnFeishuUnavailable(hasUsableFeishuCredentials()
+      ? "凭证认证熔断中，本次推送保留等待后续重试"
+      : "凭证缺失或仍为占位值，已停止推送重试");
+    return false;
+  }
   const opts = _retries && typeof _retries === "object" ? _retries : {};
   const retryCount = _retries && typeof _retries === "object" ? 2 : _retries;
   for (let attempt = 0; attempt <= retryCount; attempt++) {
     try {
       const messageId = await sendCardQueued(title, content, template, opts);
       if (!messageId) throw new Error("队列发送未返回 message_id");
+      closeFeishuAuthCircuit();
       return true;
     } catch (err) {
+      if (isFeishuAuthError(err)) {
+        openFeishuAuthCircuit(err);
+        return false;
+      }
       log(`飞书推送异常（第${attempt + 1}次）：${err.message}`);
       if (attempt < retryCount) {
         await sleep(3_000 * (attempt + 1));
@@ -835,15 +882,26 @@ function isStylePseudoConfigDiff(cd = {}) {
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
 async function sendCardViaApi(title, content, template = "red", diffFilePath, cardOpts = {}) {
+  if (!canAttemptFeishuDelivery()) {
+    const reason = hasUsableFeishuCredentials() ? "飞书凭证认证熔断中" : "飞书凭证缺失或仍为占位值";
+    warnFeishuUnavailable(`${reason}，跳过本次发送`);
+    throw new Error(reason);
+  }
   const maxAttempts = 2;
   let lastError = null;
   const opts = { ...cardOpts, diffFilePath };
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     try {
-      return await sendCard(title, content, template, opts);
+      const messageId = await sendCard(title, content, template, opts);
+      closeFeishuAuthCircuit();
+      return messageId;
     } catch (err) {
       lastError = err;
       log(`[飞书 IM API] 直接发送失败（第 ${attempt + 1}/${maxAttempts} 次）：${err.message}`);
+      if (isFeishuAuthError(err)) {
+        openFeishuAuthCircuit(err);
+        throw err;
+      }
       if (attempt < maxAttempts - 1) await sleep(800 * (attempt + 1));
     }
   }
@@ -2490,9 +2548,9 @@ function bscRpcTimeoutMs(method, params = []) {
     const filter = params[0] || {};
     const from = hexToNumber(filter.fromBlock);
     const to = hexToNumber(filter.toBlock);
-    if (from > 0 && to > 0 && to - from > 100) return CONFIG.factoryPoolMonitor.rpcHistoryTimeoutMs;
+    if (from > 0 && to > 0 && to - from > 100) return CONFIG.factoryPoolMonitor.rpcCatchupTimeoutMs;
   }
-  if (method === "eth_getBlockByNumber" && params[1]) return CONFIG.factoryPoolMonitor.rpcHistoryTimeoutMs;
+  if (method === "eth_getBlockByNumber" && params[1]) return CONFIG.factoryPoolMonitor.rpcCatchupTimeoutMs;
   return CONFIG.factoryPoolMonitor.rpcTimeoutMs;
 }
 
@@ -3052,6 +3110,7 @@ function buildFactoryPoolMonitorContent(result) {
 }
 
 let factoryPoolDeliveryQueue = Promise.resolve();
+let factoryPoolDeliveryQueued = false;
 let factoryPoolMetadataQueue = Promise.resolve();
 let factoryPoolStateWriteQueue = Promise.resolve();
 
@@ -3114,21 +3173,13 @@ function mergeFactoryPoolScanState(target, incoming) {
   if (!incoming || incoming === target) return target;
   const targetLatestBlock = Number(target.latestBlock) || 0;
   const incomingLatestBlock = Number(incoming.latestBlock) || 0;
-  const targetCheckpoints = target.blockCheckpoints || {};
-  const incomingCheckpoints = incoming.blockCheckpoints || {};
-  const cursorRollback = incomingLatestBlock >= targetLatestBlock
-    && Object.keys(targetCheckpoints).some(blockNumber =>
-      Number(blockNumber) > Number(incoming.headLastScannedBlock || 0)
-      && !(blockNumber in incomingCheckpoints));
   const maxFields = [
-    "latestBlock", "safeLatestBlock", "headLastScannedBlock", "fallbackLastScannedBlock",
-    "lastScannedBlock", "historyLogLastScannedBlock", "historyBlockLastScannedBlock",
+    "latestBlock", "safeLatestBlock", "headLastScannedBlock", "lastScannedBlock",
   ];
-  const minFields = ["historyBackwardLogCursor", "historyStateEventCursor", "historyBackwardBlockCursor"];
   const copyFields = [
     "schemaVersion", "chainId", "proxy", "deploymentBlock", "deploymentTxHash", "deployer",
     "deploymentTxChecked", "deploymentDetection", "implementationSelectors",
-    "assetRefreshCursor", "lastRealtimeRunAt", "lastCatchupRunAt", "lastHistoryRunAt", "lastRunAt",
+    "assetRefreshCursor", "lastRealtimeRunAt", "lastCatchupRunAt", "lastRunAt",
   ];
   for (const field of copyFields) {
     if (incoming[field] !== undefined && incoming[field] !== null && incoming[field] !== "") target[field] = incoming[field];
@@ -3139,15 +3190,6 @@ function mergeFactoryPoolScanState(target, incoming) {
   for (const field of maxFields) {
     const values = [target[field], incoming[field]].filter(Number.isFinite);
     if (values.length > 0) target[field] = Math.max(...values);
-  }
-  if (cursorRollback) {
-    for (const field of ["headLastScannedBlock", "fallbackLastScannedBlock", "lastScannedBlock"]) {
-      if (Number.isFinite(incoming[field])) target[field] = incoming[field];
-    }
-  }
-  for (const field of minFields) {
-    const values = [target[field], incoming[field]].filter(Number.isFinite);
-    if (values.length > 0) target[field] = Math.min(...values);
   }
   target.candidates ||= {};
   for (const [address, candidate] of Object.entries(incoming.candidates || {})) {
@@ -3164,22 +3206,11 @@ function mergeFactoryPoolScanState(target, incoming) {
       target.assets[address] = asset;
     }
   }
-  target.relatedSelectors = { ...(target.relatedSelectors || {}), ...(incoming.relatedSelectors || {}) };
-  target.blockCheckpoints = cursorRollback
-    ? { ...incomingCheckpoints }
-    : { ...targetCheckpoints, ...incomingCheckpoints };
   target.implementationHistory = mergeUniqueFactoryPoolRecords(
     target.implementationHistory,
     incoming.implementationHistory,
     item => `${item?.blockNumber || ""}:${item?.previous || ""}:${item?.current || ""}`,
   );
-  target.proxyUpgradeEvents = mergeUniqueFactoryPoolRecords(
-    target.proxyUpgradeEvents,
-    incoming.proxyUpgradeEvents,
-    item => `${item?.transactionHash || ""}:${item?.logIndex ?? ""}`,
-  );
-  const historyFloors = [target.historyLogLastScannedBlock, target.historyBlockLastScannedBlock].filter(Number.isFinite);
-  target.historyLastScannedBlock = historyFloors.length > 0 ? Math.min(...historyFloors) : null;
   mergeFactoryPoolVerificationHealth(target);
   return target;
 }
@@ -3321,7 +3352,6 @@ async function checkFlapFactoryPools(factoryPoolState, {
     result = await scanFn({
       state: workingState,
       rpcCall: bscRpcCall,
-      rpcBatch: calls => bscRpcBatch(calls, { requireAllResults: true }),
       persistState: async candidateState => {
         await commitFactoryPoolScanState(factoryPoolState, candidateState, saveStateFn);
       },
@@ -3361,6 +3391,9 @@ async function checkFlapFactoryPools(factoryPoolState, {
     if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
     saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
   });
+  if (sendCardFn === sendCardViaApi && !canAttemptFeishuDelivery()) {
+    return { ...result, sent: false, deliveryDeferred: true };
+  }
 
   const changeDeliveryKey = change => [
     change.current?.quoteToken || "",
@@ -3436,10 +3469,12 @@ async function checkFlapFactoryPools(factoryPoolState, {
     void Promise.resolve(pinFn(messageId)).catch(err => log(`[Flap Factory] 卡片置顶失败：${err.message}`));
     return { ...result, sent: true };
   };
+  if (factoryPoolDeliveryQueued) return { ...result, sent: false, deliveryQueued: true };
+  factoryPoolDeliveryQueued = true;
   const delivery = factoryPoolDeliveryQueue.then(deliver, deliver);
   factoryPoolDeliveryQueue = delivery.catch(error => {
     log(`[Flap Factory] 待发送通知保留，异步发送失败：${error.message}`);
-  });
+  }).finally(() => { factoryPoolDeliveryQueued = false; });
   if (awaitDelivery) return await delivery;
   return { ...result, sent: false, deliveryQueued: true };
 }
@@ -5828,7 +5863,7 @@ async function startMonitor() {
         || Number.isFinite(factoryPoolState.lastScannedBlock);
       await checkFlapFactoryPools(factoryPoolState, {
         suppressNotifications: !hasFactoryBaseline,
-        scanConfig: { scanRealtime: true, scanCatchup: false, scanHistory: false },
+        scanConfig: { scanRealtime: true, scanCatchup: false, scanAssets: false },
       });
     } catch (err) {
       try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
@@ -5843,9 +5878,8 @@ async function startMonitor() {
   );
 
   let isFactoryRealtimeScanning = false;
-  let isFactoryFallbackScanning = false;
   let isFactoryCatchupScanning = false;
-  let isFactoryHistoryScanning = false;
+  let isFactoryAssetScanning = false;
   let isFactoryBackgroundScanning = false;
   function getFactoryRealtimeLag() {
     const latest = Number(factoryPoolState.latestBlock);
@@ -5860,7 +5894,7 @@ async function startMonitor() {
     isFactoryRealtimeScanning = true;
     try {
       await checkFlapFactoryPools(factoryPoolState, {
-        scanConfig: { scanRealtime: true, scanCatchup: false, scanHistory: false },
+        scanConfig: { scanRealtime: true, scanCatchup: false, scanAssets: false },
         awaitDelivery: false,
       });
     } catch (err) {
@@ -5871,20 +5905,20 @@ async function startMonitor() {
     }
   }
 
-  async function factoryPoolFallbackPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryFallbackScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
-    isFactoryFallbackScanning = true;
+  async function factoryPoolAssetPoll() {
+    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryAssetScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
+    isFactoryAssetScanning = true;
     isFactoryBackgroundScanning = true;
     try {
       await checkFlapFactoryPools(factoryPoolState, {
-        scanConfig: { scanRealtime: false, scanFallback: true, scanCatchup: false, scanHistory: false },
+        scanConfig: { scanRealtime: false, scanCatchup: false, scanAssets: true },
         awaitDelivery: false,
       });
     } catch (err) {
       try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
-      log(`[Flap Factory 漏检] 检测失败：${err.message}`);
+      log(`[Flap Factory 资产复核] 检测失败：${err.message}`);
     } finally {
-      isFactoryFallbackScanning = false;
+      isFactoryAssetScanning = false;
       isFactoryBackgroundScanning = false;
     }
   }
@@ -5895,7 +5929,7 @@ async function startMonitor() {
     isFactoryBackgroundScanning = true;
     try {
       await checkFlapFactoryPools(factoryPoolState, {
-        scanConfig: { scanRealtime: false, scanCatchup: true, scanHistory: false },
+        scanConfig: { scanRealtime: false, scanCatchup: true, scanAssets: false },
         awaitDelivery: false,
       });
     } catch (err) {
@@ -5903,24 +5937,6 @@ async function startMonitor() {
       log(`[Flap Factory 补扫] 检测失败：${err.message}`);
     } finally {
       isFactoryCatchupScanning = false;
-      isFactoryBackgroundScanning = false;
-    }
-  }
-
-  async function factoryPoolHistoryPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryHistoryScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
-    isFactoryHistoryScanning = true;
-    isFactoryBackgroundScanning = true;
-    try {
-      await checkFlapFactoryPools(factoryPoolState, {
-        scanConfig: { scanRealtime: false, scanCatchup: false, scanHistory: true },
-        awaitDelivery: false,
-      });
-    } catch (err) {
-      try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
-      log(`[Flap Factory 历史] 检测失败：${err.message}`);
-    } finally {
-      isFactoryHistoryScanning = false;
       isFactoryBackgroundScanning = false;
     }
   }
@@ -5936,14 +5952,12 @@ async function startMonitor() {
 
   const factoryBackgroundTasks = {
     catchup: factoryPoolCatchupPoll,
-    fallback: factoryPoolFallbackPoll,
-    history: factoryPoolHistoryPoll,
+    assets: factoryPoolAssetPoll,
   };
   let factoryBackgroundTaskIndex = 0;
   const factoryBackgroundTickMs = Math.max(250, Math.floor(Math.min(
     CONFIG.factoryPoolMonitor.intervalMs,
     CONFIG.factoryPoolMonitor.catchupIntervalMs,
-    CONFIG.factoryPoolMonitor.historyIntervalMs,
   ) / 2));
   async function factoryPoolBackgroundPoll() {
     if (!CONFIG.factoryPoolMonitor.enabled || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
