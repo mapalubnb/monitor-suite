@@ -327,6 +327,11 @@ const UA_POOL = [
 ];
 const PROCESS_BROWSER_UA = UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
 
+// 兼容其他 HTTP 模块的既有调用，同时避免同一进程内 UA 持续变化。
+function nextUA() {
+  return PROCESS_BROWSER_UA;
+}
+
 function browserHeaders(userAgent = PROCESS_BROWSER_UA) {
   return {
     "User-Agent": userAgent,
@@ -4367,6 +4372,17 @@ function isAssetDownloadComplete(assetUrlMap, assetContents) {
   });
 }
 
+function sameStaticAssetResource(cachedUrl, currentUrl) {
+  if (!cachedUrl || !currentUrl) return false;
+  try {
+    const cached = new URL(cachedUrl);
+    const current = new URL(currentUrl);
+    return cached.origin === current.origin && cached.pathname === current.pathname;
+  } catch {
+    return false;
+  }
+}
+
 function planFrontendAssetRefresh(assetUrlMap, oldFeatures = null, requestContext = {}) {
   const reusable = {};
   const downloads = new Map();
@@ -4376,8 +4392,8 @@ function planFrontendAssetRefresh(assetUrlMap, oldFeatures = null, requestContex
   };
   for (const [assetKey, url] of assetUrlMap || []) {
     const cached = available[assetKey];
-    if (cached?.url && cached.url === url) {
-      reusable[assetKey] = cached;
+    if (sameStaticAssetResource(cached?.url, url)) {
+      reusable[assetKey] = cached.url === url ? cached : { ...cached, url };
     } else {
       downloads.set(assetKey, { url, previous: null, ...requestContext });
     }
@@ -9895,6 +9911,7 @@ export const __testables = {
   formatNetworkError,
   fetchSafe,
   fetchStaticAssetSafe,
+  nextUA,
   browserHeaders,
   staticAssetHeaders,
   downloadAssetContents,

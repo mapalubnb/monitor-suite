@@ -22,6 +22,7 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
     "https://bsc.rpc.blxrbdn.com",
     "https://rpc.48.club",
   ]);
+  assert.equal(__testables.nextUA(), __testables.nextUA());
 });
 
 test("contract fingerprints use storage and code without eth_getProof", async () => {
@@ -865,7 +866,7 @@ test("static asset headers match browser subresource semantics", () => {
   );
 });
 
-test("dpl URL changes force an asset refresh even when the chunk path is unchanged", () => {
+test("dpl-only URL changes migrate cached assets without downloading all chunks again", () => {
   const key = "/_next/static/chunks/app.js";
   const oldUrl = `https://four.meme${key}?dpl=1018`;
   const newUrl = `https://four.meme${key}?dpl=1019`;
@@ -879,8 +880,25 @@ test("dpl URL changes force an asset refresh even when the chunk path is unchang
     referer: "https://four.meme/en/advanced",
     userAgent: "Chrome/150",
   });
-  assert.deepEqual([...plan.downloads.keys()], [key]);
-  assert.equal(plan.downloads.get(key).referer, "https://four.meme/en/advanced");
+  assert.equal(plan.downloads.size, 0);
+  assert.equal(plan.reusable[key].url, newUrl);
+  assert.equal(__testables.isAssetDownloadComplete(features.assetUrlMap, plan.reusable), true);
+});
+
+test("a changed chunk path is downloaded with the current page request context", () => {
+  const oldKey = "/_next/static/chunks/app-old.js";
+  const newKey = "/_next/static/chunks/app-new.js";
+  const current = new Map([[newKey, `https://four.meme${newKey}?dpl=1019`]]);
+  const plan = __testables.planFrontendAssetRefresh(current, {
+    assetContents: {
+      [oldKey]: { url: `https://four.meme${oldKey}?dpl=1018`, contentHash: "old" },
+    },
+  }, {
+    referer: "https://four.meme/en/advanced",
+    userAgent: "Chrome/150",
+  });
+  assert.deepEqual([...plan.downloads.keys()], [newKey]);
+  assert.equal(plan.downloads.get(newKey).referer, "https://four.meme/en/advanced");
 });
 
 test("failed new frontend asset remains pending and only the failed item is retried next round", async () => {
