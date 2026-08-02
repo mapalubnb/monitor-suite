@@ -88,6 +88,7 @@ pm2 status
 
 - Four.meme 前端最低 `5` 秒，API 最低 `8` 秒，其余高频模块最低 `1` 秒。
 - Four.meme HTTP 链上读取以 `https://bsc.rpc.blxrbdn.com` 为主节点，`https://rpc.48.club` 为备用节点。
+- Four.meme 合约监控使用 `eth_getStorageAt + eth_getCode` 批量读取并在本地计算代码哈希，不依赖公共节点兼容性较差的 `eth_getProof`。
 - Flap 轮询最低 `500ms`。
 - Flap Factory 实时扫描使用固定 1 秒节拍和 0 确认块；RPC 自动选择低延迟健康节点，断点补扫与资产复核在后台轮转并主动让路。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。

@@ -6785,8 +6785,7 @@ async function checkGithub(lastSha) {
    ══════════════════════════════════════════ */
 
 /**
- * 用 RPC Batch 一次请求获取所有合约的 bytecode + EIP-1967 implementation
- * 将原来 12+ 次串行 RPC 压缩为 1 次 batch
+ * 用 RPC Batch 获取所有合约的 bytecode + EIP-1967 implementation。
  */
 /**
  * 从 bytecode 中提取 4 字节函数选择器 (function selectors)
@@ -7161,96 +7160,69 @@ async function buildContractTargets() {
   return targets;
 }
 
-async function fetchContractFingerprints() {
-  const result = {};
-  const bscContracts = await buildContractTargets();
+function isValidRpcHex(value, { bytes } = {}) {
+  if (typeof value !== "string" || !/^0x(?:[a-fA-F0-9]{2})*$/.test(value)) return false;
+  return bytes == null || value.length === 2 + bytes * 2;
+}
 
-  // 每轮先读取小体积 codeHash 和代理槽；只有哈希变化时才下载完整 bytecode。
+async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bscRpcBatch) {
+  const result = {};
+
+  // 主合约代码与代理槽在同一批读取，避免不兼容的 eth_getProof 增加一次往返。
   const calls = [];
   for (const c of bscContracts) {
-    calls.push({ method: "eth_getProof", params: [c.addr, [], "latest"] });
     calls.push({ method: "eth_getStorageAt", params: [c.addr, CONFIG.eip1967Slot, "latest"] });
+    calls.push({ method: "eth_getCode", params: [c.addr, "latest"] });
   }
-  const batchResults = await bscRpcBatch(calls);
+  const batchResults = await rpcBatchFn(calls);
 
-  const codeCalls = [];
-  const codeMappings = [];
   for (let i = 0; i < bscContracts.length; i++) {
     const c = bscContracts[i];
-    const proof = batchResults[i * 2];
-    const rawSlot = batchResults[i * 2 + 1] || "0x" + "0".repeat(64);
-    const old = snapshot?.contractFingerprints?.[c.label];
-    const proofCodeHash = String(proof?.codeHash || "").toLowerCase();
-    const reusable = proofCodeHash
-      && old?.rpcCodeHash === proofCodeHash
-      && normalizeAddress(old.address) === normalizeAddress(c.addr);
-    result[c.label] = reusable ? { ...old } : {
-      codeHash: "",
-      codeSize: 0,
+    const rawSlot = batchResults[i * 2];
+    const code = batchResults[i * 2 + 1];
+    if (!isValidRpcHex(rawSlot, { bytes: 32 })) {
+      throw new Error(`合约 ${c.label} 代理槽读取失败，保留上一轮快照`);
+    }
+    if (!isValidRpcHex(code)) {
+      throw new Error(`合约 ${c.label} 字节码读取失败，保留上一轮快照`);
+    }
+    result[c.label] = {
+      codeHash: md5(code),
+      codeSize: Math.floor((code.length - 2) / 2),
       address: c.addr,
-      selectors: [],
+      selectors: extractSelectors(code),
+      source: c.source || "static",
+      networkCode: c.networkCode || CONFIG.networkCode,
     };
-    result[c.label].address = c.addr;
-    result[c.label].source = c.source || "static";
-    result[c.label].networkCode = c.networkCode || CONFIG.networkCode;
-    if (proofCodeHash) result[c.label].rpcCodeHash = proofCodeHash;
     for (const field of ["discoveredVia", "linkedRegistry", "linkedCore", "linkedFeeRouter"]) {
       if (c[field]) result[c.label][field] = c[field];
-      else delete result[c.label][field];
     }
-    const impl = "0x" + rawSlot.slice(26);
-    const isProxy = impl !== "0x0000000000000000000000000000000000000000"
-      && rawSlot !== "0x0000000000000000000000000000000000000000000000000000000000000000";
-    if (isProxy) {
+    const impl = normalizeAddress("0x" + rawSlot.slice(-40));
+    if (impl && impl !== ZERO_ADDRESS) {
       result[c.label].implAddress = impl;
-    } else {
-      delete result[c.label].implAddress;
-      delete result[c.label].implCodeHash;
-      delete result[c.label].implCodeSize;
-      delete result[c.label].implSelectors;
-      delete result[c.label].implRpcCodeHash;
-    }
-    if (!reusable) {
-      codeCalls.push({ method: "eth_getCode", params: [c.addr, "latest"] });
-      codeMappings.push({ label: c.label, kind: "main" });
     }
   }
 
   const implItems = Object.entries(result).filter(([, item]) => item.implAddress);
-  const implProofs = implItems.length > 0
-    ? await bscRpcBatch(implItems.map(([, item]) => ({ method: "eth_getProof", params: [item.implAddress, [], "latest"] })))
+  const implCodes = implItems.length > 0
+    ? await rpcBatchFn(implItems.map(([, item]) => ({ method: "eth_getCode", params: [item.implAddress, "latest"] })))
     : [];
   for (let i = 0; i < implItems.length; i++) {
     const [label, item] = implItems[i];
-    const old = snapshot?.contractFingerprints?.[label];
-    const proofCodeHash = String(implProofs[i]?.codeHash || "").toLowerCase();
-    const reusable = proofCodeHash
-      && old?.implRpcCodeHash === proofCodeHash
-      && normalizeAddress(old.implAddress) === normalizeAddress(item.implAddress);
-    if (proofCodeHash) item.implRpcCodeHash = proofCodeHash;
-    if (!reusable) {
-      codeCalls.push({ method: "eth_getCode", params: [item.implAddress, "latest"] });
-      codeMappings.push({ label, kind: "impl" });
+    const code = implCodes[i];
+    if (!isValidRpcHex(code)) {
+      throw new Error(`合约 ${label} implementation 字节码读取失败，保留上一轮快照`);
     }
-  }
-
-  const codes = codeCalls.length > 0 ? await bscRpcBatch(codeCalls) : [];
-  for (let i = 0; i < codeMappings.length; i++) {
-    const mapping = codeMappings[i];
-    const code = codes[i] || "0x";
-    const size = code ? Math.floor((code.length - 2) / 2) : 0;
-    if (mapping.kind === "main") {
-      result[mapping.label].codeHash = md5(code);
-      result[mapping.label].codeSize = size;
-      result[mapping.label].selectors = extractSelectors(code);
-    } else {
-      result[mapping.label].implCodeHash = md5(code);
-      result[mapping.label].implCodeSize = size;
-      result[mapping.label].implSelectors = extractSelectors(code);
-    }
+    item.implCodeHash = md5(code);
+    item.implCodeSize = Math.floor((code.length - 2) / 2);
+    item.implSelectors = extractSelectors(code);
   }
 
   return result;
+}
+
+async function fetchContractFingerprints() {
+  return fetchContractFingerprintsForTargets(await buildContractTargets());
 }
 
 function diffContractFingerprints(oldFp, newFp) {
@@ -9780,6 +9752,7 @@ export const __testables = {
   formatI18nChanges,
   formatRouteChanges,
   formatContractChanges,
+  fetchContractFingerprintsForTargets,
   formatOnchainChanges,
   formatActorActions,
   buildFullDiffText,

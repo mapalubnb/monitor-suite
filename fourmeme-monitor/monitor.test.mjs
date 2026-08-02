@@ -24,6 +24,47 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
   ]);
 });
 
+test("contract fingerprints use storage and code without eth_getProof", async () => {
+  const address = "0x1111111111111111111111111111111111111111";
+  const implementation = "0x2222222222222222222222222222222222222222";
+  const slot = `0x${"0".repeat(24)}${implementation.slice(2)}`;
+  const batches = [];
+  const result = await __testables.fetchContractFingerprintsForTargets([
+    { label: "Proxy", addr: address, source: "test", networkCode: "BSC" },
+  ], async calls => {
+    batches.push(calls);
+    assert.equal(calls.some(call => call.method === "eth_getProof"), false);
+    if (batches.length === 1) {
+      assert.deepEqual(calls.map(call => call.method), ["eth_getStorageAt", "eth_getCode"]);
+      return [slot, "0x63a9059cbb00"];
+    }
+    assert.deepEqual(calls, [{ method: "eth_getCode", params: [implementation, "latest"] }]);
+    return ["0x635c60da1b00"];
+  });
+  assert.equal(batches.length, 2);
+  assert.equal(result.Proxy.address, address);
+  assert.equal(result.Proxy.implAddress, implementation);
+  assert.equal(result.Proxy.codeSize, 6);
+  assert.equal(result.Proxy.implCodeSize, 6);
+  assert.deepEqual(result.Proxy.selectors, ["0xa9059cbb"]);
+  assert.deepEqual(result.Proxy.implSelectors, ["0x5c60da1b"]);
+  assert.equal("rpcCodeHash" in result.Proxy, false);
+  assert.equal("implRpcCodeHash" in result.Proxy, false);
+});
+
+test("contract fingerprint RPC failure cannot become empty bytecode", async () => {
+  const zeroSlot = `0x${"0".repeat(64)}`;
+  await assert.rejects(
+    __testables.fetchContractFingerprintsForTargets([
+      { label: "TokenManager", addr: "0x3333333333333333333333333333333333333333", source: "test" },
+    ], async calls => {
+      assert.deepEqual(calls.map(call => call.method), ["eth_getStorageAt", "eth_getCode"]);
+      return [zeroSlot, null];
+    }),
+    /字节码读取失败，保留上一轮快照/,
+  );
+});
+
 test("startup card copy reflects active frontend and api cadences", () => {
   const progress = __testables.buildStartupProgressContent();
   const ready = __testables.buildStartupReadyContent();
