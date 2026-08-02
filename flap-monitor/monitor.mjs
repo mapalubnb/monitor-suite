@@ -2533,6 +2533,91 @@ function resetBscRpcHealth() {
   bscRpcHealthByKey.clear();
 }
 
+function dedupeBscLogs(logs = []) {
+  const unique = new Map();
+  for (const logEntry of logs) {
+    const key = `${String(logEntry?.transactionHash || "").toLowerCase()}:${String(logEntry?.logIndex || "").toLowerCase()}`;
+    if (key === ":") continue;
+    if (!unique.has(key)) unique.set(key, logEntry);
+  }
+  return [...unique.values()].sort((left, right) =>
+    hexToNumber(left.blockNumber) - hexToNumber(right.blockNumber)
+    || hexToNumber(left.transactionIndex) - hexToNumber(right.transactionIndex)
+    || hexToNumber(left.logIndex) - hexToNumber(right.logIndex));
+}
+
+async function executeBscGetLogsRequest(params, options = {}) {
+  const preferenceKey = bscRpcPreferenceKey("eth_getLogs", params);
+  const indexes = orderedBscRpcIndexes(preferenceKey);
+  const timeoutMs = bscRpcTimeoutMs("eth_getLogs", params);
+  const controllers = [];
+  let settled = false;
+  let emptyVotes = 0;
+  let finished = 0;
+  const errors = [];
+  const payload = { jsonrpc: "2.0", id: 1, method: "eth_getLogs", params };
+
+  return await new Promise((resolve, reject) => {
+    const finish = (value, index, latencyMs) => {
+      if (settled) return;
+      settled = true;
+      preferredBscRpcIndexByKey.set(preferenceKey, index);
+      updateBscRpcHealth(preferenceKey, index, latencyMs);
+      for (const controller of controllers) controller.abort();
+      resolve(value);
+    };
+    const maybeReject = () => {
+      if (settled || finished < indexes.length) return;
+      settled = true;
+      const message = emptyVotes === 1
+        ? "eth_getLogs 仅一个节点返回空结果，未达到双节点一致"
+        : errors.at(-1)?.message || "所有 BSC RPC 节点均不可用";
+      reject(new Error(message));
+    };
+
+    indexes.forEach((index, position) => {
+      void (async () => {
+        if (position > 0) await sleep(CONFIG.factoryPoolMonitor.rpcHedgeDelayMs * position);
+        if (settled) return;
+        const controller = new AbortController();
+        controllers.push(controller);
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const startedAt = Date.now();
+        try {
+          const response = await fetch(CONFIG.bscRpcUrls[index], {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+            signal: controller.signal,
+          });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          const json = await response.json();
+          if (json?.error) throw new Error(json.error.message || JSON.stringify(json.error));
+          if (!Array.isArray(json?.result)) throw new Error("eth_getLogs 返回非数组");
+          const latencyMs = Math.max(1, Date.now() - startedAt);
+          const logs = dedupeBscLogs(json.result);
+          if (logs.length > 0) {
+            finish(logs, index, latencyMs);
+            return;
+          }
+          emptyVotes++;
+          updateBscRpcHealth(preferenceKey, index, latencyMs);
+          if (emptyVotes >= 2) finish([], index, latencyMs);
+        } catch (error) {
+          if (!settled) {
+            errors.push(error);
+            updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt, true);
+          }
+        } finally {
+          clearTimeout(timer);
+          finished++;
+          maybeReject();
+        }
+      })();
+    });
+  });
+}
+
 async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null) {
   const indexes = orderedBscRpcIndexes(preferenceKey);
   const controllers = [];
@@ -2581,6 +2666,11 @@ async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateR
 }
 
 async function bscRpcCall(method, params = [], options = {}) {
+  if (method === "eth_getLogs") {
+    const logs = await executeBscGetLogsRequest(params, options);
+    if (options.requireResult && logs == null) throw new Error("eth_getLogs 返回空结果");
+    return logs;
+  }
   const preferenceKey = bscRpcPreferenceKey(method, params);
   const json = await executeBscRpcRequest(
     { jsonrpc: "2.0", id: 1, method, params },
@@ -2963,6 +3053,152 @@ function buildFactoryPoolMonitorContent(result) {
 
 let factoryPoolDeliveryQueue = Promise.resolve();
 let factoryPoolMetadataQueue = Promise.resolve();
+let factoryPoolStateWriteQueue = Promise.resolve();
+
+function withFactoryPoolStateWrite(operation) {
+  const job = factoryPoolStateWriteQueue.then(operation, operation);
+  factoryPoolStateWriteQueue = job.catch(() => undefined);
+  return job;
+}
+
+function cloneFactoryPoolState(state) {
+  return structuredClone(state);
+}
+
+function mergeUniqueFactoryPoolRecords(current = [], incoming = [], keyFn = item => JSON.stringify(item)) {
+  const merged = new Map();
+  for (const item of [...current, ...incoming]) merged.set(keyFn(item), item);
+  return [...merged.values()];
+}
+
+function mergeFactoryPoolCandidate(current = {}, incoming = {}) {
+  const currentBlock = Number(current.lastVerifyBlock) || 0;
+  const incomingBlock = Number(incoming.lastVerifyBlock) || 0;
+  const currentAttempt = Number(current.lastVerifyAttemptAtMs) || 0;
+  const incomingAttempt = Number(incoming.lastVerifyAttemptAtMs) || 0;
+  const latest = incomingBlock > currentBlock || (incomingBlock === currentBlock && incomingAttempt >= currentAttempt)
+    ? incoming
+    : current;
+  const firstSeenBlocks = [current.firstSeenBlock, incoming.firstSeenBlock].filter(Number.isFinite);
+  const lastSeenBlocks = [current.lastSeenBlock, incoming.lastSeenBlock].filter(Number.isFinite);
+  return {
+    ...current,
+    ...latest,
+    firstSeenBlock: firstSeenBlocks.length > 0 ? Math.min(...firstSeenBlocks) : null,
+    lastSeenBlock: lastSeenBlocks.length > 0 ? Math.max(...lastSeenBlocks) : null,
+    sources: mergeUniqueFactoryPoolRecords(current.sources, incoming.sources, source => source.key),
+  };
+}
+
+function mergeFactoryPoolVerificationHealth(state) {
+  const candidates = Object.values(state.candidates || {});
+  const pending = candidates.filter(candidate => candidate?.pendingVerification);
+  const failing = pending.filter(candidate => candidate?.lastVerifyError);
+  const latestFailure = [...failing].sort((left, right) =>
+    (right.lastVerifyAttemptAtMs || 0) - (left.lastVerifyAttemptAtMs || 0))[0];
+  const previous = state.verificationHealth || {};
+  state.verificationHealth = {
+    pendingCount: pending.length,
+    failingCount: failing.length,
+    consecutiveFailures: failing.reduce((total, candidate) => total + (candidate.consecutiveVerifyFailures || 0), 0),
+    lastError: latestFailure?.lastVerifyError || "",
+    lastFailureAt: latestFailure?.lastVerifyFailureAt || previous.lastFailureAt || "",
+    lastSuccessAt: failing.length === 0 ? (previous.lastSuccessAt || ts()) : (previous.lastSuccessAt || ""),
+  };
+  state.lastError = failing.length > 0
+    ? `候选复核失败 ${failing.length} 个：${latestFailure.quoteToken}｜${latestFailure.lastVerifyError}`
+    : "";
+}
+
+function mergeFactoryPoolScanState(target, incoming) {
+  if (!incoming || incoming === target) return target;
+  const targetLatestBlock = Number(target.latestBlock) || 0;
+  const incomingLatestBlock = Number(incoming.latestBlock) || 0;
+  const targetCheckpoints = target.blockCheckpoints || {};
+  const incomingCheckpoints = incoming.blockCheckpoints || {};
+  const cursorRollback = incomingLatestBlock >= targetLatestBlock
+    && Object.keys(targetCheckpoints).some(blockNumber =>
+      Number(blockNumber) > Number(incoming.headLastScannedBlock || 0)
+      && !(blockNumber in incomingCheckpoints));
+  const maxFields = [
+    "latestBlock", "safeLatestBlock", "headLastScannedBlock", "fallbackLastScannedBlock",
+    "lastScannedBlock", "historyLogLastScannedBlock", "historyBlockLastScannedBlock",
+  ];
+  const minFields = ["historyBackwardLogCursor", "historyStateEventCursor", "historyBackwardBlockCursor"];
+  const copyFields = [
+    "schemaVersion", "chainId", "proxy", "deploymentBlock", "deploymentTxHash", "deployer",
+    "deploymentTxChecked", "deploymentDetection", "implementationSelectors",
+    "assetRefreshCursor", "lastRealtimeRunAt", "lastCatchupRunAt", "lastHistoryRunAt", "lastRunAt",
+  ];
+  for (const field of copyFields) {
+    if (incoming[field] !== undefined && incoming[field] !== null && incoming[field] !== "") target[field] = incoming[field];
+  }
+  if (incoming.currentImplementation && incomingLatestBlock >= targetLatestBlock) {
+    target.currentImplementation = incoming.currentImplementation;
+  }
+  for (const field of maxFields) {
+    const values = [target[field], incoming[field]].filter(Number.isFinite);
+    if (values.length > 0) target[field] = Math.max(...values);
+  }
+  if (cursorRollback) {
+    for (const field of ["headLastScannedBlock", "fallbackLastScannedBlock", "lastScannedBlock"]) {
+      if (Number.isFinite(incoming[field])) target[field] = incoming[field];
+    }
+  }
+  for (const field of minFields) {
+    const values = [target[field], incoming[field]].filter(Number.isFinite);
+    if (values.length > 0) target[field] = Math.min(...values);
+  }
+  target.candidates ||= {};
+  for (const [address, candidate] of Object.entries(incoming.candidates || {})) {
+    target.candidates[address] = mergeFactoryPoolCandidate(target.candidates[address], candidate);
+  }
+  target.assets ||= {};
+  for (const [address, asset] of Object.entries(incoming.assets || {})) {
+    const current = target.assets[address];
+    const currentBlock = Number(current?.lastVerifiedBlock) || 0;
+    const incomingBlock = Number(asset?.lastVerifiedBlock) || 0;
+    const currentVersion = Number(current?.lastVerifiedAtMs) || 0;
+    const incomingVersion = Number(asset?.lastVerifiedAtMs) || 0;
+    if (!current || incomingBlock > currentBlock || (incomingBlock === currentBlock && incomingVersion >= currentVersion)) {
+      target.assets[address] = asset;
+    }
+  }
+  target.relatedSelectors = { ...(target.relatedSelectors || {}), ...(incoming.relatedSelectors || {}) };
+  target.blockCheckpoints = cursorRollback
+    ? { ...incomingCheckpoints }
+    : { ...targetCheckpoints, ...incomingCheckpoints };
+  target.implementationHistory = mergeUniqueFactoryPoolRecords(
+    target.implementationHistory,
+    incoming.implementationHistory,
+    item => `${item?.blockNumber || ""}:${item?.previous || ""}:${item?.current || ""}`,
+  );
+  target.proxyUpgradeEvents = mergeUniqueFactoryPoolRecords(
+    target.proxyUpgradeEvents,
+    incoming.proxyUpgradeEvents,
+    item => `${item?.transactionHash || ""}:${item?.logIndex ?? ""}`,
+  );
+  const historyFloors = [target.historyLogLastScannedBlock, target.historyBlockLastScannedBlock].filter(Number.isFinite);
+  target.historyLastScannedBlock = historyFloors.length > 0 ? Math.min(...historyFloors) : null;
+  mergeFactoryPoolVerificationHealth(target);
+  return target;
+}
+
+async function commitFactoryPoolScanState(target, incoming, saveStateFn = saveFactoryPoolState) {
+  return await withFactoryPoolStateWrite(() => {
+    mergeFactoryPoolScanState(target, incoming);
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, target);
+    return target;
+  });
+}
+
+async function recordFactoryPoolScanError(state, error, saveStateFn = saveFactoryPoolState) {
+  await withFactoryPoolStateWrite(() => {
+    state.lastError = error.message;
+    state.lastRunAt = ts();
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, state);
+  });
+}
 
 function factoryPoolMetadataFingerprint(asset = {}) {
   return `${asset.name || ""}\u0000${asset.symbol || ""}\u0000${asset.metadataSource || ""}`;
@@ -3006,12 +3242,25 @@ async function enrichFactoryPoolMetadataAfterSend({
   const addresses = [...new Set(changes.map(change => normalizeAddress(change.current?.quoteToken)).filter(Boolean))];
   const workAddresses = getFactoryPoolMetadataWorkAddresses(state, addresses);
   if (workAddresses.length === 0) return { patched: false, metadataChanged: false };
+  const workingState = cloneFactoryPoolState(state);
   const before = new Map(workAddresses.map(address => [address, factoryPoolMetadataStateFingerprint(state.assets?.[address])]));
   const beforeCard = new Map(addresses.map(address => [address, factoryPoolMetadataFingerprint(state.assets?.[address])]));
-  await enrichFn(state, workAddresses);
+  await enrichFn(workingState, workAddresses);
   const stateChanged = workAddresses.some(address =>
-    before.get(address) !== factoryPoolMetadataStateFingerprint(state.assets?.[address]));
-  if (stateChanged) saveFn(stateFile, state);
+    before.get(address) !== factoryPoolMetadataStateFingerprint(workingState.assets?.[address]));
+  if (stateChanged) {
+    await withFactoryPoolStateWrite(() => {
+      for (const address of workAddresses) {
+        const metadata = workingState.assets?.[address];
+        const current = state.assets?.[address];
+        if (!metadata || !current) continue;
+        for (const field of ["name", "symbol", "metadataSource", "metadataUpdatedAt", "metadataNextRetryAt", "metadataError"]) {
+          current[field] = metadata[field] || "";
+        }
+      }
+      saveFn(stateFile, state);
+    });
+  }
 
   const metadataChanged = addresses.some(address =>
     beforeCard.get(address) !== factoryPoolMetadataFingerprint(state.assets?.[address]));
@@ -3064,42 +3313,54 @@ async function checkFlapFactoryPools(factoryPoolState, {
   awaitDelivery = true,
 } = {}) {
   if (!CONFIG.factoryPoolMonitor.enabled) return { changed: false, sent: false, state: factoryPoolState };
-  const previousAssets = snapshotFactoryPoolAssets(factoryPoolState);
-  const previousImplementation = factoryPoolState.currentImplementation || "";
+  const workingState = cloneFactoryPoolState(factoryPoolState);
+  const previousAssets = snapshotFactoryPoolAssets(workingState);
+  const previousImplementation = workingState.currentImplementation || "";
   let result;
   try {
     result = await scanFn({
-      state: factoryPoolState,
+      state: workingState,
       rpcCall: bscRpcCall,
       rpcBatch: calls => bscRpcBatch(calls, { requireAllResults: true }),
+      persistState: async candidateState => {
+        await commitFactoryPoolScanState(factoryPoolState, candidateState, saveStateFn);
+      },
       config: { ...CONFIG.factoryPoolMonitor, ...scanConfig },
       log,
     });
   } catch (error) {
-    if (!suppressNotifications) {
-      const partialChanges = collectFactoryPoolStateChanges(previousAssets, factoryPoolState);
-      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, partialChanges);
-      if (previousImplementation && factoryPoolState.currentImplementation !== previousImplementation) {
-        factoryPoolState.pendingImplementationChange = [...(factoryPoolState.implementationHistory || [])].reverse()
-          .find(change => change.previous === previousImplementation && change.current === factoryPoolState.currentImplementation)
-          || { previous: previousImplementation, current: factoryPoolState.currentImplementation };
+    const partialChanges = collectFactoryPoolStateChanges(previousAssets, workingState);
+    await withFactoryPoolStateWrite(() => {
+      mergeFactoryPoolScanState(factoryPoolState, workingState);
+      factoryPoolState.lastError = error.message;
+      if (!suppressNotifications) {
+        factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, partialChanges);
+        if (previousImplementation && workingState.currentImplementation !== previousImplementation) {
+          factoryPoolState.pendingImplementationChange = [...(workingState.implementationHistory || [])].reverse()
+            .find(change => change.previous === previousImplementation && change.current === workingState.currentImplementation)
+            || { previous: previousImplementation, current: workingState.currentImplementation };
+        }
       }
-      if (partialChanges.length > 0 || factoryPoolState.pendingImplementationChange) {
-        saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      if (!suppressNotifications && (partialChanges.length > 0 || factoryPoolState.pendingImplementationChange)) {
         log(`[Flap Factory] 扫描后续步骤失败，已保留 ${partialChanges.length} 个待发送状态变更`);
       }
-    }
+    });
     throw error;
   }
+  result = { ...result, state: factoryPoolState };
   if (suppressNotifications) {
-    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    await commitFactoryPoolScanState(factoryPoolState, workingState, saveStateFn);
     void scheduleMetadataFn({ state: factoryPoolState, result });
     return { ...result, sent: false };
   }
 
-  factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
-  if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
-  saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+  await withFactoryPoolStateWrite(() => {
+    mergeFactoryPoolScanState(factoryPoolState, workingState);
+    factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
+    if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+  });
 
   const changeDeliveryKey = change => [
     change.current?.quoteToken || "",
@@ -3108,23 +3369,27 @@ async function checkFlapFactoryPools(factoryPoolState, {
     change.current?.fingerprint || "",
   ].join(":");
   const deliver = async () => {
-    const changesToSend = [...factoryPoolState.pendingChanges];
-    const implementationToSend = factoryPoolState.pendingImplementationChange;
+    const deliveryState = await withFactoryPoolStateWrite(() => {
+      const changesToSend = [...factoryPoolState.pendingChanges];
+      const implementationToSend = factoryPoolState.pendingImplementationChange;
+      const sendingKeys = new Set(changesToSend.map(changeDeliveryKey));
+      factoryPoolState.sendingChanges = changesToSend;
+      factoryPoolState.sendingImplementationChange = implementationToSend;
+      factoryPoolState.pendingChanges = factoryPoolState.pendingChanges
+        .filter(change => !sendingKeys.has(changeDeliveryKey(change)));
+      if (factoryPoolState.pendingImplementationChange?.previous === implementationToSend?.previous
+        && factoryPoolState.pendingImplementationChange?.current === implementationToSend?.current) {
+        factoryPoolState.pendingImplementationChange = null;
+      }
+      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      return { changesToSend, implementationToSend };
+    });
+    const { changesToSend, implementationToSend } = deliveryState;
     const shouldNotify = changesToSend.length > 0 || Boolean(implementationToSend?.previous);
     if (!shouldNotify) {
       void scheduleMetadataFn({ state: factoryPoolState, result });
       return { ...result, sent: false };
     }
-    const sendingKeys = new Set(changesToSend.map(changeDeliveryKey));
-    factoryPoolState.sendingChanges = changesToSend;
-    factoryPoolState.sendingImplementationChange = implementationToSend;
-    factoryPoolState.pendingChanges = factoryPoolState.pendingChanges
-      .filter(change => !sendingKeys.has(changeDeliveryKey(change)));
-    if (factoryPoolState.pendingImplementationChange?.previous === implementationToSend?.previous
-      && factoryPoolState.pendingImplementationChange?.current === implementationToSend?.current) {
-      factoryPoolState.pendingImplementationChange = null;
-    }
-    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
     const pendingResult = {
       ...result,
       changes: changesToSend,
@@ -3136,29 +3401,31 @@ async function checkFlapFactoryPools(factoryPoolState, {
     try {
       messageId = await sendCardFn(title, initialContent, "red");
     } catch (error) {
-      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(changesToSend, factoryPoolState.pendingChanges);
-      if (!factoryPoolState.pendingImplementationChange?.previous) {
-        factoryPoolState.pendingImplementationChange = implementationToSend;
-      }
-      factoryPoolState.sendingChanges = [];
-      factoryPoolState.sendingImplementationChange = null;
-      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      await withFactoryPoolStateWrite(() => {
+        factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(changesToSend, factoryPoolState.pendingChanges);
+        if (!factoryPoolState.pendingImplementationChange?.previous) factoryPoolState.pendingImplementationChange = implementationToSend;
+        factoryPoolState.sendingChanges = [];
+        factoryPoolState.sendingImplementationChange = null;
+        saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      });
       throw error;
     }
     if (!messageId) {
-      factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(changesToSend, factoryPoolState.pendingChanges);
-      if (!factoryPoolState.pendingImplementationChange?.previous) {
-        factoryPoolState.pendingImplementationChange = implementationToSend;
-      }
-      factoryPoolState.sendingChanges = [];
-      factoryPoolState.sendingImplementationChange = null;
-      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      await withFactoryPoolStateWrite(() => {
+        factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(changesToSend, factoryPoolState.pendingChanges);
+        if (!factoryPoolState.pendingImplementationChange?.previous) factoryPoolState.pendingImplementationChange = implementationToSend;
+        factoryPoolState.sendingChanges = [];
+        factoryPoolState.sendingImplementationChange = null;
+        saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+      });
       void scheduleMetadataFn({ state: factoryPoolState, result: pendingResult });
       return { ...result, sent: false };
     }
-    factoryPoolState.sendingChanges = [];
-    factoryPoolState.sendingImplementationChange = null;
-    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    await withFactoryPoolStateWrite(() => {
+      factoryPoolState.sendingChanges = [];
+      factoryPoolState.sendingImplementationChange = null;
+      saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
+    });
     void scheduleMetadataFn({
       state: factoryPoolState,
       result: pendingResult,
@@ -3171,7 +3438,6 @@ async function checkFlapFactoryPools(factoryPoolState, {
   };
   const delivery = factoryPoolDeliveryQueue.then(deliver, deliver);
   factoryPoolDeliveryQueue = delivery.catch(error => {
-    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState);
     log(`[Flap Factory] 待发送通知保留，异步发送失败：${error.message}`);
   });
   if (awaitDelivery) return await delivery;
@@ -5565,9 +5831,7 @@ async function startMonitor() {
         scanConfig: { scanRealtime: true, scanCatchup: false, scanHistory: false },
       });
     } catch (err) {
-      factoryPoolState.lastError = err.message;
-      factoryPoolState.lastRunAt = ts();
-      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
       log(`[Flap Factory] 启动检测失败：${err.message}`);
     }
   }
@@ -5600,9 +5864,7 @@ async function startMonitor() {
         awaitDelivery: false,
       });
     } catch (err) {
-      factoryPoolState.lastError = err.message;
-      factoryPoolState.lastRunAt = ts();
-      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
       log(`[Flap Factory 实时] 检测失败：${err.message}`);
     } finally {
       isFactoryRealtimeScanning = false;
@@ -5619,9 +5881,7 @@ async function startMonitor() {
         awaitDelivery: false,
       });
     } catch (err) {
-      factoryPoolState.lastError = err.message;
-      factoryPoolState.lastRunAt = ts();
-      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
       log(`[Flap Factory 漏检] 检测失败：${err.message}`);
     } finally {
       isFactoryFallbackScanning = false;
@@ -5639,9 +5899,7 @@ async function startMonitor() {
         awaitDelivery: false,
       });
     } catch (err) {
-      factoryPoolState.lastError = err.message;
-      factoryPoolState.lastRunAt = ts();
-      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
       log(`[Flap Factory 补扫] 检测失败：${err.message}`);
     } finally {
       isFactoryCatchupScanning = false;
@@ -5659,9 +5917,7 @@ async function startMonitor() {
         awaitDelivery: false,
       });
     } catch (err) {
-      factoryPoolState.lastError = err.message;
-      factoryPoolState.lastRunAt = ts();
-      try { saveFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, factoryPoolState); } catch {}
+      try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
       log(`[Flap Factory 历史] 检测失败：${err.message}`);
     } finally {
       isFactoryHistoryScanning = false;
@@ -6068,6 +6324,8 @@ export const __testables = {
   resolveFactoryPoolTokenMetadata,
   bscRpcCall,
   bscRpcBatch,
+  executeBscGetLogsRequest,
+  mergeFactoryPoolScanState,
   resetBscRpcHealth,
   buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,

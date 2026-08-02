@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 7;
+export const FACTORY_POOL_SCHEMA_VERSION = 8;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -235,6 +235,14 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     pendingImplementationChange: null,
     sendingChanges: [],
     sendingImplementationChange: null,
+    verificationHealth: {
+      pendingCount: 0,
+      failingCount: 0,
+      consecutiveFailures: 0,
+      lastError: "",
+      lastFailureAt: "",
+      lastSuccessAt: "",
+    },
     lastRealtimeRunAt: "",
     lastCatchupRunAt: "",
     lastHistoryRunAt: "",
@@ -264,6 +272,13 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
     if (typeof candidate.effectiveEnabled !== "boolean") {
       candidate.effectiveEnabled = Boolean(candidate.configured) && !candidate.creationDisabled;
     }
+    if (typeof candidate.pendingVerification !== "boolean") {
+      candidate.pendingVerification = Boolean(candidate.lastVerifyError) || !candidate.lastVerifiedAt;
+    }
+    if (!Number.isFinite(candidate.verifyFailureCount)) candidate.verifyFailureCount = 0;
+    if (!Number.isFinite(candidate.consecutiveVerifyFailures)) candidate.consecutiveVerifyFailures = 0;
+    if (!Number.isFinite(candidate.lastVerifyAttemptAtMs)) candidate.lastVerifyAttemptAtMs = 0;
+    if (!Number.isFinite(candidate.lastVerifyBlock)) candidate.lastVerifyBlock = 0;
   }
   // v7 重放轻量状态事件历史，让错过实时窗口的实例无需完整扫块即可重建候选。
   if (previousSchemaVersion < 7) state.historyStateEventCursor = null;
@@ -282,6 +297,10 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
     state.pendingImplementationChange = state.sendingImplementationChange;
   }
   state.sendingImplementationChange = null;
+  if (!state.verificationHealth || typeof state.verificationHealth !== "object") {
+    state.verificationHealth = { ...base.verificationHealth };
+  }
+  refreshCandidateVerificationHealth(state);
   return state;
 }
 
@@ -312,6 +331,11 @@ function rememberCandidate(state, item) {
     lastSeenBlock: item.blockNumber || null,
     sources: [],
     sourceCount: 0,
+    pendingVerification: true,
+    verifyFailureCount: 0,
+    consecutiveVerifyFailures: 0,
+    lastVerifyAttemptAtMs: 0,
+    lastVerifyBlock: 0,
   };
   const key = candidateKey({ ...item, quoteToken });
   if (current.sources.some(source => source.key === key)) return false;
@@ -319,6 +343,9 @@ function rememberCandidate(state, item) {
     ? (item.blockNumber || null)
     : Math.min(current.firstSeenBlock, item.blockNumber || current.firstSeenBlock);
   current.lastSeenBlock = Math.max(current.lastSeenBlock || 0, item.blockNumber || 0) || null;
+  current.lastTxHash = String(item.txHash || current.lastTxHash || "").toLowerCase();
+  current.lastSourceBlock = item.blockNumber ?? current.lastSourceBlock ?? null;
+  current.pendingVerification = true;
   current.sources.push({
     key,
     source: item.source || "unknown",
@@ -347,6 +374,27 @@ function rememberCandidate(state, item) {
     state.relatedSelectors[selector] = related;
   }
   return true;
+}
+
+function refreshCandidateVerificationHealth(state) {
+  const candidates = Object.values(state.candidates || {});
+  const pending = candidates.filter(candidate => candidate?.pendingVerification);
+  const failing = pending.filter(candidate => candidate.lastVerifyError);
+  const latestFailure = [...failing].sort((left, right) =>
+    (right.lastVerifyAttemptAtMs || 0) - (left.lastVerifyAttemptAtMs || 0))[0];
+  const previous = state.verificationHealth || {};
+  state.verificationHealth = {
+    pendingCount: pending.length,
+    failingCount: failing.length,
+    consecutiveFailures: failing.reduce((total, candidate) => total + (candidate.consecutiveVerifyFailures || 0), 0),
+    lastError: latestFailure?.lastVerifyError || "",
+    lastFailureAt: latestFailure?.lastVerifyFailureAt || previous.lastFailureAt || "",
+    lastSuccessAt: previous.lastSuccessAt || "",
+  };
+  if (failing.length > 0) {
+    state.lastError = `候选复核失败 ${failing.length} 个：${latestFailure.quoteToken}｜${latestFailure.lastVerifyError}`;
+  }
+  return state.verificationHealth;
 }
 
 function updateHistoryFloor(state) {
@@ -534,18 +582,32 @@ export function classifyFactoryPoolChange(previous, current) {
   return "modified";
 }
 
-async function verifyCandidates({ state, rpcCall, items, blockTag = "latest" }) {
+async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", persistState, log }) {
   const unique = new Map();
+  let discoveredCandidate = false;
   for (const item of items) {
     const address = normalizeAddress(item.quoteToken);
     if (!address) continue;
+    if (item.source !== "periodic-refresh" && item.source !== "pending-retry") {
+      discoveredCandidate = rememberCandidate(state, { ...item, quoteToken: address }) || discoveredCandidate;
+    }
     if (!unique.has(address) || (!unique.get(address)?.selector && item.selector)) unique.set(address, item);
+  }
+  if (discoveredCandidate && typeof persistState === "function") {
+    refreshCandidateVerificationHealth(state);
+    await persistState(state, { reason: "candidate-discovered" });
   }
 
   const changes = [];
   for (const [quoteToken, source] of unique) {
     let decoded;
     let creationDisabled;
+    const candidate = state.candidates[quoteToken]
+      || (rememberCandidate(state, { ...source, quoteToken }), state.candidates[quoteToken]);
+    candidate.pendingVerification = true;
+    candidate.lastVerifyAttemptAtMs = Date.now();
+    candidate.lastVerifyAttemptAt = nowText();
+    candidate.lastVerifyBlock = hexToNumber(blockTag) || state.safeLatestBlock || source.blockNumber || 0;
     try {
       const [configurationRaw, creationDisabledRaw] = await Promise.all([
         rpcCall("eth_call", [{ to: state.proxy, data: buildQuoteTokenConfigurationCall(quoteToken) }, blockTag], { requireResult: true }),
@@ -554,15 +616,26 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest" }) 
       decoded = decodeQuoteTokenConfiguration(configurationRaw);
       creationDisabled = decodeBooleanResult(creationDisabledRaw);
     } catch (error) {
-      const candidate = state.candidates[quoteToken];
-      if (candidate) candidate.lastVerifyError = error.message;
+      candidate.lastVerifyError = error.message;
+      candidate.lastVerifyFailureAt = nowText();
+      candidate.verifyFailureCount = (candidate.verifyFailureCount || 0) + 1;
+      candidate.consecutiveVerifyFailures = (candidate.consecutiveVerifyFailures || 0) + 1;
+      candidate.pendingVerification = true;
+      refreshCandidateVerificationHealth(state);
+      if (candidate.consecutiveVerifyFailures === 1 || candidate.consecutiveVerifyFailures % 10 === 0) {
+        log?.(`[Flap Factory] 候选复核失败 ${quoteToken}（连续 ${candidate.consecutiveVerifyFailures} 次）：${error.message}`);
+      }
+      if (typeof persistState === "function") {
+        await persistState(state, { reason: "candidate-verify-failed", quoteToken });
+      }
       continue;
     }
     const previous = state.assets[quoteToken];
-    if (source.source !== "periodic-refresh" || !state.candidates[quoteToken]) rememberCandidate(state, { ...source, quoteToken });
-    const candidate = state.candidates[quoteToken];
     candidate.lastVerifiedAt = nowText();
     candidate.lastVerifyError = "";
+    candidate.lastVerifyFailureAt = "";
+    candidate.consecutiveVerifyFailures = 0;
+    candidate.pendingVerification = false;
     candidate.configured = decoded.configured;
     candidate.creationDisabled = creationDisabled;
     candidate.effectiveEnabled = decoded.configured && !creationDisabled;
@@ -593,16 +666,22 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest" }) 
       metadataUpdatedAt: previous?.metadataUpdatedAt || "",
       metadataNextRetryAt: previous?.metadataNextRetryAt || "",
       metadataError: previous?.metadataError || "",
+      lastVerifiedBlock: hexToNumber(blockTag) || state.safeLatestBlock || source.blockNumber || null,
+      lastVerifiedAtMs: candidate.lastVerifyAttemptAtMs,
     };
     state.assets[quoteToken] = next;
     if (!previous || previous.fingerprint !== next.fingerprint) {
       changes.push({ type: classifyFactoryPoolChange(previous, next), previous: previous || null, current: next });
     }
   }
+  const health = refreshCandidateVerificationHealth(state);
+  if (health.failingCount === 0) {
+    state.verificationHealth.lastSuccessAt = nowText();
+  }
   return changes;
 }
 
-async function refreshKnownAssets({ state, rpcCall, limit, blockTag }) {
+async function refreshKnownAssets({ state, rpcCall, limit, blockTag, persistState, log }) {
   const addresses = Object.keys(state.assets).sort();
   if (addresses.length === 0 || limit <= 0) return [];
   const start = Math.max(0, Number(state.assetRefreshCursor) || 0) % addresses.length;
@@ -615,6 +694,8 @@ async function refreshKnownAssets({ state, rpcCall, limit, blockTag }) {
     state,
     rpcCall,
     blockTag,
+    persistState,
+    log,
     items: selected.map(quoteToken => ({ quoteToken, source: "periodic-refresh" })),
   });
 }
@@ -662,7 +743,7 @@ function dedupeChanges(changes) {
   return unique;
 }
 
-async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag }) {
+async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag, persistState, log }) {
   if (fromBlock > toBlock) return { changes: [], toBlock: fromBlock - 1, checkpoints: {} };
   const logRange = await fetchRangeLogs(rpcCall, state.proxy, fromBlock, toBlock);
   const scannedTo = logRange.toBlock;
@@ -673,7 +754,7 @@ async function scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, 
     ...fullBlocks.items,
   ];
   return {
-    changes: await verifyCandidates({ state, rpcCall, items, blockTag }),
+    changes: await verifyCandidates({ state, rpcCall, items, blockTag, persistState, log }),
     toBlock: scannedTo,
     checkpoints: fullBlocks.checkpoints,
   };
@@ -731,7 +812,17 @@ function deriveRealtimeStateEventChanges(logs, previousAssets, finalAssets, prox
   return { changes, addresses: new Set(transientAssets.keys()) };
 }
 
-async function scanStateEventRange({ state, rpcCall, fromBlock, toBlock, blockTag, preserveTransitions = false }) {
+async function scanStateEventRange({
+  state,
+  rpcCall,
+  fromBlock,
+  toBlock,
+  blockTag,
+  preserveTransitions = false,
+  retryPending = false,
+  persistState,
+  log,
+}) {
   if (fromBlock > toBlock) return { changes: [], toBlock: fromBlock - 1 };
   const logRange = await fetchRangeLogs(
     rpcCall,
@@ -741,12 +832,23 @@ async function scanStateEventRange({ state, rpcCall, fromBlock, toBlock, blockTa
     [FACTORY_POOL_STATE_EVENT_TOPICS],
   );
   const items = (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
+  if (retryPending) {
+    for (const candidate of Object.values(state.candidates || {})) {
+      if (!candidate?.pendingVerification) continue;
+      items.push({
+        quoteToken: candidate.quoteToken,
+        source: "pending-retry",
+        txHash: candidate.lastTxHash || "",
+        blockNumber: candidate.lastSourceBlock || candidate.lastSeenBlock || null,
+      });
+    }
+  }
   const previousAssets = preserveTransitions
     ? new Map([...new Set(items.map(item => item.quoteToken))]
         .filter(quoteToken => state.assets[quoteToken])
         .map(quoteToken => [quoteToken, { ...state.assets[quoteToken] }]))
     : new Map();
-  const verifiedChanges = await verifyCandidates({ state, rpcCall, items, blockTag });
+  const verifiedChanges = await verifyCandidates({ state, rpcCall, items, blockTag, persistState, log });
   if (!preserveTransitions || previousAssets.size === 0) {
     return { changes: verifiedChanges, toBlock: logRange.toBlock };
   }
@@ -765,7 +867,7 @@ function trimBlockCheckpoints(state, confirmations) {
   while (blocks.length > Math.max(40, confirmations * 8)) delete state.blockCheckpoints[blocks.shift()];
 }
 
-export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}, log } = {}) {
+export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, persistState, config = {}, log } = {}) {
   if (!state || typeof rpcCall !== "function") throw new Error("Factory 扫描缺少 state 或 rpcCall");
   const cfg = {
     confirmations: 0,
@@ -848,6 +950,9 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
           toBlock: safeLatest,
           blockTag: safeBlockTag,
           preserveTransitions: true,
+          retryPending: true,
+          persistState,
+          log,
         }),
         refreshImplementation({ state, rpcCall, log }),
       ]);
@@ -865,12 +970,28 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     if (!Number.isFinite(state.fallbackLastScannedBlock)) {
       state.fallbackLastScannedBlock = Math.max(state.deploymentBlock - 1, safeLatest - cfg.realtimeBootstrapBlocks);
     }
-    allChanges.push(...await refreshKnownAssets({ state, rpcCall, limit: cfg.assetRefreshPerRun, blockTag: safeBlockTag }));
+    allChanges.push(...await refreshKnownAssets({
+      state,
+      rpcCall,
+      limit: cfg.assetRefreshPerRun,
+      blockTag: safeBlockTag,
+      persistState,
+      log,
+    }));
     reorg = await rollbackReorgIfNeeded({ state, rpcCall, log });
     if (state.fallbackLastScannedBlock < safeLatest) {
       const fromBlock = state.fallbackLastScannedBlock + 1;
       const toBlock = Math.min(safeLatest, fromBlock + cfg.realtimeMaxBlocksPerRun - 1);
-      const range = await scanForwardRange({ state, rpcCall, rpcBatch, fromBlock, toBlock, blockTag: safeBlockTag });
+      const range = await scanForwardRange({
+        state,
+        rpcCall,
+        rpcBatch,
+        fromBlock,
+        toBlock,
+        blockTag: safeBlockTag,
+        persistState,
+        log,
+      });
       allChanges.push(...range.changes);
       state.fallbackLastScannedBlock = range.toBlock;
       Object.assign(state.blockCheckpoints, range.checkpoints);
@@ -892,6 +1013,8 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
         fromBlock,
         toBlock,
         blockTag: safeBlockTag,
+        persistState,
+        log,
       });
       allChanges.push(...range.changes);
       state.lastScannedBlock = Math.max(state.lastScannedBlock, range.toBlock);
@@ -918,7 +1041,14 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
     })));
     const stateEventItems = stateEventResults.flatMap(({ result: logRange }) =>
       (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy)));
-    allChanges.push(...await verifyCandidates({ state, rpcCall, items: stateEventItems, blockTag: safeBlockTag }));
+    allChanges.push(...await verifyCandidates({
+      state,
+      rpcCall,
+      items: stateEventItems,
+      blockTag: safeBlockTag,
+      persistState,
+      log,
+    }));
     let contiguousCursor = state.historyStateEventCursor;
     for (const { range, result: logRange } of stateEventResults) {
       if (range.toBlock !== contiguousCursor - 1) break;
@@ -939,7 +1069,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       recordProxyUpgradeEvents(state, logRange.logs);
       const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
       const items = collectCandidatesFromLogsAndTransactions(logRange.logs, transactions, state.proxy);
-      allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag }));
+      allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag, persistState, log }));
       state.historyBackwardLogCursor = logRange.fromBlock;
     }
 
@@ -950,7 +1080,14 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
         const toBlock = state.historyBackwardBlockCursor - 1;
         const fromBlock = Math.max(backwardBlockFloor, toBlock - cfg.historyBackwardBlockChunkBlocks + 1);
         const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, toBlock, rpcBatch);
-        allChanges.push(...await verifyCandidates({ state, rpcCall, items: fullBlocks.items, blockTag: safeBlockTag }));
+        allChanges.push(...await verifyCandidates({
+          state,
+          rpcCall,
+          items: fullBlocks.items,
+          blockTag: safeBlockTag,
+          persistState,
+          log,
+        }));
         state.historyBackwardBlockCursor = fromBlock;
       }
     }
@@ -963,7 +1100,7 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       recordProxyUpgradeEvents(state, logRange.logs);
       const transactions = await collectTransactionsForLogs(rpcCall, logRange.logs, rpcBatch);
       const items = collectCandidatesFromLogsAndTransactions(logRange.logs, transactions, state.proxy);
-      allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag }));
+      allChanges.push(...await verifyCandidates({ state, rpcCall, items, blockTag: safeBlockTag, persistState, log }));
       state.historyLogLastScannedBlock = logRange.toBlock;
     }
 
@@ -972,7 +1109,14 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
       const fromBlock = state.historyBlockLastScannedBlock + 1;
       const toBlock = Math.min(forwardBlockTarget, fromBlock + cfg.historyBlockChunkBlocks - 1);
       const fullBlocks = await scanFullBlockRange(rpcCall, state.proxy, fromBlock, toBlock, rpcBatch);
-      allChanges.push(...await verifyCandidates({ state, rpcCall, items: fullBlocks.items, blockTag: safeBlockTag }));
+      allChanges.push(...await verifyCandidates({
+        state,
+        rpcCall,
+        items: fullBlocks.items,
+        blockTag: safeBlockTag,
+        persistState,
+        log,
+      }));
       state.historyBlockLastScannedBlock = toBlock;
     }
     state.lastHistoryRunAt = nowText();
@@ -980,7 +1124,10 @@ export async function runFactoryPoolScan({ state, rpcCall, rpcBatch, config = {}
 
   updateHistoryFloor(state);
   state.lastRunAt = nowText();
-  state.lastError = "";
+  const verificationHealth = refreshCandidateVerificationHealth(state);
+  state.lastError = verificationHealth.failingCount > 0
+    ? `候选复核失败 ${verificationHealth.failingCount} 个：${verificationHealth.lastError}`
+    : "";
   return {
     changed: allChanges.length > 0 || Boolean(implementationChange),
     changes: dedupeChanges(allChanges),

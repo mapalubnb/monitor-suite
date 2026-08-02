@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 process.env.FLAP_MONITOR_TEST = "1";
 
@@ -70,6 +71,40 @@ test("Factory RPC hedging uses the first valid low-latency node", async () => {
     const result = await __testables.bscRpcCall("eth_blockNumber", [], { requireResult: true });
     assert.equal(result, "0x2");
     assert.ok(Date.now() - startedAt < 180);
+  } finally {
+    globalThis.fetch = originalFetch;
+    __testables.CONFIG.bscRpcUrls = originalUrls;
+    __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs = originalHedgeDelay;
+    __testables.resetBscRpcHealth();
+  }
+});
+
+test("Factory eth_getLogs ignores one empty RPC when another returns logs", async () => {
+  const originalFetch = globalThis.fetch;
+  const originalUrls = __testables.CONFIG.bscRpcUrls;
+  const originalHedgeDelay = __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs;
+  const txHash = `0x${"ab".repeat(32)}`;
+  __testables.CONFIG.bscRpcUrls = ["https://empty.rpc", "https://logs.rpc"];
+  __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs = 50;
+  __testables.resetBscRpcHealth();
+  globalThis.fetch = async url => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      jsonrpc: "2.0",
+      id: 1,
+      result: String(url).includes("empty") ? [] : [{
+        transactionHash: txHash,
+        logIndex: "0x0",
+        blockNumber: "0x64",
+        transactionIndex: "0x0",
+      }],
+    }),
+  });
+  try {
+    const result = await __testables.executeBscGetLogsRequest([{ fromBlock: "0x64", toBlock: "0x64" }]);
+    assert.equal(result.length, 1);
+    assert.equal(result[0].transactionHash, txHash);
   } finally {
     globalThis.fetch = originalFetch;
     __testables.CONFIG.bscRpcUrls = originalUrls;
@@ -491,7 +526,7 @@ test("Factory schema migration replays state-event history and preserves assets"
       },
     },
   });
-  assert.equal(migrated.schemaVersion, 7);
+  assert.equal(migrated.schemaVersion, 8);
   assert.equal(migrated.historyStateEventCursor, null);
   assert.equal("historyConfigEventCursor" in migrated, false);
   assert.equal(migrated.pendingChanges.length, 1);
@@ -700,6 +735,186 @@ test("Factory realtime fast path rescans the latest blocks without duplicate cha
   assert.equal(result.changed, false);
 });
 
+test("Factory pending candidate survives a failed getter and succeeds on the next realtime scan", async () => {
+  const token = "0x4545454545454545454545454545454545454545";
+  const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
+  const txHash = `0x${"45".repeat(32)}`;
+  const state = createFactoryPoolState();
+  Object.assign(state, {
+    deploymentBlock: 1,
+    deploymentTxChecked: true,
+    deploymentDetection: "test",
+    currentImplementation: implementation,
+    headLastScannedBlock: 99,
+    lastScannedBlock: 99,
+  });
+  const getterResult = `0x${[1n, 35n, 35n, 7n, 0n].map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  let latestBlock = 100;
+  let failGetter = true;
+  const lifecycle = [];
+  const rpcCall = async (method, params) => {
+    if (method === "eth_chainId") return "0x38";
+    if (method === "eth_blockNumber") return `0x${latestBlock.toString(16)}`;
+    if (method === "eth_getStorageAt") return `0x${"0".repeat(24)}${implementation.slice(2)}`;
+    if (method === "eth_getCode") return "0x8063aabbccdd146100";
+    if (method === "eth_getLogs") {
+      if (latestBlock > 100) return [];
+      return [{
+        address: FLAP_FACTORY_PROXY,
+        topics: [QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC],
+        data: `0x${token.slice(2).padStart(64, "0")}${[1n, 35n, 35n, 7n, 0n].map(value => value.toString(16).padStart(64, "0")).join("")}`,
+        transactionHash: txHash,
+        blockNumber: "0x64",
+        logIndex: "0x0",
+      }];
+    }
+    if (method === "eth_call") {
+      lifecycle.push("eth_call");
+      if (failGetter) throw new Error("temporary getter failure");
+      return factoryGetterResult(method, params, getterResult, BOOLEAN_FALSE_RESULT);
+    }
+    throw new Error(`unexpected RPC method ${method}`);
+  };
+  const config = {
+    confirmations: 0,
+    scanRealtime: true,
+    scanCatchup: false,
+    scanHistory: false,
+    assetRefreshPerRun: 0,
+  };
+  const first = await runFactoryPoolScan({
+    state,
+    rpcCall,
+    config,
+    persistState: async persistedState => {
+      lifecycle.push("persist");
+      assert.equal(persistedState.candidates[token].lastTxHash, txHash);
+      assert.equal(persistedState.candidates[token].lastSourceBlock, 100);
+    },
+  });
+  assert.equal(lifecycle[0], "persist");
+  assert.equal(first.changes.length, 0);
+  assert.equal(state.headLastScannedBlock, 100);
+  assert.equal(state.candidates[token].pendingVerification, true);
+  assert.match(state.candidates[token].lastVerifyError, /temporary getter failure/);
+  assert.equal(state.verificationHealth.failingCount, 1);
+  assert.match(state.lastError, /候选复核失败/);
+
+  failGetter = false;
+  latestBlock = 101;
+  const second = await runFactoryPoolScan({ state, rpcCall, config, persistState: async () => {} });
+  assert.equal(second.changes.length, 1);
+  assert.equal(second.changes[0].type, "added");
+  assert.equal(state.candidates[token].pendingVerification, false);
+  assert.equal(state.candidates[token].lastVerifyError, "");
+  assert.equal(state.verificationHealth.failingCount, 0);
+  assert.equal(state.lastError, "");
+});
+
+test("Factory realtime and background scans merge cursors assets and notifications", async () => {
+  const realtimeToken = "0x1111111111111111111111111111111111111111";
+  const historyToken = "0x2222222222222222222222222222222222222222";
+  const state = createFactoryPoolState();
+  state.latestBlock = 100;
+  state.headLastScannedBlock = 100;
+  state.historyBackwardLogCursor = 100;
+  const sentContents = [];
+  let realtimeEntered;
+  let historyEntered;
+  const realtimeReady = new Promise(resolve => { realtimeEntered = resolve; });
+  const historyReady = new Promise(resolve => { historyEntered = resolve; });
+  const scanFn = async ({ state: working, config }) => {
+    const realtime = config.scanRealtime;
+    if (realtime) {
+      realtimeEntered();
+      await historyReady;
+    } else {
+      historyEntered();
+      await realtimeReady;
+    }
+    const token = realtime ? realtimeToken : historyToken;
+    const asset = {
+      quoteToken: token,
+      configured: true,
+      creationDisabled: false,
+      effectiveEnabled: true,
+      fingerprint: realtime ? "realtime" : "history",
+      lastVerifiedAtMs: realtime ? 200 : 150,
+    };
+    working.assets[token] = asset;
+    working.candidates[token] = {
+      quoteToken: token,
+      pendingVerification: false,
+      lastVerifyAttemptAtMs: asset.lastVerifiedAtMs,
+      sources: [],
+    };
+    if (realtime) {
+      working.latestBlock = 200;
+      working.headLastScannedBlock = 200;
+    } else {
+      working.historyBackwardLogCursor = 50;
+    }
+    return {
+      changed: true,
+      changes: [{ type: "added", previous: null, current: asset }],
+      implementationChange: null,
+      state: working,
+    };
+  };
+  const common = {
+    scanFn,
+    sendCardFn: async (_title, content) => {
+      sentContents.push(content);
+      return `om_${sentContents.length}`;
+    },
+    saveStateFn: () => {},
+    pinFn: async () => {},
+    scheduleMetadataFn: async () => ({ patched: false }),
+  };
+  await Promise.all([
+    __testables.checkFlapFactoryPools(state, { ...common, scanConfig: { scanRealtime: true, scanHistory: false } }),
+    __testables.checkFlapFactoryPools(state, { ...common, scanConfig: { scanRealtime: false, scanHistory: true } }),
+  ]);
+  assert.equal(state.headLastScannedBlock, 200);
+  assert.equal(state.historyBackwardLogCursor, 50);
+  assert.ok(state.assets[realtimeToken]);
+  assert.ok(state.assets[historyToken]);
+  assert.ok(sentContents.length >= 1);
+  const delivered = sentContents.join("\n");
+  assert.match(delivered, new RegExp(realtimeToken));
+  assert.match(delivered, new RegExp(historyToken));
+});
+
+test("Factory state merge prefers newer chain data and preserves an explicit reorg rollback", () => {
+  const token = "0x3333333333333333333333333333333333333333";
+  const target = createFactoryPoolState();
+  Object.assign(target, {
+    latestBlock: 200,
+    headLastScannedBlock: 200,
+    fallbackLastScannedBlock: 200,
+    lastScannedBlock: 200,
+    blockCheckpoints: { 200: "0xold" },
+    assets: {
+      [token]: { quoteToken: token, fingerprint: "new", lastVerifiedBlock: 200, lastVerifiedAtMs: 100 },
+    },
+  });
+  const stale = structuredClone(target);
+  stale.assets[token] = { quoteToken: token, fingerprint: "stale", lastVerifiedBlock: 199, lastVerifiedAtMs: 999 };
+  __testables.mergeFactoryPoolScanState(target, stale);
+  assert.equal(target.assets[token].fingerprint, "new");
+
+  const rollback = structuredClone(target);
+  rollback.headLastScannedBlock = 199;
+  rollback.fallbackLastScannedBlock = 199;
+  rollback.lastScannedBlock = 199;
+  rollback.blockCheckpoints = {};
+  __testables.mergeFactoryPoolScanState(target, rollback);
+  assert.equal(target.headLastScannedBlock, 199);
+  assert.equal(target.fallbackLastScannedBlock, 199);
+  assert.equal(target.lastScannedBlock, 199);
+  assert.deepEqual(target.blockCheckpoints, {});
+});
+
 test("Factory realtime state event discovers paused QQQB with its current on-chain configuration", async () => {
   const token = "0x205812cdbed920aff76c6580abd681a46d11efc7";
   const implementation = "0x150103da235bc6caef37a7ca31373bbdf40ccd2e";
@@ -845,6 +1060,34 @@ test("Factory reverse state-event scan discovers active TSLAB without hardcoded 
   assert.equal(result.changes[0].type, "added");
   assert.equal(state.assets[token].effectiveEnabled, true);
   assert.deepEqual(state.assets[token].values, ["1", "37", "37", "7", "0"]);
+});
+
+test("Factory real TSLAB event fixture preserves configuration and resume evidence", () => {
+  const fixture = JSON.parse(readFileSync(new URL("./fixtures/factory-pool-events.json", import.meta.url), "utf-8")).tslab;
+  const token = fixture.quoteToken.toLowerCase();
+  const configuration = extractFactoryLogCandidates({
+    address: FLAP_FACTORY_PROXY,
+    topics: [fixture.configuration.topic0],
+    data: `0x${token.slice(2).padStart(64, "0")}${fixture.configuration.values
+      .map(value => BigInt(value).toString(16).padStart(64, "0")).join("")}`,
+    transactionHash: fixture.configuration.transactionHash,
+    blockNumber: `0x${fixture.configuration.blockNumber.toString(16)}`,
+    logIndex: "0x0",
+  });
+  const resumed = extractFactoryLogCandidates({
+    address: FLAP_FACTORY_PROXY,
+    topics: [fixture.creationResumed.topic0, `0x${token.slice(2).padStart(64, "0")}`],
+    data: BOOLEAN_FALSE_RESULT,
+    transactionHash: fixture.creationResumed.transactionHash,
+    blockNumber: `0x${fixture.creationResumed.blockNumber.toString(16)}`,
+    logIndex: "0x1",
+  });
+  assert.equal(configuration[0].quoteToken, token);
+  assert.equal(configuration[0].txHash, fixture.configuration.transactionHash);
+  assert.equal(configuration[0].blockNumber, fixture.configuration.blockNumber);
+  assert.equal(resumed[0].quoteToken, token);
+  assert.equal(resumed[0].txHash, fixture.creationResumed.transactionHash);
+  assert.equal(resumed[0].blockNumber, fixture.creationResumed.blockNumber);
 });
 
 test("Factory fallback path discovers transaction candidates and stays deduplicated after fast delivery", async () => {

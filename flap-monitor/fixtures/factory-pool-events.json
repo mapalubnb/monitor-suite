@@ -1,0 +1,17 @@
+{
+  "tslab": {
+    "quoteToken": "0x5b1910eAaD6450E50f816082Aa078C41F10C292f",
+    "configuration": {
+      "blockNumber": 113153082,
+      "transactionHash": "0x99f138e8f529b6b810dd2ed856f651c0df33c2562a8c961740a54ce6cb7f184b",
+      "topic0": "0x9a1f38e55c729ebf0c45d240a00b09f0a79a715df7cfd6e8942bd3f8da839199",
+      "values": [1, 37, 37, 7, 0]
+    },
+    "creationResumed": {
+      "blockNumber": 113171883,
+      "transactionHash": "0xc04d5df8a09bebfaf831d72b7d1d96795691d642e9962a30083a8d0421e6a1bc",
+      "topic0": "0xe5b8809453111201d2eac9f84326f432b0227317d947894494170516ed3e68b7",
+      "disabled": false
+    }
+  }
+}
