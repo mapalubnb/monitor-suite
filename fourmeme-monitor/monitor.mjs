@@ -160,6 +160,7 @@ const CONFIG = {
   actorStateFile: join(__dirname, "actor-state.json"),
   runtimeMetricsFile: join(__dirname, "runtime-metrics.json"),
   frontendRouteDecisionsFile: join(__dirname, "frontend-route-decisions.json"),
+  frontendAssetFailuresFile: join(__dirname, "frontend-asset-failures.json"),
 
   // ── 反风控 ──
   // 每次请求随机抖动范围（毫秒），叠加到间隔上
@@ -367,7 +368,80 @@ function staticAssetHeaders(assetUrl, referer = "", userAgent = PROCESS_BROWSER_
 // --- Per-domain 自适应退避 ---
 const domainBackoff = new Map(); // domain -> { delayMs, lastFail }
 const frontendAssetWarningState = new Map();
+const frontendAssetRetryState = new Map();
 const FRONTEND_ASSET_WARNING_COOLDOWN_MS = 10 * 60_000;
+const FRONTEND_ASSET_RETRY_INITIAL_MS = 30_000;
+const FRONTEND_ASSET_RETRY_MAX_MS = 300_000;
+const FRONTEND_ASSET_RETRY_MAX_ENTRIES = 500;
+let frontendAssetDiagnosticsDirty = false;
+
+function currentFrontendAssetRetry(url, now = Date.now()) {
+  const state = frontendAssetRetryState.get(url);
+  if (!state || state.nextRetryAt <= now) return null;
+  return { ...state, remainingMs: state.nextRetryAt - now };
+}
+
+function describeAssetDownloadError(error) {
+  if (!error) return "下载失败";
+  if (isTransientNetworkError(error)) return formatNetworkError(error);
+  return error?.message || String(error);
+}
+
+function recordFrontendAssetFailure(url, failure, now = Date.now()) {
+  if (!url) return null;
+  const previous = frontendAssetRetryState.get(url);
+  const failCount = (previous?.failCount || 0) + 1;
+  const delayMs = Math.min(
+    FRONTEND_ASSET_RETRY_INITIAL_MS * (2 ** Math.min(failCount - 1, 8)),
+    FRONTEND_ASSET_RETRY_MAX_MS,
+  );
+  const state = {
+    url,
+    filename: failure?.filename || previous?.filename || "",
+    reason: failure?.reason || "网络错误",
+    message: failure?.message || "下载失败",
+    referer: failure?.referer || previous?.referer || "",
+    failCount,
+    lastFailedAt: now,
+    nextRetryAt: now + delayMs,
+  };
+  frontendAssetRetryState.set(url, state);
+  if (frontendAssetRetryState.size > FRONTEND_ASSET_RETRY_MAX_ENTRIES) {
+    const oldest = [...frontendAssetRetryState.entries()]
+      .sort(([, a], [, b]) => a.lastFailedAt - b.lastFailedAt)
+      .slice(0, frontendAssetRetryState.size - FRONTEND_ASSET_RETRY_MAX_ENTRIES);
+    for (const [staleUrl] of oldest) frontendAssetRetryState.delete(staleUrl);
+  }
+  frontendAssetDiagnosticsDirty = true;
+  return state;
+}
+
+function clearFrontendAssetFailure(url) {
+  if (!frontendAssetRetryState.delete(url)) return false;
+  frontendAssetDiagnosticsDirty = true;
+  return true;
+}
+
+function persistFrontendAssetFailureDiagnostics() {
+  if (IS_TEST_MODE || !frontendAssetDiagnosticsDirty) return false;
+  try {
+    const failures = [...frontendAssetRetryState.values()]
+      .sort((a, b) => a.url.localeCompare(b.url))
+      .map(item => ({
+        ...item,
+        lastFailedAt: new Date(item.lastFailedAt).toISOString(),
+        nextRetryAt: new Date(item.nextRetryAt).toISOString(),
+      }));
+    const tmpFile = CONFIG.frontendAssetFailuresFile + ".tmp";
+    writeFileSync(tmpFile, JSON.stringify({ updatedAt: new Date().toISOString(), failures }, null, 2), "utf-8");
+    renameSync(tmpFile, CONFIG.frontendAssetFailuresFile);
+    frontendAssetDiagnosticsDirty = false;
+    return true;
+  } catch (error) {
+    log(`[前端资源] 失败诊断写入失败：${error.message}`);
+    return false;
+  }
+}
 
 function getDomain(url) {
   try { return new URL(url).hostname; } catch { return url; }
@@ -422,7 +496,7 @@ function sleep(ms) {
 }
 
 function createHostLimiter({ minDelayMs = 0, now = () => Date.now(), sleepFn = sleep } = {}) {
-  const chains = new Map();
+  const startChains = new Map();
   const lastStartedAt = new Map();
   const delayMs = Math.max(0, Number(minDelayMs) || 0);
 
@@ -432,20 +506,18 @@ function createHostLimiter({ minDelayMs = 0, now = () => Date.now(), sleepFn = s
 
   async function schedule(url, task) {
     const host = hostKey(url);
-    const previous = chains.get(host) || Promise.resolve();
-    const current = previous.catch(() => {}).then(async () => {
+    const previousStart = startChains.get(host) || Promise.resolve();
+    const start = previousStart.catch(() => {}).then(async () => {
       if (delayMs > 0 && lastStartedAt.has(host)) {
         const waitMs = delayMs - (now() - lastStartedAt.get(host));
         if (waitMs > 0) await sleepFn(waitMs);
       }
       lastStartedAt.set(host, now());
-      return task();
     });
-    chains.set(host, current);
-    current.finally(() => {
-      if (chains.get(host) === current) chains.delete(host);
-    }).catch(() => {});
-    return current;
+    startChains.set(host, start);
+    await start;
+    if (startChains.get(host) === start) startChains.delete(host);
+    return task();
   }
 
   return { schedule };
@@ -2221,8 +2293,8 @@ function isCriticalFrontendString(s) {
 
 function prioritizeFrontendStrings(strings, limit = 240) {
   const unique = [...new Set(strings || [])];
-  const readable = unique.filter(s => isCriticalFrontendString(s) || isReadableBusinessText(s));
-  const rest = unique.filter(s => !isCriticalFrontendString(s) && !isReadableBusinessText(s));
+  const readable = unique.filter(s => isCriticalFrontendString(s) || isReadableFrontendSignalString(s));
+  const rest = unique.filter(s => !isCriticalFrontendString(s) && !isReadableFrontendSignalString(s));
   return [...readable.sort(), ...rest.sort().slice(0, Math.max(0, limit - readable.length))];
 }
 
@@ -2316,7 +2388,23 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
       const cached = await sharedCache.get(url).catch(error => ({ error }));
       return cached?.data
         ? { data: { ...cached.data, filename: assetKey } }
-        : { failure: { filename: assetKey, url, reason: cached?.reason || classifyAssetDownloadFailure(cached?.error), message: cached?.error?.message || "共享下载失败" } };
+        : { failure: {
+          filename: assetKey,
+          url,
+          referer,
+          reason: cached?.reason || classifyAssetDownloadFailure(cached?.error),
+          message: cached?.message || describeAssetDownloadError(cached?.error) || "共享下载失败",
+        } };
+    }
+
+    const retryState = currentFrontendAssetRetry(url);
+    if (retryState) {
+      const outcome = {
+        reason: "退避",
+        message: `${retryState.message}；${Math.ceil(retryState.remainingMs / 1000)} 秒后重试`,
+      };
+      if (sharedCache) sharedCache.set(url, Promise.resolve(outcome));
+      return { failure: { filename: assetKey, url, referer, ...outcome } };
     }
 
     const promise = (async () => {
@@ -2335,7 +2423,12 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
         }
         const content = await res.text();
         const ext = assetKey.endsWith(".css") ? "css" : "js";
-        const strings = prioritizeFrontendStrings(extractStrings(content, ext));
+        let strings;
+        try {
+          strings = prioritizeFrontendStrings(extractStrings(content, ext));
+        } catch (error) {
+          return { reason: "解析错误", error };
+        }
         return { data: {
           url,
           contentHash: md5(content),
@@ -2352,9 +2445,19 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
 
     if (sharedCache) sharedCache.set(url, promise);
     const outcome = await promise;
-    return outcome?.data
-      ? { data: { ...outcome.data, filename: assetKey } }
-      : { failure: { filename: assetKey, url, reason: outcome?.reason || "网络错误", message: outcome?.error?.message || "下载失败" } };
+    if (outcome?.data) {
+      clearFrontendAssetFailure(url);
+      return { data: { ...outcome.data, filename: assetKey } };
+    }
+    const failure = {
+      filename: assetKey,
+      url,
+      referer,
+      reason: outcome?.reason || "网络错误",
+      message: describeAssetDownloadError(outcome?.error),
+    };
+    recordFrontendAssetFailure(url, failure);
+    return { failure };
   }
 
   for (let i = 0; i < entries.length; i += BATCH) {
@@ -2373,6 +2476,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
       }
     }
   }
+  persistFrontendAssetFailureDiagnostics();
   return diagnostics ? { contents: results, failures } : results;
 }
 
@@ -4420,11 +4524,15 @@ function logFrontendAssetWarning(url, { requested, expected, available, failures
     return false;
   }
   const failureSummary = summarizeAssetDownloadFailures(failures);
-  const signature = `${requested}/${expected}:${available}:${failureSummary}`;
+  const firstFailure = failures.find(failure => failure?.url) || failures[0];
+  const firstDetail = firstFailure
+    ? `｜首项 ${firstFailure.filename || "未知资源"}：${firstFailure.message || firstFailure.reason || "下载失败"}${firstFailure.url ? `｜${firstFailure.url}` : ""}`
+    : "";
+  const signature = `${requested}/${expected}:${available}:${failureSummary}:${firstFailure?.url || ""}:${firstFailure?.message || ""}`;
   const previous = frontendAssetWarningState.get(label);
   if (previous?.signature === signature && now - previous.loggedAt < FRONTEND_ASSET_WARNING_COOLDOWN_MS) return false;
   frontendAssetWarningState.set(label, { signature, loggedAt: now });
-  logger(`  [${label}] 新资源下载未完成 ${requested - failures.length}/${requested}｜全量缓存 ${available}/${expected}｜${failureSummary}；保留旧快照，下轮只重试失败资源`);
+  logger(`  [${label}] 新资源下载未完成 ${requested - failures.length}/${requested}｜全量缓存 ${available}/${expected}｜${failureSummary}${firstDetail}；保留旧快照，下轮只重试失败资源`);
   return true;
 }
 
@@ -9820,6 +9928,7 @@ async function gracefulShutdown(signal) {
   await waitQueueDrain(30_000);
   // 保存最终快照
   try {
+    persistFrontendAssetFailureDiagnostics();
     await saveActorCheckpoint(snapshot);
     await saveSnapshot(snapshot);
     await runtimeMetricsWriteQueue;
@@ -9920,6 +10029,13 @@ export const __testables = {
   summarizeAssetDownloadFailures,
   logFrontendAssetWarning,
   resetFrontendAssetWarningsForTests: () => frontendAssetWarningState.clear(),
+  currentFrontendAssetRetry,
+  recordFrontendAssetFailure,
+  clearFrontendAssetFailure,
+  resetFrontendAssetRetriesForTests: () => {
+    frontendAssetRetryState.clear();
+    frontendAssetDiagnosticsDirty = false;
+  },
   shouldReuseFrontendAssetContents,
   compactFrontendAssetContents,
   hydrateFrontendAssetContents,

@@ -902,6 +902,7 @@ test("a changed chunk path is downloaded with the current page request context",
 });
 
 test("failed new frontend asset remains pending and only the failed item is retried next round", async () => {
+  __testables.resetFrontendAssetRetriesForTests();
   const current = new Map();
   const oldContents = {};
   for (let i = 0; i < 47; i++) {
@@ -919,6 +920,8 @@ test("failed new frontend asset remains pending and only the failed item is retr
   });
   assert.deepEqual(Object.keys(first.contents), ["chunk-45.js"]);
   assert.equal(first.failures[0].reason, "HTTP 403");
+  assert.ok(__testables.currentFrontendAssetRetry(current.get("chunk-46.js")));
+  __testables.clearFrontendAssetFailure(current.get("chunk-46.js"));
 
   const secondPlan = __testables.planFrontendAssetRefresh(current, {
     assetContents: oldContents,
@@ -933,6 +936,84 @@ test("failed new frontend asset remains pending and only the failed item is retr
   assert.equal(second.failures.length, 0);
   assert.equal(Object.keys(merged).length, 47);
   assert.equal(__testables.isAssetDownloadComplete(current, merged), true);
+});
+
+test("frontend asset retry state backs off across rounds and clears immediately after recovery", async () => {
+  __testables.resetFrontendAssetRetriesForTests();
+  const key = "/_next/static/chunks/new.js";
+  const url = `https://four.meme${key}?dpl=1019`;
+  const failedAt = Date.now();
+  const state = __testables.recordFrontendAssetFailure(url, {
+    filename: key,
+    reason: "网络错误",
+    message: "ECONNRESET",
+    referer: "https://four.meme/en/advanced",
+  }, failedAt);
+  assert.equal(state.failCount, 1);
+  assert.equal(state.nextRetryAt, failedAt + 30_000);
+  assert.match(__testables.currentFrontendAssetRetry(url, failedAt + 1).message, /ECONNRESET/);
+  assert.equal(__testables.currentFrontendAssetRetry(url, failedAt + 30_000), null);
+  __testables.clearFrontendAssetFailure(url);
+  __testables.recordFrontendAssetFailure(url, {
+    filename: key,
+    reason: "网络错误",
+    message: "ECONNRESET",
+  }, Date.now() - 30_001);
+
+  const result = await __testables.downloadAssetContents(new Map([[key, {
+    url,
+    referer: "https://four.meme/en/advanced",
+  }]]), null, {
+    diagnostics: true,
+    fetchFn: async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => "recovered chunk",
+    }),
+  });
+  assert.equal(result.failures.length, 0);
+  assert.equal(__testables.currentFrontendAssetRetry(url), null);
+});
+
+test("downloaded frontend chunks with readable strings are parsed without a local analysis failure", async () => {
+  __testables.resetFrontendAssetRetriesForTests();
+  const key = "/_next/static/chunks/readable.js";
+  const url = `https://four.meme${key}?dpl=1019`;
+  const result = await __testables.downloadAssetContents(new Map([[key, { url }]]), null, {
+    diagnostics: true,
+    fetchFn: async () => ({
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => `"Create Token";"Enable Tax";"Launch your token now"`,
+    }),
+  });
+  assert.equal(result.failures.length, 0);
+  assert.deepEqual(result.contents[key].strings, ["Create Token", "Enable Tax", "Launch your token now"]);
+});
+
+test("frontend pages share one asset backoff and do not repeat a blocked request", async () => {
+  __testables.resetFrontendAssetRetriesForTests();
+  const key = "/_next/static/chunks/shared.js";
+  const url = `https://four.meme${key}?dpl=1019`;
+  __testables.recordFrontendAssetFailure(url, {
+    filename: key,
+    reason: "网络错误",
+    message: "ETIMEDOUT",
+  });
+  const sharedCache = new Map();
+  let requests = 0;
+  const fetchFn = async () => {
+    requests++;
+    throw new Error("should not run during backoff");
+  };
+  const first = await __testables.downloadAssetContents(new Map([[key, { url, referer: "https://four.meme/en/advanced" }]]), sharedCache, { diagnostics: true, fetchFn });
+  const second = await __testables.downloadAssetContents(new Map([[key, { url, referer: "https://four.meme/zh-TW/advanced" }]]), sharedCache, { diagnostics: true, fetchFn });
+  assert.equal(requests, 0);
+  assert.equal(first.failures[0].reason, "退避");
+  assert.equal(second.failures[0].reason, "退避");
+  assert.match(second.failures[0].message, /ETIMEDOUT/);
 });
 
 test("static asset HTTP failures do not enter the page and API domain backoff path", async () => {
@@ -968,6 +1049,7 @@ test("frontend asset failure logs are aggregated and rate limited for 10 minutes
   assert.equal(lines.length, 1);
   assert.match(lines[0], /新资源下载未完成 0\/2/);
   assert.match(lines[0], /HTTP 403 2 个/);
+  assert.match(lines[0], /首项/);
   assert.equal(__testables.logFrontendAssetWarning("https://four.meme/en/advanced", details, 601_001, line => lines.push(line)), true);
   assert.equal(lines.length, 2);
 });
@@ -1181,6 +1263,33 @@ test("host limiter spaces same-host tasks without changing caller order", async 
   const second = await limiter.schedule("https://four.meme/b", async () => "second");
   assert.equal(second, "second");
   assert.deepEqual(waits, [100]);
+});
+
+test("host limiter spaces request starts without waiting for the previous response", async () => {
+  let now = 0;
+  let releaseFirst;
+  const events = [];
+  const firstBlocked = new Promise(resolve => { releaseFirst = resolve; });
+  const limiter = __testables.createHostLimiter({
+    minDelayMs: 100,
+    now: () => now,
+    sleepFn: async ms => { now += ms; },
+  });
+  const first = limiter.schedule("https://four.meme/a", async () => {
+    events.push("first-start");
+    await firstBlocked;
+    events.push("first-end");
+  });
+  const second = limiter.schedule("https://four.meme/b", async () => {
+    events.push("second-start");
+    return "second";
+  });
+
+  assert.equal(await second, "second");
+  assert.deepEqual(events, ["first-start", "second-start"]);
+  releaseFirst();
+  await first;
+  assert.deepEqual(events, ["first-start", "second-start", "first-end"]);
 });
 
 test("overdue module scheduling skips expired ticks without changing the configured interval", () => {

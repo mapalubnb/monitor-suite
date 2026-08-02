@@ -12,6 +12,8 @@ actor-state.json
 actor-state.json.tmp
 runtime-metrics.json
 runtime-metrics.json.tmp
+frontend-asset-failures.json
+frontend-asset-failures.json.tmp
 factory-pool-state.json
 factory-pool-state.json.tmp
 lastpoll.txt
