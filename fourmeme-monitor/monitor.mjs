@@ -201,8 +201,8 @@ const CONFIG = {
 
   // ── BSC RPC ──
   bscRpcUrls: [
-    "https://rpc.48.club",
     "https://bsc.rpc.blxrbdn.com",
+    "https://rpc.48.club",
   ],
   bscWsUrls: (process.env.BSC_WS_URLS || process.env.FOURMEME_BSC_WS_URLS || "wss://bsc-rpc.publicnode.com")
     .split(",")
