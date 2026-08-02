@@ -5,7 +5,7 @@
  *   1. 各模块独立定时器，互不阻塞
  *   2. BSC RPC batch 请求（模块 6/7 提速 ~10x）
  *   3. 前端/API 并行抓取（模块 2/3 提速 ~3-4x）
- *   4. 全面反风控：UA 轮换、按域名自适应退避、请求抖动、GitHub 认证限速
+ *   4. 全面反风控：进程级稳定 UA、按域名自适应退避、请求抖动、GitHub 认证限速
  *
  * 模块与频率：
  *   模块1: 底池配置   — 每 2s（纯 API，轻量，退避保护）
@@ -319,27 +319,17 @@ const CONFIG = {
    反风控基础设施
    ══════════════════════════════════════════ */
 
-// --- UA 轮换池 ---
+// --- 进程级稳定 UA：同一监控进程模拟同一浏览器会话 ---
 const UA_POOL = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14.5; rv:126.0) Gecko/20100101 Firefox/126.0",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
 ];
-let uaIndex = 0;
-function nextUA() {
-  const ua = UA_POOL[uaIndex];
-  uaIndex = (uaIndex + 1) % UA_POOL.length;
-  return ua;
-}
+const PROCESS_BROWSER_UA = UA_POOL[Math.floor(Math.random() * UA_POOL.length)];
 
-function browserHeaders() {
+function browserHeaders(userAgent = PROCESS_BROWSER_UA) {
   return {
-    "User-Agent": nextUA(),
+    "User-Agent": userAgent,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
@@ -350,6 +340,22 @@ function browserHeaders() {
     "Sec-Fetch-Site": "none",
     "Sec-Fetch-User": "?1",
     "Upgrade-Insecure-Requests": "1",
+  };
+}
+
+function staticAssetHeaders(assetUrl, referer = "", userAgent = PROCESS_BROWSER_UA) {
+  const parsed = new URL(assetUrl);
+  const isStyle = parsed.pathname.endsWith(".css");
+  return {
+    "User-Agent": userAgent,
+    "Accept": isStyle ? "text/css,*/*;q=0.1" : "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Cache-Control": "no-cache",
+    "Referer": referer || `${parsed.origin}/`,
+    "Sec-Fetch-Dest": isStyle ? "style" : "script",
+    "Sec-Fetch-Mode": "no-cors",
+    "Sec-Fetch-Site": "same-origin",
   };
 }
 
@@ -2299,6 +2305,8 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
   async function fetchAsset(assetKey, asset) {
     const url = typeof asset === "string" ? asset : asset.url;
     const previous = typeof asset === "object" ? asset.previous : null;
+    const referer = typeof asset === "object" ? asset.referer : "";
+    const userAgent = typeof asset === "object" ? asset.userAgent : PROCESS_BROWSER_UA;
     if (sharedCache?.has(url)) {
       const cached = await sharedCache.get(url).catch(error => ({ error }));
       return cached?.data
@@ -2308,7 +2316,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
 
     const promise = (async () => {
       try {
-        const headers = { ...browserHeaders(), "Accept": "*/*" };
+        const headers = staticAssetHeaders(url, referer, userAgent);
         if (previous?.etag) headers["If-None-Match"] = previous.etag;
         if (previous?.lastModified) headers["If-Modified-Since"] = previous.lastModified;
         const res = await fetchFn(url, {
@@ -2477,6 +2485,7 @@ function shouldReuseFrontendAssetContents(_url, oldFeatures, features) {
     && oldFeatures.assetHash === features.assetHash
     && oldFeatures.assetContents
     && Object.keys(oldFeatures.assetContents).length > 0
+    && isAssetDownloadComplete(features.assetUrlMap, oldFeatures.assetContents)
   );
 }
 
@@ -3147,7 +3156,7 @@ async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
   const candidateUrls = [];
   if (assetUrlMap instanceof Map) {
     for (const [, url] of assetUrlMap) {
-      if (/\/chunks\/\d+-[a-f0-9]+\.js$/i.test(url)) candidateUrls.push(url);
+      if (/\/_next\/static\/chunks\/[^?#]+\.js(?:\?|$)/i.test(url)) candidateUrls.push(url);
     }
   }
   if (candidateUrls.length === 0) return null;
@@ -3155,7 +3164,9 @@ async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
   const tasks = candidateUrls.map(async (url, idx) => {
     await sleep(idx * 100);  // stagger
     try {
-      const res = await fetchSafe(url, { headers: browserHeaders() }, 8_000);
+      const res = await fetchStaticAssetSafe(url, {
+        headers: staticAssetHeaders(url, `${String(baseUrl).replace(/\/+$/, "")}/`),
+      }, 8_000);
       if (!res.ok) return null;
       const jsContent = await res.text();
       if (!jsContent.includes("JSON.parse('")) return null;
@@ -4308,11 +4319,11 @@ function extractPageFeatures(html, url) {
   for (const m of assetMatches) {
     const raw = m[1];
     const fullUrl = raw.startsWith("http") ? raw : baseUrl + raw;
-    const cleanUrl = fullUrl.split("?")[0];
-    const parsed = new URL(cleanUrl);
+    const parsed = new URL(fullUrl);
+    parsed.hash = "";
     const path = parsed.pathname;
     pathSet.add(path);
-    features.assetUrlMap.set(path, cleanUrl);
+    features.assetUrlMap.set(path, parsed.href);
   }
   features.assetFiles = [...pathSet].sort();
   features.assetHash = md5(features.assetFiles.join("\n"));
@@ -4352,11 +4363,11 @@ function isAssetDownloadComplete(assetUrlMap, assetContents) {
   if (!assetUrlMap?.size) return false;
   return [...assetUrlMap].every(([assetKey, url]) => {
     const cached = assetContents?.[assetKey];
-    return Boolean(cached && (!cached.url || cached.url === url));
+    return Boolean(cached?.url && cached.url === url);
   });
 }
 
-function planFrontendAssetRefresh(assetUrlMap, oldFeatures = null) {
+function planFrontendAssetRefresh(assetUrlMap, oldFeatures = null, requestContext = {}) {
   const reusable = {};
   const downloads = new Map();
   const available = {
@@ -4365,10 +4376,10 @@ function planFrontendAssetRefresh(assetUrlMap, oldFeatures = null) {
   };
   for (const [assetKey, url] of assetUrlMap || []) {
     const cached = available[assetKey];
-    if (cached && (!cached.url || cached.url === url)) {
+    if (cached?.url && cached.url === url) {
       reusable[assetKey] = cached;
     } else {
-      downloads.set(assetKey, { url, previous: null });
+      downloads.set(assetKey, { url, previous: null, ...requestContext });
     }
   }
   return { reusable, downloads };
@@ -4443,8 +4454,9 @@ function chooseBetterFrontendPage(existing, candidate) {
 async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   let features = null;
   const startedAt = Date.now();
+  const pageUserAgent = PROCESS_BROWSER_UA;
   try {
-    const headers = browserHeaders();
+    const headers = browserHeaders(pageUserAgent);
     // 有未完成资源时必须重新取得 HTML 中的资源清单，不能被 304 短路掉重试。
     if (!oldFeatures?.assetDownloadPending) {
       if (oldFeatures?.htmlEtag) headers["If-None-Match"] = oldFeatures.htmlEtag;
@@ -4512,7 +4524,10 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   } else {
     // assetHash 变了（或首次）→ 复用未变化资源，仅下载新增或 URL 变化的资源。
     try {
-      const refresh = planFrontendAssetRefresh(features.assetUrlMap, oldFeatures);
+      const refresh = planFrontendAssetRefresh(features.assetUrlMap, oldFeatures, {
+        referer: url,
+        userAgent: pageUserAgent,
+      });
       const downloaded = await downloadAssetContents(refresh.downloads, assetCache, { diagnostics: true });
       const merged = { ...refresh.reusable, ...downloaded.contents };
       if (!isAssetDownloadComplete(features.assetUrlMap, merged)) {
@@ -4528,7 +4543,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
           features.assetDownloadPending = {};
           for (const [assetKey, data] of Object.entries(oldFeatures.assetDownloadPending || {})) {
             const currentUrl = features.assetUrlMap.get(assetKey);
-            if (currentUrl && (!data?.url || data.url === currentUrl)) features.assetDownloadPending[assetKey] = data;
+            if (currentUrl && data?.url === currentUrl) features.assetDownloadPending[assetKey] = data;
           }
           Object.assign(features.assetDownloadPending, downloaded.contents);
           features.assetContentHash = oldFeatures.assetContentHash || frontendAssetContentsHash(oldFeatures.assetContents);
@@ -9648,7 +9663,7 @@ function buildStartupReadyContent() {
     `HTML 并发：${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)}`,
     `资源并发：${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)}`,
     `异常资源复查：${formatDuration(CONFIG.frontendAssetJitter.quickConfirmDelayMs)}`,
-    `请求策略：UA 轮换｜请求抖动｜同域限速｜条件请求｜失败退避`,
+    `请求策略：稳定 UA｜资源 Referer｜请求抖动｜同域限速｜条件请求｜失败退避`,
     `链上策略：tx.from 过滤｜确认块保护｜命中后合约复查`,
     ``,
     `**05｜性能基线**`,
@@ -9820,6 +9835,7 @@ export const __testables = {
   setSnapshotForTests,
   discoverFrontendUrlsFromPages,
   extractTextContent,
+  extractPageFeatures,
   extractHrefRoutesFromHtml,
   extractNextData,
   stableJsonHash,
@@ -9879,6 +9895,8 @@ export const __testables = {
   formatNetworkError,
   fetchSafe,
   fetchStaticAssetSafe,
+  browserHeaders,
+  staticAssetHeaders,
   downloadAssetContents,
   isAssetDownloadComplete,
   planFrontendAssetRefresh,

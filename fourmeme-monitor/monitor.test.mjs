@@ -829,6 +829,60 @@ test("frontend asset refresh reuses 45 unchanged resources and downloads only 2 
   assert.equal(__testables.isAssetDownloadComplete(current, complete), true);
 });
 
+test("current Turbopack HTML keeps the real dpl asset URL while using the path as identity", () => {
+  const html = `<!doctype html><html><head>
+    <link rel="stylesheet" href="/_next/static/chunks/layout.css?dpl=1019">
+    <script src="/_next/static/chunks/turbopack-runtime.js?dpl=1019"></script>
+  </head><body><script>self.__next_f.push([1,"route"])</script></body></html>`;
+  const features = __testables.extractPageFeatures(html, "https://four.meme/en/advanced");
+  assert.deepEqual(features.assetFiles, [
+    "/_next/static/chunks/layout.css",
+    "/_next/static/chunks/turbopack-runtime.js",
+  ]);
+  assert.equal(
+    features.assetUrlMap.get("/_next/static/chunks/turbopack-runtime.js"),
+    "https://four.meme/_next/static/chunks/turbopack-runtime.js?dpl=1019",
+  );
+});
+
+test("static asset headers match browser subresource semantics", () => {
+  const userAgent = "Mozilla/5.0 Chrome/150.0.0.0 Safari/537.36";
+  const scriptHeaders = __testables.staticAssetHeaders(
+    "https://four.meme/_next/static/chunks/app.js?dpl=1019",
+    "https://four.meme/en/advanced",
+    userAgent,
+  );
+  assert.equal(scriptHeaders["User-Agent"], userAgent);
+  assert.equal(scriptHeaders.Referer, "https://four.meme/en/advanced");
+  assert.equal(scriptHeaders["Sec-Fetch-Dest"], "script");
+  assert.equal(scriptHeaders["Sec-Fetch-Mode"], "no-cors");
+  assert.equal(scriptHeaders["Sec-Fetch-Site"], "same-origin");
+  assert.equal("Sec-Fetch-User" in scriptHeaders, false);
+  assert.equal("Upgrade-Insecure-Requests" in scriptHeaders, false);
+  assert.equal(
+    __testables.staticAssetHeaders("https://four.meme/_next/static/chunks/app.css")["Sec-Fetch-Dest"],
+    "style",
+  );
+});
+
+test("dpl URL changes force an asset refresh even when the chunk path is unchanged", () => {
+  const key = "/_next/static/chunks/app.js";
+  const oldUrl = `https://four.meme${key}?dpl=1018`;
+  const newUrl = `https://four.meme${key}?dpl=1019`;
+  const oldFeatures = {
+    assetHash: "same-paths",
+    assetContents: { [key]: { url: oldUrl, contentHash: "old", size: 10, strings: [], ext: "js" } },
+  };
+  const features = { assetHash: "same-paths", assetUrlMap: new Map([[key, newUrl]]) };
+  assert.equal(__testables.shouldReuseFrontendAssetContents("https://four.meme/en/advanced", oldFeatures, features), false);
+  const plan = __testables.planFrontendAssetRefresh(features.assetUrlMap, oldFeatures, {
+    referer: "https://four.meme/en/advanced",
+    userAgent: "Chrome/150",
+  });
+  assert.deepEqual([...plan.downloads.keys()], [key]);
+  assert.equal(plan.downloads.get(key).referer, "https://four.meme/en/advanced");
+});
+
 test("failed new frontend asset remains pending and only the failed item is retried next round", async () => {
   const current = new Map();
   const oldContents = {};
@@ -901,13 +955,14 @@ test("frontend asset failure logs are aggregated and rate limited for 10 minutes
 });
 
 test("unchanged create-token assets reuse previous asset contents", () => {
+  const url = "https://four.meme/_next/main.js?dpl=1019";
   const oldFeatures = {
     assetHash: "same-assets",
     assetContents: {
-      "main.js": { contentHash: "old", size: 100, strings: ["Create Token", "buyFee"], ext: "js" },
+      "main.js": { url, contentHash: "old", size: 100, strings: ["Create Token", "buyFee"], ext: "js" },
     },
   };
-  const features = { assetHash: "same-assets" };
+  const features = { assetHash: "same-assets", assetUrlMap: new Map([["main.js", url]]) };
   assert.equal(
     __testables.shouldReuseFrontendAssetContents("https://four.meme/en/create-token", oldFeatures, features),
     true,
