@@ -809,6 +809,97 @@ test("fetchSafe retries transient network errors and returns the recovered respo
   assert.deepEqual(delays, [1_000, 2_000]);
 });
 
+test("frontend asset refresh reuses 45 unchanged resources and downloads only 2 new resources", () => {
+  const current = new Map();
+  const oldContents = {};
+  for (let i = 0; i < 47; i++) {
+    const key = `chunk-${i}.js`;
+    const url = `https://four.meme/_next/${key}`;
+    current.set(key, url);
+    if (i < 45) oldContents[key] = { url, contentHash: `old-${i}`, size: 10, strings: [], ext: "js" };
+  }
+  const plan = __testables.planFrontendAssetRefresh(current, { assetContents: oldContents });
+  assert.equal(Object.keys(plan.reusable).length, 45);
+  assert.deepEqual([...plan.downloads.keys()], ["chunk-45.js", "chunk-46.js"]);
+  const complete = {
+    ...plan.reusable,
+    "chunk-45.js": { url: current.get("chunk-45.js") },
+    "chunk-46.js": { url: current.get("chunk-46.js") },
+  };
+  assert.equal(__testables.isAssetDownloadComplete(current, complete), true);
+});
+
+test("failed new frontend asset remains pending and only the failed item is retried next round", async () => {
+  const current = new Map();
+  const oldContents = {};
+  for (let i = 0; i < 47; i++) {
+    const key = `chunk-${i}.js`;
+    const url = `https://four.meme/_next/${key}`;
+    current.set(key, url);
+    if (i < 45) oldContents[key] = { url, contentHash: `old-${i}`, size: 10, strings: [], ext: "js" };
+  }
+  const firstPlan = __testables.planFrontendAssetRefresh(current, { assetContents: oldContents });
+  const first = await __testables.downloadAssetContents(firstPlan.downloads, null, {
+    diagnostics: true,
+    fetchFn: async url => url.endsWith("chunk-46.js")
+      ? { ok: false, status: 403, headers: { get: () => null }, text: async () => "" }
+      : { ok: true, status: 200, headers: { get: () => null }, text: async () => "fresh chunk" },
+  });
+  assert.deepEqual(Object.keys(first.contents), ["chunk-45.js"]);
+  assert.equal(first.failures[0].reason, "HTTP 403");
+
+  const secondPlan = __testables.planFrontendAssetRefresh(current, {
+    assetContents: oldContents,
+    assetDownloadPending: first.contents,
+  });
+  assert.deepEqual([...secondPlan.downloads.keys()], ["chunk-46.js"]);
+  const second = await __testables.downloadAssetContents(secondPlan.downloads, null, {
+    diagnostics: true,
+    fetchFn: async () => ({ ok: true, status: 200, headers: { get: () => null }, text: async () => "recovered chunk" }),
+  });
+  const merged = { ...secondPlan.reusable, ...second.contents };
+  assert.equal(second.failures.length, 0);
+  assert.equal(Object.keys(merged).length, 47);
+  assert.equal(__testables.isAssetDownloadComplete(current, merged), true);
+});
+
+test("static asset HTTP failures do not enter the page and API domain backoff path", async () => {
+  let requests = 0;
+  const response = await __testables.fetchStaticAssetSafe(
+    "https://four.meme/_next/static/chunk.js",
+    {},
+    1_000,
+    async () => {
+      requests++;
+      return { ok: false, status: 403, text: async () => "Forbidden" };
+    },
+    async () => {},
+  );
+  assert.equal(response.status, 403);
+  assert.equal(requests, 1);
+});
+
+test("frontend asset failure logs are aggregated and rate limited for 10 minutes", () => {
+  __testables.resetFrontendAssetWarningsForTests();
+  const lines = [];
+  const details = {
+    requested: 2,
+    expected: 47,
+    available: 45,
+    failures: [
+      { reason: "HTTP 403" },
+      { reason: "HTTP 403" },
+    ],
+  };
+  assert.equal(__testables.logFrontendAssetWarning("https://four.meme/en/advanced", details, 1_000, line => lines.push(line)), true);
+  assert.equal(__testables.logFrontendAssetWarning("https://four.meme/en/advanced", details, 2_000, line => lines.push(line)), false);
+  assert.equal(lines.length, 1);
+  assert.match(lines[0], /新资源下载未完成 0\/2/);
+  assert.match(lines[0], /HTTP 403 2 个/);
+  assert.equal(__testables.logFrontendAssetWarning("https://four.meme/en/advanced", details, 601_001, line => lines.push(line)), true);
+  assert.equal(lines.length, 2);
+});
+
 test("unchanged create-token assets reuse previous asset contents", () => {
   const oldFeatures = {
     assetHash: "same-assets",

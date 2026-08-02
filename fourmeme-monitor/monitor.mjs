@@ -355,6 +355,8 @@ function browserHeaders() {
 
 // --- Per-domain 自适应退避 ---
 const domainBackoff = new Map(); // domain -> { delayMs, lastFail }
+const frontendAssetWarningState = new Map();
+const FRONTEND_ASSET_WARNING_COOLDOWN_MS = 10 * 60_000;
 
 function getDomain(url) {
   try { return new URL(url).hostname; } catch { return url; }
@@ -2250,12 +2252,46 @@ function extractStrings(content, ext) {
   return [...strings].sort();
 }
 
+async function fetchStaticAssetSafe(url, opts, timeoutMs = 8_000, requestFn = fetchWithTimeout, delayFn = sleep) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const response = await requestFn(url, opts, timeoutMs);
+      if (response.status >= 500 && attempt === 0) {
+        try { await response.text(); } catch {}
+        await delayFn(500);
+        continue;
+      }
+      return response;
+    } catch (error) {
+      lastError = error;
+      if (attempt === 0 && (error?.name === "AbortError" || isTransientNetworkError(error))) {
+        await delayFn(500);
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw lastError || new Error(`静态资源请求失败：${url}`);
+}
+
+function classifyAssetDownloadFailure(error, status = 0) {
+  if (status === 403 || status === 429) return `HTTP ${status}`;
+  if (status >= 400) return `HTTP ${status}`;
+  const kind = classifyFetchFailure(error);
+  return { backoff: "退避", rate_limited: "限流", timeout: "超时", error: "网络错误" }[kind] || "网络错误";
+}
+
 /**
- * 批量下载资源文件内容（带并发控制和错开延迟）
- * 返回: { [filename]: { contentHash, size, strings, ext } }
+ * 批量下载资源文件内容（带并发控制和错开延迟）。
+ * diagnostics=true 时同时返回逐资源失败原因。
  */
-async function downloadAssetContents(assetUrls, sharedCache = null) {
+async function downloadAssetContents(assetUrls, sharedCache = null, {
+  diagnostics = false,
+  fetchFn = fetchStaticAssetSafe,
+} = {}) {
   const results = {};
+  const failures = [];
   const BATCH = readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6);
   const STAGGER = 80;     // 批内请求间隔 ms
   const entries = [...assetUrls.entries()]; // [[filename, url], ...]
@@ -2264,8 +2300,10 @@ async function downloadAssetContents(assetUrls, sharedCache = null) {
     const url = typeof asset === "string" ? asset : asset.url;
     const previous = typeof asset === "object" ? asset.previous : null;
     if (sharedCache?.has(url)) {
-      const cached = await sharedCache.get(url).catch(() => null);
-      return cached ? { ...cached, filename: assetKey } : null;
+      const cached = await sharedCache.get(url).catch(error => ({ error }));
+      return cached?.data
+        ? { data: { ...cached.data, filename: assetKey } }
+        : { failure: { filename: assetKey, url, reason: cached?.reason || classifyAssetDownloadFailure(cached?.error), message: cached?.error?.message || "共享下载失败" } };
     }
 
     const promise = (async () => {
@@ -2273,21 +2311,19 @@ async function downloadAssetContents(assetUrls, sharedCache = null) {
         const headers = { ...browserHeaders(), "Accept": "*/*" };
         if (previous?.etag) headers["If-None-Match"] = previous.etag;
         if (previous?.lastModified) headers["If-Modified-Since"] = previous.lastModified;
-        const res = await fetchSafe(url, {
+        const res = await fetchFn(url, {
           headers,
         }, 8_000);
         if (res.status === 304 && previous) {
-          return {
-            ...previous,
-            url: previous.url || url,
-            fromCache: true,
-          };
+          return { data: { ...previous, url: previous.url || url, fromCache: true } };
         }
-        if (!res.ok) return null;
+        if (!res.ok) {
+          return { reason: classifyAssetDownloadFailure(null, res.status), error: new Error(`HTTP ${res.status}`) };
+        }
         const content = await res.text();
         const ext = assetKey.endsWith(".css") ? "css" : "js";
         const strings = prioritizeFrontendStrings(extractStrings(content, ext));
-        return {
+        return { data: {
           url,
           contentHash: md5(content),
           size: content.length,
@@ -2295,15 +2331,17 @@ async function downloadAssetContents(assetUrls, sharedCache = null) {
           ext,
           etag: res.headers.get("etag") || "",
           lastModified: res.headers.get("last-modified") || "",
-        };
-      } catch {
-        return null;
+        } };
+      } catch (error) {
+        return { reason: classifyAssetDownloadFailure(error), error };
       }
-    })().catch(() => null);
+    })().catch(error => ({ reason: classifyAssetDownloadFailure(error), error }));
 
     if (sharedCache) sharedCache.set(url, promise);
-    const data = await promise;
-    return data ? { ...data, filename: assetKey } : null;
+    const outcome = await promise;
+    return outcome?.data
+      ? { data: { ...outcome.data, filename: assetKey } }
+      : { failure: { filename: assetKey, url, reason: outcome?.reason || "网络错误", message: outcome?.error?.message || "下载失败" } };
   }
 
   for (let i = 0; i < entries.length; i += BATCH) {
@@ -2313,12 +2351,16 @@ async function downloadAssetContents(assetUrls, sharedCache = null) {
     );
     const batchResults = await Promise.allSettled(tasks);
     for (const r of batchResults) {
-      if (r.status === "fulfilled" && r.value) {
-        results[r.value.filename] = r.value;
+      if (r.status === "fulfilled" && r.value?.data) {
+        results[r.value.data.filename] = r.value.data;
+      } else if (r.status === "fulfilled" && r.value?.failure) {
+        failures.push(r.value.failure);
+      } else if (r.status === "rejected") {
+        failures.push({ filename: "未知资源", url: "", reason: classifyAssetDownloadFailure(r.reason), message: r.reason?.message || String(r.reason) });
       }
     }
   }
-  return results;
+  return diagnostics ? { contents: results, failures } : results;
 }
 
 function frontendAssetContentsHash(assetContents) {
@@ -2371,9 +2413,14 @@ function hydrateFrontendAssetContents(refs, store = {}) {
 function hydrateFrontendSnapshotAssets(data) {
   if (!data?.frontendPages || !data?._frontendAssetStore) return data;
   for (const page of Object.values(data.frontendPages)) {
-    if (page?.assetContents || !page?.assetContentRefs) continue;
-    const hydrated = hydrateFrontendAssetContents(page.assetContentRefs, data._frontendAssetStore);
-    if (Object.keys(hydrated).length > 0) page.assetContents = hydrated;
+    if (!page?.assetContents && page?.assetContentRefs) {
+      const hydrated = hydrateFrontendAssetContents(page.assetContentRefs, data._frontendAssetStore);
+      if (Object.keys(hydrated).length > 0) page.assetContents = hydrated;
+    }
+    if (!page?.assetDownloadPending && page?.assetDownloadPendingRefs) {
+      const hydrated = hydrateFrontendAssetContents(page.assetDownloadPendingRefs, data._frontendAssetStore);
+      if (Object.keys(hydrated).length > 0) page.assetDownloadPending = hydrated;
+    }
   }
   return data;
 }
@@ -2395,6 +2442,12 @@ function compactFrontendSnapshotForDisk(data) {
     if (assetContents && Object.keys(assetContents).length > 0) {
       diskPage.assetContentRefs = compactFrontendAssetContents(assetContents, diskData._frontendAssetStore);
       delete diskPage.assetContents;
+    }
+    if (page?.assetDownloadPending && Object.keys(page.assetDownloadPending).length > 0) {
+      diskPage.assetDownloadPendingRefs = compactFrontendAssetContents(page.assetDownloadPending, diskData._frontendAssetStore);
+      delete diskPage.assetDownloadPending;
+    } else {
+      delete diskPage.assetDownloadPendingRefs;
     }
     diskData.frontendPages[key] = diskPage;
   }
@@ -4295,22 +4348,57 @@ function validateFrontendPageFeatures(url, html, features) {
   }
 }
 
-function isAssetDownloadComplete(assetUrlMap, assetContents, oldFeatures = null) {
-  const expected = assetUrlMap?.size || 0;
-  const downloaded = Object.keys(assetContents || {}).length;
-  if (expected === 0) return false;
-  const ratio = downloaded / expected;
-  const hadGoodBaseline = oldFeatures?.assetContents && Object.keys(oldFeatures.assetContents).length >= Math.max(5, Math.floor(expected * 0.5));
-  if (hadGoodBaseline) return ratio >= 0.85;
-  return ratio >= 0.7 && downloaded >= 5;
+function isAssetDownloadComplete(assetUrlMap, assetContents) {
+  if (!assetUrlMap?.size) return false;
+  return [...assetUrlMap].every(([assetKey, url]) => {
+    const cached = assetContents?.[assetKey];
+    return Boolean(cached && (!cached.url || cached.url === url));
+  });
 }
 
-function attachPreviousAssets(assetUrlMap, oldFeatures = null) {
-  const map = new Map();
+function planFrontendAssetRefresh(assetUrlMap, oldFeatures = null) {
+  const reusable = {};
+  const downloads = new Map();
+  const available = {
+    ...(oldFeatures?.assetContents || {}),
+    ...(oldFeatures?.assetDownloadPending || {}),
+  };
   for (const [assetKey, url] of assetUrlMap || []) {
-    map.set(assetKey, { url, previous: oldFeatures?.assetContents?.[assetKey] || null });
+    const cached = available[assetKey];
+    if (cached && (!cached.url || cached.url === url)) {
+      reusable[assetKey] = cached;
+    } else {
+      downloads.set(assetKey, { url, previous: null });
+    }
   }
-  return map;
+  return { reusable, downloads };
+}
+
+function summarizeAssetDownloadFailures(failures = []) {
+  const counts = new Map();
+  for (const failure of failures) {
+    const reason = failure?.reason || "未知错误";
+    counts.set(reason, (counts.get(reason) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([reason, count]) => `${reason} ${count} 个`)
+    .join("；");
+}
+
+function logFrontendAssetWarning(url, { requested, expected, available, failures }, now = Date.now(), logger = log) {
+  const label = urlLabel(url);
+  if (!failures?.length) {
+    frontendAssetWarningState.delete(label);
+    return false;
+  }
+  const failureSummary = summarizeAssetDownloadFailures(failures);
+  const signature = `${requested}/${expected}:${available}:${failureSummary}`;
+  const previous = frontendAssetWarningState.get(label);
+  if (previous?.signature === signature && now - previous.loggedAt < FRONTEND_ASSET_WARNING_COOLDOWN_MS) return false;
+  frontendAssetWarningState.set(label, { signature, loggedAt: now });
+  logger(`  [${label}] 新资源下载未完成 ${requested - failures.length}/${requested}｜全量缓存 ${available}/${expected}｜${failureSummary}；保留旧快照，下轮只重试失败资源`);
+  return true;
 }
 
 async function runLimited(taskFactories, limit) {
@@ -4357,8 +4445,11 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   const startedAt = Date.now();
   try {
     const headers = browserHeaders();
-    if (oldFeatures?.htmlEtag) headers["If-None-Match"] = oldFeatures.htmlEtag;
-    if (oldFeatures?.htmlLastModified) headers["If-Modified-Since"] = oldFeatures.htmlLastModified;
+    // 有未完成资源时必须重新取得 HTML 中的资源清单，不能被 304 短路掉重试。
+    if (!oldFeatures?.assetDownloadPending) {
+      if (oldFeatures?.htmlEtag) headers["If-None-Match"] = oldFeatures.htmlEtag;
+      if (oldFeatures?.htmlLastModified) headers["If-Modified-Since"] = oldFeatures.htmlLastModified;
+    }
     const res = await fetchSafe(url, { headers });
     if (res.status === 304 && oldFeatures) {
       return {
@@ -4374,7 +4465,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
     if (html.length < 1000) throw new Error(`响应过短（${html.length} 字节），可能被拦截`);
 
     const htmlHash = md5(html);
-    if (oldFeatures?.htmlHash && oldFeatures.htmlHash === htmlHash) {
+    if (oldFeatures?.htmlHash && oldFeatures.htmlHash === htmlHash && !oldFeatures.assetDownloadPending) {
       return {
         data: {
           ...oldFeatures,
@@ -4402,6 +4493,9 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
   if (shouldReuseFrontendAssetContents(url, oldFeatures, features)) {
     // assetHash 未变 → 复用缓存，跳过下载
     features.assetContents = oldFeatures.assetContents;
+    delete features.assetDownloadPending;
+    delete features.assetDownloadPendingRefs;
+    logFrontendAssetWarning(url, { requested: 0, expected: features.assetUrlMap?.size || 0, available: Object.keys(features.assetContents || {}).length, failures: [] });
     // i18n: 每次都从 streaming HTML 重新提取，因为 i18n 可能随 SSR 内容变化而非静态资源变化
     try {
       let i18nResult = extractI18nFromStreamingHtml(features.html);
@@ -4416,21 +4510,38 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
       }
     } catch (err) { log(`  [i18n] 提取异常（非致命）：${err.message}`); }
   } else {
-    // assetHash 变了（或首次）→ 下载资源
+    // assetHash 变了（或首次）→ 复用未变化资源，仅下载新增或 URL 变化的资源。
     try {
-      features.assetContents = await downloadAssetContents(attachPreviousAssets(features.assetUrlMap, oldFeatures), assetCache);
-      if (!isAssetDownloadComplete(features.assetUrlMap, features.assetContents, oldFeatures)) {
+      const refresh = planFrontendAssetRefresh(features.assetUrlMap, oldFeatures);
+      const downloaded = await downloadAssetContents(refresh.downloads, assetCache, { diagnostics: true });
+      const merged = { ...refresh.reusable, ...downloaded.contents };
+      if (!isAssetDownloadComplete(features.assetUrlMap, merged)) {
         const expected = features.assetUrlMap?.size || 0;
-        const downloaded = Object.keys(features.assetContents || {}).length;
+        logFrontendAssetWarning(url, {
+          requested: refresh.downloads.size,
+          expected,
+          available: Object.keys(merged).length,
+          failures: downloaded.failures,
+        });
         if (oldFeatures?.assetContents && Object.keys(oldFeatures.assetContents).length > 0) {
-          log(`  [${urlLabel(url)}] 资源下载不完整 ${downloaded}/${expected}，沿用上一轮资源内容，避免半包误报`);
           features.assetContents = oldFeatures.assetContents;
+          features.assetDownloadPending = {};
+          for (const [assetKey, data] of Object.entries(oldFeatures.assetDownloadPending || {})) {
+            const currentUrl = features.assetUrlMap.get(assetKey);
+            if (currentUrl && (!data?.url || data.url === currentUrl)) features.assetDownloadPending[assetKey] = data;
+          }
+          Object.assign(features.assetDownloadPending, downloaded.contents);
           features.assetContentHash = oldFeatures.assetContentHash || frontendAssetContentsHash(oldFeatures.assetContents);
           features.assetHash = oldFeatures.assetHash || features.assetHash;
           features.assetFiles = oldFeatures.assetFiles || features.assetFiles;
         } else {
-          throw new Error(`资源下载不完整 ${downloaded}/${expected}`);
+          throw new Error(`资源下载不完整 ${Object.keys(merged).length}/${expected}`);
         }
+      } else {
+        features.assetContents = merged;
+        delete features.assetDownloadPending;
+        delete features.assetDownloadPendingRefs;
+        logFrontendAssetWarning(url, { requested: 0, expected: features.assetUrlMap?.size || 0, available: Object.keys(merged).length, failures: [] });
       }
     } catch (err) {
       features.assetContents = null;
@@ -9763,9 +9874,17 @@ export const __testables = {
   buildGlobalFrontendRouteNotification,
   frontendAssetChangeSignature,
   classifyFetchFailure,
+  classifyAssetDownloadFailure,
   isTransientNetworkError,
   formatNetworkError,
   fetchSafe,
+  fetchStaticAssetSafe,
+  downloadAssetContents,
+  isAssetDownloadComplete,
+  planFrontendAssetRefresh,
+  summarizeAssetDownloadFailures,
+  logFrontendAssetWarning,
+  resetFrontendAssetWarningsForTests: () => frontendAssetWarningState.clear(),
   shouldReuseFrontendAssetContents,
   compactFrontendAssetContents,
   hydrateFrontendAssetContents,
