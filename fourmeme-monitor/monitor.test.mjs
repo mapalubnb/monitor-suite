@@ -18,6 +18,10 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
   assert.equal(__testables.CONFIG.apiProbeStaggerMs, 150);
   assert.equal(__testables.CONFIG.hostRequestMinDelayMs, 60);
   assert.equal(__testables.CONFIG.frontendRouteRemovalConfirmRuns, 2);
+  assert.deepEqual(__testables.CONFIG.bscRpcUrls, [
+    "https://rpc.48.club",
+    "https://bsc.rpc.blxrbdn.com",
+  ]);
 });
 
 test("startup card copy reflects active frontend and api cadences", () => {

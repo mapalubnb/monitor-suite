@@ -87,6 +87,7 @@ pm2 status
 ## ⏱️ 调整频率
 
 - Four.meme 前端最低 `5` 秒，API 最低 `8` 秒，其余高频模块最低 `1` 秒。
+- Four.meme HTTP 链上读取默认只使用 `https://rpc.48.club` 与 `https://bsc.rpc.blxrbdn.com`。
 - Flap 轮询最低 `500ms`。
 - Flap Factory 实时扫描使用固定 1 秒节拍和 0 确认块；RPC 自动选择低延迟健康节点，断点补扫与资产复核在后台轮转并主动让路。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。

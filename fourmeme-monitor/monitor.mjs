@@ -201,10 +201,8 @@ const CONFIG = {
 
   // ── BSC RPC ──
   bscRpcUrls: [
-    "https://bsc.publicnode.com",
-    "https://bsc-dataseed.binance.org/",
-    "https://bsc-dataseed1.defibit.io/",
-    "https://bsc-dataseed2.defibit.io/",
+    "https://rpc.48.club",
+    "https://bsc.rpc.blxrbdn.com",
   ],
   bscWsUrls: (process.env.BSC_WS_URLS || process.env.FOURMEME_BSC_WS_URLS || "wss://bsc-rpc.publicnode.com")
     .split(",")
