@@ -201,10 +201,15 @@ const CONFIG = {
   hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 60),
 
   // ── BSC RPC ──
-  bscRpcUrls: [
+  bscRpcUrls: [...new Set((process.env.FOURMEME_BSC_RPC_URLS || [
     "https://bsc.rpc.blxrbdn.com",
     "https://rpc.48.club",
-  ],
+    "https://bnb-mainnet.g.alchemy.com/public",
+    "https://bsc-rpc.publicnode.com",
+  ].join(","))
+    .split(/[\s,]+/)
+    .map(s => s.trim())
+    .filter(Boolean))],
   bscWsUrls: (process.env.BSC_WS_URLS || process.env.FOURMEME_BSC_WS_URLS || "wss://bsc-rpc.publicnode.com")
     .split(",")
     .map(s => s.trim())
@@ -1401,26 +1406,136 @@ async function fetchProbe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
    BSC JSON-RPC 工具（含 Batch）
    ══════════════════════════════════════════ */
 
-// --- 单次 RPC（保留作为 fallback）---
-async function bscRpcCall(method, params) {
-  let lastErr;
-  for (const rpcUrl of CONFIG.bscRpcUrls) {
-    try {
-      const res = await fetchSafe(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-      }, 8_000);
-      const json = await res.json();
-      if (json.error) throw new Error(`RPC error: ${json.error.message || JSON.stringify(json.error)}`);
-      return json.result;
-    } catch (err) {
-      lastErr = err;
-      // 429/403 对单个节点的限流不应终止整个调用，继续尝试下一个节点
-      continue;
+function createRpcEndpointPool(urls, {
+  now = () => Date.now(),
+  isBackedOff = url => Boolean(currentBackoffState(getDomain(url))),
+  failureCooldownMs = 30_000,
+} = {}) {
+  const endpoints = [...new Set(urls || [])].map((url, index) => ({
+    url,
+    index,
+    inFlight: 0,
+    consecutiveFailures: 0,
+    ewmaLatencyMs: null,
+    lastSelectedAt: 0,
+    successCount: 0,
+    failureCount: 0,
+    lastFailureAt: 0,
+  }));
+
+  function acquire(excludedUrls = new Set()) {
+    const currentTime = now();
+    for (const endpoint of endpoints) {
+      if (endpoint.consecutiveFailures > 0 && currentTime - endpoint.lastFailureAt >= failureCooldownMs) {
+        endpoint.consecutiveFailures = 0;
+      }
+    }
+    const candidates = endpoints
+      .filter(endpoint => !excludedUrls.has(endpoint.url) && !isBackedOff(endpoint.url))
+      .sort((left, right) => (
+        left.inFlight - right.inFlight
+        || left.consecutiveFailures - right.consecutiveFailures
+        || left.lastSelectedAt - right.lastSelectedAt
+        || (left.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER) - (right.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER)
+        || left.index - right.index
+      ));
+    const endpoint = candidates[0];
+    if (!endpoint) return null;
+    endpoint.inFlight++;
+    endpoint.lastSelectedAt = now();
+    return { endpoint, startedAt: now() };
+  }
+
+  function release(lease, succeeded) {
+    if (!lease?.endpoint) return;
+    const endpoint = lease.endpoint;
+    endpoint.inFlight = Math.max(0, endpoint.inFlight - 1);
+    const latencyMs = Math.max(0, now() - lease.startedAt);
+    if (succeeded) {
+      endpoint.successCount++;
+      endpoint.consecutiveFailures = 0;
+      endpoint.ewmaLatencyMs = endpoint.ewmaLatencyMs == null
+        ? latencyMs
+        : endpoint.ewmaLatencyMs * 0.7 + latencyMs * 0.3;
+    } else {
+      endpoint.failureCount++;
+      endpoint.consecutiveFailures++;
+      endpoint.lastFailureAt = now();
     }
   }
-  throw lastErr || new Error("所有 BSC RPC 节点均不可用");
+
+  return {
+    size: endpoints.length,
+    acquire,
+    succeed: lease => release(lease, true),
+    fail: lease => release(lease, false),
+    snapshot: () => endpoints.map(endpoint => ({ ...endpoint })),
+  };
+}
+
+function createAllRpcBackoffError() {
+  const error = new Error("[退避中] 所有 BSC RPC 节点均处于退避状态");
+  error.code = "BSC_RPC_ALL_BACKED_OFF";
+  return error;
+}
+
+const bscRpcEndpointPool = createRpcEndpointPool(CONFIG.bscRpcUrls);
+const bscRpcInflight = new Map();
+
+async function requestBscRpcPayload(payload, timeoutMs, {
+  pool = bscRpcEndpointPool,
+  inflight = bscRpcInflight,
+  fetchFn = fetchSafe,
+  parseResponse = response => response.json(),
+  dedupeKeySuffix = "json",
+} = {}) {
+  const dedupeKey = `${timeoutMs}:${dedupeKeySuffix}:${JSON.stringify(payload)}`;
+  const existing = inflight.get(dedupeKey);
+  if (existing) return existing;
+
+  const request = (async () => {
+    const attempted = new Set();
+    let lastErr;
+    while (attempted.size < pool.size) {
+      const lease = pool.acquire(attempted);
+      if (!lease) {
+        if (attempted.size === 0) throw createAllRpcBackoffError();
+        break;
+      }
+      const rpcUrl = lease.endpoint.url;
+      attempted.add(rpcUrl);
+      try {
+        const response = await fetchFn(rpcUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        }, timeoutMs);
+        const parsed = await parseResponse(response, rpcUrl);
+        pool.succeed(lease);
+        return parsed;
+      } catch (err) {
+        pool.fail(lease);
+        lastErr = err;
+      }
+    }
+    if (lastErr) throw lastErr;
+    throw createAllRpcBackoffError();
+  })();
+
+  inflight.set(dedupeKey, request);
+  try {
+    return await request;
+  } finally {
+    if (inflight.get(dedupeKey) === request) inflight.delete(dedupeKey);
+  }
+}
+
+// --- 单次 RPC ---
+async function bscRpcCall(method, params) {
+  const json = await requestBscRpcPayload({ jsonrpc: "2.0", id: 1, method, params }, 8_000);
+  if (json?.error) throw new Error(`RPC error: ${json.error.message || JSON.stringify(json.error)}`);
+  if (!json || !("result" in json)) throw new Error("RPC 返回缺少 result");
+  return json.result;
 }
 
 const rpcItemErrorLogState = new Map();
@@ -1460,6 +1575,7 @@ async function bscRpcBatch(calls) {
       const result = await bscRpcCall(calls[0].method, calls[0].params);
       return [result];
     } catch (err) {
+      if (err?.code === "BSC_RPC_ALL_BACKED_OFF") throw err;
       const info = shouldLogRpcItemError(calls[0], err.message);
       if (info.shouldLog) {
         const suffix = info.suppressed ? `（已合并 ${info.suppressed} 条同类错误）` : "";
@@ -1475,40 +1591,36 @@ async function bscRpcBatch(calls) {
     params: c.params,
   }));
 
-  let lastErr;
-  for (const rpcUrl of CONFIG.bscRpcUrls) {
-    try {
-      const res = await fetchSafe(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }, 15_000);
-      const results = await res.json();
-      if (!Array.isArray(results)) {
-        throw new Error("Batch RPC 返回非数组: " + JSON.stringify(results).slice(0, 200));
+  const results = await requestBscRpcPayload(payload, 15_000, {
+    parseResponse: async response => {
+      const json = await response.json();
+      if (!Array.isArray(json)) {
+        throw new Error("Batch RPC 返回非数组: " + JSON.stringify(json).slice(0, 200));
       }
-      // 按 id 排序后提取 result
-      results.sort((a, b) => a.id - b.id);
-      return results.map(r => {
-        if (r.error) {
-          const call = calls[r.id - 1];
-          const message = r.error.message || JSON.stringify(r.error);
-          const info = shouldLogRpcItemError(call, message);
-          if (info.shouldLog) {
-            const suffix = info.suppressed ? `（已合并 ${info.suppressed} 条同类错误）` : "";
-            log(`[RPC] 批量第 ${r.id} 项 ${formatRpcCallSample(call)} 失败：${message}${suffix}`);
-          }
-          return null;
-        }
-        return r.result;
-      });
-    } catch (err) {
-      lastErr = err;
-      // 429/403 对单个节点的限流不应终止整个调用，继续尝试下一个节点
-      continue;
+      return json;
+    },
+    dedupeKeySuffix: "batch-json",
+  });
+  return normalizeBscRpcBatchResults(calls, results);
+}
+
+function normalizeBscRpcBatchResults(calls, results) {
+  const byId = new Map(results.map(result => [Number(result.id), result]));
+  return calls.map((call, index) => {
+    const id = index + 1;
+    const result = byId.get(id);
+    if (!result) throw new Error(`Batch RPC 返回缺少 id=${id}`);
+    if (result.error) {
+      const message = result.error.message || JSON.stringify(result.error);
+      const info = shouldLogRpcItemError(call, message);
+      if (info.shouldLog) {
+        const suffix = info.suppressed ? `（已合并 ${info.suppressed} 条同类错误）` : "";
+        log(`[RPC] 批量第 ${id} 项 ${formatRpcCallSample(call)} 失败：${message}${suffix}`);
+      }
+      return null;
     }
-  }
-  throw lastErr || new Error("所有 BSC RPC 节点 batch 均不可用");
+    return result.result;
+  });
 }
 
 function encodeUint256(n) {
@@ -8251,46 +8363,48 @@ function rawRpcPayloadContainsActor(payload, actorAddresses) {
   return new RegExp(pattern, "i").test(String(payload || ""));
 }
 
-async function fetchActorBlocksWithRawPrefilter(blockCalls, actorAddresses) {
+async function fetchActorBlocksWithRawPrefilter(
+  blockCalls,
+  actorAddresses,
+  rpcRequestFn = requestBscRpcPayload,
+  rpcBatchFn = bscRpcBatch,
+) {
   if (actorAddresses.length === 0) return [];
-  let lastErr;
-  for (const rpcUrl of CONFIG.bscRpcUrls) {
-    try {
-      const payload = blockCalls.map((call, index) => ({
-        jsonrpc: "2.0",
-        id: index + 1,
-        method: call.method,
-        params: call.params,
-      }));
-      const res = await fetchSafe(rpcUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      }, 15_000);
-      const raw = await res.text();
-      if (!rawRpcPayloadContainsActor(raw, actorAddresses)) {
-        if (/"error"\s*:/i.test(raw) || !/"result"\s*:/i.test(raw)) {
-          throw new Error(`区块 RPC 返回异常：${raw.slice(0, 200)}`);
+  const payload = blockCalls.map((call, index) => ({
+    jsonrpc: "2.0",
+    id: index + 1,
+    method: call.method,
+    params: call.params,
+  }));
+  try {
+    return await rpcRequestFn(payload, 15_000, {
+      parseResponse: async res => {
+        const raw = await res.text();
+        if (!rawRpcPayloadContainsActor(raw, actorAddresses)) {
+          if (/"error"\s*:/i.test(raw) || !/"result"\s*:/i.test(raw)) {
+            throw new Error(`区块 RPC 返回异常：${raw.slice(0, 200)}`);
+          }
+          actorRawScanState.lastMode = "rawBlockPreFilter";
+          actorRawScanState.fastSkips++;
+          return [];
         }
-        actorRawScanState.lastMode = "rawBlockPreFilter";
-        actorRawScanState.fastSkips++;
-        return [];
-      }
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed) || parsed.some(item => item?.error)) {
-        throw new Error(`区块 RPC 返回无效：${raw.slice(0, 200)}`);
-      }
-      parsed.sort((a, b) => a.id - b.id);
-      actorRawScanState.lastMode = "rawBlockParsed";
-      return parsed.map(item => item.result);
-    } catch (err) {
-      lastErr = err;
-    }
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.some(item => item?.error)) {
+          throw new Error(`区块 RPC 返回无效：${raw.slice(0, 200)}`);
+        }
+        parsed.sort((a, b) => a.id - b.id);
+        actorRawScanState.lastMode = "rawBlockParsed";
+        return parsed.map(item => item.result);
+      },
+      dedupeKeySuffix: `actor-raw:${[...actorAddresses].sort().join(",")}`,
+    });
+  } catch (err) {
+    if (err?.code === "BSC_RPC_ALL_BACKED_OFF") throw err;
+    actorRawScanState.lastMode = "batchFallback";
+    actorRawScanState.fallbacks++;
+    log(`[创建者] 原始区块预过滤不可用，回退标准 RPC 解析：${err?.message || "未知错误"}`);
+    return rpcBatchFn(blockCalls);
   }
-  actorRawScanState.lastMode = "batchFallback";
-  actorRawScanState.fallbacks++;
-  log(`[创建者] 原始区块预过滤不可用，回退标准 RPC 解析：${lastErr?.message || "未知错误"}`);
-  return bscRpcBatch(blockCalls);
 }
 
 async function fetchActorBlockActions(fromBlock, toBlock, context, state, rpcBatchFn = bscRpcBatch) {
@@ -10019,6 +10133,12 @@ export const __testables = {
   isTransientNetworkError,
   formatNetworkError,
   fetchSafe,
+  createRpcEndpointPool,
+  requestBscRpcPayload,
+  bscRpcCall,
+  bscRpcBatch,
+  normalizeBscRpcBatchResults,
+  fetchActorBlocksWithRawPrefilter,
   fetchStaticAssetSafe,
   nextUA,
   browserHeaders,

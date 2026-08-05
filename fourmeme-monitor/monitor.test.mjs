@@ -21,8 +21,124 @@ test("default fourmeme frontend and api cadences are fast but bounded", () => {
   assert.deepEqual(__testables.CONFIG.bscRpcUrls, [
     "https://bsc.rpc.blxrbdn.com",
     "https://rpc.48.club",
+    "https://bnb-mainnet.g.alchemy.com/public",
+    "https://bsc-rpc.publicnode.com",
   ]);
   assert.equal(__testables.nextUA(), __testables.nextUA());
+});
+
+test("RPC endpoint pool rotates healthy nodes and favors lower in-flight", () => {
+  let now = 100;
+  const pool = __testables.createRpcEndpointPool([
+    "https://rpc-1.test",
+    "https://rpc-2.test",
+    "https://rpc-3.test",
+  ], { now: () => now++, isBackedOff: () => false });
+  const first = pool.acquire();
+  const second = pool.acquire();
+  assert.equal(first.endpoint.url, "https://rpc-1.test");
+  assert.equal(second.endpoint.url, "https://rpc-2.test");
+  pool.succeed(first);
+  pool.succeed(second);
+  assert.equal(pool.acquire().endpoint.url, "https://rpc-3.test");
+});
+
+test("RPC endpoint pool skips a backed-off node", () => {
+  const pool = __testables.createRpcEndpointPool([
+    "https://limited.test",
+    "https://healthy.test",
+  ], { isBackedOff: url => url.includes("limited") });
+  assert.equal(pool.acquire().endpoint.url, "https://healthy.test");
+});
+
+test("RPC request immediately switches nodes after one endpoint is rate limited", async () => {
+  const pool = __testables.createRpcEndpointPool([
+    "https://limited.test",
+    "https://healthy.test",
+  ], { isBackedOff: () => false });
+  const requestedUrls = [];
+  const result = await __testables.requestBscRpcPayload(
+    { jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] },
+    8_000,
+    {
+      pool,
+      inflight: new Map(),
+      fetchFn: async url => {
+        requestedUrls.push(url);
+        if (url.includes("limited")) throw new Error("HTTP 429 (风控)");
+        return { json: async () => ({ jsonrpc: "2.0", id: 1, result: "0x2" }) };
+      },
+    },
+  );
+  assert.equal(result.result, "0x2");
+  assert.deepEqual(requestedUrls, ["https://limited.test", "https://healthy.test"]);
+});
+
+test("identical concurrent RPC payloads share one HTTP request", async () => {
+  const pool = __testables.createRpcEndpointPool(["https://rpc.test"], { isBackedOff: () => false });
+  const inflight = new Map();
+  let requests = 0;
+  let resolveRequest;
+  const fetchFn = async () => {
+    requests++;
+    await new Promise(resolve => { resolveRequest = resolve; });
+    return { json: async () => ({ jsonrpc: "2.0", id: 1, result: "0x1" }) };
+  };
+  const payload = { jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] };
+  const first = __testables.requestBscRpcPayload(payload, 8_000, { pool, inflight, fetchFn });
+  const second = __testables.requestBscRpcPayload(payload, 8_000, { pool, inflight, fetchFn });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(requests, 1);
+  resolveRequest();
+  assert.deepEqual(await Promise.all([first, second]), [
+    { jsonrpc: "2.0", id: 1, result: "0x1" },
+    { jsonrpc: "2.0", id: 1, result: "0x1" },
+  ]);
+  assert.equal(inflight.size, 0);
+});
+
+test("RPC request fails fast once every endpoint is backed off", async () => {
+  const pool = __testables.createRpcEndpointPool([
+    "https://rpc-1.test",
+    "https://rpc-2.test",
+  ], { isBackedOff: () => true });
+  let requests = 0;
+  await assert.rejects(
+    __testables.requestBscRpcPayload(
+      { jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] },
+      8_000,
+      { pool, inflight: new Map(), fetchFn: async () => { requests++; } },
+    ),
+    error => error.code === "BSC_RPC_ALL_BACKED_OFF",
+  );
+  assert.equal(requests, 0);
+});
+
+test("batch RPC responses are restored to request id order", () => {
+  const calls = [
+    { method: "eth_blockNumber", params: [] },
+    { method: "eth_getCode", params: ["0x1", "latest"] },
+  ];
+  assert.deepEqual(__testables.normalizeBscRpcBatchResults(calls, [
+    { jsonrpc: "2.0", id: 2, result: "0xcode" },
+    { jsonrpc: "2.0", id: 1, result: "0xblock" },
+  ]), ["0xblock", "0xcode"]);
+});
+
+test("actor raw prefilter does not retry through batch when all RPC nodes back off", async () => {
+  const error = new Error("all backed off");
+  error.code = "BSC_RPC_ALL_BACKED_OFF";
+  let fallbackCalls = 0;
+  await assert.rejects(
+    __testables.fetchActorBlocksWithRawPrefilter(
+      [{ method: "eth_getBlockByNumber", params: ["latest", true] }],
+      ["0x1111111111111111111111111111111111111111"],
+      async () => { throw error; },
+      async () => { fallbackCalls++; return []; },
+    ),
+    candidate => candidate === error,
+  );
+  assert.equal(fallbackCalls, 0);
 });
 
 test("contract fingerprints use storage and code without eth_getProof", async () => {
