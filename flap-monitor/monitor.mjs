@@ -19,13 +19,17 @@ import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, readdirSync, unlinkSync, statSync, renameSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import WebSocket from "ws";
 import { sendCard, sendCardQueued, patchCard, pinMessage, waitQueueDrain } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
+  FACTORY_POOL_STATE_EVENT_TOPICS,
   FLAP_FACTORY_PROXY,
   classifyFactoryPoolChange,
   createFactoryPoolState,
   loadFactoryPoolState,
+  factoryPoolEventKey,
+  ingestFactoryPoolEvent,
   mergePendingFactoryPoolChanges,
   runFactoryPoolScan,
   saveFactoryPoolState,
@@ -109,6 +113,10 @@ const CONFIG = {
     rpcTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_RPC_TIMEOUT_MS", 2_000, 500),
     rpcCatchupTimeoutMs: readPositiveIntEnv("FLAP_FACTORY_RPC_CATCHUP_TIMEOUT_MS", 8_000, 1_000),
     rpcHedgeDelayMs: readPositiveIntEnv("FLAP_FACTORY_RPC_HEDGE_DELAY_MS", 120, 50),
+    wsEnabled: process.env.FLAP_FACTORY_WS_ENABLED !== "false",
+    wsUrls: [...new Set((process.env.FLAP_FACTORY_WS_URLS || "wss://bsc-rpc.publicnode.com,wss://bsc.publicnode.com")
+      .split(",").map(value => value.trim()).filter(Boolean))],
+    wsBackfillBlocks: Math.min(20_000, readPositiveIntEnv("FLAP_FACTORY_WS_BACKFILL_BLOCKS", 10_000, 5_000)),
   },
 
   // 反风控
@@ -2769,6 +2777,7 @@ async function bscRpcBatch(calls = [], options = {}) {
 
 const ERC20_NAME_SELECTOR = "0x06fdde03";
 const ERC20_SYMBOL_SELECTOR = "0x95d89b41";
+const ERC20_DECIMALS_SELECTOR = "0x313ce567";
 
 function cleanTokenMetadataText(value) {
   return String(value || "").replace(/[\u0000-\u001f\u007f]/g, "").replace(/\s+/g, " ").trim();
@@ -2795,6 +2804,17 @@ function decodeErc20MetadataText(value) {
   }
 }
 
+function decodeErc20Decimals(value) {
+  const hex = String(value || "").replace(/^0x/i, "");
+  if (!/^[a-fA-F0-9]{64,}$/.test(hex)) return null;
+  try {
+    const decimals = Number(BigInt(`0x${hex.slice(0, 64)}`));
+    return Number.isInteger(decimals) && decimals >= 0 && decimals <= 255 ? decimals : null;
+  } catch {
+    return null;
+  }
+}
+
 function parseGoPlusTokenMetadata(payload, addresses = []) {
   const result = payload?.result && typeof payload.result === "object" ? payload.result : {};
   const metadata = {};
@@ -2812,13 +2832,15 @@ async function resolveErc20MetadataViaRpc(tokens, rpcBatchFn) {
   const calls = tokens.flatMap(address => [
     { method: "eth_call", params: [{ to: address, data: ERC20_NAME_SELECTOR }, "latest"] },
     { method: "eth_call", params: [{ to: address, data: ERC20_SYMBOL_SELECTOR }, "latest"] },
+    { method: "eth_call", params: [{ to: address, data: ERC20_DECIMALS_SELECTOR }, "latest"] },
   ]);
   const values = await rpcBatchFn(calls);
   const metadata = {};
   tokens.forEach((address, index) => {
-    const name = decodeErc20MetadataText(values[index * 2]);
-    const symbol = decodeErc20MetadataText(values[index * 2 + 1]);
-    if (name || symbol) metadata[address] = { name, symbol, source: "onchain" };
+    const name = decodeErc20MetadataText(values[index * 3]);
+    const symbol = decodeErc20MetadataText(values[index * 3 + 1]);
+    const decimals = decodeErc20Decimals(values[index * 3 + 2]);
+    if (name || symbol || decimals != null) metadata[address] = { name, symbol, decimals, source: "onchain" };
   });
   return metadata;
 }
@@ -2827,7 +2849,7 @@ async function resolveFactoryPoolTokenMetadata(addresses, options = {}) {
   const normalized = [...new Set(addresses.map(normalizeAddress).filter(Boolean))];
   const metadata = {};
   if (normalized.includes(BNB_QUOTE_TOKEN)) {
-    metadata[BNB_QUOTE_TOKEN] = { name: "BNB", symbol: "BNB", source: "native" };
+    metadata[BNB_QUOTE_TOKEN] = { name: "BNB", symbol: "BNB", decimals: 18, source: "native" };
   }
   const tokens = normalized.filter(address => address !== BNB_QUOTE_TOKEN);
   if (tokens.length === 0) return { metadata, errors: [] };
@@ -2840,38 +2862,38 @@ async function resolveFactoryPoolTokenMetadata(addresses, options = {}) {
   const onchainPromise = resolveErc20MetadataViaRpc(tokens, rpcBatchFn)
     .then(value => ({ value, error: null }))
     .catch(error => ({ value: {}, error }));
-  try {
-    const url = new URL(apiUrl);
-    url.searchParams.set("contract_addresses", tokens.join(","));
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (!options.onchainOnly) {
     try {
-      const response = await fetchFn(url, { headers: { Accept: "application/json" }, signal: controller.signal });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      Object.assign(metadata, parseGoPlusTokenMetadata(await response.json(), tokens));
-    } finally {
-      clearTimeout(timer);
+      const url = new URL(apiUrl);
+      url.searchParams.set("contract_addresses", tokens.join(","));
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetchFn(url, { headers: { Accept: "application/json" }, signal: controller.signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        Object.assign(metadata, parseGoPlusTokenMetadata(await response.json(), tokens));
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch (error) {
+      errors.push(`GoPlus: ${error.name === "AbortError" ? `超时 ${timeoutMs}ms` : error.message}`);
     }
-  } catch (error) {
-    errors.push(`GoPlus: ${error.name === "AbortError" ? `超时 ${timeoutMs}ms` : error.message}`);
   }
 
-  const unresolved = tokens.filter(address => !metadata[address]?.name || !metadata[address]?.symbol);
-  if (unresolved.length > 0) {
-    const onchain = await onchainPromise;
-    if (onchain.error) {
-      errors.push(`链上元数据: ${onchain.error.message}`);
-    } else {
-      for (const address of unresolved) {
-        const fallback = onchain.value[address];
-        if (!fallback) continue;
-        const current = metadata[address] || { name: "", symbol: "", source: "" };
-        metadata[address] = {
-          name: current.name || fallback.name,
-          symbol: current.symbol || fallback.symbol,
-          source: current.source ? `${current.source}+onchain` : "onchain",
-        };
-      }
+  const onchain = await onchainPromise;
+  if (onchain.error) {
+    errors.push(`链上元数据: ${onchain.error.message}`);
+  } else {
+    for (const address of tokens) {
+      const fallback = onchain.value[address];
+      if (!fallback) continue;
+      const current = metadata[address] || { name: "", symbol: "", decimals: null, source: "" };
+      metadata[address] = {
+        name: current.name || fallback.name,
+        symbol: current.symbol || fallback.symbol,
+        decimals: fallback.decimals,
+        source: current.source ? `${current.source}+onchain` : "onchain",
+      };
     }
   }
   return { metadata, errors };
@@ -2891,10 +2913,18 @@ async function enrichFactoryPoolTokenMetadata(state, preferredAddresses = []) {
     if (item) {
       asset.name = item.name || asset.name || "";
       asset.symbol = item.symbol || asset.symbol || "";
+      if (Number.isInteger(item.decimals)) asset.decimals = item.decimals;
       asset.metadataSource = item.source;
       asset.metadataUpdatedAt = updatedAt;
-      asset.metadataNextRetryAt = asset.name && asset.symbol ? "" : nextRetryAt;
-      asset.metadataError = "";
+      const metadataComplete = asset.name && asset.symbol && Number.isInteger(asset.decimals);
+      asset.metadataNextRetryAt = metadataComplete ? "" : nextRetryAt;
+      asset.metadataError = metadataComplete ? "" : result.errors.join("｜") || "ERC20 元数据不完整";
+      const candidate = state.candidates?.[address];
+      if (candidate) {
+        candidate.name = asset.name;
+        candidate.symbol = asset.symbol;
+        candidate.decimals = asset.decimals;
+      }
     } else {
       asset.metadataNextRetryAt = nextRetryAt;
       asset.metadataError = result.errors.join("｜") || "免费 API 与链上调用均未返回名称";
@@ -3206,6 +3236,13 @@ function mergeFactoryPoolScanState(target, incoming) {
       target.assets[address] = asset;
     }
   }
+  target.recentEvents = Object.fromEntries(mergeUniqueFactoryPoolRecords(
+    Object.entries(target.recentEvents || {}).map(([key, event]) => ({ key, ...event })),
+    Object.entries(incoming.recentEvents || {}).map(([key, event]) => ({ key, ...event })),
+    item => item.key,
+  ).sort((left, right) => (right.blockNumber || 0) - (left.blockNumber || 0))
+    .slice(0, 20_000)
+    .map(({ key, ...event }) => [key, event]));
   target.implementationHistory = mergeUniqueFactoryPoolRecords(
     target.implementationHistory,
     incoming.implementationHistory,
@@ -3232,7 +3269,7 @@ async function recordFactoryPoolScanError(state, error, saveStateFn = saveFactor
 }
 
 function factoryPoolMetadataFingerprint(asset = {}) {
-  return `${asset.name || ""}\u0000${asset.symbol || ""}\u0000${asset.metadataSource || ""}`;
+  return `${asset.name || ""}\u0000${asset.symbol || ""}\u0000${asset.decimals ?? ""}\u0000${asset.metadataSource || ""}`;
 }
 
 function factoryPoolMetadataStateFingerprint(asset = {}) {
@@ -3250,7 +3287,7 @@ function getFactoryPoolMetadataWorkAddresses(state, preferredAddresses = []) {
   return [...new Set([...preferred, ...Object.keys(state.assets || {}).sort()])]
     .filter(address => {
       const asset = state.assets?.[address];
-      if (!asset || (asset.name && asset.symbol)) return false;
+      if (!asset || (asset.name && asset.symbol && Number.isInteger(asset.decimals))) return false;
       const retryAt = Date.parse(asset.metadataNextRetryAt || "");
       return !Number.isFinite(retryAt) || retryAt <= now;
     })
@@ -3288,6 +3325,7 @@ async function enrichFactoryPoolMetadataAfterSend({
         for (const field of ["name", "symbol", "metadataSource", "metadataUpdatedAt", "metadataNextRetryAt", "metadataError"]) {
           current[field] = metadata[field] || "";
         }
+        if (Number.isInteger(metadata.decimals)) current.decimals = metadata.decimals;
       }
       saveFn(stateFile, state);
     });
@@ -3477,6 +3515,253 @@ async function checkFlapFactoryPools(factoryPoolState, {
   }).finally(() => { factoryPoolDeliveryQueued = false; });
   if (awaitDelivery) return await delivery;
   return { ...result, sent: false, deliveryQueued: true };
+}
+
+function createFactoryPoolWsFeed({
+  urls,
+  proxy,
+  topics,
+  onEvent,
+  onSubscribed,
+  logFn = log,
+  WebSocketImpl = WebSocket,
+  reconnectBaseMs = 1_000,
+  reconnectMaxMs = 30_000,
+} = {}) {
+  const endpoints = (urls || []).map((url, index) => ({
+    url,
+    index,
+    ws: null,
+    subscriptionId: "",
+    reconnectAttempts: 0,
+    reconnectTimer: null,
+    awaitingPong: false,
+    stopped: false,
+  }));
+  let heartbeatTimer = null;
+  let stopped = false;
+
+  const safeUrl = url => String(url || "").replace(/\/\/[^/@]+@/, "//***@");
+
+  function scheduleReconnect(endpoint, reason) {
+    if (stopped || endpoint.stopped || endpoint.reconnectTimer) return;
+    const delay = Math.min(reconnectMaxMs, reconnectBaseMs * (2 ** Math.min(endpoint.reconnectAttempts, 5)));
+    endpoint.reconnectAttempts++;
+    logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 将在 ${Math.round(delay / 1000)}s 后重连：${reason || "连接关闭"}`);
+    endpoint.reconnectTimer = setTimeout(() => {
+      endpoint.reconnectTimer = null;
+      connect(endpoint);
+    }, delay);
+  }
+
+  function connect(endpoint) {
+    if (stopped || endpoint.stopped) return;
+    logFn(`[Flap Factory WSS] 正在连接：${safeUrl(endpoint.url)}`);
+    const ws = new WebSocketImpl(endpoint.url, { handshakeTimeout: 10_000 });
+    endpoint.ws = ws;
+    endpoint.subscriptionId = "";
+    ws.on("open", () => {
+      endpoint.awaitingPong = false;
+      ws.send(JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_subscribe",
+        params: ["logs", { address: proxy, topics: [topics] }],
+      }));
+    });
+    ws.on("message", raw => {
+      endpoint.awaitingPong = false;
+      let message;
+      try { message = JSON.parse(String(raw)); } catch {
+        logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 消息解析失败`);
+        return;
+      }
+      if (message.id === 1) {
+        if (message.error) {
+          logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 订阅失败：${message.error.message || JSON.stringify(message.error)}`);
+          try { ws.close(); } catch {}
+          return;
+        }
+        if (message.result) {
+          endpoint.subscriptionId = message.result;
+          endpoint.reconnectAttempts = 0;
+          logFn(`[Flap Factory WSS] 已订阅 ${safeUrl(endpoint.url)}：${message.result}`);
+          void Promise.resolve(onSubscribed?.(endpoint.url)).catch(error => {
+            logFn(`[Flap Factory WSS] 启动回扫失败：${error.message}`);
+          });
+        }
+        return;
+      }
+      const event = message.params?.result;
+      if (!event || event.removed) return;
+      void Promise.resolve(onEvent?.(event, endpoint.url)).catch(error => {
+        logFn(`[Flap Factory WSS] 事件处理失败：${error.message}`);
+      });
+    });
+    ws.on("close", (code, reason) => {
+      if (endpoint.ws === ws) endpoint.ws = null;
+      endpoint.subscriptionId = "";
+      scheduleReconnect(endpoint, `close ${code}${reason ? ` ${reason}` : ""}`);
+    });
+    ws.on("error", error => {
+      logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 异常：${error.message}`);
+      try { ws.terminate(); } catch { try { ws.close(); } catch {} }
+    });
+    ws.on("pong", () => { endpoint.awaitingPong = false; });
+  }
+
+  function start() {
+    stopped = false;
+    for (const endpoint of endpoints) {
+      endpoint.stopped = false;
+      connect(endpoint);
+    }
+    heartbeatTimer = setInterval(() => {
+      for (const endpoint of endpoints) {
+        if (endpoint.ws?.readyState === WebSocketImpl.OPEN) {
+          if (endpoint.awaitingPong) {
+            logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 心跳超时，主动重连`);
+            try { endpoint.ws.terminate(); } catch { try { endpoint.ws.close(); } catch {} }
+            continue;
+          }
+          endpoint.awaitingPong = true;
+          try { endpoint.ws.ping(); } catch {}
+        }
+      }
+    }, 30_000);
+    return api;
+  }
+
+  function stop() {
+    stopped = true;
+    if (heartbeatTimer) clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+    for (const endpoint of endpoints) {
+      endpoint.stopped = true;
+      if (endpoint.reconnectTimer) clearTimeout(endpoint.reconnectTimer);
+      endpoint.reconnectTimer = null;
+      try { endpoint.ws?.close(); } catch {}
+      endpoint.ws = null;
+      endpoint.subscriptionId = "";
+      endpoint.awaitingPong = false;
+    }
+  }
+
+  const api = {
+    start,
+    stop,
+    snapshot: () => endpoints.map(endpoint => ({
+      url: endpoint.url,
+      connected: Boolean(endpoint.subscriptionId),
+      subscriptionId: endpoint.subscriptionId,
+      reconnectAttempts: endpoint.reconnectAttempts,
+    })),
+  };
+  return api;
+}
+
+async function processFactoryPoolFeedEvent(factoryPoolState, logEntry, source = "factory-wss") {
+  const result = await checkFlapFactoryPools(factoryPoolState, {
+    awaitDelivery: false,
+    scanFn: async ({ state, rpcCall, persistState, log: scanLog }) => {
+      const ingested = await ingestFactoryPoolEvent({
+        state,
+        logEntry,
+        rpcCall,
+        persistState,
+        source,
+        log: scanLog,
+      });
+      if (!ingested.processed) {
+        return { changed: false, changes: [], implementationChange: null, state, ...ingested };
+      }
+      const quoteToken = ingested.item.quoteToken;
+      const asset = state.assets?.[quoteToken];
+      if (asset?.configured) {
+        const metadataResult = await resolveFactoryPoolTokenMetadata([quoteToken], { onchainOnly: true });
+        const metadata = metadataResult.metadata[quoteToken];
+        if (metadata) {
+          asset.name = metadata.name || asset.name || "";
+          asset.symbol = metadata.symbol || asset.symbol || "";
+          if (Number.isInteger(metadata.decimals)) asset.decimals = metadata.decimals;
+          asset.metadataSource = metadata.source || asset.metadataSource || "";
+          asset.metadataUpdatedAt = new Date().toISOString();
+          asset.metadataError = metadataResult.errors.join("｜");
+          const candidate = state.candidates?.[quoteToken];
+          if (candidate) {
+            candidate.name = asset.name;
+            candidate.symbol = asset.symbol;
+            candidate.decimals = asset.decimals;
+          }
+        }
+      }
+      const current = state.assets?.[quoteToken];
+      const eventConfig = ingested.item.eventConfiguration;
+      if (eventConfig) {
+        const configText = [
+          `enabled=${eventConfig.enabled}`,
+          `defaultCurve=${eventConfig.defaultCurve}`,
+          `alternativeCurve=${eventConfig.alternativeCurve}`,
+          `nativeToQuoteSwapType=${eventConfig.nativeToQuoteSwapType}`,
+          `dexId=${eventConfig.dexId}`,
+        ].join(", ");
+        const eventLabel = eventConfig.enabled === 1 ? "发现新底池" : "底池配置变更";
+        log(`[Flap Factory WSS] ${eventLabel}：symbol=${current?.symbol || "未知"}｜name=${current?.name || "未知"}｜address=${quoteToken}｜config={${configText}}｜disabled=${current?.creationDisabled ?? "未知"}｜tx=${ingested.item.txHash}`);
+      }
+      if (typeof ingested.item.eventDisabled === "boolean") {
+        log(`[Flap Factory WSS] 底池状态：symbol=${current?.symbol || "未知"}｜address=${quoteToken}｜disabled=${current?.creationDisabled ?? ingested.item.eventDisabled}｜tx=${ingested.item.txHash}`);
+        if (ingested.item.eventDisabled === false) {
+          log(`[Flap Factory WSS] 底池开放：symbol=${current?.symbol || "未知"}｜address=${quoteToken}｜tx=${ingested.item.txHash}`);
+        }
+      }
+      const changes = ingested.changes.map(change => ({
+        ...change,
+        current: state.assets?.[change.current.quoteToken] || change.current,
+      }));
+      return { ...ingested, changed: changes.length > 0, changes, implementationChange: null, state };
+    },
+  });
+  return result;
+}
+
+function createFactoryPoolEventQueue(factoryPoolState, processor = processFactoryPoolFeedEvent) {
+  let tail = Promise.resolve();
+  const queuedKeys = new Set();
+  function enqueue(logEntry, source) {
+    const key = factoryPoolEventKey(logEntry);
+    if (!key || queuedKeys.has(key)) return Promise.resolve({ duplicate: true });
+    queuedKeys.add(key);
+    const job = tail.then(() => processor(factoryPoolState, logEntry, source));
+    tail = job.catch(error => {
+      log(`[Flap Factory WSS] 事件 ${key} 处理失败：${error.message}`);
+    }).finally(() => queuedKeys.delete(key));
+    return job;
+  }
+  return { enqueue, drain: () => tail };
+}
+
+async function backfillFactoryPoolFeedEvents(
+  eventQueue,
+  blocks = CONFIG.factoryPoolMonitor.wsBackfillBlocks,
+  rpcCall = bscRpcCall,
+  proxy = CONFIG.factoryPoolMonitor.proxy,
+) {
+  const latest = hexToNumber(await rpcCall("eth_blockNumber", []));
+  const fromBlock = Math.max(0, latest - Math.max(1, blocks) + 1);
+  log(`[Flap Factory WSS] 启动短窗口回扫：${fromBlock} → ${latest}`);
+  const events = await rpcCall("eth_getLogs", [{
+    address: proxy,
+    fromBlock: numberToHex(fromBlock),
+    toBlock: numberToHex(latest),
+    topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
+  }]);
+  const ordered = [...(events || [])].sort((left, right) =>
+    hexToNumber(left.blockNumber) - hexToNumber(right.blockNumber)
+    || hexToNumber(left.transactionIndex) - hexToNumber(right.transactionIndex)
+    || hexToNumber(left.logIndex) - hexToNumber(right.logIndex));
+  for (const event of ordered) await eventQueue.enqueue(event, "factory-wss-backfill");
+  log(`[Flap Factory WSS] 短窗口回扫完成：读取 ${ordered.length} 条事件`);
+  return { fromBlock, latest, eventCount: ordered.length };
 }
 
 function extractStrings(content, ext) {
@@ -5871,6 +6156,31 @@ async function startMonitor() {
     }
   }
 
+  const factoryPoolEventQueue = createFactoryPoolEventQueue(factoryPoolState);
+  global.__factoryPoolEventQueueDrain = factoryPoolEventQueue.drain;
+  if (CONFIG.factoryPoolMonitor.enabled && CONFIG.factoryPoolMonitor.wsEnabled && CONFIG.factoryPoolMonitor.wsUrls.length > 0) {
+    let backfillStarted = false;
+    const factoryPoolWsFeed = createFactoryPoolWsFeed({
+      urls: CONFIG.factoryPoolMonitor.wsUrls,
+      proxy: CONFIG.factoryPoolMonitor.proxy,
+      topics: FACTORY_POOL_STATE_EVENT_TOPICS,
+      onEvent: event => factoryPoolEventQueue.enqueue(event, "factory-wss"),
+      onSubscribed: async () => {
+        if (backfillStarted) return;
+        backfillStarted = true;
+        try {
+          await backfillFactoryPoolFeedEvents(factoryPoolEventQueue);
+        } catch (error) {
+          backfillStarted = false;
+          throw error;
+        }
+      },
+    });
+    global.__factoryPoolWsFeed = factoryPoolWsFeed.start();
+  } else {
+    log("[Flap Factory WSS] 未启用或未配置节点，继续使用 1 秒 HTTP 扫描");
+  }
+
   await sendFeishu(
     "Flap 监控 v2 已启动",
     buildFlapStartupContent(snapshot, (await import("node:os")).hostname(), factoryPoolState),
@@ -6292,6 +6602,13 @@ async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   log(`收到 ${signal}，正在优雅退出……`);
+  if (global.__factoryPoolWsFeed) {
+    global.__factoryPoolWsFeed.stop();
+    log("已停止 Flap Factory WebSocket 订阅");
+  }
+  if (global.__factoryPoolEventQueueDrain) {
+    try { await global.__factoryPoolEventQueueDrain(); } catch {}
+  }
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   try { saveSnapshot(loadSnapshot() || {}); } catch {}
@@ -6334,12 +6651,17 @@ export const __testables = {
   enrichFactoryPoolMetadataAfterSend,
   scheduleFactoryPoolMetadataEnrichment,
   decodeErc20MetadataText,
+  decodeErc20Decimals,
   parseGoPlusTokenMetadata,
   resolveFactoryPoolTokenMetadata,
   bscRpcCall,
   bscRpcBatch,
   executeBscGetLogsRequest,
   mergeFactoryPoolScanState,
+  createFactoryPoolWsFeed,
+  createFactoryPoolEventQueue,
+  processFactoryPoolFeedEvent,
+  backfillFactoryPoolFeedEvents,
   resetBscRpcHealth,
   buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,

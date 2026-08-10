@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 9;
+export const FACTORY_POOL_SCHEMA_VERSION = 10;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -19,6 +19,7 @@ export const FACTORY_POOL_STATE_EVENT_TOPICS = [
 ];
 const FACTORY_POOL_STATE_EVENT_TOPIC_SET = new Set(FACTORY_POOL_STATE_EVENT_TOPICS);
 const MAX_FACTORY_POOL_CANDIDATES = 5_000;
+const MAX_FACTORY_POOL_RECENT_EVENTS = 20_000;
 const MAX_FACTORY_POOL_STATE_BYTES = 16 * 1024 * 1024;
 
 const ZERO_WORD = "0".repeat(64);
@@ -79,6 +80,12 @@ export function decodeQuoteTokenConfiguration(result) {
   return {
     fields,
     values,
+    enabled: Number(values[0]),
+    officialCandidate: Number(values[0]) === 1,
+    defaultCurve: Number(values[1]),
+    alternativeCurve: Number(values[2]),
+    nativeToQuoteSwapType: Number(values[3]),
+    dexId: Number(values[4]),
     configured,
     configurationPresent: fields.some(field => field !== `0x${ZERO_WORD}`),
     fingerprint: hashValue(fields.join(":")),
@@ -108,6 +115,10 @@ export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY
     const quoteToken = /^[a-fA-F0-9]{64,}$/.test(data)
       ? normalizeAddress(`0x${data.slice(24, 64)}`)
       : "";
+    let eventConfiguration = null;
+    if (data.length >= 384) {
+      try { eventConfiguration = decodeQuoteTokenConfiguration(`0x${data.slice(64, 384)}`); } catch {}
+    }
     return quoteToken ? [{
       quoteToken,
       selector: "",
@@ -116,12 +127,15 @@ export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY
       blockNumber: hexToNumber(logEntry?.blockNumber),
       logIndex: hexToNumber(logEntry?.logIndex),
       source: "event",
+      eventConfiguration,
     }] : [];
   }
   if (topic0 === QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC) {
     const quoteToken = extractAddressWords(logEntry?.topics?.[1] || "")[0]
       || extractAddressWords(logEntry?.data || "")[0]
       || "";
+    let eventDisabled = null;
+    try { eventDisabled = decodeBooleanResult(logEntry?.data || ""); } catch {}
     return quoteToken ? [{
       quoteToken,
       selector: QUOTE_TOKEN_CREATION_DISABLED_SELECTOR,
@@ -130,6 +144,7 @@ export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY
       blockNumber: hexToNumber(logEntry?.blockNumber),
       logIndex: hexToNumber(logEntry?.logIndex),
       source: "event",
+      eventDisabled,
     }] : [];
   }
   return [];
@@ -172,8 +187,15 @@ function migrateFactoryPoolAsset(asset = {}) {
     effectiveEnabled: configured && !creationDisabled,
     configurationFingerprint,
     fingerprint: hashValue(`${configurationFingerprint}:${creationDisabled ? 1 : 0}`),
+    enabled: Number(values[0] ?? asset.enabled ?? (configured ? 1 : 0)),
+    officialCandidate: configured,
+    defaultCurve: Number(values[1] ?? asset.defaultCurve ?? 0),
+    alternativeCurve: Number(values[2] ?? asset.alternativeCurve ?? 0),
+    nativeToQuoteSwapType: Number(values[3] ?? asset.nativeToQuoteSwapType ?? 0),
+    dexId: Number(values[4] ?? asset.dexId ?? 0),
+    disabled: creationDisabled,
+    decimals: Number.isFinite(Number(asset.decimals)) ? Number(asset.decimals) : null,
   };
-  delete migrated.enabled;
   return migrated;
 }
 
@@ -196,6 +218,7 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
     implementationHistory: [],
     candidates: {},
     assets: {},
+    recentEvents: {},
     assetRefreshCursor: 0,
     pendingChanges: [],
     pendingImplementationChange: null,
@@ -222,13 +245,15 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
   state.schemaVersion = FACTORY_POOL_SCHEMA_VERSION;
   state.chainId = BSC_CHAIN_ID;
   state.proxy = normalizeAddress(proxy);
-  for (const key of ["candidates", "assets"]) {
+  for (const key of ["candidates", "assets", "recentEvents"]) {
     if (!state[key] || typeof state[key] !== "object" || Array.isArray(state[key])) state[key] = {};
   }
   state.assets = Object.fromEntries(Object.entries(state.assets).map(([address, asset]) => [address, migrateFactoryPoolAsset(asset)]));
   for (const candidate of Object.values(state.candidates)) {
     if (!candidate || typeof candidate !== "object") continue;
-    delete candidate.enabled;
+    if (!Number.isFinite(Number(candidate.enabled))) candidate.enabled = candidate.configured ? 1 : 0;
+    if (typeof candidate.officialCandidate !== "boolean") candidate.officialCandidate = Number(candidate.enabled) === 1;
+    if (typeof candidate.disabled !== "boolean") candidate.disabled = Boolean(candidate.creationDisabled);
     if (typeof candidate.creationDisabled !== "boolean") candidate.creationDisabled = false;
     if (typeof candidate.effectiveEnabled !== "boolean") {
       candidate.effectiveEnabled = Boolean(candidate.configured) && !candidate.creationDisabled;
@@ -246,6 +271,10 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
       || candidate?.sources?.some(source => FACTORY_POOL_STATE_EVENT_TOPIC_SET.has(String(source.topic0 || "").toLowerCase())))
     .sort(([, left], [, right]) => (right.lastSeenBlock || 0) - (left.lastSeenBlock || 0))
     .slice(0, MAX_FACTORY_POOL_CANDIDATES));
+  state.recentEvents = Object.fromEntries(Object.entries(state.recentEvents)
+    .filter(([key, event]) => /^[a-f0-9x]+:\d+$/i.test(key) && event && typeof event === "object")
+    .sort(([, left], [, right]) => (right.blockNumber || 0) - (left.blockNumber || 0))
+    .slice(0, MAX_FACTORY_POOL_RECENT_EVENTS));
   for (const key of [
     "fallbackLastScannedBlock", "historyLogLastScannedBlock", "historyBlockLastScannedBlock",
     "historyBackwardLogCursor", "historyStateEventCursor", "historyBackwardBlockCursor",
@@ -296,6 +325,31 @@ function candidateKey(item) {
   return `${item.source || "unknown"}:${item.txHash || ""}:${item.logIndex ?? ""}:${item.selector || item.topic0 || ""}:${item.quoteToken}`;
 }
 
+export function factoryPoolEventKey(logEntry) {
+  const txHash = String(logEntry?.transactionHash || "").toLowerCase();
+  const logIndex = hexToNumber(logEntry?.logIndex);
+  return /^0x[a-f0-9]{64}$/.test(txHash) ? `${txHash}:${logIndex}` : "";
+}
+
+function rememberFactoryPoolEvent(state, logEntry, source) {
+  const key = factoryPoolEventKey(logEntry);
+  if (!key || state.recentEvents?.[key]) return false;
+  state.recentEvents ||= {};
+  state.recentEvents[key] = {
+    blockNumber: hexToNumber(logEntry?.blockNumber),
+    transactionHash: String(logEntry?.transactionHash || "").toLowerCase(),
+    logIndex: hexToNumber(logEntry?.logIndex),
+    source: source || "event",
+    seenAt: nowText(),
+  };
+  const entries = Object.entries(state.recentEvents);
+  if (entries.length > MAX_FACTORY_POOL_RECENT_EVENTS) {
+    entries.sort(([, left], [, right]) => (right.blockNumber || 0) - (left.blockNumber || 0));
+    state.recentEvents = Object.fromEntries(entries.slice(0, MAX_FACTORY_POOL_RECENT_EVENTS));
+  }
+  return true;
+}
+
 function rememberCandidate(state, item) {
   const quoteToken = normalizeAddress(item?.quoteToken);
   if (!quoteToken) return false;
@@ -310,13 +364,27 @@ function rememberCandidate(state, item) {
     consecutiveVerifyFailures: 0,
     lastVerifyAttemptAtMs: 0,
     lastVerifyBlock: 0,
+    firstSeenAt: nowText(),
   };
   const key = candidateKey({ ...item, quoteToken });
   if (current.sources.some(source => source.key === key)) return false;
+  current.firstSeenAt ||= nowText();
   current.firstSeenBlock = current.firstSeenBlock == null
     ? (item.blockNumber || null)
     : Math.min(current.firstSeenBlock, item.blockNumber || current.firstSeenBlock);
   current.lastSeenBlock = Math.max(current.lastSeenBlock || 0, item.blockNumber || 0) || null;
+  current.blockNumber = item.blockNumber ?? current.blockNumber ?? null;
+  current.transactionHash = String(item.txHash || current.transactionHash || "").toLowerCase();
+  current.logIndex = item.logIndex ?? current.logIndex ?? null;
+  current.lastSeenAt = nowText();
+  current.source = item.source || current.source || "event";
+  if (!Number.isInteger(current.decimals)) current.decimals = null;
+  if (item.eventConfiguration) {
+    for (const field of ["enabled", "defaultCurve", "alternativeCurve", "nativeToQuoteSwapType", "dexId"]) {
+      current[field] = item.eventConfiguration[field];
+    }
+  }
+  if (typeof item.eventDisabled === "boolean") current.disabled = item.eventDisabled;
   current.lastTxHash = String(item.txHash || current.lastTxHash || "").toLowerCase();
   current.lastSourceBlock = item.blockNumber ?? current.lastSourceBlock ?? null;
   current.pendingVerification = true;
@@ -493,6 +561,12 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
       ]);
       decoded = decodeQuoteTokenConfiguration(configurationRaw);
       creationDisabled = decodeBooleanResult(creationDisabledRaw);
+      if (source.eventConfiguration && source.eventConfiguration.fingerprint !== decoded.fingerprint) {
+        throw new Error("Factory getter 尚未同步到配置事件状态");
+      }
+      if (typeof source.eventDisabled === "boolean" && source.eventDisabled !== creationDisabled) {
+        throw new Error("Factory getter 尚未同步到开放状态事件");
+      }
     } catch (error) {
       candidate.lastVerifyError = error.message;
       candidate.lastVerifyFailureAt = nowText();
@@ -515,7 +589,14 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
     candidate.consecutiveVerifyFailures = 0;
     candidate.pendingVerification = false;
     candidate.configured = decoded.configured;
+    candidate.enabled = decoded.enabled;
+    candidate.officialCandidate = decoded.officialCandidate;
+    candidate.defaultCurve = decoded.defaultCurve;
+    candidate.alternativeCurve = decoded.alternativeCurve;
+    candidate.nativeToQuoteSwapType = decoded.nativeToQuoteSwapType;
+    candidate.dexId = decoded.dexId;
     candidate.creationDisabled = creationDisabled;
+    candidate.disabled = creationDisabled;
     candidate.effectiveEnabled = decoded.configured && !creationDisabled;
     if (!decoded.configurationPresent && !previous) continue;
 
@@ -524,8 +605,15 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
     const next = {
       quoteToken,
       configured: decoded.configured,
+      enabled: decoded.enabled,
+      officialCandidate: decoded.officialCandidate,
+      defaultCurve: decoded.defaultCurve,
+      alternativeCurve: decoded.alternativeCurve,
+      nativeToQuoteSwapType: decoded.nativeToQuoteSwapType,
+      dexId: decoded.dexId,
       configurationPresent: decoded.configurationPresent,
       creationDisabled,
+      disabled: creationDisabled,
       effectiveEnabled: decoded.configured && !creationDisabled,
       fields: decoded.fields,
       values: decoded.values,
@@ -535,11 +623,18 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
       firstSeenBlock: previous?.firstSeenBlock ?? source.blockNumber ?? null,
       lastChangedAt: previous?.fingerprint === fingerprint ? previous.lastChangedAt : nowText(),
       lastSeenBlock: source.blockNumber ?? previous?.lastSeenBlock ?? null,
+      blockNumber: source.blockNumber ?? previous?.blockNumber ?? null,
+      transactionHash: source.txHash || previous?.transactionHash || "",
+      logIndex: source.logIndex ?? previous?.logIndex ?? null,
+      lastSeenAt: source.blockNumber ? nowText() : previous?.lastSeenAt || nowText(),
       lastTxHash: source.txHash || previous?.lastTxHash || "",
       lastSelector: source.selector || previous?.lastSelector || "",
-      source: source.source || previous?.source || "",
+      source: source.source === "periodic-refresh"
+        ? previous?.source || source.source
+        : source.source || previous?.source || "",
       name: previous?.name || "",
       symbol: previous?.symbol || "",
+      decimals: Number.isFinite(Number(previous?.decimals)) ? Number(previous.decimals) : null,
       metadataSource: previous?.metadataSource || "",
       metadataUpdatedAt: previous?.metadataUpdatedAt || "",
       metadataNextRetryAt: previous?.metadataNextRetryAt || "",
@@ -558,6 +653,45 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
   }
   pruneFactoryPoolCandidates(state);
   return changes;
+}
+
+export async function ingestFactoryPoolEvent({
+  state,
+  logEntry,
+  rpcCall,
+  persistState,
+  source = "factory-wss",
+  log,
+} = {}) {
+  if (!state || typeof rpcCall !== "function") throw new Error("Factory WSS 事件处理缺少 state 或 rpcCall");
+  const items = extractFactoryLogCandidates(logEntry, state.proxy);
+  if (items.length === 0) throw new Error(`无法解析 Factory 事件：${String(logEntry?.topics?.[0] || "未知 topic")}`);
+  const key = factoryPoolEventKey(logEntry);
+  if (!rememberFactoryPoolEvent(state, logEntry, source)) {
+    return { processed: false, duplicate: true, eventKey: key, changes: [], item: items[0], state };
+  }
+  const blockNumber = hexToNumber(logEntry?.blockNumber);
+  state.latestBlock = Math.max(Number(state.latestBlock) || 0, blockNumber);
+  state.safeLatestBlock = Math.max(Number(state.safeLatestBlock) || 0, blockNumber);
+  const enrichedItems = items.map(item => ({ ...item, source }));
+  const changes = await verifyCandidates({
+    state,
+    rpcCall,
+    items: enrichedItems,
+    blockTag: "latest",
+    persistState,
+    log,
+  });
+  state.lastRealtimeRunAt = nowText();
+  state.lastRunAt = nowText();
+  return {
+    processed: true,
+    duplicate: false,
+    eventKey: key,
+    changes,
+    item: enrichedItems[0],
+    state,
+  };
 }
 
 async function refreshKnownAssets({ state, rpcCall, limit, blockTag, persistState, log }) {
@@ -667,7 +801,8 @@ async function scanStateEventRange({
     toBlock,
     [FACTORY_POOL_STATE_EVENT_TOPICS],
   );
-  const items = (logRange.logs || []).flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
+  const freshLogs = (logRange.logs || []).filter(logEntry => rememberFactoryPoolEvent(state, logEntry, "factory-http"));
+  const items = freshLogs.flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
   if (retryPending) {
     for (const candidate of Object.values(state.candidates || {})) {
       if (!candidate?.pendingVerification) continue;
@@ -688,7 +823,7 @@ async function scanStateEventRange({
   if (!preserveTransitions || previousAssets.size === 0) {
     return { changes: verifiedChanges, toBlock: logRange.toBlock };
   }
-  const derived = deriveRealtimeStateEventChanges(logRange.logs, previousAssets, state.assets, state.proxy);
+  const derived = deriveRealtimeStateEventChanges(freshLogs, previousAssets, state.assets, state.proxy);
   return {
     changes: [
       ...derived.changes,

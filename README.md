@@ -80,7 +80,7 @@ pm2 status
 | Four.meme | 创建者链上动作 | WebSocket 实时，HTTP 8 秒兜底 |
 | Four.meme | GitHub 提交 | 有 Token 30 秒，无 Token 90 秒 |
 | Flap.sh | 页面与链上注册中心 | 1 秒 |
-| Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | 1 秒，不等待确认块 |
+| Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | WSS 实时，HTTP 1 秒兜底，不等待确认块 |
 | Flap.sh | Factory 断点补扫 | 后台运行，自动找回停机或 RPC 故障期间的变化 |
 | Flap.sh | Factory 已知资产复核 | 后台轮转，补充发现 getter 状态变化 |
 
@@ -95,6 +95,9 @@ pm2 status
 - Four.meme 合约监控使用 `eth_getStorageAt + eth_getCode` 批量读取并在本地计算代码哈希，不依赖公共节点兼容性较差的 `eth_getProof`。
 - Flap 轮询最低 `500ms`。
 - Flap Factory 实时扫描使用固定 1 秒节拍和 0 确认块；RPC 自动选择低延迟健康节点，断点补扫与资产复核在后台轮转并主动让路。
+- Factory 默认并行订阅 `wss://bsc-rpc.publicnode.com` 与 `wss://bsc.publicnode.com`。WSS 收到官方配置或开放状态事件后立即持久化候选，再复核 Factory getter 并读取 ERC20 `name/symbol/decimals`。
+- WSS 建立后只回扫最近 `10000` 个区块，范围可通过 `FLAP_FACTORY_WS_BACKFILL_BLOCKS` 调整为 `5000～20000`；事件使用 `transactionHash + logIndex` 持久化去重，重启和双节点投递不会重复入库。
+- WSS 仅更新候选库、输出日志并复用现有飞书通知，不签名、不发送交易，也不改变任何自动发射逻辑。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。
 - Factory 不再从部署区块开始扫描完整历史。更新部署前已经存在、但当前 15 个基线资产之外的旧资产不会自动回溯；更新后的新事件和停机缺口仍会及时发现。
 - 频率变量均在 [.env.example](./.env.example) 中有说明；修改 `.env` 后执行 `mon-restart`。

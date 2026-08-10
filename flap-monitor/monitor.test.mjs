@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EventEmitter } from "node:events";
 
 process.env.FLAP_MONITOR_TEST = "1";
 
@@ -25,6 +26,8 @@ const {
   decodeQuoteTokenConfiguration,
   extractBytecodeSelectors,
   extractFactoryLogCandidates,
+  factoryPoolEventKey,
+  ingestFactoryPoolEvent,
   mergePendingFactoryPoolChanges,
   migrateFactoryPoolState,
   loadFactoryPoolState,
@@ -50,6 +53,12 @@ test("default Flap polling interval remains fast and configurable", () => {
   assert.equal(__testables.CONFIG.factoryPoolMonitor.catchupMaxBlocksPerRun, 2_000);
   assert.equal("historyConfigEventChunkBlocks" in __testables.CONFIG.factoryPoolMonitor, false);
   assert.deepEqual(__testables.FACTORY_BACKGROUND_TASK_ORDER, ["catchup", "assets"]);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.wsEnabled, true);
+  assert.deepEqual(__testables.CONFIG.factoryPoolMonitor.wsUrls, [
+    "wss://bsc-rpc.publicnode.com",
+    "wss://bsc.publicnode.com",
+  ]);
+  assert.equal(__testables.CONFIG.factoryPoolMonitor.wsBackfillBlocks, 10_000);
 });
 
 test("Factory RPC hedging uses the first valid low-latency node", async () => {
@@ -307,7 +316,7 @@ test("Factory asynchronous metadata failure does not patch or reject delivery fl
 
 test("Factory metadata enrichment skips completed assets without queue work or state writes", async () => {
   const token = "0x7979797979797979797979797979797979797979";
-  const state = { assets: { [token]: { quoteToken: token, name: "Ready Pool", symbol: "READY", configured: true, creationDisabled: false, effectiveEnabled: true } } };
+  const state = { assets: { [token]: { quoteToken: token, name: "Ready Pool", symbol: "READY", decimals: 18, configured: true, creationDisabled: false, effectiveEnabled: true } } };
   let enrichCalls = 0;
   let saveCalls = 0;
   const outcome = await __testables.scheduleFactoryPoolMetadataEnrichment({
@@ -390,11 +399,15 @@ test("Factory token metadata falls back to read-only ERC20 calls", async () => {
     apiUrl: "https://metadata.example/token",
     fetchFn: async () => ({ ok: false, status: 503 }),
     rpcBatchFn: async calls => {
-      assert.equal(calls.length, 2);
-      return [encodeDynamicText("Chain Pool"), `0x${Buffer.from("CHAIN").toString("hex").padEnd(64, "0")}`];
+      assert.equal(calls.length, 3);
+      return [
+        encodeDynamicText("Chain Pool"),
+        `0x${Buffer.from("CHAIN").toString("hex").padEnd(64, "0")}`,
+        `0x${18n.toString(16).padStart(64, "0")}`,
+      ];
     },
   });
-  assert.deepEqual(result.metadata[token], { name: "Chain Pool", symbol: "CHAIN", source: "onchain" });
+  assert.deepEqual(result.metadata[token], { name: "Chain Pool", symbol: "CHAIN", decimals: 18, source: "onchain" });
   assert.match(result.errors[0], /GoPlus: HTTP 503/);
 });
 
@@ -538,8 +551,230 @@ test("Factory v2 configuration and creation-disabled events extract the complete
     data: BOOLEAN_TRUE_RESULT,
   });
   assert.equal(configuration[0].quoteToken, token);
+  assert.deepEqual({
+    enabled: configuration[0].eventConfiguration.enabled,
+    defaultCurve: configuration[0].eventConfiguration.defaultCurve,
+    alternativeCurve: configuration[0].eventConfiguration.alternativeCurve,
+    nativeToQuoteSwapType: configuration[0].eventConfiguration.nativeToQuoteSwapType,
+    dexId: configuration[0].eventConfiguration.dexId,
+  }, { enabled: 1, defaultCurve: 35, alternativeCurve: 35, nativeToQuoteSwapType: 7, dexId: 0 });
   assert.equal(paused[0].quoteToken, token);
   assert.equal(paused[0].selector, QUOTE_TOKEN_CREATION_DISABLED_SELECTOR);
+  assert.equal(paused[0].eventDisabled, true);
+});
+
+test("Factory WSS event persists a complete candidate before getter verification", async () => {
+  const token = "0x1212121212121212121212121212121212121212";
+  const txHash = `0x${"ab".repeat(32)}`;
+  const values = [1n, 35n, 34n, 7n, 2n];
+  const getterResult = `0x${values.map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const event = {
+    address: FLAP_FACTORY_PROXY,
+    topics: [QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC],
+    data: `0x${token.slice(2).padStart(64, "0")}${getterResult.slice(2)}`,
+    transactionHash: txHash,
+    blockNumber: "0x64",
+    logIndex: "0x2",
+  };
+  const state = createFactoryPoolState();
+  const lifecycle = [];
+  let rpcCalls = 0;
+  const result = await ingestFactoryPoolEvent({
+    state,
+    logEntry: event,
+    source: "factory-wss",
+    persistState: async persisted => {
+      lifecycle.push("persist");
+      const candidate = persisted.candidates[token];
+      assert.equal(candidate.transactionHash, txHash);
+      assert.equal(candidate.logIndex, 2);
+      assert.equal(candidate.enabled, 1);
+      assert.equal(candidate.defaultCurve, 35);
+      assert.equal(candidate.alternativeCurve, 34);
+      assert.equal(candidate.nativeToQuoteSwapType, 7);
+      assert.equal(candidate.dexId, 2);
+      assert.equal(candidate.source, "factory-wss");
+      assert.ok(candidate.firstSeenAt);
+      assert.ok(candidate.lastSeenAt);
+    },
+    rpcCall: async (method, params) => {
+      rpcCalls++;
+      lifecycle.push("eth_call");
+      return factoryGetterResult(method, params, getterResult, BOOLEAN_FALSE_RESULT);
+    },
+  });
+  assert.equal(lifecycle[0], "persist");
+  assert.equal(result.processed, true);
+  assert.equal(result.changes[0].type, "added");
+  assert.equal(state.assets[token].enabled, 1);
+  assert.equal(state.assets[token].disabled, false);
+  assert.equal(state.assets[token].effectiveEnabled, true);
+  assert.equal(state.assets[token].transactionHash, txHash);
+  assert.equal(state.assets[token].logIndex, 2);
+  assert.equal(state.assets[token].source, "factory-wss");
+  assert.equal(factoryPoolEventKey(event), `${txHash}:2`);
+
+  const duplicate = await ingestFactoryPoolEvent({
+    state,
+    logEntry: event,
+    rpcCall: async () => { rpcCalls++; },
+  });
+  assert.equal(duplicate.duplicate, true);
+  assert.equal(rpcCalls, 2);
+});
+
+test("Factory WSS disabled=false event marks a watched asset as resumed", async () => {
+  const token = "0x3434343434343434343434343434343434343434";
+  const values = [1n, 35n, 35n, 7n, 0n];
+  const getterResult = `0x${values.map(value => value.toString(16).padStart(64, "0")).join("")}`;
+  const state = createFactoryPoolState();
+  state.assets[token] = {
+    quoteToken: token,
+    configured: true,
+    enabled: 1,
+    creationDisabled: true,
+    disabled: true,
+    effectiveEnabled: false,
+    fields: values.map(value => `0x${value.toString(16).padStart(64, "0")}`),
+    values: values.map(String),
+    configurationFingerprint: "before",
+    fingerprint: "paused",
+  };
+  const event = {
+    address: FLAP_FACTORY_PROXY,
+    topics: [QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC, `0x${token.slice(2).padStart(64, "0")}`],
+    data: BOOLEAN_FALSE_RESULT,
+    transactionHash: `0x${"cd".repeat(32)}`,
+    blockNumber: "0x65",
+    logIndex: "0x0",
+  };
+  const result = await ingestFactoryPoolEvent({
+    state,
+    logEntry: event,
+    rpcCall: async (method, params) => factoryGetterResult(method, params, getterResult, BOOLEAN_FALSE_RESULT),
+    persistState: async () => {},
+  });
+  assert.equal(result.item.eventDisabled, false);
+  assert.equal(result.changes[0].type, "resumed");
+  assert.equal(state.assets[token].disabled, false);
+  assert.equal(state.assets[token].effectiveEnabled, true);
+});
+
+test("Factory WSS candidate remains pending while HTTP getter is behind the event", async () => {
+  const token = "0x5656565656565656565656565656565656565656";
+  const eventValues = [1n, 35n, 35n, 7n, 0n];
+  const staleValues = [0n, 0n, 0n, 0n, 0n];
+  const event = {
+    address: FLAP_FACTORY_PROXY,
+    topics: [QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC],
+    data: `0x${token.slice(2).padStart(64, "0")}${eventValues.map(value => value.toString(16).padStart(64, "0")).join("")}`,
+    transactionHash: `0x${"56".repeat(32)}`,
+    blockNumber: "0x66",
+    logIndex: "0x0",
+  };
+  const state = createFactoryPoolState();
+  const result = await ingestFactoryPoolEvent({
+    state,
+    logEntry: event,
+    rpcCall: async (method, params) => factoryGetterResult(
+      method,
+      params,
+      `0x${staleValues.map(value => value.toString(16).padStart(64, "0")).join("")}`,
+      BOOLEAN_FALSE_RESULT,
+    ),
+    persistState: async () => {},
+  });
+  assert.equal(result.changes.length, 0);
+  assert.equal(state.assets[token], undefined);
+  assert.equal(state.candidates[token].pendingVerification, true);
+  assert.match(state.candidates[token].lastVerifyError, /尚未同步/);
+  assert.equal(state.candidates[token].enabled, 1);
+});
+
+test("parallel Factory WSS feeds subscribe together and queue duplicate logs once", async () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = FakeWebSocket.OPEN;
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+    send(value) { this.sent.push(JSON.parse(value)); }
+    ping() {}
+    close() { this.readyState = 3; this.emit("close", 1000, "test"); }
+  }
+  const event = {
+    address: FLAP_FACTORY_PROXY,
+    topics: [QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC],
+    data: "0x",
+    transactionHash: `0x${"ef".repeat(32)}`,
+    blockNumber: "0x66",
+    logIndex: "0x1",
+  };
+  let processed = 0;
+  const queue = __testables.createFactoryPoolEventQueue({}, async () => {
+    processed++;
+    await new Promise(resolve => setImmediate(resolve));
+    return { processed: true };
+  });
+  const feed = __testables.createFactoryPoolWsFeed({
+    urls: ["wss://one.test", "wss://two.test"],
+    proxy: FLAP_FACTORY_PROXY,
+    topics: FACTORY_POOL_STATE_EVENT_TOPICS,
+    onEvent: logEntry => queue.enqueue(logEntry, "factory-wss"),
+    WebSocketImpl: FakeWebSocket,
+    logFn: () => {},
+    reconnectBaseMs: 1,
+  }).start();
+  assert.equal(FakeWebSocket.instances.length, 2);
+  for (const socket of FakeWebSocket.instances) {
+    socket.emit("open");
+    assert.deepEqual(socket.sent[0].params, ["logs", {
+      address: FLAP_FACTORY_PROXY,
+      topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
+    }]);
+    socket.emit("message", JSON.stringify({ params: { result: event } }));
+  }
+  await queue.drain();
+  assert.equal(processed, 1);
+  FakeWebSocket.instances[0].emit("close", 1006, "lost");
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(FakeWebSocket.instances.length, 3);
+  feed.stop();
+});
+
+test("Factory WSS startup backfill scans only the configured short window", async () => {
+  const calls = [];
+  const events = [{
+    address: FLAP_FACTORY_PROXY,
+    topics: [QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC],
+    data: "0x",
+    transactionHash: `0x${"12".repeat(32)}`,
+    blockNumber: "0x2710",
+    logIndex: "0x0",
+  }];
+  const queued = [];
+  const result = await __testables.backfillFactoryPoolFeedEvents({
+    enqueue: async (event, source) => queued.push({ event, source }),
+  }, 5_000, async (method, params) => {
+    calls.push({ method, params });
+    if (method === "eth_blockNumber") return "0x2710";
+    if (method === "eth_getLogs") return events;
+    throw new Error(method);
+  }, FLAP_FACTORY_PROXY);
+  assert.equal(result.fromBlock, 5_001);
+  assert.equal(result.latest, 10_000);
+  assert.equal(result.eventCount, 1);
+  assert.deepEqual(calls[1].params[0], {
+    address: FLAP_FACTORY_PROXY,
+    fromBlock: "0x1389",
+    toBlock: "0x2710",
+    topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
+  });
+  assert.equal(queued[0].source, "factory-wss-backfill");
 });
 
 test("Factory change classifier distinguishes all five business states", () => {
@@ -577,7 +812,7 @@ test("Factory schema migration removes historical state and preserves assets", (
       },
     },
   });
-  assert.equal(migrated.schemaVersion, 9);
+  assert.equal(migrated.schemaVersion, 10);
   assert.equal("historyStateEventCursor" in migrated, false);
   assert.equal("historyConfigEventCursor" in migrated, false);
   assert.equal(migrated.pendingChanges.length, 1);
@@ -585,7 +820,10 @@ test("Factory schema migration removes historical state and preserves assets", (
   assert.equal(migrated.assets[token].configured, true);
   assert.equal(migrated.assets[token].creationDisabled, false);
   assert.equal(migrated.assets[token].effectiveEnabled, true);
-  assert.equal("enabled" in migrated.assets[token], false);
+  assert.equal(migrated.assets[token].enabled, 1);
+  assert.equal(migrated.assets[token].defaultCurve, 35);
+  assert.equal(migrated.assets[token].disabled, false);
+  assert.deepEqual(migrated.recentEvents, {});
 });
 
 test("Factory state compactor streams away exploded candidates and keeps assets and cursors", async () => {
