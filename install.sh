@@ -542,6 +542,18 @@ if [ -f "$SNAP" ]; then
     const enabledPoolAssets=poolAssets.filter(poolEffective).length;
     const pausedPoolAssets=poolAssets.filter(poolPaused).length;
     const disabledPoolAssets=poolAssets.filter(v=>v&&!poolConfigured(v)).length;
+    const wss=fp.wssHealth||{};
+    const wssEnabled=wss.enabled===true;
+    const wssConfigured=Number(wss.configuredCount)||0;
+    const wssSubscribed=Number(wss.subscribedCount)||0;
+    const wssStatusMap={healthy:'运行正常',degraded:'部分可用',connecting:'连接中',reconnecting:'重连中',stopped:'已停止',disabled:'未启用'};
+    const wssStatus=wssEnabled?(wssStatusMap[wss.status]||wss.status||'未知'):'未启用';
+    const backfillStatusMap={idle:'等待',running:'进行中',completed:'已完成',failed:'失败'};
+    const backfillCode=wss.backfill?.status||'idle';
+    const backfillLabel=wssEnabled?(backfillStatusMap[backfillCode]||backfillCode):'未启用';
+    const backfillStatus=wssEnabled&&backfillCode==='completed'&&Number.isFinite(Number(wss.backfill?.fromBlock))?backfillLabel+'｜范围 '+wss.backfill.fromBlock+' → '+wss.backfill.toBlock+'｜事件 '+(Number(wss.backfill.eventCount)||0)+' 条':backfillLabel;
+    const wssNeedsAttention=wssEnabled&&(['reconnecting','stopped'].includes(wss.status)||wss.backfill?.status==='failed');
+    const wssStarting=wssEnabled&&wss.status==='connecting';
     const registryAddress=registry.address||'0x90497450f2a706f1951b5bdda52b4e5d16f34c06';
     const knownVaults=Object.keys(registry.knownVaults||{});
     const safeLatest=registry.safeLatestBlock??'-';
@@ -560,6 +572,7 @@ if [ -f "$SNAP" ]; then
     const health=[];
     if(typeof lag==='number'&&lag>300) health.push(warn('链上延迟 '+lag+' 块'));
     if(enabledVisibleFactories<visibleFactories) health.push(warn('有可见金库未启用'));
+    if(wssNeedsAttention) health.push(warn('Factory 实时通道异常'));
 
     const pageStats=keys.map(k=>{
       const f=pages[k]||{};
@@ -607,8 +620,12 @@ if [ -f "$SNAP" ]; then
     const factoryLatest=fp.latestBlock??fp.safeLatestBlock??'-';
     const factoryScanned=fp.headLastScannedBlock??'-';
     const headLag=Number.isFinite(Number(factoryLatest))&&Number.isFinite(Number(factoryScanned))?Math.max(0,Number(factoryLatest)-Number(factoryScanned)):'-';
-    console.log('监控状态：'+(fp.lastError?warn('需要关注'):(typeof headLag==='number'&&headLag>20?warn('存在延迟'):ok('运行正常'))));
-    console.log('扫描进度：已扫 '+factoryScanned+'｜最新 '+factoryLatest+'｜延迟 '+headLag+' 块');
+    const factoryStatus=fp.lastError||wssNeedsAttention?'需要关注':wssStarting?'连接中':wss.status==='degraded'?'部分可用':typeof headLag==='number'&&headLag>20?'存在延迟':'运行正常';
+    console.log('监控状态：'+(factoryStatus==='运行正常'?ok(factoryStatus):warn(factoryStatus)));
+    console.log('实时通道：'+wssStatus+'｜已订阅 '+wssSubscribed+'/'+wssConfigured+'｜最后订阅 '+(wss.lastSubscribedAt?fmtTime(wss.lastSubscribedAt):'暂无')+'｜最后事件 '+(wss.lastEventAt?fmtTime(wss.lastEventAt):'暂无'));
+    console.log('HTTP 兜底：已扫 '+factoryScanned+'｜最新 '+factoryLatest+'｜延迟 '+headLag+' 块');
+    console.log('短窗口回扫：'+backfillStatus);
+    if(wss.lastError||wss.backfill?.lastError) console.log('实时通道异常：'+(wss.lastError||wss.backfill.lastError));
     console.log('资产数量：'+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
     if(poolAssets.length===0) console.log('尚未发现已配置的 Factory 底池资产');
     for(const [index,v] of poolAssets.entries()){

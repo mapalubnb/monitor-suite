@@ -27,6 +27,7 @@ import {
   FLAP_FACTORY_PROXY,
   classifyFactoryPoolChange,
   createFactoryPoolState,
+  createFactoryPoolWsHealth,
   loadFactoryPoolState,
   factoryPoolEventKey,
   ingestFactoryPoolEvent,
@@ -3150,6 +3151,33 @@ function withFactoryPoolStateWrite(operation) {
   return job;
 }
 
+async function recordFactoryPoolWsHealth(state, snapshot, saveStateFn = saveFactoryPoolState) {
+  if (!state || !snapshot) return;
+  await withFactoryPoolStateWrite(() => {
+    const previous = state.wssHealth && typeof state.wssHealth === "object"
+      ? state.wssHealth
+      : createFactoryPoolWsHealth();
+    state.wssHealth = {
+      ...previous,
+      ...snapshot,
+      endpoints: snapshot.endpoints || previous.endpoints || {},
+      backfill: previous.backfill || createFactoryPoolWsHealth().backfill,
+    };
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, state);
+  });
+}
+
+async function recordFactoryPoolWsBackfill(state, patch, saveStateFn = saveFactoryPoolState) {
+  await withFactoryPoolStateWrite(() => {
+    const health = state.wssHealth && typeof state.wssHealth === "object"
+      ? state.wssHealth
+      : createFactoryPoolWsHealth();
+    health.backfill = { ...createFactoryPoolWsHealth().backfill, ...(health.backfill || {}), ...patch };
+    state.wssHealth = health;
+    saveStateFn(CONFIG.factoryPoolMonitor.stateFile, state);
+  });
+}
+
 function cloneFactoryPoolState(state) {
   return structuredClone(state);
 }
@@ -3523,6 +3551,7 @@ function createFactoryPoolWsFeed({
   topics,
   onEvent,
   onSubscribed,
+  onStatus,
   logFn = log,
   WebSocketImpl = WebSocket,
   reconnectBaseMs = 1_000,
@@ -3537,16 +3566,67 @@ function createFactoryPoolWsFeed({
     reconnectTimer: null,
     awaitingPong: false,
     stopped: false,
+    status: "idle",
+    connectedAt: "",
+    subscribedAt: "",
+    lastEventAt: "",
+    lastDisconnectedAt: "",
+    lastError: "",
+    lastErrorAt: "",
   }));
   let heartbeatTimer = null;
   let stopped = false;
 
   const safeUrl = url => String(url || "").replace(/\/\/[^/@]+@/, "//***@");
+  const nowIso = () => new Date().toISOString();
+
+  function snapshot() {
+    const endpointStates = Object.fromEntries(endpoints.map(endpoint => [safeUrl(endpoint.url), {
+      status: endpoint.status,
+      subscribed: Boolean(endpoint.subscriptionId),
+      reconnectAttempts: endpoint.reconnectAttempts,
+      connectedAt: endpoint.connectedAt,
+      subscribedAt: endpoint.subscribedAt,
+      lastEventAt: endpoint.lastEventAt,
+      lastDisconnectedAt: endpoint.lastDisconnectedAt,
+      lastError: endpoint.lastError,
+      lastErrorAt: endpoint.lastErrorAt,
+    }]));
+    const subscribedCount = endpoints.filter(endpoint => endpoint.subscriptionId).length;
+    let status = "connecting";
+    if (stopped) status = "stopped";
+    else if (endpoints.length === 0) status = "disabled";
+    else if (subscribedCount === endpoints.length) status = "healthy";
+    else if (subscribedCount > 0) status = "degraded";
+    else if (endpoints.some(endpoint => endpoint.status === "error" || endpoint.status === "reconnecting")) status = "reconnecting";
+    return {
+      enabled: endpoints.length > 0,
+      configuredCount: endpoints.length,
+      subscribedCount,
+      status,
+      endpoints: endpointStates,
+      lastSubscribedAt: endpoints.map(endpoint => endpoint.subscribedAt).filter(Boolean).sort().at(-1) || "",
+      lastEventAt: endpoints.map(endpoint => endpoint.lastEventAt).filter(Boolean).sort().at(-1) || "",
+      lastDisconnectedAt: endpoints.map(endpoint => endpoint.lastDisconnectedAt).filter(Boolean).sort().at(-1) || "",
+      lastError: endpoints.map(endpoint => endpoint.lastError).filter(Boolean).at(-1) || "",
+      lastErrorAt: endpoints.map(endpoint => endpoint.lastErrorAt).filter(Boolean).sort().at(-1) || "",
+    };
+  }
+
+  function emitStatus() {
+    void Promise.resolve(onStatus?.(snapshot())).catch(error => {
+      logFn(`[Flap Factory WSS] 状态保存失败：${error.message}`);
+    });
+  }
 
   function scheduleReconnect(endpoint, reason) {
     if (stopped || endpoint.stopped || endpoint.reconnectTimer) return;
     const delay = Math.min(reconnectMaxMs, reconnectBaseMs * (2 ** Math.min(endpoint.reconnectAttempts, 5)));
     endpoint.reconnectAttempts++;
+    endpoint.status = "reconnecting";
+    endpoint.lastError = reason || "连接关闭";
+    endpoint.lastErrorAt = nowIso();
+    emitStatus();
     logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 将在 ${Math.round(delay / 1000)}s 后重连：${reason || "连接关闭"}`);
     endpoint.reconnectTimer = setTimeout(() => {
       endpoint.reconnectTimer = null;
@@ -3557,11 +3637,16 @@ function createFactoryPoolWsFeed({
   function connect(endpoint) {
     if (stopped || endpoint.stopped) return;
     logFn(`[Flap Factory WSS] 正在连接：${safeUrl(endpoint.url)}`);
+    endpoint.status = "connecting";
+    emitStatus();
     const ws = new WebSocketImpl(endpoint.url, { handshakeTimeout: 10_000 });
     endpoint.ws = ws;
     endpoint.subscriptionId = "";
     ws.on("open", () => {
       endpoint.awaitingPong = false;
+      endpoint.status = "subscribing";
+      endpoint.connectedAt = nowIso();
+      emitStatus();
       ws.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -3573,11 +3658,18 @@ function createFactoryPoolWsFeed({
       endpoint.awaitingPong = false;
       let message;
       try { message = JSON.parse(String(raw)); } catch {
+        endpoint.lastError = "消息解析失败";
+        endpoint.lastErrorAt = nowIso();
+        emitStatus();
         logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 消息解析失败`);
         return;
       }
       if (message.id === 1) {
         if (message.error) {
+          endpoint.status = "error";
+          endpoint.lastError = message.error.message || JSON.stringify(message.error);
+          endpoint.lastErrorAt = nowIso();
+          emitStatus();
           logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 订阅失败：${message.error.message || JSON.stringify(message.error)}`);
           try { ws.close(); } catch {}
           return;
@@ -3585,6 +3677,10 @@ function createFactoryPoolWsFeed({
         if (message.result) {
           endpoint.subscriptionId = message.result;
           endpoint.reconnectAttempts = 0;
+          endpoint.status = "subscribed";
+          endpoint.subscribedAt = nowIso();
+          endpoint.lastError = "";
+          emitStatus();
           logFn(`[Flap Factory WSS] 已订阅 ${safeUrl(endpoint.url)}：${message.result}`);
           void Promise.resolve(onSubscribed?.(endpoint.url)).catch(error => {
             logFn(`[Flap Factory WSS] 启动回扫失败：${error.message}`);
@@ -3594,6 +3690,8 @@ function createFactoryPoolWsFeed({
       }
       const event = message.params?.result;
       if (!event || event.removed) return;
+      endpoint.lastEventAt = nowIso();
+      emitStatus();
       void Promise.resolve(onEvent?.(event, endpoint.url)).catch(error => {
         logFn(`[Flap Factory WSS] 事件处理失败：${error.message}`);
       });
@@ -3601,9 +3699,15 @@ function createFactoryPoolWsFeed({
     ws.on("close", (code, reason) => {
       if (endpoint.ws === ws) endpoint.ws = null;
       endpoint.subscriptionId = "";
+      endpoint.status = "reconnecting";
+      endpoint.lastDisconnectedAt = nowIso();
       scheduleReconnect(endpoint, `close ${code}${reason ? ` ${reason}` : ""}`);
     });
     ws.on("error", error => {
+      endpoint.status = "error";
+      endpoint.lastError = error.message;
+      endpoint.lastErrorAt = nowIso();
+      emitStatus();
       logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 异常：${error.message}`);
       try { ws.terminate(); } catch { try { ws.close(); } catch {} }
     });
@@ -3621,6 +3725,9 @@ function createFactoryPoolWsFeed({
         if (endpoint.ws?.readyState === WebSocketImpl.OPEN) {
           if (endpoint.awaitingPong) {
             logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 心跳超时，主动重连`);
+            endpoint.lastError = "心跳超时";
+            endpoint.lastErrorAt = nowIso();
+            emitStatus();
             try { endpoint.ws.terminate(); } catch { try { endpoint.ws.close(); } catch {} }
             continue;
           }
@@ -3644,18 +3751,15 @@ function createFactoryPoolWsFeed({
       endpoint.ws = null;
       endpoint.subscriptionId = "";
       endpoint.awaitingPong = false;
+      endpoint.status = "stopped";
     }
+    emitStatus();
   }
 
   const api = {
     start,
     stop,
-    snapshot: () => endpoints.map(endpoint => ({
-      url: endpoint.url,
-      connected: Boolean(endpoint.subscriptionId),
-      subscriptionId: endpoint.subscriptionId,
-      reconnectAttempts: endpoint.reconnectAttempts,
-    })),
+    snapshot,
   };
   return api;
 }
@@ -6018,6 +6122,30 @@ async function runCheck() {
    持续监控模式（主循环）
    ══════════════════════════════════════════ */
 
+function factoryPoolWssDisplay(state = {}) {
+  const health = state.wssHealth;
+  if (!health || health.enabled !== true) {
+    return { status: "未启用", statusCode: "disabled", subscribed: "0/0", backfill: "未启用", backfillStatus: "disabled", lastSubscribed: "暂无", lastEvent: "暂无", error: "" };
+  }
+  const statusMap = { healthy: "运行正常", degraded: "部分可用", connecting: "连接中", reconnecting: "重连中", stopped: "已停止", disabled: "未启用" };
+  const backfillStatus = health.backfill?.status || "idle";
+  const backfillMap = { idle: "等待", running: "进行中", completed: "已完成", failed: "失败" };
+  const backfillLabel = backfillMap[backfillStatus] || backfillStatus;
+  const backfill = backfillStatus === "completed" && Number.isFinite(Number(health.backfill?.fromBlock))
+    ? `${backfillLabel}｜范围 ${health.backfill.fromBlock} → ${health.backfill.toBlock}｜事件 ${Number(health.backfill.eventCount) || 0} 条`
+    : backfillLabel;
+  return {
+    status: statusMap[health.status] || health.status || "未知",
+    statusCode: health.status || "unknown",
+    subscribed: `${Number(health.subscribedCount) || 0}/${Number(health.configuredCount) || 0}`,
+    backfill,
+    backfillStatus,
+    lastSubscribed: health.lastSubscribedAt ? new Date(health.lastSubscribedAt).toLocaleString("zh-CN", { hour12: false }) : "暂无",
+    lastEvent: health.lastEventAt ? new Date(health.lastEventAt).toLocaleString("zh-CN", { hour12: false }) : "暂无",
+    error: health.lastError || health.backfill?.lastError || "",
+  };
+}
+
 function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPoolState = createFactoryPoolState(CONFIG.factoryPoolMonitor.proxy)) {
   const pages = Object.values(snapshot.pages || {});
   const factories = Object.values(snapshot.vaultFactories || {}).filter(factory => factory?.showInCAStore === true);
@@ -6039,6 +6167,16 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
   const robinhoodLaunchUrl = buildVaultFactoryLaunchUrl(ROBINHOOD_INDEX_VAULT_FACTORY, { chain: "robinhood" });
   const poolAssets = Object.values(factoryPoolState.assets || {}).sort((a, b) => a.quoteToken.localeCompare(b.quoteToken));
   const factoryRealtimeLag = Math.max(0, (factoryPoolState.safeLatestBlock || 0) - (factoryPoolState.headLastScannedBlock || 0));
+  const factoryWss = factoryPoolWssDisplay(factoryPoolState);
+  const factoryStatus = factoryPoolState.lastError
+    ? "需要关注"
+    : factoryWss.statusCode === "reconnecting" || factoryWss.statusCode === "stopped" || factoryWss.backfillStatus === "failed"
+      ? "需要关注"
+      : factoryWss.statusCode === "connecting"
+        ? "连接中"
+        : factoryWss.statusCode === "degraded"
+          ? "部分可用"
+          : factoryRealtimeLag > CONFIG.factoryPoolMonitor.realtimeMaxBlocksPerRun ? "存在延迟" : "运行正常";
   const poolAssetLines = poolAssets.length > 0
     ? poolAssets.map((asset, index) =>
         `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetName(asset)}｜状态 ${formatFactoryPoolAssetStatus(asset)}｜地址 ${addressLink(asset.quoteToken)}`)
@@ -6065,7 +6203,11 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     "",
     "**05｜Factory 底池资产**",
     `Factory Proxy：${addressLink(factoryPoolState.proxy || CONFIG.factoryPoolMonitor.proxy)}`,
-    `监控状态：${factoryPoolState.lastError ? "需要关注" : factoryRealtimeLag > CONFIG.factoryPoolMonitor.realtimeMaxBlocksPerRun ? "存在延迟" : "运行正常"}`,
+    `监控状态：${factoryStatus}`,
+    `实时通道：${factoryWss.status}｜已订阅 ${factoryWss.subscribed}｜最后订阅 ${factoryWss.lastSubscribed}｜最后事件 ${factoryWss.lastEvent}`,
+    `HTTP 兜底：已扫 ${factoryPoolState.headLastScannedBlock ?? "尚未建立"}｜最新 ${factoryPoolState.latestBlock ?? factoryPoolState.safeLatestBlock ?? "尚未建立"}｜延迟 ${factoryRealtimeLag} 块`,
+    `短窗口回扫：${factoryWss.backfill}`,
+    ...(factoryWss.error ? [`实时通道异常：${factoryWss.error}`] : []),
     `资产数量：${poolAssets.length}｜支持创建 ${poolAssets.filter(asset => asset.effectiveEnabled).length}｜暂停创建 ${poolAssets.filter(asset => asset.configured && asset.creationDisabled).length}｜已停用 ${poolAssets.filter(asset => !asset.configured).length}`,
     ...poolAssetLines,
     "",
@@ -6158,28 +6300,56 @@ async function startMonitor() {
 
   const factoryPoolEventQueue = createFactoryPoolEventQueue(factoryPoolState);
   global.__factoryPoolEventQueueDrain = factoryPoolEventQueue.drain;
+  let firstFactoryWsSubscription = Promise.resolve();
   if (CONFIG.factoryPoolMonitor.enabled && CONFIG.factoryPoolMonitor.wsEnabled && CONFIG.factoryPoolMonitor.wsUrls.length > 0) {
     let backfillStarted = false;
+    let resolveFirstFactoryWsSubscription;
+    firstFactoryWsSubscription = new Promise(resolve => { resolveFirstFactoryWsSubscription = resolve; });
     const factoryPoolWsFeed = createFactoryPoolWsFeed({
       urls: CONFIG.factoryPoolMonitor.wsUrls,
       proxy: CONFIG.factoryPoolMonitor.proxy,
       topics: FACTORY_POOL_STATE_EVENT_TOPICS,
       onEvent: event => factoryPoolEventQueue.enqueue(event, "factory-wss"),
+      onStatus: health => recordFactoryPoolWsHealth(factoryPoolState, health),
       onSubscribed: async () => {
+        await recordFactoryPoolWsHealth(factoryPoolState, factoryPoolWsFeed.snapshot());
+        resolveFirstFactoryWsSubscription();
         if (backfillStarted) return;
         backfillStarted = true;
+        await recordFactoryPoolWsBackfill(factoryPoolState, {
+          status: "running",
+          startedAt: new Date().toISOString(),
+          completedAt: "",
+          lastError: "",
+        });
         try {
-          await backfillFactoryPoolFeedEvents(factoryPoolEventQueue);
+          const backfill = await backfillFactoryPoolFeedEvents(factoryPoolEventQueue);
+          await recordFactoryPoolWsBackfill(factoryPoolState, {
+            status: "completed",
+            fromBlock: backfill.fromBlock,
+            toBlock: backfill.latest,
+            eventCount: backfill.eventCount,
+            completedAt: new Date().toISOString(),
+            lastError: "",
+          });
         } catch (error) {
           backfillStarted = false;
+          await recordFactoryPoolWsBackfill(factoryPoolState, {
+            status: "failed",
+            completedAt: new Date().toISOString(),
+            lastError: error.message,
+          });
           throw error;
         }
       },
     });
     global.__factoryPoolWsFeed = factoryPoolWsFeed.start();
   } else {
+    await recordFactoryPoolWsHealth(factoryPoolState, createFactoryPoolWsHealth());
     log("[Flap Factory WSS] 未启用或未配置节点，继续使用 1 秒 HTTP 扫描");
   }
+
+  await Promise.race([firstFactoryWsSubscription, sleep(2_500)]);
 
   await sendFeishu(
     "Flap 监控 v2 已启动",

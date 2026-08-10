@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 10;
+export const FACTORY_POOL_SCHEMA_VERSION = 11;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -23,6 +23,30 @@ const MAX_FACTORY_POOL_RECENT_EVENTS = 20_000;
 const MAX_FACTORY_POOL_STATE_BYTES = 16 * 1024 * 1024;
 
 const ZERO_WORD = "0".repeat(64);
+
+export function createFactoryPoolWsHealth() {
+  return {
+    enabled: false,
+    configuredCount: 0,
+    subscribedCount: 0,
+    status: "disabled",
+    endpoints: {},
+    lastSubscribedAt: "",
+    lastEventAt: "",
+    lastDisconnectedAt: "",
+    lastError: "",
+    lastErrorAt: "",
+    backfill: {
+      status: "idle",
+      fromBlock: null,
+      toBlock: null,
+      eventCount: 0,
+      startedAt: "",
+      completedAt: "",
+      lastError: "",
+    },
+  };
+}
 
 function nowText() {
   return new Date().toLocaleString("zh-CN", { hour12: false });
@@ -232,6 +256,7 @@ export function createFactoryPoolState(proxy = FLAP_FACTORY_PROXY) {
       lastFailureAt: "",
       lastSuccessAt: "",
     },
+    wssHealth: createFactoryPoolWsHealth(),
     lastRealtimeRunAt: "",
     lastCatchupRunAt: "",
     lastRunAt: "",
@@ -245,6 +270,15 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
   state.schemaVersion = FACTORY_POOL_SCHEMA_VERSION;
   state.chainId = BSC_CHAIN_ID;
   state.proxy = normalizeAddress(proxy);
+  const defaultWsHealth = createFactoryPoolWsHealth();
+  state.wssHealth = state.wssHealth && typeof state.wssHealth === "object"
+    ? { ...defaultWsHealth, ...state.wssHealth }
+    : defaultWsHealth;
+  state.wssHealth.endpoints = state.wssHealth.endpoints && typeof state.wssHealth.endpoints === "object"
+    && !Array.isArray(state.wssHealth.endpoints) ? state.wssHealth.endpoints : {};
+  state.wssHealth.backfill = state.wssHealth.backfill && typeof state.wssHealth.backfill === "object"
+    ? { ...defaultWsHealth.backfill, ...state.wssHealth.backfill }
+    : defaultWsHealth.backfill;
   for (const key of ["candidates", "assets", "recentEvents"]) {
     if (!state[key] || typeof state[key] !== "object" || Array.isArray(state[key])) state[key] = {};
   }

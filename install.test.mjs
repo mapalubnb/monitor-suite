@@ -133,6 +133,15 @@ test("Flap status shows concise Factory pool state", () => {
     lastScannedBlock: 100,
     safeLatestBlock: 100,
     latestBlock: 105,
+    wssHealth: {
+      enabled: true,
+      configuredCount: 2,
+      subscribedCount: 2,
+      status: "healthy",
+      lastSubscribedAt: "2026-08-10T01:01:03.000Z",
+      lastEventAt: "2026-08-10T01:02:03.000Z",
+      backfill: { status: "completed", fromBlock: 95, toBlock: 105, eventCount: 1 },
+    },
     historyLogLastScannedBlock: 90,
     historyBlockLastScannedBlock: 80,
     historyLastScannedBlock: 80,
@@ -147,13 +156,35 @@ test("Flap status shows concise Factory pool state", () => {
   });
   assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
   assert.match(output, /监控状态：<font color="green">运行正常<\/font>/);
-  assert.match(output, /扫描进度：已扫 100｜最新 105｜延迟 5 块/);
+  assert.match(output, /实时通道：运行正常｜已订阅 2\/2｜最后订阅 .*｜最后事件/);
+  assert.match(output, /HTTP 兜底：已扫 100｜最新 105｜延迟 5 块/);
+  assert.match(output, /短窗口回扫：已完成/);
   assert.match(output, /资产数量：2 个｜支持创建 1 个｜暂停创建 1 个｜已停用 0 个/);
   assert.match(output, /BNB｜状态 支持创建｜地址 \[0x0000000000000000000000000000000000000000\]/);
   assert.match(output, /Tether Gold \(XAUt\)｜状态 暂停创建｜地址 \[0x21caef8a43163eea865baee23b9c2e327696a3bf\]/);
   assert.doesNotMatch(output, /字段 [1-5]：/);
   assert.doesNotMatch(output, new RegExp(txHash));
   assert.doesNotMatch(output, /部署区块|实时头部|配置事件连续补扫|历史反向|配置事件快速回溯|Implementation|选择器/);
+});
+
+test("Flap status reports WSS outage and backfill failure", () => {
+  const output = renderFlapStatus({ pages: {}, vaultFactories: {} }, {
+    headLastScannedBlock: 105,
+    latestBlock: 105,
+    assets: {},
+    wssHealth: {
+      enabled: true,
+      configuredCount: 2,
+      subscribedCount: 0,
+      status: "reconnecting",
+      lastError: "两个节点均已断开",
+      backfill: { status: "failed", lastError: "回扫请求失败" },
+    },
+  });
+  assert.match(output, /监控状态：<font color="orange">需要关注<\/font>/);
+  assert.match(output, /实时通道：重连中｜已订阅 0\/2/);
+  assert.match(output, /短窗口回扫：失败/);
+  assert.match(output, /实时通道异常：两个节点均已断开/);
 });
 
 test("Four.meme pool status keeps only the requested four fields", () => {

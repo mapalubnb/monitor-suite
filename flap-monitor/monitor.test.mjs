@@ -143,6 +143,16 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
     headLastScannedBlock: 105,
     lastScannedBlock: 100,
     safeLatestBlock: 105,
+    latestBlock: 105,
+    wssHealth: {
+      enabled: true,
+      configuredCount: 2,
+      subscribedCount: 2,
+      status: "healthy",
+      lastSubscribedAt: "2026-08-10T01:01:03.000Z",
+      lastEventAt: "2026-08-10T01:02:03.000Z",
+      backfill: { status: "completed", fromBlock: 95, toBlock: 105, eventCount: 1 },
+    },
     historyLastScannedBlock: 90,
     assets: {
       [BNB_QUOTE_TOKEN]: { quoteToken: BNB_QUOTE_TOKEN, configured: true, creationDisabled: false, effectiveEnabled: true, values: ["1", "2", "3", "4", "5"] },
@@ -169,6 +179,9 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
   assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
   assert.match(content, /\*\*05｜Factory 底池资产\*\*/);
   assert.match(content, /监控状态：运行正常/);
+  assert.match(content, /实时通道：运行正常｜已订阅 2\/2｜最后订阅 .*｜最后事件/);
+  assert.match(content, /HTTP 兜底：已扫 105｜最新 105｜延迟 0 块/);
+  assert.match(content, /短窗口回扫：已完成/);
   assert.match(content, /资产数量：2｜支持创建 1｜暂停创建 1｜已停用 0/);
   assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
   assert.match(content, /Tether Gold \(XAUt\)｜状态 暂停创建｜地址/);
@@ -715,6 +728,7 @@ test("parallel Factory WSS feeds subscribe together and queue duplicate logs onc
     logIndex: "0x1",
   };
   let processed = 0;
+  const healthSnapshots = [];
   const queue = __testables.createFactoryPoolEventQueue({}, async () => {
     processed++;
     await new Promise(resolve => setImmediate(resolve));
@@ -725,6 +739,7 @@ test("parallel Factory WSS feeds subscribe together and queue duplicate logs onc
     proxy: FLAP_FACTORY_PROXY,
     topics: FACTORY_POOL_STATE_EVENT_TOPICS,
     onEvent: logEntry => queue.enqueue(logEntry, "factory-wss"),
+    onStatus: health => healthSnapshots.push(health),
     WebSocketImpl: FakeWebSocket,
     logFn: () => {},
     reconnectBaseMs: 1,
@@ -736,13 +751,22 @@ test("parallel Factory WSS feeds subscribe together and queue duplicate logs onc
       address: FLAP_FACTORY_PROXY,
       topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
     }]);
+    socket.emit("message", JSON.stringify({ id: 1, result: `subscription-${socket.url}` }));
     socket.emit("message", JSON.stringify({ params: { result: event } }));
   }
   await queue.drain();
   assert.equal(processed, 1);
+  assert.equal(healthSnapshots.at(-1).subscribedCount, 2);
+  assert.equal(healthSnapshots.at(-1).status, "healthy");
+  assert.ok(healthSnapshots.at(-1).lastEventAt);
   FakeWebSocket.instances[0].emit("close", 1006, "lost");
+  assert.equal(healthSnapshots.at(-1).status, "degraded");
+  assert.equal(healthSnapshots.at(-1).subscribedCount, 1);
+  FakeWebSocket.instances[1].emit("close", 1006, "lost");
+  assert.equal(healthSnapshots.at(-1).status, "reconnecting");
+  assert.equal(healthSnapshots.at(-1).subscribedCount, 0);
   await new Promise(resolve => setTimeout(resolve, 5));
-  assert.equal(FakeWebSocket.instances.length, 3);
+  assert.equal(FakeWebSocket.instances.length, 4);
   feed.stop();
 });
 
@@ -812,7 +836,7 @@ test("Factory schema migration removes historical state and preserves assets", (
       },
     },
   });
-  assert.equal(migrated.schemaVersion, 10);
+  assert.equal(migrated.schemaVersion, 11);
   assert.equal("historyStateEventCursor" in migrated, false);
   assert.equal("historyConfigEventCursor" in migrated, false);
   assert.equal(migrated.pendingChanges.length, 1);
@@ -824,6 +848,8 @@ test("Factory schema migration removes historical state and preserves assets", (
   assert.equal(migrated.assets[token].defaultCurve, 35);
   assert.equal(migrated.assets[token].disabled, false);
   assert.deepEqual(migrated.recentEvents, {});
+  assert.equal(migrated.wssHealth.status, "disabled");
+  assert.equal(migrated.wssHealth.backfill.status, "idle");
 });
 
 test("Factory state compactor streams away exploded candidates and keeps assets and cursors", async () => {
