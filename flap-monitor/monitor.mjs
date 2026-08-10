@@ -118,6 +118,7 @@ const CONFIG = {
     wsUrls: [...new Set((process.env.FLAP_FACTORY_WS_URLS || "wss://bsc-rpc.publicnode.com,wss://bsc.publicnode.com")
       .split(",").map(value => value.trim()).filter(Boolean))],
     wsBackfillBlocks: Math.min(20_000, readPositiveIntEnv("FLAP_FACTORY_WS_BACKFILL_BLOCKS", 10_000, 5_000)),
+    wsBackfillChunkBlocks: Math.min(5_000, readPositiveIntEnv("FLAP_FACTORY_WS_BACKFILL_CHUNK_BLOCKS", 2_000, 100)),
   },
 
   // 反风控
@@ -2636,10 +2637,13 @@ async function executeBscGetLogsRequest(params, options = {}) {
     const maybeReject = () => {
       if (settled || finished < indexes.length) return;
       settled = true;
+      const errorSummary = [...new Set(errors.map(error => error?.message).filter(Boolean))].join("；");
       const message = emptyVotes === 1
-        ? "eth_getLogs 仅一个节点返回空结果，未达到双节点一致"
+        ? `eth_getLogs 仅一个节点返回空结果，未达到双节点一致${errorSummary ? `；其他节点：${errorSummary}` : ""}`
         : errors.at(-1)?.message || "所有 BSC RPC 节点均不可用";
-      reject(new Error(message));
+      const error = new Error(message);
+      error.rpcErrors = errors.map(item => item?.message).filter(Boolean);
+      reject(error);
     };
 
     indexes.forEach((index, position) => {
@@ -3849,23 +3853,49 @@ async function backfillFactoryPoolFeedEvents(
   blocks = CONFIG.factoryPoolMonitor.wsBackfillBlocks,
   rpcCall = bscRpcCall,
   proxy = CONFIG.factoryPoolMonitor.proxy,
+  chunkBlocks = CONFIG.factoryPoolMonitor.wsBackfillChunkBlocks,
 ) {
   const latest = hexToNumber(await rpcCall("eth_blockNumber", []));
   const fromBlock = Math.max(0, latest - Math.max(1, blocks) + 1);
-  log(`[Flap Factory WSS] 启动短窗口回扫：${fromBlock} → ${latest}`);
-  const events = await rpcCall("eth_getLogs", [{
-    address: proxy,
-    fromBlock: numberToHex(fromBlock),
-    toBlock: numberToHex(latest),
-    topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
-  }]);
-  const ordered = [...(events || [])].sort((left, right) =>
+  const initialChunkSize = Math.max(100, Math.min(5_000, Number(chunkBlocks) || 2_000));
+  const allEvents = [];
+  let completedChunks = 0;
+  const rangeLimitPattern = /maximum block range|exceed(?:ed)? maximum block range|limit exceeded|block range (?:is )?too (?:large|wide)|query exceeds|too many blocks/i;
+
+  async function readRange(rangeFrom, rangeTo) {
+    try {
+      const events = await rpcCall("eth_getLogs", [{
+        address: proxy,
+        fromBlock: numberToHex(rangeFrom),
+        toBlock: numberToHex(rangeTo),
+        topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
+      }]);
+      completedChunks++;
+      return events || [];
+    } catch (error) {
+      const rangeSize = rangeTo - rangeFrom + 1;
+      const details = [error.message, ...(error.rpcErrors || [])].join("｜");
+      if (rangeSize <= 100 || !rangeLimitPattern.test(details)) throw error;
+      const middle = Math.floor((rangeFrom + rangeTo) / 2);
+      log(`[Flap Factory WSS] 回扫范围受限，自动拆分：${rangeFrom} → ${rangeTo}`);
+      const left = await readRange(rangeFrom, middle);
+      const right = await readRange(middle + 1, rangeTo);
+      return [...left, ...right];
+    }
+  }
+
+  log(`[Flap Factory WSS] 启动短窗口回扫：${fromBlock} → ${latest}｜分块 ${initialChunkSize}`);
+  for (let rangeFrom = fromBlock; rangeFrom <= latest; rangeFrom += initialChunkSize) {
+    const rangeTo = Math.min(latest, rangeFrom + initialChunkSize - 1);
+    allEvents.push(...await readRange(rangeFrom, rangeTo));
+  }
+  const ordered = dedupeBscLogs(allEvents).sort((left, right) =>
     hexToNumber(left.blockNumber) - hexToNumber(right.blockNumber)
     || hexToNumber(left.transactionIndex) - hexToNumber(right.transactionIndex)
     || hexToNumber(left.logIndex) - hexToNumber(right.logIndex));
   for (const event of ordered) await eventQueue.enqueue(event, "factory-wss-backfill");
-  log(`[Flap Factory WSS] 短窗口回扫完成：读取 ${ordered.length} 条事件`);
-  return { fromBlock, latest, eventCount: ordered.length };
+  log(`[Flap Factory WSS] 短窗口回扫完成：${completedChunks} 个分块｜读取 ${ordered.length} 条事件`);
+  return { fromBlock, latest, eventCount: ordered.length, chunkCount: completedChunks };
 }
 
 function extractStrings(content, ext) {
@@ -6125,7 +6155,7 @@ async function runCheck() {
 function factoryPoolWssDisplay(state = {}) {
   const health = state.wssHealth;
   if (!health || health.enabled !== true) {
-    return { status: "未启用", statusCode: "disabled", subscribed: "0/0", backfill: "未启用", backfillStatus: "disabled", lastSubscribed: "暂无", lastEvent: "暂无", error: "" };
+    return { status: "未启用", statusCode: "disabled", subscribed: "0/0", backfill: "未启用", backfillStatus: "disabled", lastSubscribed: "暂无", lastEvent: "暂无", wssError: "", backfillError: "" };
   }
   const statusMap = { healthy: "运行正常", degraded: "部分可用", connecting: "连接中", reconnecting: "重连中", stopped: "已停止", disabled: "未启用" };
   const backfillStatus = health.backfill?.status || "idle";
@@ -6142,7 +6172,8 @@ function factoryPoolWssDisplay(state = {}) {
     backfillStatus,
     lastSubscribed: health.lastSubscribedAt ? new Date(health.lastSubscribedAt).toLocaleString("zh-CN", { hour12: false }) : "暂无",
     lastEvent: health.lastEventAt ? new Date(health.lastEventAt).toLocaleString("zh-CN", { hour12: false }) : "暂无",
-    error: health.lastError || health.backfill?.lastError || "",
+    wssError: health.lastError || "",
+    backfillError: health.backfill?.lastError || "",
   };
 }
 
@@ -6207,7 +6238,8 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     `实时通道：${factoryWss.status}｜已订阅 ${factoryWss.subscribed}｜最后订阅 ${factoryWss.lastSubscribed}｜最后事件 ${factoryWss.lastEvent}`,
     `HTTP 兜底：已扫 ${factoryPoolState.headLastScannedBlock ?? "尚未建立"}｜最新 ${factoryPoolState.latestBlock ?? factoryPoolState.safeLatestBlock ?? "尚未建立"}｜延迟 ${factoryRealtimeLag} 块`,
     `短窗口回扫：${factoryWss.backfill}`,
-    ...(factoryWss.error ? [`实时通道异常：${factoryWss.error}`] : []),
+    ...(factoryWss.wssError ? [`实时通道异常：${factoryWss.wssError}`] : []),
+    ...(factoryWss.backfillError ? [`短窗口回扫异常：${factoryWss.backfillError}`] : []),
     `资产数量：${poolAssets.length}｜支持创建 ${poolAssets.filter(asset => asset.effectiveEnabled).length}｜暂停创建 ${poolAssets.filter(asset => asset.configured && asset.creationDisabled).length}｜已停用 ${poolAssets.filter(asset => !asset.configured).length}`,
     ...poolAssetLines,
     "",

@@ -625,7 +625,8 @@ if [ -f "$SNAP" ]; then
     console.log('实时通道：'+wssStatus+'｜已订阅 '+wssSubscribed+'/'+wssConfigured+'｜最后订阅 '+(wss.lastSubscribedAt?fmtTime(wss.lastSubscribedAt):'暂无')+'｜最后事件 '+(wss.lastEventAt?fmtTime(wss.lastEventAt):'暂无'));
     console.log('HTTP 兜底：已扫 '+factoryScanned+'｜最新 '+factoryLatest+'｜延迟 '+headLag+' 块');
     console.log('短窗口回扫：'+backfillStatus);
-    if(wss.lastError||wss.backfill?.lastError) console.log('实时通道异常：'+(wss.lastError||wss.backfill.lastError));
+    if(wss.lastError) console.log('实时通道异常：'+wss.lastError);
+    if(wss.backfill?.lastError) console.log('短窗口回扫异常：'+wss.backfill.lastError);
     console.log('资产数量：'+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
     if(poolAssets.length===0) console.log('尚未发现已配置的 Factory 底池资产');
     for(const [index,v] of poolAssets.entries()){

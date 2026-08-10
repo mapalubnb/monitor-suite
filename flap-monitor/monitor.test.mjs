@@ -770,7 +770,7 @@ test("parallel Factory WSS feeds subscribe together and queue duplicate logs onc
   feed.stop();
 });
 
-test("Factory WSS startup backfill scans only the configured short window", async () => {
+test("Factory WSS startup backfill scans the configured short window in RPC-safe chunks", async () => {
   const calls = [];
   const events = [{
     address: FLAP_FACTORY_PROXY,
@@ -792,13 +792,35 @@ test("Factory WSS startup backfill scans only the configured short window", asyn
   assert.equal(result.fromBlock, 5_001);
   assert.equal(result.latest, 10_000);
   assert.equal(result.eventCount, 1);
-  assert.deepEqual(calls[1].params[0], {
-    address: FLAP_FACTORY_PROXY,
-    fromBlock: "0x1389",
-    toBlock: "0x2710",
-    topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
-  });
+  assert.equal(result.chunkCount, 3);
+  assert.deepEqual(calls.slice(1).map(call => [call.params[0].fromBlock, call.params[0].toBlock]), [
+    ["0x1389", "0x1b58"],
+    ["0x1b59", "0x2328"],
+    ["0x2329", "0x2710"],
+  ]);
+  for (const call of calls.slice(1)) {
+    assert.equal(call.params[0].address, FLAP_FACTORY_PROXY);
+    assert.deepEqual(call.params[0].topics, [FACTORY_POOL_STATE_EVENT_TOPICS]);
+  }
   assert.equal(queued[0].source, "factory-wss-backfill");
+});
+
+test("Factory WSS startup backfill automatically splits an RPC-limited range", async () => {
+  const ranges = [];
+  const result = await __testables.backfillFactoryPoolFeedEvents({ enqueue: async () => {} }, 1_000, async (method, params) => {
+    if (method === "eth_blockNumber") return "0x3e8";
+    const from = Number.parseInt(params[0].fromBlock, 16);
+    const to = Number.parseInt(params[0].toBlock, 16);
+    ranges.push([from, to]);
+    if (to - from + 1 > 250) throw new Error("exceed maximum block range: 250");
+    return [];
+  }, FLAP_FACTORY_PROXY, 1_000);
+  assert.equal(result.fromBlock, 1);
+  assert.equal(result.latest, 1_000);
+  assert.equal(result.chunkCount, 4);
+  assert.deepEqual(ranges.filter(([from, to]) => to - from + 1 <= 250), [
+    [1, 250], [251, 500], [501, 750], [751, 1_000],
+  ]);
 });
 
 test("Factory change classifier distinguishes all five business states", () => {

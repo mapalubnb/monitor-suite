@@ -185,6 +185,7 @@ test("Flap status reports WSS outage and backfill failure", () => {
   assert.match(output, /实时通道：重连中｜已订阅 0\/2/);
   assert.match(output, /短窗口回扫：失败/);
   assert.match(output, /实时通道异常：两个节点均已断开/);
+  assert.match(output, /短窗口回扫异常：回扫请求失败/);
 });
 
 test("Four.meme pool status keeps only the requested four fields", () => {
