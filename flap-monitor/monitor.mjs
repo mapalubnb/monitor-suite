@@ -2984,8 +2984,8 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
 
 function buildVaultFactoryLaunchUrl(factory, options = {}) {
   if (!/^0x[a-fA-F0-9]{40}$/.test(String(factory || ""))) return "";
-  const suffix = options.chain === "robinhood" ? "&chain=robinhood&lang=zh" : "";
-  return `https://flap.sh/launch?vaultfactory=${factory}${suffix}`;
+  const chain = options.chain === "robinhood" ? "robinhood" : "bnb";
+  return `https://flap.sh/launch?vaultfactory=${factory}&chain=${chain}&lang=zh`;
 }
 
 function vaultLaunchLink(factory, label = "打开金库") {

@@ -112,8 +112,8 @@ test("Flap status links current factories and registered vaults to launch pages"
       knownVaults: { [registered]: {} },
     },
   });
-  assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}`));
-  assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${registered}`));
+  assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}&chain=bnb&lang=zh`));
+  assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${registered}&chain=bnb&lang=zh`));
   assert.match(output, /\*\*05｜Robinhood CAStore\*\*/);
   assert.match(output, /https:\/\/flap\.sh\/robinhood\/CAstore\?lang=zh/);
   assert.match(output, /币股（IndexVault）｜状态 监控中/);

@@ -521,7 +521,7 @@ if [ -f "$SNAP" ]; then
     const s=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
     const fp=fs.existsSync('$FACTORY_STATE')?JSON.parse(fs.readFileSync('$FACTORY_STATE','utf-8')):{};
     const mdLink=(label,url)=>'['+label+']('+url+')';
-    const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+(chain==='robinhood'?'&chain=robinhood&lang=zh':''));
+    const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+(chain==='robinhood'?'robinhood':'bnb')+'&lang=zh');
     const robinhoodPage='https://flap.sh/robinhood/CAstore?lang=zh';
     const robinhoodFactory='0xe6ca297D1d963b6F00d5b216986123CAeB883AF6';
     const robinhoodLaunch='https://flap.sh/launch?vaultfactory='+robinhoodFactory+'&chain=robinhood&lang=zh';

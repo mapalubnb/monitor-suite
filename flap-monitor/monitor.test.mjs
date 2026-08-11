@@ -169,7 +169,7 @@ test("Flap startup card is complete and uses no emoji or bullet list markers", (
   for (const url of __testables.CONFIG.urls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   for (const url of __testables.CONFIG.bscRpcUrls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   assert.match(content, /0x0000000000000000000000000000000000000001/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x0000000000000000000000000000000000000001/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x0000000000000000000000000000000000000001&chain=bnb&lang=zh/);
   assert.doesNotMatch(content, /隐藏金库|0x0000000000000000000000000000000000000002/);
   assert.match(content, /展示数量：1/);
   assert.match(content, /\*\*04｜Robinhood CAStore\*\*/);
@@ -2245,7 +2245,7 @@ test("CAstore Chinese vault headings are extracted as structured vault sections"
       <h2>热门金库</h2>
       <h3>禮物稅收金庫</h3>
       <p>指定一個 X 帳戶作為禮物擁有者，可以將交易費用分配給任何 EVM 地址。</p>
-      <a href="/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003">Open</a>
+      <a href="/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh">Open</a>
       <h3>LP质押分红金库</h3>
       <p>将你的 LP 代币质押进金库，获得 BNB 分红奖励。</p>
       <h3>黑洞排行榜燃烧分红金库</h3>
@@ -2322,8 +2322,8 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   assert.match(notification.content, /禮物稅收金庫/);
   assert.match(notification.content, /指定一個 X 帳戶/);
   assert.match(notification.content, /<font color="green">新增金库<\/font>/);
-  assert.equal(notification.launchUrl, "https://flap.sh/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003");
-  assert.match(notification.content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003\)/);
+  assert.equal(notification.launchUrl, "https://flap.sh/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh");
+  assert.match(notification.content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh\)/);
   assert.match(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
@@ -2723,8 +2723,8 @@ test("vault factory card summarizes counts before details", () => {
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
   assert.match(content, /enabled：<font color="red">true<\/font> → <font color="green">false<\/font>/);
-  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${addedFactory}`));
-  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${modifiedFactory}`));
+  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${addedFactory}&chain=bnb&lang=zh`));
+  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${modifiedFactory}&chain=bnb&lang=zh`));
 });
 
 test("hidden new vault factory also includes its Flap launch link", () => {
@@ -2735,7 +2735,7 @@ test("hidden new vault factory also includes its Flap launch link", () => {
     modified: [],
   });
   assert.match(content, /新增隐藏金库工厂/);
-  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}`));
+  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}&chain=bnb&lang=zh`));
 });
 
 test("round vault factory aggregation stabilizes conflicting page snapshots", () => {
@@ -2802,10 +2802,10 @@ test("vault factory extraction resolves webpack aliases for visible CAStore vaul
   assert.match(title, /新增可见 1 \/ 下架 1/);
   assert.match(content, /IndexVault/);
   assert.match(content, /0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5&chain=bnb&lang=zh/);
   assert.match(content, /StocksVault/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb&chain=bnb&lang=zh/);
+  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a&chain=bnb&lang=zh/);
   assert.match(content, /showInCAStore/);
 });
 
@@ -2831,11 +2831,11 @@ test("registry log extraction detects on-chain registered vault address", () => 
   assert.match(content, /注册中心:/);
   assert.doesNotMatch(content, /证据详情/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
-  assert.match(content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5\)/);
+  assert.match(content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh\)/);
   assert.match(content, /0x9e239cd0/);
   assert.equal(
     __testables.buildVaultFactoryLaunchUrl(addresses[0]),
-    "https://flap.sh/launch?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5",
+    "https://flap.sh/launch?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh",
   );
 });
 
