@@ -1,15 +1,15 @@
 {
   "name": "monitor-suite",
-  "version": "1.3.26",
+  "version": "1.3.27",
   "description": "Four.meme 和 Flap.sh 平台变更自动化监控系统",
   "type": "module",
   "private": true,
   "scripts": {
-    "check": "node --check fourmeme-monitor/monitor.mjs && node --check fourmeme-monitor/feishu-bot.mjs && node --check flap-monitor/factory-pool-monitor.mjs && node --check flap-monitor/compact-factory-pool-state.mjs && node --check flap-monitor/monitor.mjs",
-    "test": "node --test install.test.mjs shared/feishu-client.test.mjs fourmeme-monitor/monitor.test.mjs flap-monitor/monitor.test.mjs",
+    "check": "node --check fourmeme-monitor/monitor.mjs && node --check fourmeme-monitor/feishu-bot.mjs && node --check flap-monitor/factory-pool-monitor.mjs && node --check flap-monitor/compact-factory-pool-state.mjs && node --check flap-monitor/contract-integrity-monitor.mjs && node --check flap-monitor/monitor.mjs",
+    "test": "node --test install.test.mjs shared/feishu-client.test.mjs fourmeme-monitor/monitor.test.mjs flap-monitor/monitor.test.mjs flap-monitor/contract-integrity-monitor.test.mjs",
     "check:fourmeme": "node --check fourmeme-monitor/monitor.mjs",
     "test:fourmeme": "node --test fourmeme-monitor/monitor.test.mjs",
-    "test:flap": "node --test flap-monitor/monitor.test.mjs",
+    "test:flap": "node --test flap-monitor/monitor.test.mjs flap-monitor/contract-integrity-monitor.test.mjs",
     "repair:flap-factory-state": "node flap-monitor/compact-factory-pool-state.mjs"
   },
   "dependencies": {

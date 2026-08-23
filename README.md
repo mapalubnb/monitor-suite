@@ -5,13 +5,13 @@
 ## ✨ 主要功能
 
 - **Four.meme**：底池、前端页面、公开 API、OpenFour 模板、GitHub、合约及链上参数。
-- **Flap.sh**：BNB CAStore、Robinhood CAStore、金库工厂、链上金库注册，以及 Factory 底池的新增、配置修改、暂停、恢复和停用。
+- **Flap.sh**：BNB CAStore、Robinhood CAStore、metadata schema、Vault Portal、Vault Factory、SwapRegistry、核心代理升级，以及 Factory 底池状态。
 - **飞书卡片**：规则结果优先发送，AI 摘要异步补充；长文案、URL、地址和交易哈希完整保留。
 - **稳定低延迟**：支持 PM2、动态 RPC 竞速、短超时切换、断点补扫和去重；Factory 名称与飞书发送不阻塞后续扫描。
 - **前端增量抓取**：FourMeme 保留真实 `dpl` 部署 URL，同路径部署参数变化直接迁移缓存，只下载新增或路径变化的资源；部分失败会在下轮只补抓失败项。
 - **前端抗风控**：同一进程使用稳定浏览器标识，脚本和样式请求携带正确的资源类型与页面来源；同域请求只错开启动时间，慢响应不会串行阻塞页面和 API 监控。
 - **Factory 防漏检**：新候选先保存再复核，getter 暂时失败会持续重试；RPC 空日志需双节点确认，避免错误推进游标。
-- **低资源运行**：Factory 只读取三个可信配置事件，不遍历历史交易；状态文件自动剪枝并使用紧凑格式保存。
+- **低资源运行**：不使用 `newHeads`，不读取完整区块交易，不枚举未知 mapping；精准合约事件配合低频批量状态校验，状态文件独立保存并自动剪枝。
 
 > ℹ️ 项目不包含心跳检测和日报，只推送启动、变更、异常与恢复消息。
 
@@ -79,10 +79,14 @@ pm2 status
 | Four.meme | 公开 API 结构与值 | 10 秒 |
 | Four.meme | 创建者链上动作 | WebSocket 实时，HTTP 8 秒兜底 |
 | Four.meme | GitHub 提交 | 有 Token 30 秒，无 Token 90 秒 |
-| Flap.sh | 页面与链上注册中心 | 1 秒 |
+| Flap.sh | 页面与 Vault Portal 注册事件 | 页面 1 秒；注册事件沿用现有低频确认扫描 |
 | Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | WSS 实时，HTTP 1 秒兜底，不等待确认块 |
 | Flap.sh | Factory 断点补扫 | 后台运行，自动找回停机或 RPC 故障期间的变化 |
 | Flap.sh | Factory 已知资产复核 | 后台轮转，补充发现 getter 状态变化 |
+| Flap.sh | Factory / SwapRegistry / Vault Portal 核心完整性 | 精准地址 WSS；HTTP 批量校验 10 秒兜底 |
+| Flap.sh | Vault Factory 与已知资产黑名单/信任状态 | 60 秒轮转 |
+| Flap.sh | bytecode hash 与函数选择器审计 | 10 分钟 |
+| Flap.sh | 前端 metadata schema | 仅静态资源变化时解析 |
 
 前端页面或 API 遇到 `403`、`429`、Cloudflare 或网络异常时会自动退避和重试。静态资源按 URL 独立执行 `30 秒 → 60 秒 → 120 秒 → 5 分钟` 退避，成功后立即恢复；HTML 仍按 7 秒频率检测。只有当前资源全部就绪后才更新正式快照，不会把半包或请求失败误判为业务变更。
 
@@ -101,6 +105,11 @@ pm2 status
 - WSS 仅更新候选库、输出日志并复用现有飞书通知，不签名、不发送交易，也不改变任何自动发射逻辑。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。
 - Factory 不再从部署区块开始扫描完整历史。更新部署前已经存在、但当前 15 个基线资产之外的旧资产不会自动回溯；更新后的新事件和停机缺口仍会及时发现。
+- Factory 的升级/权限关键事件合并到原有 WSS 订阅；SwapRegistry、Vault Portal、Vault Factory 及链上发现的实现合约使用相同 WSS 节点做精准地址订阅，不增加新区块订阅。
+- 核心代理 implementation/admin/beacon 槽与关键 getter 默认每 10 秒合并成批量 RPC；已知底池资产的 `isSpammerBlocked`、`isBlacklisted`、信任等级和计价币许可按 60 秒轮转。
+- bytecode 只在首次发现、实现地址变化或 10 分钟审计时读取，不会每轮重复下载。
+- 前端静态资源只保存 metadata 字段顺序、指纹和明确的合约地址提示，不保存原始 JS；旧快照升级时仅重建一次基线，不产生误报。
+- 在不读取完整区块且不枚举未知 key 的约束下，无事件、目标地址也未知的私有 mapping 写入无法被链上监控发现；一旦地址进入 Factory 资产、Vault Factory 或前端配置目录，后续状态变化会进入轮转校验。
 - 频率变量均在 [.env.example](./.env.example) 中有说明；修改 `.env` 后执行 `mon-restart`。
 - 遇到源站风控时，优先适当增加间隔或将前端并发从 `6` 降到 `4`。
 
@@ -142,6 +151,7 @@ fl-status
 - Factory 扫描落后：检查 `fl-status` 的实时与断点游标以及 RPC 日志；断点补扫会从 `lastScannedBlock` 继续，不会遍历部署以来的全部历史。
 - Factory 实时通道异常：检查 `fl-status` 的 WSS 已订阅数量；单节点断线会显示“部分可用”，全部断线会显示“需要关注”。短窗口回扫失败会单独显示，不与 WSS 连接错误混淆。
 - Factory 显示候选复核失败：候选地址和交易证据已保留，实时轮询会自动重试；检查 RPC getter 可用性即可。
+- 合约完整性异常：检查 `fl-status` 的合约目录、精准地址 WSS、核心校验、扩展轮转与代码审计时间；发送失败的变更会保留在 `contract-integrity-state.json`。
 
 ## ✅ 本地验证
 

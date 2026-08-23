@@ -16,6 +16,8 @@ frontend-asset-failures.json
 frontend-asset-failures.json.tmp
 factory-pool-state.json
 factory-pool-state.json.tmp
+contract-integrity-state.json
+contract-integrity-state.json.tmp
 lastpoll.txt
 history.jsonl
 diffs/

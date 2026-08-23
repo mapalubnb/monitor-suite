@@ -39,19 +39,22 @@ function renderFourmemeStatus(snapshot) {
   }
 }
 
-function renderFlapStatus(snapshot, factoryState = {}) {
+function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}) {
   const source = extractHeredoc("fl-status");
   const script = extractNodeEvalScripts(source).find(item => item.includes("vaultLink"));
   assert.ok(script, "未找到 Flap 快照状态渲染器");
   const dir = mkdtempSync(join(tmpdir(), "monitor-suite-flap-status-"));
   const snapshotPath = join(dir, "snapshot.json");
   const factoryStatePath = join(dir, "factory-pool-state.json");
+  const integrityStatePath = join(dir, "contract-integrity-state.json");
   try {
     writeFileSync(snapshotPath, JSON.stringify(snapshot), "utf-8");
     writeFileSync(factoryStatePath, JSON.stringify(factoryState), "utf-8");
+    writeFileSync(integrityStatePath, JSON.stringify(integrityState), "utf-8");
     const runnable = script
       .replaceAll("'$SNAP'", JSON.stringify(snapshotPath))
-      .replaceAll("'$FACTORY_STATE'", JSON.stringify(factoryStatePath));
+      .replaceAll("'$FACTORY_STATE'", JSON.stringify(factoryStatePath))
+      .replaceAll("'$INTEGRITY_STATE'", JSON.stringify(integrityStatePath));
     const result = spawnSync(process.execPath, ["-e", runnable], { encoding: "utf-8" });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
@@ -95,6 +98,34 @@ test("embedded status command JavaScript is syntactically valid", () => {
       assert.doesNotThrow(() => new Function(script), `${name} 内嵌 JavaScript 语法错误`);
     }
   }
+});
+
+test("separate Flap deployment copies every runtime module", () => {
+  for (const file of [
+    "monitor.mjs",
+    "factory-pool-monitor.mjs",
+    "compact-factory-pool-state.mjs",
+    "contract-integrity-monitor.mjs",
+    "package.json",
+  ]) {
+    assert.match(installSource, new RegExp(`cp flap-monitor/${file.replaceAll(".", "\\.")} \\"\\$FLAP_DIR/\\"`));
+  }
+});
+
+test("Flap status includes Vault Portal and contract integrity health", () => {
+  const output = renderFlapStatus({ pages: {}, vaultFactories: {}, registryMonitor: {} }, {}, {
+    catalog: { one: {}, two: {} },
+    trackedAssets: { asset: {} },
+    pendingChanges: [{ id: "change" }],
+    lastCoreScanAt: "2026-08-23T01:00:00.000Z",
+    lastExtendedScanAt: "2026-08-23T01:00:00.000Z",
+    lastCodeAuditAt: "2026-08-23T01:00:00.000Z",
+    wssHealth: { contracts: { status: "healthy", subscribedCount: 2, configuredCount: 2 } },
+  });
+  assert.match(output, /\*\*07｜Vault Portal 链上注册\*\*/);
+  assert.match(output, /\*\*08｜合约与配置完整性\*\*/);
+  assert.match(output, /合约目录：2 个｜已知资产 1 个｜待发送变更 1 项/);
+  assert.match(output, /精准地址 WSS：healthy｜已订阅 2\/2/);
 });
 
 test("Flap status links current factories and registered vaults to launch pages", () => {

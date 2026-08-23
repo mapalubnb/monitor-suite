@@ -35,6 +35,18 @@ import {
   runFactoryPoolScan,
   saveFactoryPoolState,
 } from "./factory-pool-monitor.mjs";
+import {
+  CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS,
+  acknowledgeContractIntegrityChanges,
+  buildContractIntegrityContent,
+  contractIntegritySubscriptionAddresses,
+  ingestContractIntegrityEvent,
+  loadContractIntegrityState,
+  runContractIntegrityStateScan,
+  saveContractIntegrityState,
+  scanContractIntegrityEvents,
+  syncContractIntegrityCatalog,
+} from "./contract-integrity-monitor.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
@@ -119,6 +131,18 @@ const CONFIG = {
       .split(",").map(value => value.trim()).filter(Boolean))],
     wsBackfillBlocks: Math.min(20_000, readPositiveIntEnv("FLAP_FACTORY_WS_BACKFILL_BLOCKS", 10_000, 5_000)),
     wsBackfillChunkBlocks: Math.min(5_000, readPositiveIntEnv("FLAP_FACTORY_WS_BACKFILL_CHUNK_BLOCKS", 2_000, 100)),
+  },
+  contractIntegrityMonitor: {
+    enabled: process.env.FLAP_CONTRACT_INTEGRITY_MONITOR !== "false",
+    stateFile: join(__dirname, "contract-integrity-state.json"),
+    coreIntervalMs: readPositiveIntEnv("FLAP_CONTRACT_CORE_INTERVAL_MS", 10_000, 5_000),
+    extendedIntervalMs: readPositiveIntEnv("FLAP_CONTRACT_EXTENDED_INTERVAL_MS", 60_000, 30_000),
+    codeAuditIntervalMs: readPositiveIntEnv("FLAP_CONTRACT_CODE_AUDIT_INTERVAL_MS", 600_000, 60_000),
+    eventMaxBlocksPerRun: readPositiveIntEnv("FLAP_CONTRACT_EVENT_MAX_BLOCKS", 2_000, 100),
+    trackedAssetLimit: readPositiveIntEnv("FLAP_CONTRACT_TRACKED_ASSETS_PER_RUN", 20, 1),
+    wsEnabled: process.env.FLAP_CONTRACT_WS_ENABLED !== "false",
+    wsUrls: [...new Set((process.env.FLAP_CONTRACT_WS_URLS || process.env.FLAP_FACTORY_WS_URLS || "wss://bsc-rpc.publicnode.com,wss://bsc.publicnode.com")
+      .split(",").map(value => value.trim()).filter(Boolean))],
   },
 
   // 反风控
@@ -733,6 +757,7 @@ function emptyFlapChangeMeta() {
     textChanges: [],
     i18nChangeCount: 0,
     i18nDiffs: [],
+    metadataSchemaDiffs: [],
     caStoreVaultDiffs: [],
     nextDataChanged: false,
     fullDiffLines: [],
@@ -742,6 +767,13 @@ function emptyFlapChangeMeta() {
 /* ── 快照读写 ── */
 const CURRENT_SCHEMA_VERSION = 6;
 const CA_STORE_VAULT_SCHEMA_VERSION = 3;
+const ASSET_ANALYSIS_SCHEMA_VERSION = 1;
+const METADATA_SCHEMA_FIELDS = Object.freeze([
+  "creator", "description", "website", "telegram", "twitter", "github", "youtube", "debox", "buy",
+  "name", "symbol", "image", "sell",
+]);
+const METADATA_INPUT_FIELDS = new Set(["creator", "description", "website", "telegram", "twitter", "github", "youtube", "debox", "buy"]);
+const METADATA_OUTPUT_FIELDS = new Set(["name", "symbol", "description", "image", "website", "twitter", "telegram", "github", "youtube", "debox", "buy", "sell", "creator"]);
 
 function loadSnapshot() {
   try {
@@ -779,7 +811,7 @@ function migrateSnapshot(data) {
   if (ver < 5) {
     log("[快照迁移] v4 → v5：CAstore 金库实例保留重复项");
   }
-  if (ver < 6) log("[快照迁移] v5 → v6：新增 Flap 注册中心链上监控字段");
+  if (ver < 6) log("[快照迁移] v5 → v6：新增 Flap Vault Portal 链上监控字段");
   if (!data.registryMonitor) data.registryMonitor = {};
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   return data;
@@ -1081,6 +1113,7 @@ function isFlapAssetOnlyNotification(notification) {
   if (hasPageSpecificAssetChange(notification)) return false;
   if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return false;
   if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return false;
+  if (hasItems(meta.metadataSchemaDiffs)) return false;
   if (hasItems(meta.caStoreVaultDiffs)) return false;
   if (hasItems(assetStats.configDiffs)) return false;
   if (hasItems(assetStats.vaultDiffs)) return false;
@@ -1094,6 +1127,7 @@ function hasFlapPageLevelChange(notification) {
   const meta = notification?.meta || {};
   if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return true;
   if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return true;
+  if (hasItems(meta.metadataSchemaDiffs)) return true;
   if (hasItems(meta.caStoreVaultDiffs)) return true;
   return false;
 }
@@ -1164,6 +1198,7 @@ function hasNotificationPayload(notification) {
   if (!notification.sharedResourceStripped && (notification.changes || []).length > 0) return true;
   if ((meta.textChangeCount || 0) > 0 || hasItems(meta.textChanges)) return true;
   if ((meta.i18nChangeCount || 0) > 0 || hasItems(meta.i18nDiffs)) return true;
+  if (hasItems(meta.metadataSchemaDiffs)) return true;
   if (hasItems(meta.caStoreVaultDiffs)) return true;
   if (meta.assetStats) return true;
   return false;
@@ -2972,8 +3007,8 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
   }
   const content = buildFlapCardContent({
     summary: [
-      `- 链上注册中心发现新金库 ${events.length} 个`,
-      `- 注册中心: ${addressLink(CONFIG.registryMonitor.address)}`,
+      `- Vault Portal 发现新金库 ${events.length} 个`,
+      `- Vault Portal: ${addressLink(CONFIG.registryMonitor.address)}`,
       `- 扫描区块: ${fromBlock} → ${toBlock}`,
     ],
     primaryTitle: "链上新金库注册",
@@ -3013,7 +3048,7 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
   if (!state.lastBlock) {
     state.lastBlock = Math.max(0, safeLatest - CONFIG.registryMonitor.bootstrapLookbackBlocks);
     state.knownVaults = state.knownVaults || {};
-    log(`[Flap 注册中心] 初始化区块游标：${state.lastBlock}（确认块=${safeLatest}）`);
+    log(`[Flap Vault Portal] 初始化区块游标：${state.lastBlock}（确认块=${safeLatest}）`);
     return { changed: true, sent: false, initialized: true };
   }
   if (state.lastBlock >= safeLatest) return { changed: false, sent: false };
@@ -3553,6 +3588,7 @@ function createFactoryPoolWsFeed({
   urls,
   proxy,
   topics,
+  label = "Flap Factory WSS",
   onEvent,
   onSubscribed,
   onStatus,
@@ -3619,7 +3655,7 @@ function createFactoryPoolWsFeed({
 
   function emitStatus() {
     void Promise.resolve(onStatus?.(snapshot())).catch(error => {
-      logFn(`[Flap Factory WSS] 状态保存失败：${error.message}`);
+      logFn(`[${label}] 状态保存失败：${error.message}`);
     });
   }
 
@@ -3631,7 +3667,7 @@ function createFactoryPoolWsFeed({
     endpoint.lastError = reason || "连接关闭";
     endpoint.lastErrorAt = nowIso();
     emitStatus();
-    logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 将在 ${Math.round(delay / 1000)}s 后重连：${reason || "连接关闭"}`);
+    logFn(`[${label}] ${safeUrl(endpoint.url)} 将在 ${Math.round(delay / 1000)}s 后重连：${reason || "连接关闭"}`);
     endpoint.reconnectTimer = setTimeout(() => {
       endpoint.reconnectTimer = null;
       connect(endpoint);
@@ -3640,7 +3676,7 @@ function createFactoryPoolWsFeed({
 
   function connect(endpoint) {
     if (stopped || endpoint.stopped) return;
-    logFn(`[Flap Factory WSS] 正在连接：${safeUrl(endpoint.url)}`);
+    logFn(`[${label}] 正在连接：${safeUrl(endpoint.url)}`);
     endpoint.status = "connecting";
     emitStatus();
     const ws = new WebSocketImpl(endpoint.url, { handshakeTimeout: 10_000 });
@@ -3651,11 +3687,13 @@ function createFactoryPoolWsFeed({
       endpoint.status = "subscribing";
       endpoint.connectedAt = nowIso();
       emitStatus();
+      const filter = { address: proxy };
+      if (Array.isArray(topics) && topics.length > 0) filter.topics = [topics];
       ws.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
         method: "eth_subscribe",
-        params: ["logs", { address: proxy, topics: [topics] }],
+        params: ["logs", filter],
       }));
     });
     ws.on("message", raw => {
@@ -3665,7 +3703,7 @@ function createFactoryPoolWsFeed({
         endpoint.lastError = "消息解析失败";
         endpoint.lastErrorAt = nowIso();
         emitStatus();
-        logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 消息解析失败`);
+        logFn(`[${label}] ${safeUrl(endpoint.url)} 消息解析失败`);
         return;
       }
       if (message.id === 1) {
@@ -3674,7 +3712,7 @@ function createFactoryPoolWsFeed({
           endpoint.lastError = message.error.message || JSON.stringify(message.error);
           endpoint.lastErrorAt = nowIso();
           emitStatus();
-          logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 订阅失败：${message.error.message || JSON.stringify(message.error)}`);
+          logFn(`[${label}] ${safeUrl(endpoint.url)} 订阅失败：${message.error.message || JSON.stringify(message.error)}`);
           try { ws.close(); } catch {}
           return;
         }
@@ -3685,9 +3723,9 @@ function createFactoryPoolWsFeed({
           endpoint.subscribedAt = nowIso();
           endpoint.lastError = "";
           emitStatus();
-          logFn(`[Flap Factory WSS] 已订阅 ${safeUrl(endpoint.url)}：${message.result}`);
+          logFn(`[${label}] 已订阅 ${safeUrl(endpoint.url)}：${message.result}`);
           void Promise.resolve(onSubscribed?.(endpoint.url)).catch(error => {
-            logFn(`[Flap Factory WSS] 启动回扫失败：${error.message}`);
+            logFn(`[${label}] 启动回扫失败：${error.message}`);
           });
         }
         return;
@@ -3697,7 +3735,7 @@ function createFactoryPoolWsFeed({
       endpoint.lastEventAt = nowIso();
       emitStatus();
       void Promise.resolve(onEvent?.(event, endpoint.url)).catch(error => {
-        logFn(`[Flap Factory WSS] 事件处理失败：${error.message}`);
+        logFn(`[${label}] 事件处理失败：${error.message}`);
       });
     });
     ws.on("close", (code, reason) => {
@@ -3712,7 +3750,7 @@ function createFactoryPoolWsFeed({
       endpoint.lastError = error.message;
       endpoint.lastErrorAt = nowIso();
       emitStatus();
-      logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 异常：${error.message}`);
+      logFn(`[${label}] ${safeUrl(endpoint.url)} 异常：${error.message}`);
       try { ws.terminate(); } catch { try { ws.close(); } catch {} }
     });
     ws.on("pong", () => { endpoint.awaitingPong = false; });
@@ -3728,7 +3766,7 @@ function createFactoryPoolWsFeed({
       for (const endpoint of endpoints) {
         if (endpoint.ws?.readyState === WebSocketImpl.OPEN) {
           if (endpoint.awaitingPong) {
-            logFn(`[Flap Factory WSS] ${safeUrl(endpoint.url)} 心跳超时，主动重连`);
+            logFn(`[${label}] ${safeUrl(endpoint.url)} 心跳超时，主动重连`);
             endpoint.lastError = "心跳超时";
             endpoint.lastErrorAt = nowIso();
             emitStatus();
@@ -4552,13 +4590,15 @@ function buildVaultFactoryChangeTitle(changes, prefix = "") {
 function planAssetContentDownload(oldFeatures, newFeatures) {
   const oldContents = oldFeatures?.assetContents || {};
   const oldAssetFiles = new Set(oldFeatures?.assetFiles || []);
+  const forceJsAnalysis = oldFeatures?.assetAnalysisSchemaVersion !== ASSET_ANALYSIS_SCHEMA_VERSION;
   const reusedContents = {};
   const reuseFilenames = [];
   const toDownload = [];
 
   for (const path of newFeatures?.assetFiles || []) {
     const filename = assetPathToFilename(path);
-    if (oldAssetFiles.has(path) && oldContents[filename]) {
+    const isJs = filename.endsWith(".js");
+    if (oldAssetFiles.has(path) && oldContents[filename] && !(forceJsAnalysis && isJs)) {
       reusedContents[filename] = oldContents[filename];
       reuseFilenames.push(filename);
     } else {
@@ -4567,6 +4607,179 @@ function planAssetContentDownload(oldFeatures, newFeatures) {
   }
 
   return { reusedContents, reuseFilenames: reuseFilenames.sort(), toDownload };
+}
+
+function extractMetadataFieldRuns(content) {
+  const fieldPattern = METADATA_SCHEMA_FIELDS.join("|");
+  const re = new RegExp(`(?:^|[,{])\\s*["']?(${fieldPattern})["']?\\s*:`, "g");
+  const matches = [];
+  let match;
+  while ((match = re.exec(String(content || ""))) !== null) {
+    matches.push({ field: match[1], index: match.index, objectStart: match[0].includes("{") });
+  }
+  const runs = [];
+  let current = [];
+  for (const item of matches) {
+    const previous = current.at(-1);
+    if (previous && (item.objectStart || item.index - previous.index > 900 || current.some(value => value.field === item.field))) {
+      if (current.length >= 4) runs.push(current);
+      current = [];
+    }
+    current.push(item);
+  }
+  if (current.length >= 4) runs.push(current);
+  return runs.map(run => run.map(item => item.field));
+}
+
+function scoreMetadataSchema(fields, kind) {
+  const set = new Set(fields);
+  const expected = kind === "output" ? METADATA_OUTPUT_FIELDS : METADATA_INPUT_FIELDS;
+  let score = fields.filter(field => expected.has(field)).length * 10;
+  if (kind === "output") score += ["name", "symbol", "image"].filter(field => set.has(field)).length * 20;
+  else score += ["creator", "description"].filter(field => set.has(field)).length * 20;
+  return score;
+}
+
+function extractMetadataSchemasFromAsset(content, filename = "") {
+  const runs = extractMetadataFieldRuns(content);
+  const candidates = [];
+  for (const fields of runs) {
+    const set = new Set(fields);
+    if (set.has("name") && set.has("symbol") && set.has("image")) {
+      candidates.push({ kind: "output", orderedFields: fields.filter(field => METADATA_OUTPUT_FIELDS.has(field)), source: filename });
+    }
+    if (set.has("creator") && set.has("description") && !set.has("image")) {
+      candidates.push({ kind: "input", orderedFields: fields.filter(field => METADATA_INPUT_FIELDS.has(field)), source: filename });
+    }
+  }
+  const best = {};
+  for (const candidate of candidates) {
+    if (candidate.orderedFields.length < 4) continue;
+    if (!best[candidate.kind] || scoreMetadataSchema(candidate.orderedFields, candidate.kind) > scoreMetadataSchema(best[candidate.kind].orderedFields, candidate.kind)) {
+      best[candidate.kind] = candidate;
+    }
+  }
+  return Object.values(best).sort((left, right) => left.kind.localeCompare(right.kind));
+}
+
+function extractContractHintsFromAsset(content, filename = "") {
+  const source = String(content || "");
+  const hints = [];
+  const classifiers = [
+    { kind: "swapRegistry", label: "Flap SwapRegistry（前端配置）", proxy: true, re: /swap\s*registry|swapregistry/gi },
+    { kind: "vaultPortal", label: "Flap Vault Portal（前端配置）", proxy: true, re: /vault\s*portal|vaultportal/gi },
+    { kind: "vaultFactory", label: "Flap Vault Factory（前端配置）", re: /vault\s*factory|vaultfactory/gi },
+    { kind: "tokenImplementation", label: "Flap 税币实现（前端配置）", re: /tax(?:ed)?tokenimpl|tax_token_impl/gi },
+    { kind: "tokenImplementation", label: "Flap 代币实现（前端配置）", re: /standardtokenimpl|tokenimplv?3|token_implementation/gi },
+    { kind: "factory", label: "Flap Factory（前端配置）", proxy: true, re: /(?:^|[^a-z])factory(?:[^a-z]|$)/gi },
+  ];
+  const addressRe = /0x[a-fA-F0-9]{40}/g;
+  let match;
+  while ((match = addressRe.exec(source)) !== null) {
+    const start = Math.max(0, match.index - 180);
+    const context = source.slice(start, Math.min(source.length, match.index + 222));
+    const addressStart = match.index - start;
+    const addressEnd = addressStart + match[0].length;
+    let selected = null;
+    for (const classifier of classifiers) {
+      classifier.re.lastIndex = 0;
+      let keyword;
+      while ((keyword = classifier.re.exec(context)) !== null) {
+        const keywordEnd = keyword.index + keyword[0].length;
+        const distance = keywordEnd <= addressStart
+          ? addressStart - keywordEnd
+          : keyword.index >= addressEnd
+            ? keyword.index - addressEnd
+            : 0;
+        if (distance <= 140 && (!selected || distance < selected.distance)) selected = { ...classifier, distance };
+      }
+    }
+    if (selected) hints.push({
+      address: match[0].toLowerCase(),
+      kind: selected.kind,
+      label: selected.label,
+      proxy: selected.proxy,
+      source: filename,
+    });
+  }
+  return [...new Map(hints.map(hint => [`${hint.kind}:${hint.address}`, hint])).values()];
+}
+
+function applyFrontendAssetAnalysis(features) {
+  const schemaCandidates = [];
+  const contractHints = [];
+  for (const entry of Object.values(features?.assetContents || {})) {
+    schemaCandidates.push(...(entry.metadataSchemas || []));
+    contractHints.push(...(entry.contractHints || []));
+  }
+  const bestSchemas = {};
+  for (const schema of schemaCandidates) {
+    const current = bestSchemas[schema.kind];
+    const score = scoreMetadataSchema(schema.orderedFields || [], schema.kind);
+    if (!current || score > scoreMetadataSchema(current.orderedFields || [], current.kind)
+      || (score === scoreMetadataSchema(current.orderedFields || [], current.kind) && String(schema.source).localeCompare(String(current.source)) < 0)) {
+      bestSchemas[schema.kind] = schema;
+    }
+  }
+  features.assetAnalysisSchemaVersion = ASSET_ANALYSIS_SCHEMA_VERSION;
+  features.metadataSchemas = Object.values(bestSchemas).sort((left, right) => left.kind.localeCompare(right.kind));
+  features.metadataSchemaFingerprint = md5(JSON.stringify(features.metadataSchemas.map(schema => [schema.kind, schema.orderedFields])));
+  features.contractHints = [...new Map(contractHints.map(hint => [`${hint.kind}:${hint.address}`, hint])).values()]
+    .sort((left, right) => `${left.kind}:${left.address}`.localeCompare(`${right.kind}:${right.address}`));
+  features.contractHintsFingerprint = md5(JSON.stringify(features.contractHints.map(hint => [hint.kind, hint.address, hint.proxy])));
+  return features;
+}
+
+function diffMetadataSchemas(oldFeatures, newFeatures) {
+  if (oldFeatures?.assetAnalysisSchemaVersion !== ASSET_ANALYSIS_SCHEMA_VERSION
+    || newFeatures?.assetAnalysisSchemaVersion !== ASSET_ANALYSIS_SCHEMA_VERSION) return [];
+  const oldMap = new Map((oldFeatures.metadataSchemas || []).map(schema => [schema.kind, schema]));
+  const newMap = new Map((newFeatures.metadataSchemas || []).map(schema => [schema.kind, schema]));
+  const diffs = [];
+  for (const kind of new Set([...oldMap.keys(), ...newMap.keys()])) {
+    const previous = oldMap.get(kind)?.orderedFields || [];
+    const current = newMap.get(kind)?.orderedFields || [];
+    if (JSON.stringify(previous) === JSON.stringify(current)) continue;
+    diffs.push({
+      kind,
+      previous,
+      current,
+      added: current.filter(field => !previous.includes(field)),
+      removed: previous.filter(field => !current.includes(field)),
+      reordered: previous.length === current.length
+        && previous.every(field => current.includes(field))
+        && JSON.stringify(previous) !== JSON.stringify(current),
+      source: newMap.get(kind)?.source || oldMap.get(kind)?.source || "",
+    });
+  }
+  return diffs;
+}
+
+function formatMetadataSchemaDiffs(diffs) {
+  const lines = ["Flap 前端 metadata schema 变更："];
+  for (const diff of diffs) {
+    const label = diff.kind === "input" ? "提交字段" : "输出字段";
+    lines.push(`  ${label}${diff.source ? `（${diff.source}）` : ""}`);
+    if (diff.added.length) lines.push(`    新增：${diff.added.join(", ")}`);
+    if (diff.removed.length) lines.push(`    删除：${diff.removed.join(", ")}`);
+    if (diff.reordered) lines.push(`    顺序：${diff.previous.join(" -> ")} => ${diff.current.join(" -> ")}`);
+    if (!diff.added.length && !diff.removed.length && !diff.reordered) lines.push(`    ${diff.previous.join(" -> ")} => ${diff.current.join(" -> ")}`);
+  }
+  return lines;
+}
+
+function buildMetadataSchemaWarningContent(url, diffs) {
+  return buildFlapCardContent({
+    summary: [
+      `- 页面: [${url}](${url})`,
+      `- metadata schema 变化: ${diffs.length} 组`,
+      "- 监控范围: 仅前端字段结构，不执行任何链上操作",
+    ],
+    primaryTitle: "字段结构变化",
+    primary: formatMetadataSchemaDiffs(diffs).slice(1),
+    detailsTitle: "处理建议",
+    details: ["核对 metadata 构造与官方 pin 返回字段后，再更新发射插件兼容逻辑。"],
+  });
 }
 
 async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", options = {}) {
@@ -4599,6 +4812,11 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", op
               strings: extractStrings(content, ext),
               ext,
             };
+            if (ext === "js") {
+              entry.metadataSchemas = extractMetadataSchemasFromAsset(content, filename);
+              entry.contractHints = extractContractHintsFromAsset(content, filename);
+              entry.analysisSchemaVersion = ASSET_ANALYSIS_SCHEMA_VERSION;
+            }
             // 对含 Vault 关键词的 JS 文件提取结构化配置
             if (ext === "js" && /(?:Vault|enabled.*constraints|constraints.*enabled|DividendBps)/i.test(content)) {
               entry.vaultConfigs = extractVaultConfigs(content);
@@ -4634,13 +4852,20 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", op
 }
 
 async function hydrateAssetContents(features, oldFeatures = null, options = {}) {
-  if (oldFeatures?.assetContents && oldFeatures.assetHash === features.assetHash) {
+  if (oldFeatures?.assetContents && oldFeatures.assetHash === features.assetHash
+    && oldFeatures.assetAnalysisSchemaVersion === ASSET_ANALYSIS_SCHEMA_VERSION) {
     features.assetContents = oldFeatures.assetContents;
+    features.assetAnalysisSchemaVersion = oldFeatures.assetAnalysisSchemaVersion;
+    features.metadataSchemas = oldFeatures.metadataSchemas || [];
+    features.metadataSchemaFingerprint = oldFeatures.metadataSchemaFingerprint || "";
+    features.contractHints = oldFeatures.contractHints || [];
+    features.contractHintsFingerprint = oldFeatures.contractHintsFingerprint || "";
     return { downloaded: 0, reused: Object.keys(features.assetContents || {}).length };
   }
   const plan = planAssetContentDownload(oldFeatures, features);
   const downloaded = await downloadAssetContents(plan.toDownload, "https://flap.sh", options);
   features.assetContents = { ...plan.reusedContents, ...downloaded };
+  applyFrontendAssetAnalysis(features);
   return { downloaded: Object.keys(downloaded).length, reused: plan.reuseFilenames.length };
 }
 
@@ -5010,9 +5235,13 @@ function diffCaStoreVaultSections(oldSections = [], newSections = []) {
 
 function shouldRefreshDerivedFeatureBaseline(oldFeatures, newFeatures) {
   if (!oldFeatures || !newFeatures) return false;
-  if (!newFeatures.caStoreVaultHash) return false;
-  return !oldFeatures.caStoreVaultHash
-    || oldFeatures.caStoreVaultSchemaVersion !== CA_STORE_VAULT_SCHEMA_VERSION;
+  const caStoreBaselineMissing = Boolean(newFeatures.caStoreVaultHash) && (
+    !oldFeatures.caStoreVaultHash
+    || oldFeatures.caStoreVaultSchemaVersion !== CA_STORE_VAULT_SCHEMA_VERSION
+  );
+  const assetAnalysisBaselineMissing = newFeatures.assetAnalysisSchemaVersion === ASSET_ANALYSIS_SCHEMA_VERSION
+    && oldFeatures.assetAnalysisSchemaVersion !== ASSET_ANALYSIS_SCHEMA_VERSION;
+  return caStoreBaselineMissing || assetAnalysisBaselineMissing;
 }
 
 function formatCaStoreVaultDiffsForChanges(diffs) {
@@ -5676,7 +5905,15 @@ function flattenKeys(obj, prefix = "", result = {}) {
 
 function diffFeatures(oldF, newF) {
   const changes = [];
-  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [], caStoreVaultDiffs: [], nextDataChanged: false, fullDiffLines: [] };
+  const meta = { assetStats: null, textChangeCount: 0, textChanges: [], i18nChangeCount: 0, i18nDiffs: [], metadataSchemaDiffs: [], caStoreVaultDiffs: [], nextDataChanged: false, fullDiffLines: [] };
+
+  const metadataSchemaDiffs = diffMetadataSchemas(oldF, newF);
+  if (metadataSchemaDiffs.length > 0) {
+    const metadataLines = formatMetadataSchemaDiffs(metadataSchemaDiffs);
+    meta.metadataSchemaDiffs = metadataSchemaDiffs;
+    changes.push(...metadataLines);
+    meta.fullDiffLines.push("【Flap metadata schema 完整 Diff】", ...metadataLines);
+  }
 
   if (oldF.nextDataHash && newF.nextDataHash && oldF.nextDataHash !== newF.nextDataHash) {
     meta.nextDataChanged = true;
@@ -6008,6 +6245,80 @@ function cleanOldSnapshots(maxFiles = 100) {
 
 function urlToKey(url) { return url.replace(/[^a-zA-Z0-9]/g, "_"); }
 
+function collectSnapshotContractHints(snapshot = {}) {
+  const hints = [];
+  for (const page of Object.values(snapshot.pages || {})) hints.push(...(page?.contractHints || []));
+  return [...new Map(hints.map(hint => [`${hint.kind}:${hint.address}`, hint])).values()];
+}
+
+function syncFlapContractIntegrityCatalog(state, snapshot = {}, factoryPoolState = {}) {
+  return syncContractIntegrityCatalog(state, {
+    vaultFactories: snapshot.vaultFactories || {},
+    registeredVaults: snapshot.registryMonitor?.knownVaults || {},
+    contractHints: collectSnapshotContractHints(snapshot),
+    factoryAssets: factoryPoolState.assets || {},
+  });
+}
+
+async function runFlapContractIntegrityPass(state, {
+  snapshot = {},
+  factoryPoolState = {},
+  extended = false,
+  forceCodeAudit = false,
+  suppressNotifications = false,
+  saveStateFn = saveContractIntegrityState,
+} = {}) {
+  if (!CONFIG.contractIntegrityMonitor.enabled) return { changed: false, changes: [], state };
+  syncFlapContractIntegrityCatalog(state, snapshot, factoryPoolState);
+  const stateResult = await runContractIntegrityStateScan({
+    state,
+    rpcCall: bscRpcCall,
+    rpcBatch: calls => bscRpcBatch(calls),
+    extended,
+    forceCodeAudit,
+    trackedAssetLimit: CONFIG.contractIntegrityMonitor.trackedAssetLimit,
+    suppressFactoryImplementationChange: CONFIG.factoryPoolMonitor.enabled,
+  });
+  const eventResult = await scanContractIntegrityEvents({
+    state,
+    rpcCall: bscRpcCall,
+    latestBlock: state.latestBlock,
+    maxBlocks: CONFIG.contractIntegrityMonitor.eventMaxBlocksPerRun,
+    suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
+  });
+  if (suppressNotifications && state.pendingChanges.length > 0) {
+    acknowledgeContractIntegrityChanges(state, state.pendingChanges.map(change => change.id));
+  }
+  saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
+  return {
+    changed: stateResult.changed || eventResult.changed,
+    changes: [...stateResult.changes, ...eventResult.changes],
+    state,
+    eventResult,
+  };
+}
+
+async function deliverFlapContractIntegrityChanges(state, {
+  titlePrefix = "",
+  sendCardFn = sendCardViaApi,
+  saveStateFn = saveContractIntegrityState,
+  acknowledgeFn = acknowledgeContractIntegrityChanges,
+  pinFn = pinMessage,
+} = {}) {
+  const changes = [...(state.pendingChanges || [])];
+  if (changes.length === 0) return { sent: false, changes: [] };
+  const messageId = await sendCardFn(
+    `${titlePrefix}Flap 合约与配置完整性变更`,
+    buildContractIntegrityContent(changes, state),
+    "red",
+  );
+  if (!messageId) return { sent: false, changes };
+  acknowledgeFn(state, changes.map(change => change.id));
+  saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
+  void Promise.resolve(pinFn(messageId)).catch(error => log(`[Flap 合约完整性] 卡片置顶失败：${error.message}`));
+  return { sent: true, changes, messageId };
+}
+
 /* ══════════════════════════════════════════
    单次检测模式（node monitor.mjs check）
    ══════════════════════════════════════════ */
@@ -6084,7 +6395,8 @@ async function runCheck() {
           url,
           changes,
           meta,
-          title: "手动检测 — 页面变更",
+          title: meta.metadataSchemaDiffs?.length ? "手动检测 — Flap metadata schema 变更" : "手动检测 — 页面变更",
+          content: meta.metadataSchemaDiffs?.length ? buildMetadataSchemaWarningContent(url, meta.metadataSchemaDiffs) : undefined,
           template: "red",
           snapshotUpdate: { key, features: { ...features, originalUrl: url } },
         });
@@ -6111,7 +6423,7 @@ async function runCheck() {
     if (registryResult.changed) hasDetectedChange = true;
     if (registryResult.sent) hasNotifiedChange = true;
   } catch (err) {
-    log(`[Flap 注册中心] 手动检测失败：${err.message}`);
+    log(`[Flap Vault Portal] 手动检测失败：${err.message}`);
   }
   try {
     const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
@@ -6120,6 +6432,25 @@ async function runCheck() {
     if (factoryResult.sent) hasNotifiedChange = true;
   } catch (err) {
     log(`[Flap Factory] 手动检测失败：${err.message}`);
+  }
+  try {
+    const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
+    const integrityState = loadContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile);
+    const hasBaseline = Object.keys(integrityState.contracts || {}).length > 0;
+    const integrityResult = await runFlapContractIntegrityPass(integrityState, {
+      snapshot,
+      factoryPoolState,
+      extended: true,
+      forceCodeAudit: true,
+      suppressNotifications: !hasBaseline,
+    });
+    if (integrityResult.changed) hasDetectedChange = true;
+    if (hasBaseline) {
+      const delivery = await deliverFlapContractIntegrityChanges(integrityState, { titlePrefix: "手动检测 — " });
+      if (delivery.sent) hasNotifiedChange = true;
+    }
+  } catch (err) {
+    log(`[Flap 合约完整性] 手动检测失败：${err.message}`);
   }
 
   for (const n of coalesceFlapNotifications(notifications, { titlePrefix: "手动检测 — " })) {
@@ -6177,7 +6508,12 @@ function factoryPoolWssDisplay(state = {}) {
   };
 }
 
-function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPoolState = createFactoryPoolState(CONFIG.factoryPoolMonitor.proxy)) {
+function buildFlapStartupContent(
+  snapshot = {},
+  hostname = "未知",
+  factoryPoolState = createFactoryPoolState(CONFIG.factoryPoolMonitor.proxy),
+  contractIntegrityState = {},
+) {
   const pages = Object.values(snapshot.pages || {});
   const factories = Object.values(snapshot.vaultFactories || {}).filter(factory => factory?.showInCAStore === true);
   const registry = snapshot.registryMonitor || {};
@@ -6243,15 +6579,21 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
     `资产数量：${poolAssets.length}｜支持创建 ${poolAssets.filter(asset => asset.effectiveEnabled).length}｜暂停创建 ${poolAssets.filter(asset => asset.configured && asset.creationDisabled).length}｜已停用 ${poolAssets.filter(asset => !asset.configured).length}`,
     ...poolAssetLines,
     "",
-    "**06｜链上注册中心**",
-    `注册中心：${addressLink(CONFIG.registryMonitor.address)}`,
+    "**06｜Vault Portal 链上注册**",
+    `Vault Portal：${addressLink(CONFIG.registryMonitor.address)}`,
     `确认块：${CONFIG.registryMonitor.confirmations}`,
     `启动回溯：${CONFIG.registryMonitor.bootstrapLookbackBlocks} 块`,
     `单轮最大扫描：${CONFIG.registryMonitor.maxBlocksPerRun} 块`,
     `已扫描区块：${registry.lastBlock ?? "尚未建立"}｜安全区块 ${registry.safeLatestBlock ?? "尚未建立"}｜最新区块 ${registry.latestBlock ?? "尚未建立"}`,
     `已知链上金库：${Object.keys(registry.knownVaults || {}).length} 个`,
     "",
-    "**07｜RPC 节点**",
+    "**07｜合约与配置完整性**",
+    `监控状态：${CONFIG.contractIntegrityMonitor.enabled ? (contractIntegrityState.lastError ? "需要关注" : "运行正常") : "未启用"}`,
+    `合约目录：${Object.keys(contractIntegrityState.catalog || {}).length} 个｜已知资产：${Object.keys(contractIntegrityState.trackedAssets || {}).length} 个`,
+    `核心批量校验：${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒｜扩展轮转：${CONFIG.contractIntegrityMonitor.extendedIntervalMs / 1000} 秒｜代码审计：${CONFIG.contractIntegrityMonitor.codeAuditIntervalMs / 1000} 秒`,
+    `事件通道：精准地址 WSS + ${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒 HTTP 日志兜底`,
+    "",
+    "**08｜RPC 节点**",
     ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
   ].join("\n");
 }
@@ -6259,6 +6601,112 @@ function buildFlapStartupContent(snapshot = {}, hostname = "未知", factoryPool
 async function startMonitor() {
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
   const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
+  const contractIntegrityState = loadContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile);
+  let contractIntegrityMutationQueue = Promise.resolve();
+  let contractIntegrityDeliveryPromise = null;
+  let contractIntegrityWsFeed = null;
+  let contractIntegrityWsFingerprint = "";
+
+  function enqueueContractIntegrityMutation(operation) {
+    const job = contractIntegrityMutationQueue.then(operation, operation);
+    contractIntegrityMutationQueue = job.catch(() => undefined);
+    return job;
+  }
+
+  function scheduleContractIntegrityDelivery(titlePrefix = "") {
+    if (!CONFIG.contractIntegrityMonitor.enabled || contractIntegrityDeliveryPromise) return contractIntegrityDeliveryPromise;
+    contractIntegrityDeliveryPromise = (async () => {
+      const pendingCount = await enqueueContractIntegrityMutation(() => contractIntegrityState.pendingChanges.length);
+      if (pendingCount === 0) return { sent: false };
+      if (!canAttemptFeishuDelivery()) return { sent: false, deliveryDeferred: true };
+      try {
+        const changes = await enqueueContractIntegrityMutation(() => [...contractIntegrityState.pendingChanges]);
+        const messageId = await sendCardViaApi(
+          `${titlePrefix}Flap 合约与配置完整性变更`,
+          buildContractIntegrityContent(changes, contractIntegrityState),
+          "red",
+        );
+        if (!messageId) return { sent: false };
+        await enqueueContractIntegrityMutation(() => {
+          acknowledgeContractIntegrityChanges(contractIntegrityState, changes.map(change => change.id));
+          saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
+        });
+        void Promise.resolve(pinMessage(messageId)).catch(error => log(`[Flap 合约完整性] 卡片置顶失败：${error.message}`));
+        return { sent: true };
+      } catch (error) {
+        log(`[Flap 合约完整性] 待发送变更已保留：${error.message}`);
+        return { sent: false, error };
+      }
+    })().finally(() => { contractIntegrityDeliveryPromise = null; });
+    return contractIntegrityDeliveryPromise;
+  }
+
+  async function refreshContractIntegrityWsFeed() {
+    if (!CONFIG.contractIntegrityMonitor.enabled || !CONFIG.contractIntegrityMonitor.wsEnabled
+      || CONFIG.contractIntegrityMonitor.wsUrls.length === 0) return;
+    const addresses = contractIntegritySubscriptionAddresses(contractIntegrityState);
+    const fingerprint = addresses.join(",");
+    if (fingerprint === contractIntegrityWsFingerprint) return;
+    contractIntegrityWsFingerprint = fingerprint;
+    contractIntegrityWsFeed?.stop();
+    contractIntegrityWsFeed = null;
+    if (addresses.length === 0) return;
+    contractIntegrityWsFeed = createFactoryPoolWsFeed({
+      urls: CONFIG.contractIntegrityMonitor.wsUrls,
+      proxy: addresses,
+      topics: [],
+      label: "Flap 合约完整性 WSS",
+      onEvent: event => processContractIntegrityEvent(event, "integrity-wss"),
+      onStatus: health => enqueueContractIntegrityMutation(() => {
+        contractIntegrityState.wssHealth = { ...(contractIntegrityState.wssHealth || {}), contracts: health };
+        saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
+      }),
+    }).start();
+    global.__contractIntegrityWsFeed = contractIntegrityWsFeed;
+  }
+
+  async function processContractIntegrityEvent(event, source) {
+    const catalogSizeBefore = Object.keys(contractIntegrityState.catalog || {}).length;
+    const result = await enqueueContractIntegrityMutation(() => {
+      const outcome = ingestContractIntegrityEvent(contractIntegrityState, event, source, {
+        suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
+      });
+      if (outcome.processed) saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
+      return outcome;
+    });
+    if (Object.keys(contractIntegrityState.catalog || {}).length !== catalogSizeBefore) await refreshContractIntegrityWsFeed();
+    if (result.change) void scheduleContractIntegrityDelivery();
+    return result;
+  }
+
+  async function contractIntegrityPoll({ suppressNotifications = false, forceExtended = false, forceCodeAudit = false } = {}) {
+    if (!CONFIG.contractIntegrityMonitor.enabled) return;
+    const now = Date.now();
+    const extendedDue = forceExtended || now - (Date.parse(contractIntegrityState.lastExtendedScanAt || "") || 0) >= CONFIG.contractIntegrityMonitor.extendedIntervalMs;
+    const codeAuditDue = forceCodeAudit || now - (Date.parse(contractIntegrityState.lastCodeAuditAt || "") || 0) >= CONFIG.contractIntegrityMonitor.codeAuditIntervalMs;
+    try {
+      await enqueueContractIntegrityMutation(() => runFlapContractIntegrityPass(contractIntegrityState, {
+        snapshot,
+        factoryPoolState,
+        extended: extendedDue,
+        forceCodeAudit: codeAuditDue,
+        suppressNotifications,
+      }));
+      await refreshContractIntegrityWsFeed();
+      if (!suppressNotifications) void scheduleContractIntegrityDelivery();
+    } catch (error) {
+      await enqueueContractIntegrityMutation(() => {
+        contractIntegrityState.lastError = error.message;
+        saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
+      });
+      log(`[Flap 合约完整性] 检测失败：${error.message}`);
+    }
+  }
+
+  global.__contractIntegrityMutationDrain = () => contractIntegrityMutationQueue;
+  global.__contractIntegrityDeliveryDrain = async () => {
+    if (contractIntegrityDeliveryPromise) await contractIntegrityDeliveryPromise;
+  };
   // failCounts 改为对象结构，记录失败次数、最近错误信息和时间
   const failCounts = {};  // key -> { count, lastMsg, lastFailTime, hourlyErrors }
   const backoffSkips = {};  // key -> number of polls skipped due to domain backoff
@@ -6330,6 +6778,16 @@ async function startMonitor() {
     }
   }
 
+  if (CONFIG.contractIntegrityMonitor.enabled) {
+    const hasIntegrityBaseline = Object.keys(contractIntegrityState.contracts || {}).length > 0;
+    await contractIntegrityPoll({
+      suppressNotifications: !hasIntegrityBaseline,
+      forceExtended: true,
+      forceCodeAudit: true,
+    });
+    if (hasIntegrityBaseline) void scheduleContractIntegrityDelivery();
+  }
+
   const factoryPoolEventQueue = createFactoryPoolEventQueue(factoryPoolState);
   global.__factoryPoolEventQueueDrain = factoryPoolEventQueue.drain;
   let firstFactoryWsSubscription = Promise.resolve();
@@ -6337,11 +6795,21 @@ async function startMonitor() {
     let backfillStarted = false;
     let resolveFirstFactoryWsSubscription;
     firstFactoryWsSubscription = new Promise(resolve => { resolveFirstFactoryWsSubscription = resolve; });
+    const factoryPoolTopics = [...new Set([
+      ...FACTORY_POOL_STATE_EVENT_TOPICS,
+      ...(CONFIG.contractIntegrityMonitor.enabled ? CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS : []),
+    ])];
+    const factoryPoolTopicSet = new Set(FACTORY_POOL_STATE_EVENT_TOPICS);
+    const integrityFactoryTopicSet = new Set(CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS);
     const factoryPoolWsFeed = createFactoryPoolWsFeed({
       urls: CONFIG.factoryPoolMonitor.wsUrls,
       proxy: CONFIG.factoryPoolMonitor.proxy,
-      topics: FACTORY_POOL_STATE_EVENT_TOPICS,
-      onEvent: event => factoryPoolEventQueue.enqueue(event, "factory-wss"),
+      topics: factoryPoolTopics,
+      onEvent: event => {
+        const topic0 = String(event?.topics?.[0] || "").toLowerCase();
+        if (factoryPoolTopicSet.has(topic0)) void factoryPoolEventQueue.enqueue(event, "factory-wss");
+        if (CONFIG.contractIntegrityMonitor.enabled && integrityFactoryTopicSet.has(topic0)) void processContractIntegrityEvent(event, "factory-wss");
+      },
       onStatus: health => recordFactoryPoolWsHealth(factoryPoolState, health),
       onSubscribed: async () => {
         await recordFactoryPoolWsHealth(factoryPoolState, factoryPoolWsFeed.snapshot());
@@ -6380,12 +6848,13 @@ async function startMonitor() {
     await recordFactoryPoolWsHealth(factoryPoolState, createFactoryPoolWsHealth());
     log("[Flap Factory WSS] 未启用或未配置节点，继续使用 1 秒 HTTP 扫描");
   }
+  await refreshContractIntegrityWsFeed();
 
   await Promise.race([firstFactoryWsSubscription, sleep(2_500)]);
 
   await sendFeishu(
     "Flap 监控 v2 已启动",
-    buildFlapStartupContent(snapshot, (await import("node:os")).hostname(), factoryPoolState),
+    buildFlapStartupContent(snapshot, (await import("node:os")).hostname(), factoryPoolState, contractIntegrityState),
     "blue"
   );
 
@@ -6487,6 +6956,16 @@ async function startMonitor() {
   scheduleFactoryRealtimeNext();
   scheduleFactoryBackgroundNext();
 
+  function scheduleContractIntegrityNext(delayMs = CONFIG.contractIntegrityMonitor.coreIntervalMs) {
+    if (!CONFIG.contractIntegrityMonitor.enabled) return;
+    setTimeout(async () => {
+      const startedAt = Date.now();
+      await contractIntegrityPoll();
+      scheduleContractIntegrityNext(Math.max(250, CONFIG.contractIntegrityMonitor.coreIntervalMs - (Date.now() - startedAt)));
+    }, delayMs);
+  }
+  scheduleContractIntegrityNext();
+
   // 轮询函数：并行检测所有页面
   let pendingPoll = false;
   async function poll() {
@@ -6569,8 +7048,14 @@ async function startMonitor() {
           const oldQuality = oldFeatures ? getStoredFeatureQuality(url, oldFeatures) : null;
 
           // 仅当 assetHash 未变且旧数据完整时才复用缓存（节省带宽）
-          if (oldQuality?.valid && oldFeatures.assetContents && oldFeatures.assetHash === features.assetHash) {
+          if (oldQuality?.valid && oldFeatures.assetContents && oldFeatures.assetHash === features.assetHash
+            && oldFeatures.assetAnalysisSchemaVersion === ASSET_ANALYSIS_SCHEMA_VERSION) {
             features.assetContents = oldFeatures.assetContents;
+            features.assetAnalysisSchemaVersion = oldFeatures.assetAnalysisSchemaVersion;
+            features.metadataSchemas = oldFeatures.metadataSchemas || [];
+            features.metadataSchemaFingerprint = oldFeatures.metadataSchemaFingerprint || "";
+            features.contractHints = oldFeatures.contractHints || [];
+            features.contractHintsFingerprint = oldFeatures.contractHintsFingerprint || "";
             // i18n: 仅当之前成功提取过才复用，否则按衰减频率重试
             if (oldFeatures.i18nHash) {
               features.i18nStrings = oldFeatures.i18nStrings;
@@ -6657,7 +7142,8 @@ async function startMonitor() {
               url,
               changes,
               meta,
-              title: `Flap 页面变更`,
+              title: meta.metadataSchemaDiffs?.length ? "Flap metadata schema 变更" : "Flap 页面变更",
+              content: meta.metadataSchemaDiffs?.length ? buildMetadataSchemaWarningContent(url, meta.metadataSchemaDiffs) : undefined,
               template: "red",
               snapshotUpdate: { key, features },
             });
@@ -6696,7 +7182,7 @@ async function startMonitor() {
         const registryResult = await checkFlapRegistryLogs(snapshot);
         if (registryResult.changed) saveSnapshot(snapshot);
       } catch (err) {
-        log(`[Flap 注册中心] 检测失败：${err.message}`);
+        log(`[Flap Vault Portal] 检测失败：${err.message}`);
       }
 
       const notificationsToSend = coalesceFlapNotifications(notifications);
@@ -6749,6 +7235,7 @@ async function startMonitor() {
   process.on("SIGUSR1", () => {
     factoryPoolRealtimePoll().catch(err => log(`[SIGUSR1] Factory 实时检测异常：${err.message}`));
     factoryPoolBackgroundPoll().catch(err => log(`[SIGUSR1] Factory 后台检测异常：${err.message}`));
+    contractIntegrityPoll({ forceExtended: true, forceCodeAudit: true }).catch(err => log(`[SIGUSR1] 合约完整性检测异常：${err.message}`));
     if (isPolling) {
       pendingPoll = true;  // 利用 pendingPoll 机制，当前轮询结束后自动触发
       log("收到 SIGUSR1，当前正在轮询，将在本轮结束后立即执行");
@@ -6811,6 +7298,21 @@ async function gracefulShutdown(signal) {
   if (global.__factoryPoolEventQueueDrain) {
     try { await global.__factoryPoolEventQueueDrain(); } catch {}
   }
+  if (global.__contractIntegrityWsFeed) {
+    global.__contractIntegrityWsFeed.stop();
+    log("已停止 Flap 合约完整性 WebSocket 订阅");
+  }
+  if (global.__contractIntegrityMutationDrain) {
+    try { await global.__contractIntegrityMutationDrain(); } catch {}
+  }
+  // 先收完已入队的链上事件，再等待由这些事件触发的通知及确认写盘。
+  await Promise.resolve();
+  if (global.__contractIntegrityDeliveryDrain) {
+    try { await global.__contractIntegrityDeliveryDrain(); } catch {}
+  }
+  if (global.__contractIntegrityMutationDrain) {
+    try { await global.__contractIntegrityMutationDrain(); } catch {}
+  }
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   try { saveSnapshot(loadSnapshot() || {}); } catch {}
@@ -6823,6 +7325,7 @@ if (!IS_TEST_MODE) {
 
 export const __testables = {
   CONFIG,
+  ASSET_ANALYSIS_SCHEMA_VERSION,
   FACTORY_BACKGROUND_TASK_ORDER,
   emptyFlapChangeMeta,
   isFlapAssetOnlyNotification,
@@ -6835,12 +7338,22 @@ export const __testables = {
   extractStrings,
   downloadAssetContents,
   planAssetContentDownload,
+  applyFrontendAssetAnalysis,
+  diffMetadataSchemas,
+  extractContractHintsFromAsset,
+  extractMetadataSchemasFromAsset,
+  formatMetadataSchemaDiffs,
+  buildMetadataSchemaWarningContent,
   buildAssetSemanticProfile,
   classifyAssetPath,
   buildBriefingInput,
   buildCardBriefing,
   buildOperationalNoticeContent,
   buildFlapStartupContent,
+  collectSnapshotContractHints,
+  syncFlapContractIntegrityCatalog,
+  runFlapContractIntegrityPass,
+  deliverFlapContractIntegrityChanges,
   buildCaStoreVaultChangeNotification,
   getStandaloneCaStoreVaultDiffs,
   shouldSuppressCaStoreOnlyPageNotification,

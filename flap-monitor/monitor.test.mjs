@@ -770,6 +770,34 @@ test("parallel Factory WSS feeds subscribe together and queue duplicate logs onc
   feed.stop();
 });
 
+test("generic Flap WSS feed supports address arrays without a topics filter", () => {
+  class FakeWebSocket extends EventEmitter {
+    static OPEN = 1;
+    static instances = [];
+    constructor(url) {
+      super();
+      this.url = url;
+      this.readyState = FakeWebSocket.OPEN;
+      this.sent = [];
+      FakeWebSocket.instances.push(this);
+    }
+    send(value) { this.sent.push(JSON.parse(value)); }
+    ping() {}
+    close() { this.readyState = 3; }
+  }
+  const addresses = [`0x${"11".repeat(20)}`, `0x${"22".repeat(20)}`];
+  const feed = __testables.createFactoryPoolWsFeed({
+    urls: ["wss://integrity.test"],
+    proxy: addresses,
+    topics: [],
+    WebSocketImpl: FakeWebSocket,
+    logFn: () => {},
+  }).start();
+  FakeWebSocket.instances[0].emit("open");
+  assert.deepEqual(FakeWebSocket.instances[0].sent[0].params, ["logs", { address: addresses }]);
+  feed.stop();
+});
+
 test("Factory WSS startup backfill scans the configured short window in RPC-safe chunks", async () => {
   const calls = [];
   const events = [{
@@ -2405,6 +2433,7 @@ test("round asset cache reuses shared chunks across pages", async () => {
 
 test("asset download plan reuses unchanged assets and fetches only new paths", () => {
   const oldFeatures = {
+    assetAnalysisSchemaVersion: __testables.ASSET_ANALYSIS_SCHEMA_VERSION,
     assetFiles: ["/_next/static/chunks/webpack-a.js", "/_next/static/chunks/8101-a.js"],
     assetContents: {
       "webpack-a.js": { filename: "webpack-a.js", path: "/_next/static/chunks/webpack-a.js", contentHash: "runtime" },
@@ -2420,6 +2449,127 @@ test("asset download plan reuses unchanged assets and fetches only new paths", (
   assert.deepEqual(plan.reuseFilenames, ["webpack-a.js"]);
   assert.deepEqual(plan.toDownload, ["/_next/static/chunks/app/launch/page-b.js"]);
   assert.equal(plan.reusedContents["webpack-a.js"].contentHash, "runtime");
+});
+
+test("legacy asset snapshots redownload JavaScript once for schema analysis", () => {
+  const oldFeatures = {
+    assetFiles: ["/_next/static/chunks/runtime.js", "/_next/static/css/app.css"],
+    assetContents: {
+      "runtime.js": { filename: "runtime.js", contentHash: "old-js" },
+      "app.css": { filename: "app.css", contentHash: "old-css" },
+    },
+  };
+  const newFeatures = { assetFiles: [...oldFeatures.assetFiles] };
+  const plan = __testables.planAssetContentDownload(oldFeatures, newFeatures);
+  assert.deepEqual(plan.toDownload, ["/_next/static/chunks/runtime.js"]);
+  assert.deepEqual(plan.reuseFilenames, ["app.css"]);
+});
+
+test("Flap metadata schema analysis detects fields and ignores first baseline upgrade", () => {
+  const content = [
+    "const input={creator:a,description:b,website:c,telegram:d,twitter:e,github:f,youtube:g,debox:h,buy:i};",
+    "const output={name:n,symbol:s,description:d,image:i,website:w,twitter:t,telegram:g,github:h,youtube:y,debox:x,buy:b,sell:l,creator:c};",
+  ].join("\n");
+  const schemas = __testables.extractMetadataSchemasFromAsset(content, "launch.js");
+  assert.deepEqual(schemas.map(schema => schema.kind), ["input", "output"]);
+  assert.deepEqual(schemas.find(schema => schema.kind === "input").orderedFields, [
+    "creator", "description", "website", "telegram", "twitter", "github", "youtube", "debox", "buy",
+  ]);
+  const current = {
+    assetAnalysisSchemaVersion: __testables.ASSET_ANALYSIS_SCHEMA_VERSION,
+    metadataSchemas: schemas,
+    assetHash: "same",
+  };
+  const legacy = { assetHash: "same" };
+  assert.deepEqual(__testables.diffMetadataSchemas(legacy, current), []);
+  assert.deepEqual(__testables.diffFeatures(legacy, current).changes, []);
+});
+
+test("Flap metadata schema analysis alerts on add remove and reorder", () => {
+  const version = __testables.ASSET_ANALYSIS_SCHEMA_VERSION;
+  const oldFeatures = {
+    assetAnalysisSchemaVersion: version,
+    metadataSchemas: [{ kind: "input", source: "launch-old.js", orderedFields: ["creator", "description", "website", "twitter"] }],
+  };
+  const newFeatures = {
+    assetAnalysisSchemaVersion: version,
+    metadataSchemas: [{ kind: "input", source: "launch-new.js", orderedFields: ["description", "creator", "telegram", "twitter"] }],
+  };
+  const [diff] = __testables.diffMetadataSchemas(oldFeatures, newFeatures);
+  assert.deepEqual(diff.added, ["telegram"]);
+  assert.deepEqual(diff.removed, ["website"]);
+  assert.equal(diff.reordered, false);
+  const reorder = __testables.diffMetadataSchemas(oldFeatures, {
+    assetAnalysisSchemaVersion: version,
+    metadataSchemas: [{ kind: "input", source: "launch-new.js", orderedFields: ["description", "creator", "website", "twitter"] }],
+  })[0];
+  assert.equal(reorder.reordered, true);
+  const content = __testables.buildMetadataSchemaWarningContent("https://flap.sh/create", [diff, reorder]);
+  assert.match(content, /metadata schema 变化: 2 组/);
+  assert.match(content, /新增：telegram/);
+  assert.match(content, /删除：website/);
+  assert.match(content, /顺序：creator -> description -> website -> twitter/);
+});
+
+test("metadata schema warnings never collapse into a generic site-wide asset card", () => {
+  const schemaDiff = { kind: "input", previous: ["creator"], current: ["creator", "buy"], added: ["buy"], removed: [], reordered: false, source: "create.js" };
+  const notification = {
+    url: "https://flap.sh/create",
+    title: "Flap metadata schema 变更",
+    changes: ["Flap 前端 metadata schema 变更"],
+    content: __testables.buildMetadataSchemaWarningContent("https://flap.sh/create", [schemaDiff]),
+    meta: { ...__testables.emptyFlapChangeMeta(), metadataSchemaDiffs: [schemaDiff], assetStats: { substantiveFiles: 1 } },
+  };
+  const [result] = __testables.coalesceFlapNotifications([notification]);
+  assert.equal(result.url, notification.url);
+  assert.equal(result.title, notification.title);
+  assert.match(result.content, /新增：buy/);
+});
+
+test("contract integrity delivery acknowledges state only after a successful card send", async () => {
+  const address = "0x1111111111111111111111111111111111111111";
+  const createState = () => ({
+    latestBlock: 100,
+    catalog: { [address]: { address, label: "Test Contract" } },
+    pendingChanges: [{ id: "change-1", type: "getter", address, field: "version", previous: "1", current: "2" }],
+  });
+  let saveCount = 0;
+  const failedState = createState();
+  const failed = await __testables.deliverFlapContractIntegrityChanges(failedState, {
+    sendCardFn: async () => "",
+    saveStateFn: () => { saveCount++; },
+    pinFn: async () => {},
+  });
+  assert.equal(failed.sent, false);
+  assert.equal(failedState.pendingChanges.length, 1);
+  assert.equal(saveCount, 0);
+
+  const sentState = createState();
+  const sent = await __testables.deliverFlapContractIntegrityChanges(sentState, {
+    sendCardFn: async () => "om_test",
+    saveStateFn: () => { saveCount++; },
+    pinFn: async () => {},
+  });
+  assert.equal(sent.sent, true);
+  assert.equal(sentState.pendingChanges.length, 0);
+  assert.equal(saveCount, 1);
+});
+
+test("Flap frontend contract hints bind each address to its nearest configuration field", () => {
+  const source = "const config={"
+    + "factory:'0x1111111111111111111111111111111111111111',"
+    + "swapRegistry:'0x2222222222222222222222222222222222222222',"
+    + "vaultPortal:'0x3333333333333333333333333333333333333333',"
+    + "taxTokenImpl:'0x4444444444444444444444444444444444444444'"
+    + "};";
+  const hints = __testables.extractContractHintsFromAsset(source, "config.js");
+  assert.deepEqual(hints.map(hint => hint.kind), ["factory", "swapRegistry", "vaultPortal", "tokenImplementation"]);
+  assert.deepEqual(hints.map(hint => hint.address), [
+    "0x1111111111111111111111111111111111111111",
+    "0x2222222222222222222222222222222222222222",
+    "0x3333333333333333333333333333333333333333",
+    "0x4444444444444444444444444444444444444444",
+  ]);
 });
 
 test("asset semantic profile classifies page chunks and shared runtime chunks", () => {
@@ -2809,7 +2959,7 @@ test("vault factory extraction resolves webpack aliases for visible CAStore vaul
   assert.match(content, /showInCAStore/);
 });
 
-test("registry log extraction detects on-chain registered vault address", () => {
+test("Vault Portal log extraction detects on-chain registered vault address", () => {
   const log = {
     address: "0x90497450f2a706f1951b5bdda52b4e5d16f34c06",
     topics: ["0xd8cf270eb9827992a063745f0afaa72431f8c63fc46736f8b484862dcc709787"],
@@ -2827,8 +2977,8 @@ test("registry log extraction detects on-chain registered vault address", () => 
   }], { fromBlock: 107771732, toBlock: 107771732 });
 
   assert.deepEqual(addresses, ["0x5418f7e8ff90354db0ecd48c8b710219244eb3c5"]);
-  assert.match(content, /链上注册中心发现新金库 1 个/);
-  assert.match(content, /注册中心:/);
+  assert.match(content, /Vault Portal 发现新金库 1 个/);
+  assert.match(content, /Vault Portal:/);
   assert.doesNotMatch(content, /证据详情/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
   assert.match(content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh\)/);

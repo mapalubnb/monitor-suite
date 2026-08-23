@@ -173,6 +173,9 @@ mkdir -p "$FLAP_DIR"
 # 如果源目录和目标不同才复制
 if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; then
   cp flap-monitor/monitor.mjs "$FLAP_DIR/"
+  cp flap-monitor/factory-pool-monitor.mjs "$FLAP_DIR/"
+  cp flap-monitor/compact-factory-pool-state.mjs "$FLAP_DIR/"
+  cp flap-monitor/contract-integrity-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/package.json "$FLAP_DIR/"
   # 创建 shared 软链接
   ln -sfn "$SHARED_DIR" "$FLAP_DIR/../shared"
@@ -514,12 +517,15 @@ SNAP="/root/monitor-suite/flap-monitor/snapshot.json"
 [ -f "$SNAP" ] || SNAP="/root/flap-monitor/snapshot.json"
 FACTORY_STATE="/root/monitor-suite/flap-monitor/factory-pool-state.json"
 [ -f "$FACTORY_STATE" ] || FACTORY_STATE="/root/flap-monitor/factory-pool-state.json"
+INTEGRITY_STATE="/root/monitor-suite/flap-monitor/contract-integrity-state.json"
+[ -f "$INTEGRITY_STATE" ] || INTEGRITY_STATE="/root/flap-monitor/contract-integrity-state.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
     const fs=require('fs');
     const s=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
     const fp=fs.existsSync('$FACTORY_STATE')?JSON.parse(fs.readFileSync('$FACTORY_STATE','utf-8')):{};
+    const ci=fs.existsSync('$INTEGRITY_STATE')?JSON.parse(fs.readFileSync('$INTEGRITY_STATE','utf-8')):{};
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+(chain==='robinhood'?'robinhood':'bnb')+'&lang=zh');
     const robinhoodPage='https://flap.sh/robinhood/CAstore?lang=zh';
@@ -535,6 +541,9 @@ if [ -f "$SNAP" ]; then
     const visibleFactories=visibleFactoryItems.length;
     const enabledVisibleFactories=visibleFactoryItems.filter(v=>v&&v.enabled).length;
     const registry=s.registryMonitor||{};
+    const integrityCatalog=Object.keys(ci.catalog||{}).length;
+    const integrityAssets=Object.keys(ci.trackedAssets||{}).length;
+    const integrityWss=ci.wssHealth?.contracts||{};
     const poolAssets=Object.values(fp.assets||{}).sort((a,b)=>String(a.quoteToken||'').localeCompare(String(b.quoteToken||'')));
     const poolConfigured=v=>Boolean(v&&(v.configured??v.enabled));
     const poolPaused=v=>poolConfigured(v)&&Boolean(v.creationDisabled);
@@ -573,6 +582,7 @@ if [ -f "$SNAP" ]; then
     if(typeof lag==='number'&&lag>300) health.push(warn('链上延迟 '+lag+' 块'));
     if(enabledVisibleFactories<visibleFactories) health.push(warn('有可见金库未启用'));
     if(wssNeedsAttention) health.push(warn('Factory 实时通道异常'));
+    if(ci.lastError) health.push(warn('合约完整性检测异常'));
 
     const pageStats=keys.map(k=>{
       const f=pages[k]||{};
@@ -638,11 +648,20 @@ if [ -f "$SNAP" ]; then
     }
     console.log('');
 
-    console.log('**07｜链上注册中心**');
-    console.log('注册中心：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
+    console.log('**07｜Vault Portal 链上注册**');
+    console.log('Vault Portal：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
     console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
     console.log('已知链上金库：'+knownVaults.length+' 个');
     for(const [index,addr] of knownVaults.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(addr,'https://bscscan.com/address/'+addr)+'｜金库 '+vaultLink(addr));
+    console.log('');
+
+    console.log('**08｜合约与配置完整性**');
+    const integrityStatus=ci.lastError?'需要关注':ci.lastCoreScanAt?'运行正常':'尚未建立';
+    console.log('监控状态：'+(integrityStatus==='运行正常'?ok(integrityStatus):warn(integrityStatus)));
+    console.log('合约目录：'+integrityCatalog+' 个｜已知资产 '+integrityAssets+' 个｜待发送变更 '+((ci.pendingChanges||[]).length)+' 项');
+    console.log('精准地址 WSS：'+(integrityWss.status||'尚未建立')+'｜已订阅 '+(Number(integrityWss.subscribedCount)||0)+'/'+(Number(integrityWss.configuredCount)||0));
+    console.log('核心校验：'+(ci.lastCoreScanAt?fmtTime(ci.lastCoreScanAt):'尚未建立')+'｜扩展轮转 '+(ci.lastExtendedScanAt?fmtTime(ci.lastExtendedScanAt):'尚未建立')+'｜代码审计 '+(ci.lastCodeAuditAt?fmtTime(ci.lastCodeAuditAt):'尚未建立'));
+    if(ci.lastError) console.log('最近异常：'+ci.lastError);
     console.log('');
 
     console.log('更新时间：'+fmtTime(new Date()));
@@ -778,7 +797,7 @@ pm2 jlist 2>/dev/null | node -e "
       }[status]||'未知');
       const services=[
         {name:'fourmeme-monitor', label:'Four.meme 监控', desc:'OpenFour + 多模块全面监控'},
-        {name:'flap-monitor',     label:'Flap.sh 监控',   desc:'页面/资源/文案监控'},
+        {name:'flap-monitor',     label:'Flap.sh 监控',   desc:'页面/metadata/合约完整性监控'},
         {name:'feishu-bot',       label:'飞书交互机器人',   desc:'WebSocket 长连接'},
       ];
       for(const svc of services){
