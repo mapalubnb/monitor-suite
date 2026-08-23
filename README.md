@@ -105,7 +105,8 @@ pm2 status
 - WSS 仅更新候选库、输出日志并复用现有飞书通知，不签名、不发送交易，也不改变任何自动发射逻辑。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。
 - Factory 不再从部署区块开始扫描完整历史。更新部署前已经存在、但当前 15 个基线资产之外的旧资产不会自动回溯；更新后的新事件和停机缺口仍会及时发现。
-- Factory 的升级/权限关键事件合并到原有 WSS 订阅；SwapRegistry、Vault Portal、Vault Factory 及链上发现的实现合约使用相同 WSS 节点做精准地址订阅，不增加新区块订阅。
+- Factory 的升级/权限关键事件合并到原有 WSS 订阅；内置 SwapRegistry、Vault Portal 与链上验证过的 Vault Factory 使用相同 WSS 节点做精准地址订阅，不增加新区块订阅。
+- 前端资源提取到的合约地址只作为候选记录，不能直接进入 WSS；普通 Transfer、Deposit 等未知事件不会生成完整性告警。
 - 核心代理 implementation/admin/beacon 槽与关键 getter 默认每 10 秒合并成批量 RPC；已知底池资产的 `isSpammerBlocked`、`isBlacklisted`、信任等级和计价币许可按 60 秒轮转。
 - bytecode 只在首次发现、实现地址变化或 10 分钟审计时读取，不会每轮重复下载。
 - 前端静态资源只保存 metadata 字段顺序、指纹和明确的合约地址提示，不保存原始 JS；旧快照升级时仅重建一次基线，不产生误报。

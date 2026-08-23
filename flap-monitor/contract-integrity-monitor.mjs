@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
-export const CONTRACT_INTEGRITY_SCHEMA_VERSION = 1;
+export const CONTRACT_INTEGRITY_SCHEMA_VERSION = 2;
 export const BSC_CHAIN_ID = 56;
 export const EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
 export const EIP1967_ADMIN_SLOT = "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
@@ -57,6 +57,7 @@ const IGNORED_OPERATIONAL_TOPICS = new Set([
   VAULT_FACTORY_CATEGORY_SET_TOPIC,
 ]);
 const FULL_LOG_MONITOR_KINDS = new Set(["swapRegistry", "vaultPortal", "vaultFactory"]);
+const VERIFIED_CATALOG_SOURCES = new Set(["builtin", "onchain-getter", "vault-portal-event"]);
 
 const GETTERS = Object.freeze({
   factory: [
@@ -116,6 +117,10 @@ function encodeAddressCall(selector, address) {
   return `${selector}${"0".repeat(24)}${normalizeAddress(address).slice(2)}`;
 }
 
+function isVerifiedCatalogEntry(entry) {
+  return entry?.verified === true || VERIFIED_CATALOG_SOURCES.has(String(entry?.source || ""));
+}
+
 export function extractBytecodeSelectors(bytecode) {
   const hex = String(bytecode || "").replace(/^0x/i, "").toLowerCase();
   const selectors = new Set();
@@ -157,10 +162,10 @@ export function decodeContractValue(raw, type = "bytes32") {
 
 function staticCatalog() {
   return {
-    [FLAP_CORE_CONTRACTS.factory]: { address: FLAP_CORE_CONTRACTS.factory, label: "Flap Factory", kind: "factory", proxy: true, source: "builtin" },
-    [FLAP_CORE_CONTRACTS.swapRegistry]: { address: FLAP_CORE_CONTRACTS.swapRegistry, label: "Flap SwapRegistry", kind: "swapRegistry", proxy: true, source: "builtin" },
-    [FLAP_CORE_CONTRACTS.vaultPortal]: { address: FLAP_CORE_CONTRACTS.vaultPortal, label: "Flap Vault Portal", kind: "vaultPortal", proxy: true, source: "builtin" },
-    [FLAP_CORE_CONTRACTS.defaultVaultFactory]: { address: FLAP_CORE_CONTRACTS.defaultVaultFactory, label: "Flap 默认 Vault Factory", kind: "vaultFactory", proxy: false, source: "builtin" },
+    [FLAP_CORE_CONTRACTS.factory]: { address: FLAP_CORE_CONTRACTS.factory, label: "Flap Factory", kind: "factory", proxy: true, source: "builtin", verified: true },
+    [FLAP_CORE_CONTRACTS.swapRegistry]: { address: FLAP_CORE_CONTRACTS.swapRegistry, label: "Flap SwapRegistry", kind: "swapRegistry", proxy: true, source: "builtin", verified: true },
+    [FLAP_CORE_CONTRACTS.vaultPortal]: { address: FLAP_CORE_CONTRACTS.vaultPortal, label: "Flap Vault Portal", kind: "vaultPortal", proxy: true, source: "builtin", verified: true },
+    [FLAP_CORE_CONTRACTS.defaultVaultFactory]: { address: FLAP_CORE_CONTRACTS.defaultVaultFactory, label: "Flap 默认 Vault Factory", kind: "vaultFactory", proxy: false, source: "builtin", verified: true },
   };
 }
 
@@ -190,10 +195,17 @@ export function migrateContractIntegrityState(raw) {
   state.schemaVersion = CONTRACT_INTEGRITY_SCHEMA_VERSION;
   state.chainId = BSC_CHAIN_ID;
   state.catalog = { ...(state.catalog || {}), ...staticCatalog() };
+  for (const [address, entry] of Object.entries(state.catalog)) {
+    if (FULL_LOG_MONITOR_KINDS.has(entry?.kind) && !isVerifiedCatalogEntry(entry)) delete state.catalog[address];
+  }
   state.contracts = state.contracts && typeof state.contracts === "object" ? state.contracts : {};
   state.trackedAssets = state.trackedAssets && typeof state.trackedAssets === "object" ? state.trackedAssets : {};
   state.recentEvents = state.recentEvents && typeof state.recentEvents === "object" ? state.recentEvents : {};
-  state.pendingChanges = Array.isArray(state.pendingChanges) ? state.pendingChanges.slice(-500) : [];
+  state.pendingChanges = Array.isArray(state.pendingChanges)
+    ? state.pendingChanges.filter(change => (
+      change?.type !== "event" || Boolean(EVENT_LABELS[String(change?.topic0 || "").toLowerCase()])
+    )).slice(-500)
+    : [];
   return state;
 }
 
@@ -218,30 +230,42 @@ function addCatalogEntry(state, value, patch = {}) {
   const address = normalizeAddress(value);
   if (!address) return false;
   const previous = state.catalog[address] || {};
-  const preserveBuiltin = previous.source === "builtin";
+  const incomingVerified = patch.verified === true || VERIFIED_CATALOG_SOURCES.has(String(patch.source || ""));
+  const preserveVerified = previous.source === "builtin" || (isVerifiedCatalogEntry(previous) && !incomingVerified);
   state.catalog[address] = {
     address,
-    label: preserveBuiltin ? previous.label : patch.label || previous.label || "Flap 关联合约",
-    kind: preserveBuiltin ? previous.kind : patch.kind || previous.kind || "dependency",
-    proxy: preserveBuiltin ? previous.proxy : patch.proxy ?? previous.proxy ?? false,
-    source: preserveBuiltin ? previous.source : patch.source || previous.source || "discovered",
+    label: preserveVerified ? previous.label : patch.label || previous.label || "Flap 关联合约",
+    kind: preserveVerified ? previous.kind : patch.kind || previous.kind || "dependency",
+    proxy: preserveVerified ? previous.proxy : patch.proxy ?? previous.proxy ?? false,
+    source: preserveVerified ? previous.source : patch.source || previous.source || "discovered",
+    verified: preserveVerified ? true : incomingVerified,
+    hintedKind: preserveVerified ? previous.hintedKind : patch.hintedKind || previous.hintedKind || "",
+    evidenceSource: preserveVerified ? previous.evidenceSource : patch.evidenceSource || previous.evidenceSource || "",
   };
   return !previous.address;
 }
 
-export function syncContractIntegrityCatalog(state, { vaultFactories = {}, registeredVaults = {}, contractHints = [], factoryAssets = {} } = {}) {
+export function syncContractIntegrityCatalog(state, { vaultFactories = {}, contractHints = [], factoryAssets = {} } = {}) {
   let changed = false;
   for (const factory of Object.values(vaultFactories || {})) {
     const address = factory?.factory || factory?.address;
-    changed = addCatalogEntry(state, address, { label: `Vault Factory ${factory?.name || ""}`.trim(), kind: "vaultFactory", source: "frontend-vault-types" }) || changed;
-  }
-  for (const [registeredAddress, vault] of Object.entries(registeredVaults || {})) {
-    const address = vault?.factory || vault?.address || registeredAddress;
-    changed = addCatalogEntry(state, address, { label: "Vault Portal 注册 Vault Factory", kind: "vaultFactory", source: "vault-portal-snapshot" }) || changed;
+    changed = addCatalogEntry(state, address, {
+      label: `Vault Factory 候选 ${factory?.name || ""}`.trim(),
+      kind: "frontendHint",
+      hintedKind: "vaultFactory",
+      source: "frontend-hint",
+      evidenceSource: "frontend-vault-types",
+    }) || changed;
   }
   for (const hint of contractHints || []) {
     const kind = String(hint?.kind || "dependency");
-    changed = addCatalogEntry(state, hint?.address, { label: hint?.label || `Flap ${kind}`, kind, proxy: hint?.proxy, source: hint?.source || "frontend" }) || changed;
+    changed = addCatalogEntry(state, hint?.address, {
+      label: hint?.label || `Flap ${kind} 候选`,
+      kind: "frontendHint",
+      hintedKind: kind,
+      source: "frontend-hint",
+      evidenceSource: hint?.source || "frontend",
+    }) || changed;
   }
   for (const [address, asset] of Object.entries(factoryAssets || {})) {
     const normalized = normalizeAddress(address);
@@ -294,7 +318,9 @@ export async function runContractIntegrityStateScan({
   if (chainId !== BSC_CHAIN_ID) throw new Error(`Flap 合约完整性 RPC chainId 错误：${chainId}`);
   state.latestBlock = hexToNumber(latestHex);
   const blockTag = numberToHex(state.latestBlock);
-  const entries = Object.values(state.catalog).filter(entry => extended || ["factory", "swapRegistry", "vaultPortal"].includes(entry.kind));
+  const entries = Object.values(state.catalog).filter(entry => (
+    extended || (isVerifiedCatalogEntry(entry) && ["factory", "swapRegistry", "vaultPortal"].includes(entry.kind))
+  ));
 
   const stateCalls = [];
   for (const entry of entries) {
@@ -337,7 +363,7 @@ export async function runContractIntegrityStateScan({
     }
     contract.lastStateBlock = state.latestBlock;
   }
-  for (const derived of newDerived) addCatalogEntry(state, derived.address, { ...derived, source: "onchain-getter" });
+  for (const derived of newDerived) addCatalogEntry(state, derived.address, { ...derived, source: "onchain-getter", verified: true });
 
   const codeTargets = new Set();
   for (const entry of Object.values(state.catalog)) {
@@ -434,11 +460,12 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
   }
   if (topic0 === VAULT_FACTORY_REGISTERED_TOPIC) {
     const discovered = addressFromDataWord(logEntry?.data, 0);
-    if (discovered) addCatalogEntry(state, discovered, { label: "Portal 注册 Vault Factory", kind: "vaultFactory", source: "vault-portal-event" });
+    if (discovered) addCatalogEntry(state, discovered, { label: "Portal 注册 Vault Factory", kind: "vaultFactory", source: "vault-portal-event", verified: true });
     return { processed: true, suppressed: true, change: null };
   }
   if (IGNORED_OPERATIONAL_TOPICS.has(topic0)) return { processed: true, suppressed: true, change: null };
-  const label = EVENT_LABELS[topic0] || (address === FLAP_CORE_CONTRACTS.factory ? "Factory 未识别关键事件" : "Flap 合约未识别事件");
+  const label = EVENT_LABELS[topic0];
+  if (!label) return { processed: true, suppressed: true, unknown: true, change: null };
   const change = appendChange(state, {
     type: "event",
     address,
@@ -480,7 +507,8 @@ export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock 
 
 export function contractIntegritySubscriptionAddresses(state, { includeFactory = false } = {}) {
   return Object.values(state.catalog || {})
-    .filter(entry => (includeFactory && entry.kind === "factory") || FULL_LOG_MONITOR_KINDS.has(entry.kind))
+    .filter(entry => isVerifiedCatalogEntry(entry)
+      && ((includeFactory && entry.kind === "factory") || FULL_LOG_MONITOR_KINDS.has(entry.kind)))
     .map(entry => entry.address)
     .filter(Boolean)
     .sort();
@@ -531,4 +559,5 @@ export const __testables = {
   encodeAddressCall,
   hashText,
   normalizeAddress,
+  isVerifiedCatalogEntry,
 };

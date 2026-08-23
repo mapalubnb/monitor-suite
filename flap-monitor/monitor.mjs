@@ -767,7 +767,7 @@ function emptyFlapChangeMeta() {
 /* ── 快照读写 ── */
 const CURRENT_SCHEMA_VERSION = 6;
 const CA_STORE_VAULT_SCHEMA_VERSION = 3;
-const ASSET_ANALYSIS_SCHEMA_VERSION = 1;
+const ASSET_ANALYSIS_SCHEMA_VERSION = 2;
 const METADATA_SCHEMA_FIELDS = Object.freeze([
   "creator", "description", "website", "telegram", "twitter", "github", "youtube", "debox", "buy",
   "name", "symbol", "image", "sell",
@@ -4666,43 +4666,32 @@ function extractContractHintsFromAsset(content, filename = "") {
   const source = String(content || "");
   const hints = [];
   const classifiers = [
-    { kind: "swapRegistry", label: "Flap SwapRegistry（前端配置）", proxy: true, re: /swap\s*registry|swapregistry/gi },
-    { kind: "vaultPortal", label: "Flap Vault Portal（前端配置）", proxy: true, re: /vault\s*portal|vaultportal/gi },
-    { kind: "vaultFactory", label: "Flap Vault Factory（前端配置）", re: /vault\s*factory|vaultfactory/gi },
-    { kind: "tokenImplementation", label: "Flap 税币实现（前端配置）", re: /tax(?:ed)?tokenimpl|tax_token_impl/gi },
-    { kind: "tokenImplementation", label: "Flap 代币实现（前端配置）", re: /standardtokenimpl|tokenimplv?3|token_implementation/gi },
-    { kind: "factory", label: "Flap Factory（前端配置）", proxy: true, re: /(?:^|[^a-z])factory(?:[^a-z]|$)/gi },
+    { kind: "swapRegistry", label: "Flap SwapRegistry（前端配置）", proxy: true, key: "swapRegistry|swap_registry" },
+    { kind: "vaultPortal", label: "Flap Vault Portal（前端配置）", proxy: true, key: "vaultPortal|vault_portal" },
+    { kind: "vaultFactory", label: "Flap Vault Factory（前端配置）", key: "vaultFactory|vault_factory" },
+    { kind: "tokenImplementation", label: "Flap 税币实现（前端配置）", key: "tax(?:ed)?TokenImpl|tax_token_impl" },
+    { kind: "tokenImplementation", label: "Flap 代币实现（前端配置）", key: "standardTokenImpl|tokenImplV?3|token_implementation" },
+    { kind: "factory", label: "Flap Factory（前端配置）", proxy: true, key: "factory" },
   ];
-  const addressRe = /0x[a-fA-F0-9]{40}/g;
-  let match;
-  while ((match = addressRe.exec(source)) !== null) {
-    const start = Math.max(0, match.index - 180);
-    const context = source.slice(start, Math.min(source.length, match.index + 222));
-    const addressStart = match.index - start;
-    const addressEnd = addressStart + match[0].length;
-    let selected = null;
-    for (const classifier of classifiers) {
-      classifier.re.lastIndex = 0;
-      let keyword;
-      while ((keyword = classifier.re.exec(context)) !== null) {
-        const keywordEnd = keyword.index + keyword[0].length;
-        const distance = keywordEnd <= addressStart
-          ? addressStart - keywordEnd
-          : keyword.index >= addressEnd
-            ? keyword.index - addressEnd
-            : 0;
-        if (distance <= 140 && (!selected || distance < selected.distance)) selected = { ...classifier, distance };
-      }
+  for (const classifier of classifiers) {
+    const assignment = new RegExp(
+      `(?:^|[,{;])\\s*(?:[A-Za-z_$][\\w$]*\\.)?["']?(?:${classifier.key})["']?\\s*[:=]\\s*["']?(0x[a-fA-F0-9]{40})`,
+      "gi",
+    );
+    let match;
+    while ((match = assignment.exec(source)) !== null) {
+      hints.push({
+        index: match.index,
+        address: match[1].toLowerCase(),
+        kind: classifier.kind,
+        label: classifier.label,
+        proxy: classifier.proxy,
+        source: filename,
+      });
     }
-    if (selected) hints.push({
-      address: match[0].toLowerCase(),
-      kind: selected.kind,
-      label: selected.label,
-      proxy: selected.proxy,
-      source: filename,
-    });
   }
-  return [...new Map(hints.map(hint => [`${hint.kind}:${hint.address}`, hint])).values()];
+  return [...new Map(hints.sort((left, right) => left.index - right.index)
+    .map(({ index, ...hint }) => [`${hint.kind}:${hint.address}`, hint])).values()];
 }
 
 function applyFrontendAssetAnalysis(features) {
@@ -6254,7 +6243,6 @@ function collectSnapshotContractHints(snapshot = {}) {
 function syncFlapContractIntegrityCatalog(state, snapshot = {}, factoryPoolState = {}) {
   return syncContractIntegrityCatalog(state, {
     vaultFactories: snapshot.vaultFactories || {},
-    registeredVaults: snapshot.registryMonitor?.knownVaults || {},
     contractHints: collectSnapshotContractHints(snapshot),
     factoryAssets: factoryPoolState.assets || {},
   });
@@ -6666,7 +6654,7 @@ async function startMonitor() {
   }
 
   async function processContractIntegrityEvent(event, source) {
-    const catalogSizeBefore = Object.keys(contractIntegrityState.catalog || {}).length;
+    const subscriptionFingerprintBefore = contractIntegritySubscriptionAddresses(contractIntegrityState).join(",");
     const result = await enqueueContractIntegrityMutation(() => {
       const outcome = ingestContractIntegrityEvent(contractIntegrityState, event, source, {
         suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
@@ -6674,7 +6662,9 @@ async function startMonitor() {
       if (outcome.processed) saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
       return outcome;
     });
-    if (Object.keys(contractIntegrityState.catalog || {}).length !== catalogSizeBefore) await refreshContractIntegrityWsFeed();
+    if (contractIntegritySubscriptionAddresses(contractIntegrityState).join(",") !== subscriptionFingerprintBefore) {
+      await refreshContractIntegrityWsFeed();
+    }
     if (result.change) void scheduleContractIntegrityDelivery();
     return result;
   }

@@ -91,6 +91,34 @@ test("state migration keeps built-in core contract types authoritative", () => {
   });
   assert.equal(state.catalog[FLAP_CORE_CONTRACTS.vaultPortal].kind, "vaultPortal");
   assert.equal(state.catalog[FLAP_CORE_CONTRACTS.vaultPortal].source, "builtin");
+  assert.equal(state.catalog[FLAP_CORE_CONTRACTS.vaultPortal].verified, true);
+});
+
+test("state migration removes unverified core hints and pending unknown-event noise", () => {
+  const wbnb = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
+  const legacyVault = "0x5555555555555555555555555555555555555555";
+  const transferTopic = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+  const state = migrateContractIntegrityState({
+    catalog: {
+      [wbnb]: {
+        address: wbnb,
+        label: "Flap SwapRegistry（前端配置）",
+        kind: "swapRegistry",
+        source: "launch.js",
+      },
+      [legacyVault]: {
+        address: legacyVault,
+        label: "Vault Portal 注册 Vault Factory",
+        kind: "vaultFactory",
+        source: "vault-portal-snapshot",
+      },
+    },
+    pendingChanges: [{ id: "noise", type: "event", address: wbnb, topic0: transferTopic }],
+  });
+  assert.equal(state.catalog[wbnb], undefined);
+  assert.equal(state.catalog[legacyVault], undefined);
+  assert.equal(state.pendingChanges.length, 0);
+  assert.equal(contractIntegritySubscriptionAddresses(state).includes(wbnb), false);
 });
 
 test("corrupt integrity state is reported instead of silently discarding pending alerts", () => {
@@ -200,30 +228,33 @@ test("unchanged derived contracts do not trigger bytecode reads on every core sc
   assert.equal(codeCalls, 0);
 });
 
-test("catalog sync discovers vault factories frontend hints and known Factory assets", () => {
+test("catalog sync keeps frontend hints passive and subscribes only verified Vault Factories", () => {
   const state = createContractIntegrityState();
   const vaultFactory = `0x${"33".repeat(20)}`;
   const implementation = `0x${"44".repeat(20)}`;
   const router = `0x${"45".repeat(20)}`;
-  const registeredFactory = `0x${"46".repeat(20)}`;
+  const wbnb = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c";
   const asset = `0x${"55".repeat(20)}`;
   const changed = syncContractIntegrityCatalog(state, {
     vaultFactories: { [vaultFactory]: { factory: vaultFactory, name: "Index Vault" } },
-    registeredVaults: { [registeredFactory]: { address: registeredFactory } },
     contractHints: [
       { address: implementation, kind: "tokenImplementation", label: "Tax Token Impl" },
       { address: router, kind: "swap-router", label: "Swap Router" },
+      { address: wbnb, kind: "swapRegistry", label: "Flap SwapRegistry（前端配置）" },
     ],
     factoryAssets: { [asset]: { symbol: "TESTB" } },
   });
   assert.equal(changed, true);
-  assert.equal(state.catalog[vaultFactory].kind, "vaultFactory");
-  assert.equal(state.catalog[implementation].kind, "tokenImplementation");
-  assert.equal(state.catalog[registeredFactory].kind, "vaultFactory");
+  assert.equal(state.catalog[vaultFactory].kind, "frontendHint");
+  assert.equal(state.catalog[vaultFactory].hintedKind, "vaultFactory");
+  assert.equal(state.catalog[implementation].kind, "frontendHint");
+  assert.equal(state.catalog[implementation].hintedKind, "tokenImplementation");
   assert.equal(state.trackedAssets[asset].label, "TESTB");
-  assert.ok(contractIntegritySubscriptionAddresses(state).includes(vaultFactory));
+  assert.equal(contractIntegritySubscriptionAddresses(state).includes(vaultFactory), false);
   assert.equal(contractIntegritySubscriptionAddresses(state).includes(implementation), false);
   assert.equal(contractIntegritySubscriptionAddresses(state).includes(router), false);
+  assert.equal(state.catalog[wbnb].kind, "frontendHint");
+  assert.equal(contractIntegritySubscriptionAddresses(state).includes(wbnb), false);
 });
 
 test("integrity events deduplicate suppress existing Factory upgrade alerts and discover Vault Factory", () => {
@@ -255,7 +286,22 @@ test("integrity events deduplicate suppress existing Factory upgrade alerts and 
   };
   assert.equal(ingestContractIntegrityEvent(state, operational, "test").suppressed, true);
 
+  const pendingBeforeUnknown = state.pendingChanges.length;
+  const transfer = {
+    ...adminChange,
+    address: FLAP_CORE_CONTRACTS.swapRegistry,
+    topics: ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"],
+    transactionHash: `0x${"78".repeat(32)}`,
+  };
+  const ignoredTransfer = ingestContractIntegrityEvent(state, transfer, "test");
+  assert.equal(ignoredTransfer.unknown, true);
+  assert.equal(state.pendingChanges.length, pendingBeforeUnknown);
+
   const vaultFactory = `0x${"88".repeat(20)}`;
+  syncContractIntegrityCatalog(state, {
+    vaultFactories: { [vaultFactory]: { factory: vaultFactory, name: "Candidate" } },
+  });
+  assert.equal(contractIntegritySubscriptionAddresses(state).includes(vaultFactory), false);
   const registered = {
     ...adminChange,
     address: FLAP_CORE_CONTRACTS.vaultPortal,
@@ -265,6 +311,8 @@ test("integrity events deduplicate suppress existing Factory upgrade alerts and 
   };
   assert.equal(ingestContractIntegrityEvent(state, registered, "test").suppressed, true);
   assert.equal(state.catalog[vaultFactory].kind, "vaultFactory");
+  assert.equal(state.catalog[vaultFactory].verified, true);
+  assert.equal(contractIntegritySubscriptionAddresses(state).includes(vaultFactory), true);
 
 });
 

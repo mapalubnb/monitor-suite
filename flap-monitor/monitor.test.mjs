@@ -34,6 +34,10 @@ const {
   runFactoryPoolScan,
 } = await import("./factory-pool-monitor.mjs");
 const { compactFactoryPoolStateFile } = await import("./compact-factory-pool-state.mjs");
+const {
+  contractIntegritySubscriptionAddresses,
+  createContractIntegrityState,
+} = await import("./contract-integrity-monitor.mjs");
 
 const BOOLEAN_FALSE_RESULT = `0x${"0".repeat(64)}`;
 const BOOLEAN_TRUE_RESULT = `0x${"0".repeat(63)}1`;
@@ -2559,6 +2563,7 @@ test("Flap frontend contract hints bind each address to its nearest configuratio
   const source = "const config={"
     + "factory:'0x1111111111111111111111111111111111111111',"
     + "swapRegistry:'0x2222222222222222222222222222222222222222',"
+    + "wrappedNative:'0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c',"
     + "vaultPortal:'0x3333333333333333333333333333333333333333',"
     + "taxTokenImpl:'0x4444444444444444444444444444444444444444'"
     + "};";
@@ -2570,6 +2575,17 @@ test("Flap frontend contract hints bind each address to its nearest configuratio
     "0x3333333333333333333333333333333333333333",
     "0x4444444444444444444444444444444444444444",
   ]);
+  assert.equal(hints.some(hint => hint.address === "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"), false);
+});
+
+test("generic Vault Portal known vaults never become contract-integrity WSS targets", () => {
+  const state = createContractIntegrityState();
+  const vault = "0x5555555555555555555555555555555555555555";
+  __testables.syncFlapContractIntegrityCatalog(state, {
+    registryMonitor: { knownVaults: { [vault]: { vault, source: "portal-log" } } },
+  });
+  assert.equal(state.catalog[vault], undefined);
+  assert.equal(contractIntegritySubscriptionAddresses(state).includes(vault), false);
 });
 
 test("asset semantic profile classifies page chunks and shared runtime chunks", () => {
