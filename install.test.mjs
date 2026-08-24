@@ -39,7 +39,7 @@ function renderFourmemeStatus(snapshot) {
   }
 }
 
-function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}) {
+function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safeProposalState = {}) {
   const source = extractHeredoc("fl-status");
   const script = extractNodeEvalScripts(source).find(item => item.includes("vaultLink"));
   assert.ok(script, "未找到 Flap 快照状态渲染器");
@@ -47,14 +47,17 @@ function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}) {
   const snapshotPath = join(dir, "snapshot.json");
   const factoryStatePath = join(dir, "factory-pool-state.json");
   const integrityStatePath = join(dir, "contract-integrity-state.json");
+  const safeProposalStatePath = join(dir, "safe-proposal-state.json");
   try {
     writeFileSync(snapshotPath, JSON.stringify(snapshot), "utf-8");
     writeFileSync(factoryStatePath, JSON.stringify(factoryState), "utf-8");
     writeFileSync(integrityStatePath, JSON.stringify(integrityState), "utf-8");
+    writeFileSync(safeProposalStatePath, JSON.stringify(safeProposalState), "utf-8");
     const runnable = script
       .replaceAll("'$SNAP'", JSON.stringify(snapshotPath))
       .replaceAll("'$FACTORY_STATE'", JSON.stringify(factoryStatePath))
-      .replaceAll("'$INTEGRITY_STATE'", JSON.stringify(integrityStatePath));
+      .replaceAll("'$INTEGRITY_STATE'", JSON.stringify(integrityStatePath))
+      .replaceAll("'$SAFE_STATE'", JSON.stringify(safeProposalStatePath));
     const result = spawnSync(process.execPath, ["-e", runnable], { encoding: "utf-8" });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
@@ -106,6 +109,7 @@ test("separate Flap deployment copies every runtime module", () => {
     "factory-pool-monitor.mjs",
     "compact-factory-pool-state.mjs",
     "contract-integrity-monitor.mjs",
+    "safe-proposal-monitor.mjs",
     "package.json",
   ]) {
     assert.match(installSource, new RegExp(`cp flap-monitor/${file.replaceAll(".", "\\.")} \\"\\$FLAP_DIR/\\"`));
@@ -126,6 +130,20 @@ test("Flap status includes Vault Portal and contract integrity health", () => {
   assert.match(output, /\*\*08｜合约与配置完整性\*\*/);
   assert.match(output, /合约目录：2 个｜已知资产 1 个｜待发送变更 1 项/);
   assert.match(output, /精准地址 WSS：healthy｜已订阅 2\/2/);
+});
+
+test("Flap status includes Safe proposal nonce baseline and pending targets", () => {
+  const safe = "0xc68f29bfe2f6c3d95adb5685592b9f86680968f2";
+  const token = "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14";
+  const output = renderFlapStatus({ pages: {}, vaultFactories: {} }, {}, {}, {
+    safes: { [safe]: { address: safe, baselineEstablished: true, currentNonce: 12, lastError: "" } },
+    proposals: { first: { safe, quoteToken: token, status: "pending" } },
+    pendingChanges: [{ id: "proposal" }],
+    lastSuccessAt: "2026-08-24T04:00:00.000Z",
+  });
+  assert.match(output, /\*\*09｜Safe 开放提案预警\*\*/);
+  assert.match(output, /健康 Safe：1\/1｜有效待执行目标 1 个｜待发送变更 1 项/);
+  assert.match(output, /nonce 12｜基线完成/);
 });
 
 test("Flap status links current factories and registered vaults to launch pages", () => {

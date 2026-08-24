@@ -5,7 +5,7 @@
 ## ✨ 主要功能
 
 - **Four.meme**：底池、前端页面、公开 API、OpenFour 模板、GitHub、合约及链上参数。
-- **Flap.sh**：BNB CAStore、Robinhood CAStore、metadata schema、Vault Portal、Vault Factory、SwapRegistry、核心代理升级，以及 Factory 底池状态。
+- **Flap.sh**：BNB CAStore、Robinhood CAStore、metadata schema、Vault Portal、Vault Factory、SwapRegistry、核心代理升级、Factory 底池状态，以及管理 Safe 的底池开放提案。
 - **飞书卡片**：规则结果优先发送，AI 摘要异步补充；长文案、URL、地址和交易哈希完整保留。
 - **稳定低延迟**：支持 PM2、动态 RPC 竞速、短超时切换、断点补扫和去重；Factory 名称与飞书发送不阻塞后续扫描。
 - **前端增量抓取**：FourMeme 保留真实 `dpl` 部署 URL，同路径部署参数变化直接迁移缓存，只下载新增或路径变化的资源；部分失败会在下轮只补抓失败项。
@@ -83,6 +83,7 @@ pm2 status
 | Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | WSS 实时，HTTP 1 秒兜底，不等待确认块 |
 | Flap.sh | Factory 断点补扫 | 后台运行，自动找回停机或 RPC 故障期间的变化 |
 | Flap.sh | Factory 已知资产复核 | 后台轮转，补充发现 getter 状态变化 |
+| Flap.sh | 管理 Safe 底池开放提案 | 3 秒，按链上 nonce 精确过滤有效待执行提案 |
 | Flap.sh | Factory / SwapRegistry / Vault Portal 核心完整性 | 精准地址 WSS；HTTP 批量校验 10 秒兜底 |
 | Flap.sh | Vault Factory 与已知资产黑名单/信任状态 | 60 秒轮转 |
 | Flap.sh | bytecode hash 与函数选择器审计 | 10 分钟 |
@@ -105,6 +106,9 @@ pm2 status
 - WSS 仅更新候选库、输出日志并复用现有飞书通知，不签名、不发送交易，也不改变任何自动发射逻辑。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。
 - Factory 不再从部署区块开始扫描完整历史。更新部署前已经存在、但当前 15 个基线资产之外的旧资产不会自动回溯；更新后的新事件和停机缺口仍会及时发现。
+- Safe 提案预警默认监控新旧两个 Flap 管理 Safe，只解析发往 Factory 的 `setQuoteTokenCreationDisabled(address,false)`，并递归解析 Safe `MultiSend`；首次运行只建立基线，不发送历史提案。
+- Safe API 查询使用链上 `nonce()` 作为下限，自动排除接口仍保留的废弃历史提案；`1/2` 确认提示准备开放，`2/2` 确认提示即将执行，Factory 链上事件仍是正式开放的最终依据。
+- Safe 提案监控不订阅新区块、不读取完整交易，也不执行任何 Safe 操作；API 遇到 `429`、超时或网络失败时按 Safe 独立退避，不阻塞现有页面和链上监控。
 - Factory 的升级/权限关键事件合并到原有 WSS 订阅；内置 SwapRegistry、Vault Portal 与链上验证过的 Vault Factory 使用相同 WSS 节点做精准地址订阅，不增加新区块订阅。
 - 前端资源提取到的合约地址只作为候选记录，不能直接进入 WSS；普通 Transfer、Deposit 等未知事件不会生成完整性告警。
 - 核心代理 implementation/admin/beacon 槽与关键 getter 默认每 10 秒合并成批量 RPC；已知底池资产的 `isSpammerBlocked`、`isBlacklisted`、信任等级和计价币许可按 60 秒轮转。
@@ -153,6 +157,7 @@ fl-status
 - Factory 实时通道异常：检查 `fl-status` 的 WSS 已订阅数量；单节点断线会显示“部分可用”，全部断线会显示“需要关注”。短窗口回扫失败会单独显示，不与 WSS 连接错误混淆。
 - Factory 显示候选复核失败：候选地址和交易证据已保留，实时轮询会自动重试；检查 RPC getter 可用性即可。
 - 合约完整性异常：检查 `fl-status` 的合约目录、精准地址 WSS、核心校验、扩展轮转与代码审计时间；发送失败的变更会保留在 `contract-integrity-state.json`。
+- Safe 提案预警异常：检查 `fl-status` 的 Safe nonce、基线和最近错误；发送失败的预警会保留在 `safe-proposal-state.json`，Safe API 限流会自动恢复。
 
 ## ✅ 本地验证
 

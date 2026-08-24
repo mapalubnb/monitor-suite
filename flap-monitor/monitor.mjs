@@ -47,6 +47,15 @@ import {
   scanContractIntegrityEvents,
   syncContractIntegrityCatalog,
 } from "./contract-integrity-monitor.mjs";
+import {
+  DEFAULT_FLAP_ADMIN_SAFES,
+  acknowledgeSafeProposalChanges,
+  buildSafeProposalContent,
+  createSafeProposalState,
+  loadSafeProposalState,
+  runSafeProposalScan,
+  saveSafeProposalState,
+} from "./safe-proposal-monitor.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
@@ -143,6 +152,15 @@ const CONFIG = {
     wsEnabled: process.env.FLAP_CONTRACT_WS_ENABLED !== "false",
     wsUrls: [...new Set((process.env.FLAP_CONTRACT_WS_URLS || process.env.FLAP_FACTORY_WS_URLS || "wss://bsc-rpc.publicnode.com,wss://bsc.publicnode.com")
       .split(",").map(value => value.trim()).filter(Boolean))],
+  },
+  safeProposalMonitor: {
+    enabled: process.env.FLAP_SAFE_PROPOSAL_MONITOR !== "false",
+    stateFile: join(__dirname, "safe-proposal-state.json"),
+    intervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_INTERVAL_MS", 3_000, 1_000),
+    requestTimeoutMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_TIMEOUT_MS", 5_000, 500),
+    apiBaseUrl: process.env.FLAP_SAFE_API_BASE_URL || "https://safe-transaction-bsc.safe.global/api/v1",
+    safes: [...new Set((process.env.FLAP_ADMIN_SAFE_ADDRESSES || DEFAULT_FLAP_ADMIN_SAFES.join(","))
+      .split(",").map(value => value.trim()).filter(value => /^0x[a-fA-F0-9]{40}$/.test(value)))],
   },
 
   // 反风控
@@ -6307,6 +6325,46 @@ async function deliverFlapContractIntegrityChanges(state, {
   return { sent: true, changes, messageId };
 }
 
+async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
+  titlePrefix = "",
+  sendCardFn = sendCardViaApi,
+  saveStateFn = saveSafeProposalState,
+  acknowledgeFn = acknowledgeSafeProposalChanges,
+  pinFn = pinMessage,
+} = {}) {
+  const pending = [...(state.pendingChanges || [])];
+  if (pending.length === 0) return { sent: false, changes: [] };
+  const groups = [
+    pending.filter(change => change.type !== "invalidated"),
+    pending.filter(change => change.type === "invalidated"),
+  ].filter(group => group.length > 0);
+  const delivered = [];
+  const messageIds = [];
+  for (const changes of groups) {
+    const invalidated = changes.every(change => change.type === "invalidated");
+    const ready = changes.some(change => change.type === "ready");
+    const title = invalidated
+      ? `${titlePrefix}Flap 底池开放提案已失效`
+      : ready
+        ? `${titlePrefix}Flap 新底池即将开放`
+        : `${titlePrefix}Flap 新底池准备开放`;
+    const messageId = await sendCardFn(
+      title,
+      buildSafeProposalContent(changes, factoryPoolState?.assets || {}),
+      invalidated ? "yellow" : "red",
+    );
+    if (!messageId) continue;
+    acknowledgeFn(state, changes.map(change => change.id));
+    saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
+    delivered.push(...changes);
+    messageIds.push(messageId);
+    if (!invalidated) {
+      void Promise.resolve(pinFn(messageId)).catch(error => log(`[Flap Safe 提案] 卡片置顶失败：${error.message}`));
+    }
+  }
+  return { sent: delivered.length > 0, changes: delivered, messageIds };
+}
+
 /* ══════════════════════════════════════════
    单次检测模式（node monitor.mjs check）
    ══════════════════════════════════════════ */
@@ -6422,6 +6480,33 @@ async function runCheck() {
     log(`[Flap Factory] 手动检测失败：${err.message}`);
   }
   try {
+    if (CONFIG.safeProposalMonitor.enabled) {
+      const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
+      const safeProposalState = loadSafeProposalState(
+        CONFIG.safeProposalMonitor.stateFile,
+        CONFIG.safeProposalMonitor.safes,
+      );
+      const safeResult = await runSafeProposalScan({
+        state: safeProposalState,
+        safes: CONFIG.safeProposalMonitor.safes,
+        factoryAddress: CONFIG.factoryPoolMonitor.proxy,
+        rpcBatch: bscRpcBatch,
+        apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
+        timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
+      });
+      saveSafeProposalState(CONFIG.safeProposalMonitor.stateFile, safeProposalState);
+      if (safeResult.changed) hasDetectedChange = true;
+      if (safeProposalState.pendingChanges.length > 0) {
+        const delivery = await deliverFlapSafeProposalChanges(safeProposalState, factoryPoolState, {
+          titlePrefix: "手动检测 — ",
+        });
+        if (delivery.sent) hasNotifiedChange = true;
+      }
+    }
+  } catch (err) {
+    log(`[Flap Safe 提案] 手动检测失败：${err.message}`);
+  }
+  try {
     const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
     const integrityState = loadContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile);
     const hasBaseline = Object.keys(integrityState.contracts || {}).length > 0;
@@ -6496,11 +6581,34 @@ function factoryPoolWssDisplay(state = {}) {
   };
 }
 
+function safeProposalDisplay(state = {}) {
+  const safeStates = Object.values(state.safes || {});
+  const active = Object.values(state.proposals || {}).filter(proposal => ["pending", "ready"].includes(proposal?.status));
+  const healthyCount = safeStates.filter(item => item?.baselineEstablished && !item?.lastError).length;
+  const status = !CONFIG.safeProposalMonitor.enabled
+    ? "未启用"
+    : safeStates.some(item => item?.lastError)
+      ? "部分异常"
+      : safeStates.every(item => item?.baselineEstablished)
+        ? "运行正常"
+        : "正在建立基线";
+  return {
+    status,
+    safeStates,
+    healthyCount,
+    active,
+    lastSuccess: state.lastSuccessAt
+      ? new Date(state.lastSuccessAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })
+      : "暂无",
+  };
+}
+
 function buildFlapStartupContent(
   snapshot = {},
   hostname = "未知",
   factoryPoolState = createFactoryPoolState(CONFIG.factoryPoolMonitor.proxy),
   contractIntegrityState = {},
+  safeProposalState = createSafeProposalState(CONFIG.safeProposalMonitor.safes),
 ) {
   const pages = Object.values(snapshot.pages || {});
   const factories = Object.values(snapshot.vaultFactories || {}).filter(factory => factory?.showInCAStore === true);
@@ -6536,6 +6644,11 @@ function buildFlapStartupContent(
     ? poolAssets.map((asset, index) =>
         `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetName(asset)}｜状态 ${formatFactoryPoolAssetStatus(asset)}｜地址 ${addressLink(asset.quoteToken)}`)
     : ["尚未发现已配置的 Factory 底池资产"];
+  const safeProposal = safeProposalDisplay(safeProposalState);
+  const safeLines = safeProposal.safeStates.length > 0
+    ? safeProposal.safeStates.map((item, index) =>
+        `${String(index + 1).padStart(2, "0")}　Safe ${addressLink(item.address)}｜nonce ${item.currentNonce ?? "未知"}｜${item.lastError ? "异常" : item.baselineEstablished ? "基线完成" : "等待基线"}`)
+    : ["尚未配置 Flap 管理 Safe"];
   return [
     "**01｜运行状态**",
     "状态：监控运行中",
@@ -6581,7 +6694,14 @@ function buildFlapStartupContent(
     `核心批量校验：${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒｜扩展轮转：${CONFIG.contractIntegrityMonitor.extendedIntervalMs / 1000} 秒｜代码审计：${CONFIG.contractIntegrityMonitor.codeAuditIntervalMs / 1000} 秒`,
     `事件通道：精准地址 WSS + ${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒 HTTP 日志兜底`,
     "",
-    "**08｜RPC 节点**",
+    "**08｜Safe 开放提案预警**",
+    `监控状态：${safeProposal.status}`,
+    `轮询间隔：${CONFIG.safeProposalMonitor.intervalMs / 1000} 秒｜健康 Safe ${safeProposal.healthyCount}/${safeProposal.safeStates.length}｜最后成功 ${safeProposal.lastSuccess}`,
+    `有效待执行目标：${safeProposal.active.length} 个`,
+    ...safeLines,
+    ...(safeProposalState.lastError ? [`最近异常：${safeProposalState.lastError}`] : []),
+    "",
+    "**09｜RPC 节点**",
     ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
   ].join("\n");
 }
@@ -6590,6 +6710,10 @@ async function startMonitor() {
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
   const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
   const contractIntegrityState = loadContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile);
+  const safeProposalState = loadSafeProposalState(
+    CONFIG.safeProposalMonitor.stateFile,
+    CONFIG.safeProposalMonitor.safes,
+  );
   let contractIntegrityMutationQueue = Promise.resolve();
   let contractIntegrityDeliveryPromise = null;
   let contractIntegrityWsFeed = null;
@@ -6697,6 +6821,61 @@ async function startMonitor() {
   global.__contractIntegrityDeliveryDrain = async () => {
     if (contractIntegrityDeliveryPromise) await contractIntegrityDeliveryPromise;
   };
+  let safeProposalPollPromise = null;
+  let safeProposalDeliveryPromise = null;
+
+  function scheduleSafeProposalDelivery(titlePrefix = "") {
+    if (!CONFIG.safeProposalMonitor.enabled || safeProposalDeliveryPromise) return safeProposalDeliveryPromise;
+    if (safeProposalState.pendingChanges.length === 0 || !canAttemptFeishuDelivery()) return null;
+    safeProposalDeliveryPromise = deliverFlapSafeProposalChanges(safeProposalState, factoryPoolState, { titlePrefix })
+      .catch(error => {
+        log(`[Flap Safe 提案] 待发送变更已保留：${error.message}`);
+        return { sent: false, error };
+      })
+      .finally(() => { safeProposalDeliveryPromise = null; });
+    return safeProposalDeliveryPromise;
+  }
+
+  async function safeProposalPoll({ suppressNotifications = false, titlePrefix = "" } = {}) {
+    if (!CONFIG.safeProposalMonitor.enabled) return { changed: false, skipped: true };
+    if (safeProposalPollPromise) return await safeProposalPollPromise;
+    safeProposalPollPromise = (async () => {
+      const previousError = safeProposalState.lastError || "";
+      try {
+        const result = await runSafeProposalScan({
+          state: safeProposalState,
+          safes: CONFIG.safeProposalMonitor.safes,
+          factoryAddress: CONFIG.factoryPoolMonitor.proxy,
+          rpcBatch: bscRpcBatch,
+          apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
+          timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
+          suppressNotifications,
+        });
+        saveSafeProposalState(CONFIG.safeProposalMonitor.stateFile, safeProposalState);
+        for (const change of result.changes) {
+          log(`[Flap Safe 提案] ${change.type}｜${change.quoteToken}｜确认 ${change.confirmations}/${change.required}｜nonce ${change.nonce}`);
+        }
+        if (safeProposalState.lastError && safeProposalState.lastError !== previousError) {
+          log(`[Flap Safe 提案] 部分检测异常：${safeProposalState.lastError}`);
+        } else if (!safeProposalState.lastError && previousError) {
+          log("[Flap Safe 提案] 检测已恢复");
+        }
+        if (!suppressNotifications) void scheduleSafeProposalDelivery(titlePrefix);
+        return result;
+      } catch (error) {
+        safeProposalState.lastRunAt = ts();
+        safeProposalState.lastError = error.message;
+        saveSafeProposalState(CONFIG.safeProposalMonitor.stateFile, safeProposalState);
+        throw error;
+      }
+    })().finally(() => { safeProposalPollPromise = null; });
+    return await safeProposalPollPromise;
+  }
+
+  global.__safeProposalDrain = async () => {
+    if (safeProposalPollPromise) await safeProposalPollPromise;
+    if (safeProposalDeliveryPromise) await safeProposalDeliveryPromise;
+  };
   // failCounts 改为对象结构，记录失败次数、最近错误信息和时间
   const failCounts = {};  // key -> { count, lastMsg, lastFailTime, hourlyErrors }
   const backoffSkips = {};  // key -> number of polls skipped due to domain backoff
@@ -6778,6 +6957,14 @@ async function startMonitor() {
     if (hasIntegrityBaseline) void scheduleContractIntegrityDelivery();
   }
 
+  if (CONFIG.safeProposalMonitor.enabled) {
+    try {
+      await safeProposalPoll();
+    } catch (error) {
+      log(`[Flap Safe 提案] 启动检测失败：${error.message}`);
+    }
+  }
+
   const factoryPoolEventQueue = createFactoryPoolEventQueue(factoryPoolState);
   global.__factoryPoolEventQueueDrain = factoryPoolEventQueue.drain;
   let firstFactoryWsSubscription = Promise.resolve();
@@ -6844,7 +7031,13 @@ async function startMonitor() {
 
   await sendFeishu(
     "Flap 监控 v2 已启动",
-    buildFlapStartupContent(snapshot, (await import("node:os")).hostname(), factoryPoolState, contractIntegrityState),
+    buildFlapStartupContent(
+      snapshot,
+      (await import("node:os")).hostname(),
+      factoryPoolState,
+      contractIntegrityState,
+      safeProposalState,
+    ),
     "blue"
   );
 
@@ -6955,6 +7148,20 @@ async function startMonitor() {
     }, delayMs);
   }
   scheduleContractIntegrityNext();
+
+  function scheduleSafeProposalNext(delayMs = CONFIG.safeProposalMonitor.intervalMs) {
+    if (!CONFIG.safeProposalMonitor.enabled) return;
+    setTimeout(async () => {
+      const startedAt = Date.now();
+      try {
+        await safeProposalPoll();
+      } catch (error) {
+        log(`[Flap Safe 提案] 检测失败：${error.message}`);
+      }
+      scheduleSafeProposalNext(Math.max(250, CONFIG.safeProposalMonitor.intervalMs - (Date.now() - startedAt)));
+    }, delayMs);
+  }
+  scheduleSafeProposalNext();
 
   // 轮询函数：并行检测所有页面
   let pendingPoll = false;
@@ -7226,6 +7433,7 @@ async function startMonitor() {
     factoryPoolRealtimePoll().catch(err => log(`[SIGUSR1] Factory 实时检测异常：${err.message}`));
     factoryPoolBackgroundPoll().catch(err => log(`[SIGUSR1] Factory 后台检测异常：${err.message}`));
     contractIntegrityPoll({ forceExtended: true, forceCodeAudit: true }).catch(err => log(`[SIGUSR1] 合约完整性检测异常：${err.message}`));
+    safeProposalPoll().catch(err => log(`[SIGUSR1] Safe 提案检测异常：${err.message}`));
     if (isPolling) {
       pendingPoll = true;  // 利用 pendingPoll 机制，当前轮询结束后自动触发
       log("收到 SIGUSR1，当前正在轮询，将在本轮结束后立即执行");
@@ -7303,6 +7511,9 @@ async function gracefulShutdown(signal) {
   if (global.__contractIntegrityMutationDrain) {
     try { await global.__contractIntegrityMutationDrain(); } catch {}
   }
+  if (global.__safeProposalDrain) {
+    try { await global.__safeProposalDrain(); } catch {}
+  }
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   try { saveSnapshot(loadSnapshot() || {}); } catch {}
@@ -7340,10 +7551,12 @@ export const __testables = {
   buildCardBriefing,
   buildOperationalNoticeContent,
   buildFlapStartupContent,
+  safeProposalDisplay,
   collectSnapshotContractHints,
   syncFlapContractIntegrityCatalog,
   runFlapContractIntegrityPass,
   deliverFlapContractIntegrityChanges,
+  deliverFlapSafeProposalChanges,
   buildCaStoreVaultChangeNotification,
   getStandaloneCaStoreVaultDiffs,
   shouldSuppressCaStoreOnlyPageNotification,

@@ -2559,6 +2559,51 @@ test("contract integrity delivery acknowledges state only after a successful car
   assert.equal(saveCount, 1);
 });
 
+test("Safe proposal delivery preserves unsent alerts and acknowledges successful cards", async () => {
+  const token = "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14";
+  const createState = () => ({
+    pendingChanges: [{
+      id: "safe-change-1",
+      key: `safe:${token}`,
+      type: "proposed",
+      quoteToken: token,
+      safe: "0xc68f29bfe2f6c3d95adb5685592b9f86680968f2",
+      safeTxHash: `0x${"97".repeat(32)}`,
+      nonce: 12,
+      confirmations: 1,
+      required: 2,
+      submissionDate: "2026-08-24T03:54:41.501Z",
+    }],
+  });
+  const factoryState = { assets: { [token]: { quoteToken: token, symbol: "MSTRB" } } };
+  let saveCount = 0;
+  const failedState = createState();
+  const failed = await __testables.deliverFlapSafeProposalChanges(failedState, factoryState, {
+    sendCardFn: async () => "",
+    saveStateFn: () => { saveCount++; },
+    pinFn: async () => {},
+  });
+  assert.equal(failed.sent, false);
+  assert.equal(failedState.pendingChanges.length, 1);
+  assert.equal(saveCount, 0);
+
+  let cardContent = "";
+  const sentState = createState();
+  const sent = await __testables.deliverFlapSafeProposalChanges(sentState, factoryState, {
+    sendCardFn: async (_title, content) => {
+      cardContent = content;
+      return "om_safe";
+    },
+    saveStateFn: () => { saveCount++; },
+    pinFn: async () => {},
+  });
+  assert.equal(sent.sent, true);
+  assert.equal(sentState.pendingChanges.length, 0);
+  assert.equal(saveCount, 1);
+  assert.match(cardContent, /MSTRB/);
+  assert.match(cardContent, /确认进度: 1\/2/);
+});
+
 test("Flap frontend contract hints bind each address to its nearest configuration field", () => {
   const source = "const config={"
     + "factory:'0x1111111111111111111111111111111111111111',"
