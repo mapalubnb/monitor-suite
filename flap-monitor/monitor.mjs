@@ -6592,6 +6592,10 @@ function safeProposalDisplay(state = {}) {
       : safeStates.every(item => item?.baselineEstablished)
         ? "运行正常"
         : "正在建立基线";
+  const retryAt = safeStates
+    .map(item => Number(item?.nextAttemptAtMs) || 0)
+    .filter(value => value > Date.now())
+    .sort((a, b) => a - b)[0] || 0;
   return {
     status,
     safeStates,
@@ -6600,6 +6604,8 @@ function safeProposalDisplay(state = {}) {
     lastSuccess: state.lastSuccessAt
       ? new Date(state.lastSuccessAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })
       : "暂无",
+    retryAt: retryAt ? new Date(retryAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" }) : "暂无",
+    usingCache: safeStates.some(item => item?.lastError && item?.lastSuccessAt),
   };
 }
 
@@ -6698,6 +6704,7 @@ function buildFlapStartupContent(
     `监控状态：${safeProposal.status}`,
     `轮询间隔：${CONFIG.safeProposalMonitor.intervalMs / 1000} 秒｜健康 Safe ${safeProposal.healthyCount}/${safeProposal.safeStates.length}｜最后成功 ${safeProposal.lastSuccess}`,
     `有效待执行目标：${safeProposal.active.length} 个`,
+    ...(safeProposal.usingCache ? [`数据状态：Safe API 限流，沿用最后成功快照｜下次重试 ${safeProposal.retryAt}`] : []),
     ...safeLines,
     ...(safeProposalState.lastError ? [`最近异常：${safeProposalState.lastError}`] : []),
     "",

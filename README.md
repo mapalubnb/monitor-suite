@@ -108,7 +108,7 @@ pm2 status
 - Factory 不再从部署区块开始扫描完整历史。更新部署前已经存在、但当前 15 个基线资产之外的旧资产不会自动回溯；更新后的新事件和停机缺口仍会及时发现。
 - Safe 提案预警默认监控新旧两个 Flap 管理 Safe，只解析发往 Factory 的 `setQuoteTokenCreationDisabled(address,false)`，并递归解析 Safe `MultiSend`；首次运行只建立基线，不发送历史提案。
 - Safe API 查询使用链上 `nonce()` 作为下限，自动排除接口仍保留的废弃历史提案；`1/2` 确认提示准备开放，`2/2` 确认提示即将执行，Factory 链上事件仍是正式开放的最终依据。
-- Safe 提案监控不订阅新区块、不读取完整交易，也不执行任何 Safe 操作；API 遇到 `429`、超时或网络失败时按 Safe 独立退避，不阻塞现有页面和链上监控。
+- Safe 提案监控不订阅新区块、不读取完整交易，也不执行任何 Safe 操作；API 遇到 `429`、超时或网络失败时按 Safe 独立退避，429 最大退避 30 分钟并错开请求，不阻塞现有页面和链上监控。限流期间保留最后成功快照，并在状态卡片标明缓存状态与下次重试时间。
 - Factory 的升级/权限关键事件合并到原有 WSS 订阅；内置 SwapRegistry、Vault Portal 与链上验证过的 Vault Factory 使用相同 WSS 节点做精准地址订阅，不增加新区块订阅。
 - 前端资源提取到的合约地址只作为候选记录，不能直接进入 WSS；普通 Transfer、Deposit 等未知事件不会生成完整性告警。
 - 核心代理 implementation/admin/beacon 槽与关键 getter 默认每 10 秒合并成批量 RPC；已知底池资产的 `isSpammerBlocked`、`isBlacklisted`、信任等级和计价币许可按 60 秒轮转。

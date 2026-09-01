@@ -20,6 +20,7 @@ export const DEFAULT_FLAP_ADMIN_SAFES = [
 const MAX_PROPOSAL_RECORDS = 500;
 const MAX_PENDING_CHANGES = 200;
 const MAX_MULTISEND_DEPTH = 4;
+const SAFE_API_STAGGER_MS = 350;
 
 function nowIso(nowMs = Date.now()) {
   return new Date(nowMs).toISOString();
@@ -340,7 +341,7 @@ export async function runSafeProposalScan({
   apiBaseUrl = DEFAULT_SAFE_API_BASE_URL,
   timeoutMs = 5_000,
   baseBackoffMs = 5_000,
-  maxBackoffMs = 300_000,
+  maxBackoffMs = 1_800_000,
   suppressNotifications = false,
   nowMs = Date.now(),
 } = {}) {
@@ -362,13 +363,15 @@ export async function runSafeProposalScan({
   const errors = [];
   let successfulSafes = 0;
 
-  const settled = await Promise.allSettled(normalizedSafes.map(async safe => {
+  const settled = await Promise.allSettled(normalizedSafes.map(async (safe, index) => {
     const safeState = state.safes[safe] || createSafeStatus(safe);
     state.safes[safe] = safeState;
     const currentNonce = currentNonces.get(safe);
     safeState.currentNonce = currentNonce;
     safeState.lastNonceAt = runAt;
     if (Number(safeState.nextAttemptAtMs) > nowMs) return { safe, skipped: true, currentNonce };
+    // 错开同一轮多个 Safe 请求，降低出口 IP 触发 Safe API 限流的概率。
+    if (index > 0) await new Promise(resolve => setTimeout(resolve, index * SAFE_API_STAGGER_MS));
     const proposals = await fetchSafeProposals({
       safe: apiAddressBySafe.get(safe),
       nonce: currentNonce,
