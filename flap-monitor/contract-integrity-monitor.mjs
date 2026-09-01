@@ -299,7 +299,24 @@ function catalogGetterList(entry) {
 
 async function runBatch(rpcBatch, calls, size = 80) {
   const results = [];
-  for (let index = 0; index < calls.length; index += size) results.push(...await rpcBatch(calls.slice(index, index + size)));
+  for (let index = 0; index < calls.length; index += size) {
+    const chunk = calls.slice(index, index + size);
+    try {
+      results.push(...await rpcBatch(chunk));
+    } catch (error) {
+      // 某些代理升级后会移除可选 view；单个 getter 回滚不应让整轮完整性扫描失败。
+      if (!/execution reverted/i.test(String(error?.message || ""))) throw error;
+      for (const call of chunk) {
+        try {
+          const value = await rpcBatch([call]);
+          results.push(value?.[0] ?? null);
+        } catch (singleError) {
+          if (!/execution reverted/i.test(String(singleError?.message || ""))) throw singleError;
+          results.push(null);
+        }
+      }
+    }
+  }
   return results;
 }
 
@@ -560,4 +577,5 @@ export const __testables = {
   hashText,
   normalizeAddress,
   isVerifiedCatalogEntry,
+  runBatch,
 };

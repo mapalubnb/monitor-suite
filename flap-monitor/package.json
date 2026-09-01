@@ -1,6 +1,6 @@
 {
   "name": "flap-monitor",
-  "version": "1.2.24",
+  "version": "1.2.25",
   "description": "Flap.sh 页面、metadata schema、金库、Factory 底池、管理 Safe 提案与核心合约完整性监控",
   "type": "module",
   "private": true,

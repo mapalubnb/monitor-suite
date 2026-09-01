@@ -21,6 +21,8 @@ import {
   syncContractIntegrityCatalog,
 } from "./contract-integrity-monitor.mjs";
 
+const { __testables } = await import("./contract-integrity-monitor.mjs");
+
 const word = value => String(value || "").replace(/^0x/, "").padStart(64, "0");
 const addressWord = address => `0x${word(address)}`;
 const uintWord = value => `0x${BigInt(value).toString(16).padStart(64, "0")}`;
@@ -28,6 +30,23 @@ const stringResult = value => {
   const body = Buffer.from(value, "utf8").toString("hex");
   return `0x${word("20")}${word(Buffer.byteLength(value).toString(16))}${body.padEnd(Math.ceil(body.length / 64) * 64, "0")}`;
 };
+
+test("batch execution revert falls back to individual calls and skips only reverted getters", async () => {
+  const calls = [{ id: "ok" }, { id: "revert" }, { id: "ok-2" }];
+  const result = await __testables.runBatch(async batch => {
+    if (batch.length > 1) throw new Error("execution reverted");
+    if (batch[0].id === "revert") throw new Error("execution reverted");
+    return [`result:${batch[0].id}`];
+  }, calls);
+  assert.deepEqual(result, ["result:ok", null, "result:ok-2"]);
+});
+
+test("batch fallback still propagates non-revert RPC failures", async () => {
+  await assert.rejects(
+    () => __testables.runBatch(async () => { throw new Error("network unavailable"); }, [{ id: "x" }]),
+    /network unavailable/,
+  );
+});
 
 function createRpcFixture() {
   const values = {
