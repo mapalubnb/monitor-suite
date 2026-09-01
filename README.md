@@ -83,7 +83,7 @@ pm2 status
 | Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | WSS 实时，HTTP 1 秒兜底，不等待确认块 |
 | Flap.sh | Factory 断点补扫 | 后台运行，自动找回停机或 RPC 故障期间的变化 |
 | Flap.sh | Factory 已知资产复核 | 后台轮转，补充发现 getter 状态变化 |
-| Flap.sh | 管理 Safe 底池开放提案 | 3 秒，按链上 nonce 精确过滤有效待执行提案 |
+| Flap.sh | 管理 Safe 底池开放提案 | 30 秒，按链上 nonce 精确过滤有效待执行提案 |
 | Flap.sh | Factory / SwapRegistry / Vault Portal 核心完整性 | 精准地址 WSS；HTTP 批量校验 10 秒兜底 |
 | Flap.sh | Vault Factory 与已知资产黑名单/信任状态 | 60 秒轮转 |
 | Flap.sh | bytecode hash 与函数选择器审计 | 10 分钟 |

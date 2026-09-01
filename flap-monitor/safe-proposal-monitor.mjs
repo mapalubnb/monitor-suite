@@ -11,7 +11,7 @@ export const SAFE_PROPOSAL_SCHEMA_VERSION = 1;
 export const SAFE_NONCE_SELECTOR = "0xaffed0e0";
 export const SAFE_MULTISEND_SELECTOR = "0x8d80ff0a";
 export const SET_QUOTE_TOKEN_CREATION_DISABLED_SELECTOR = "0x8f9047e7";
-export const DEFAULT_SAFE_API_BASE_URL = "https://safe-transaction-bsc.safe.global/api/v1";
+export const DEFAULT_SAFE_API_BASE_URL = "https://api.safe.global/tx-service/bnb/api/v1";
 export const DEFAULT_FLAP_ADMIN_SAFES = [
   "0xc68f29BfE2f6c3D95AdB5685592B9F86680968f2",
   "0xA04Aa4575bA2327D28869cdD5F0E9165a8EC2CF5",

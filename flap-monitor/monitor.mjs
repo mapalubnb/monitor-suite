@@ -156,9 +156,9 @@ const CONFIG = {
   safeProposalMonitor: {
     enabled: process.env.FLAP_SAFE_PROPOSAL_MONITOR !== "false",
     stateFile: join(__dirname, "safe-proposal-state.json"),
-    intervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_INTERVAL_MS", 3_000, 1_000),
+    intervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_INTERVAL_MS", 30_000, 5_000),
     requestTimeoutMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_TIMEOUT_MS", 5_000, 500),
-    apiBaseUrl: process.env.FLAP_SAFE_API_BASE_URL || "https://safe-transaction-bsc.safe.global/api/v1",
+    apiBaseUrl: process.env.FLAP_SAFE_API_BASE_URL || "https://api.safe.global/tx-service/bnb/api/v1",
     safes: [...new Set((process.env.FLAP_ADMIN_SAFE_ADDRESSES || DEFAULT_FLAP_ADMIN_SAFES.join(","))
       .split(",").map(value => value.trim()).filter(value => /^0x[a-fA-F0-9]{40}$/.test(value)))],
   },
