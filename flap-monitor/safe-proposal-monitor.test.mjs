@@ -221,6 +221,23 @@ test("Safe API request includes the on-chain nonce filter", async () => {
   assert.match(requestedUrl, /executed=false/);
 });
 
+test("Safe API request sends the configured bearer token without exposing it in the URL", async () => {
+  let requestedUrl = "";
+  let requestedHeaders = {};
+  await fetchSafeProposals({
+    safe: SAFE,
+    nonce: 12,
+    apiKey: "test-safe-api-key",
+    fetchFn: async (url, options) => {
+      requestedUrl = url;
+      requestedHeaders = options.headers;
+      return response([]);
+    },
+  });
+  assert.equal(requestedHeaders.Authorization, "Bearer test-safe-api-key");
+  assert.doesNotMatch(requestedUrl, /test-safe-api-key/);
+});
+
 test("Safe scan preserves the EIP-55 address when building the API path", async () => {
   const state = createSafeProposalState([CHECKSUM_SAFE]);
   let requestedUrl = "";

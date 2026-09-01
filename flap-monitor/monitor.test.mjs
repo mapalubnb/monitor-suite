@@ -63,6 +63,8 @@ test("default Flap polling interval remains fast and configurable", () => {
     "wss://bsc.publicnode.com",
   ]);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.wsBackfillBlocks, 10_000);
+  assert.equal(__testables.CONFIG.safeProposalMonitor.intervalMs, 120_000);
+  assert.equal(__testables.CONFIG.safeProposalMonitor.activeIntervalMs, 30_000);
 });
 
 test("Factory RPC hedging uses the first valid low-latency node", async () => {

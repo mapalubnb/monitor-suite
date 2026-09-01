@@ -266,6 +266,7 @@ export async function fetchSafeProposals({
   safe,
   nonce,
   apiBaseUrl = DEFAULT_SAFE_API_BASE_URL,
+  apiKey = "",
   timeoutMs = 5_000,
   fetchFn = globalThis.fetch,
 } = {}) {
@@ -274,7 +275,10 @@ export async function fetchSafeProposals({
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchFn(buildSafeApiUrl(apiBaseUrl, safe, nonce), {
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json",
+        ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+      },
       signal: controller.signal,
     });
     if (!response?.ok) {
@@ -339,6 +343,7 @@ export async function runSafeProposalScan({
   rpcBatch,
   fetchFn = globalThis.fetch,
   apiBaseUrl = DEFAULT_SAFE_API_BASE_URL,
+  apiKey = "",
   timeoutMs = 5_000,
   baseBackoffMs = 5_000,
   maxBackoffMs = 1_800_000,
@@ -376,6 +381,7 @@ export async function runSafeProposalScan({
       safe: apiAddressBySafe.get(safe),
       nonce: currentNonce,
       apiBaseUrl,
+      apiKey,
       timeoutMs,
       fetchFn,
     });

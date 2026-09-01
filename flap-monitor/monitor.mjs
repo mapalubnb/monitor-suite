@@ -156,9 +156,11 @@ const CONFIG = {
   safeProposalMonitor: {
     enabled: process.env.FLAP_SAFE_PROPOSAL_MONITOR !== "false",
     stateFile: join(__dirname, "safe-proposal-state.json"),
-    intervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_INTERVAL_MS", 30_000, 5_000),
+    intervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_INTERVAL_MS", 120_000, 30_000),
+    activeIntervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_ACTIVE_INTERVAL_MS", 30_000, 10_000),
     requestTimeoutMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_TIMEOUT_MS", 5_000, 500),
     apiBaseUrl: process.env.FLAP_SAFE_API_BASE_URL || "https://api.safe.global/tx-service/bnb/api/v1",
+    apiKey: String(process.env.FLAP_SAFE_API_KEY || "").trim(),
     safes: [...new Set((process.env.FLAP_ADMIN_SAFE_ADDRESSES || DEFAULT_FLAP_ADMIN_SAFES.join(","))
       .split(",").map(value => value.trim()).filter(value => /^0x[a-fA-F0-9]{40}$/.test(value)))],
   },
@@ -6492,6 +6494,7 @@ async function runCheck() {
         factoryAddress: CONFIG.factoryPoolMonitor.proxy,
         rpcBatch: bscRpcBatch,
         apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
+        apiKey: CONFIG.safeProposalMonitor.apiKey,
         timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
       });
       saveSafeProposalState(CONFIG.safeProposalMonitor.stateFile, safeProposalState);
@@ -6702,7 +6705,7 @@ function buildFlapStartupContent(
     "",
     "**08｜Safe 开放提案预警**",
     `监控状态：${safeProposal.status}`,
-    `轮询间隔：${CONFIG.safeProposalMonitor.intervalMs / 1000} 秒｜健康 Safe ${safeProposal.healthyCount}/${safeProposal.safeStates.length}｜最后成功 ${safeProposal.lastSuccess}`,
+    `轮询间隔：空闲 ${CONFIG.safeProposalMonitor.intervalMs / 1000} 秒｜活跃 ${CONFIG.safeProposalMonitor.activeIntervalMs / 1000} 秒｜健康 Safe ${safeProposal.healthyCount}/${safeProposal.safeStates.length}｜最后成功 ${safeProposal.lastSuccess}`,
     `有效待执行目标：${safeProposal.active.length} 个`,
     ...(safeProposal.usingCache ? [`数据状态：Safe API 限流，沿用最后成功快照｜下次重试 ${safeProposal.retryAt}`] : []),
     ...safeLines,
@@ -6855,6 +6858,7 @@ async function startMonitor() {
           factoryAddress: CONFIG.factoryPoolMonitor.proxy,
           rpcBatch: bscRpcBatch,
           apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
+          apiKey: CONFIG.safeProposalMonitor.apiKey,
           timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
           suppressNotifications,
         });
@@ -7165,7 +7169,12 @@ async function startMonitor() {
       } catch (error) {
         log(`[Flap Safe 提案] 检测失败：${error.message}`);
       }
-      scheduleSafeProposalNext(Math.max(250, CONFIG.safeProposalMonitor.intervalMs - (Date.now() - startedAt)));
+      const hasActiveProposal = Object.values(safeProposalState.proposals || {})
+        .some(proposal => ["pending", "ready"].includes(proposal?.status));
+      const intervalMs = hasActiveProposal
+        ? CONFIG.safeProposalMonitor.activeIntervalMs
+        : CONFIG.safeProposalMonitor.intervalMs;
+      scheduleSafeProposalNext(Math.max(250, intervalMs - (Date.now() - startedAt)));
     }, delayMs);
   }
   scheduleSafeProposalNext();
