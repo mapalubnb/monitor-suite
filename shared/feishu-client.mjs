@@ -6,7 +6,7 @@
  *
  * 用法：
  *   import { sendCard, sendText, replyText, replyCard, patchCard,
- *            uploadFile, sendFile, replyFile, pinMessage,
+ *            uploadFile, sendFile, replyFile,
  *            getClient, lark } from "../shared/feishu-client.mjs";
  */
 
@@ -201,6 +201,11 @@ function markdownBlock(content, elementId, margin = "0") {
   };
 }
 
+function normalizeMentionId(value) {
+  const id = String(value || "").trim();
+  return /^ou_[A-Za-z0-9_-]{1,125}$/.test(id) ? id : "";
+}
+
 function parseNumberedTableRow(line) {
   if (!/^\d{2}[　\s]/.test(line) || !line.includes("｜")) return null;
   const parts = line.split("｜").map(part => part.trim()).filter(Boolean);
@@ -318,6 +323,8 @@ export function buildCardBodyElements(content, opts = {}) {
   let tableCount = 0;
   let currentHeading = "";
   const nextId = (prefix) => `${prefix}_${++elementIndex}`;
+  const mentionId = normalizeMentionId(opts.mentionOpenId);
+  if (mentionId) elements.push(markdownBlock(`<at id=${mentionId}></at>`, nextId("mention"), "0 0 4px 0"));
   const flushMarkdown = () => {
     while (markdownLines.length > 0 && !markdownLines[0].trim()) markdownLines.shift();
     while (markdownLines.length > 0 && !markdownLines.at(-1).trim()) markdownLines.pop();
@@ -570,7 +577,7 @@ export async function sendCard(title, content, template = "red", opts = {}) {
       partTitle(title, i + 1, chunks.length),
       chunks[i],
       template,
-      opts,
+      i === 0 ? opts : { ...opts, mentionOpenId: "" },
     );
     const res = await client.im.message.create({
       params: { receive_id_type: "chat_id" },
@@ -751,28 +758,6 @@ export async function replyFile(messageId, fileKey) {
     },
   }, tokenOpt);
   return assertFeishuResponse(res, "回复文件");
-}
-
-/**
- * 置顶消息（Pin）
- */
-export async function pinMessage(messageId) {
-  if (!messageId) return;
-  const client = getClient();
-  if (!client) return;
-  try {
-    const tokenOpt = await withToken();
-    const res = await client.im.pin.create({
-      data: { message_id: messageId },
-    }, tokenOpt);
-    if (res.code !== 0) {
-      log(`[置顶 Pin] 置顶失败：code=${res.code}: ${res.msg}`);
-      return;
-    }
-    log(`[置顶 Pin] 消息已置顶 → ${messageId}`);
-  } catch (err) {
-    log(`[置顶 Pin] 置顶异常：${err.message}`);
-  }
 }
 
 /* ══════════════════════════════════════════

@@ -299,6 +299,7 @@ test("Factory metadata enrichment patches the original card after first delivery
     messageId: "om_test",
     title: "Flap Factory 底池资产链上变更",
     initialContent: "名称同步中",
+    cardOpts: { mentionOpenId: "ou_test_recipient" },
     enrichFn: async targetState => {
       targetState.assets[token].name = "Fast Pool";
       targetState.assets[token].symbol = "FAST";
@@ -313,6 +314,7 @@ test("Factory metadata enrichment patches the original card after first delivery
   assert.match(patched[2], /Fast Pool \(FAST\)/);
   assert.match(patched[2], new RegExp(token));
   assert.doesNotMatch(patched[2], /名称同步中/);
+  assert.deepEqual(patched[5], { mentionOpenId: "ou_test_recipient" });
 });
 
 test("Factory asynchronous metadata failure does not patch or reject delivery flow", async () => {
@@ -377,7 +379,6 @@ test("Factory first delivery does not await metadata enrichment", async () => {
       return "om_fast";
     },
     saveStateFn: () => { deliveryOrder.push("save"); },
-    pinFn: async () => {},
     scheduleMetadataFn: () => {
       metadataScheduled = true;
       return new Promise(() => {});
@@ -477,7 +478,6 @@ test("Factory realtime scan does not wait for Feishu delivery", async () => {
     }),
     sendCardFn: () => new Promise(resolve => { finishDelivery = resolve; }),
     saveStateFn: () => {},
-    pinFn: async () => {},
     scheduleMetadataFn: async () => ({ patched: false }),
     awaitDelivery: false,
   });
@@ -1289,7 +1289,6 @@ test("Factory realtime and asset refresh scans merge cursors assets and notifica
       return `om_${sentContents.length}`;
     },
     saveStateFn: () => {},
-    pinFn: async () => {},
     scheduleMetadataFn: async () => ({ patched: false }),
   };
   await Promise.all([
@@ -1539,7 +1538,6 @@ test("Factory partial scan failure preserves and later sends an Apple resume not
       return "om_apple_resume";
     },
     saveStateFn: () => { saveCalls++; },
-    pinFn: async () => {},
     scheduleMetadataFn: async () => ({ patched: false }),
   });
   assert.equal(result.sent, true);
@@ -2540,25 +2538,31 @@ test("contract integrity delivery acknowledges state only after a successful car
     pendingChanges: [{ id: "change-1", type: "getter", address, field: "version", previous: "1", current: "2" }],
   });
   let saveCount = 0;
+  const previousMentionOpenId = __testables.CONFIG.feishuMentionOpenId;
+  __testables.CONFIG.feishuMentionOpenId = "ou_test_recipient";
   const failedState = createState();
   const failed = await __testables.deliverFlapContractIntegrityChanges(failedState, {
     sendCardFn: async () => "",
     saveStateFn: () => { saveCount++; },
-    pinFn: async () => {},
   });
   assert.equal(failed.sent, false);
   assert.equal(failedState.pendingChanges.length, 1);
   assert.equal(saveCount, 0);
 
   const sentState = createState();
+  let sentCardOpts;
   const sent = await __testables.deliverFlapContractIntegrityChanges(sentState, {
-    sendCardFn: async () => "om_test",
+    sendCardFn: async (_title, _content, _template, _diffFilePath, cardOpts) => {
+      sentCardOpts = cardOpts;
+      return "om_test";
+    },
     saveStateFn: () => { saveCount++; },
-    pinFn: async () => {},
   });
   assert.equal(sent.sent, true);
   assert.equal(sentState.pendingChanges.length, 0);
   assert.equal(saveCount, 1);
+  assert.deepEqual(sentCardOpts, { mentionOpenId: "ou_test_recipient" });
+  __testables.CONFIG.feishuMentionOpenId = previousMentionOpenId;
 });
 
 test("Safe proposal delivery preserves unsent alerts and acknowledges successful cards", async () => {
@@ -2579,31 +2583,35 @@ test("Safe proposal delivery preserves unsent alerts and acknowledges successful
   });
   const factoryState = { assets: { [token]: { quoteToken: token, symbol: "MSTRB" } } };
   let saveCount = 0;
+  const previousMentionOpenId = __testables.CONFIG.feishuMentionOpenId;
+  __testables.CONFIG.feishuMentionOpenId = "ou_test_recipient";
   const failedState = createState();
   const failed = await __testables.deliverFlapSafeProposalChanges(failedState, factoryState, {
     sendCardFn: async () => "",
     saveStateFn: () => { saveCount++; },
-    pinFn: async () => {},
   });
   assert.equal(failed.sent, false);
   assert.equal(failedState.pendingChanges.length, 1);
   assert.equal(saveCount, 0);
 
   let cardContent = "";
+  let sentCardOpts;
   const sentState = createState();
   const sent = await __testables.deliverFlapSafeProposalChanges(sentState, factoryState, {
-    sendCardFn: async (_title, content) => {
+    sendCardFn: async (_title, content, _template, _diffFilePath, cardOpts) => {
       cardContent = content;
+      sentCardOpts = cardOpts;
       return "om_safe";
     },
     saveStateFn: () => { saveCount++; },
-    pinFn: async () => {},
   });
   assert.equal(sent.sent, true);
   assert.equal(sentState.pendingChanges.length, 0);
   assert.equal(saveCount, 1);
   assert.match(cardContent, /MSTRB/);
   assert.match(cardContent, /确认进度: 1\/2/);
+  assert.deepEqual(sentCardOpts, { mentionOpenId: "ou_test_recipient" });
+  __testables.CONFIG.feishuMentionOpenId = previousMentionOpenId;
 });
 
 test("Flap frontend contract hints bind each address to its nearest configuration field", () => {

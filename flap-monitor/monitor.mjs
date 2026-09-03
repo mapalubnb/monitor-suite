@@ -20,7 +20,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rea
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
-import { sendCard, sendCardQueued, patchCard, pinMessage, waitQueueDrain } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
   FACTORY_POOL_STATE_EVENT_TOPICS,
@@ -89,6 +89,7 @@ const CONFIG = {
   feishuAppId: process.env.FEISHU_APP_ID || "",
   feishuAppSecret: process.env.FEISHU_APP_SECRET || "",
   feishuChatId: process.env.FEISHU_CHAT_ID || "",
+  feishuMentionOpenId: String(process.env.FEISHU_MENTION_OPEN_ID || "").trim(),
 
   // 轮询间隔（毫秒）
   pollIntervalMs: readPositiveIntEnv("FLAP_POLL_INTERVAL_MS", 1_000, 500),
@@ -979,6 +980,14 @@ async function sendCardViaApi(title, content, template = "red", diffFilePath, ca
  */
 async function patchCardViaApi(messageId, title, content, template = "red", diffFilePath, cardOpts = {}) {
   await patchCard(messageId, title, content, template, { ...cardOpts, diffFilePath });
+}
+
+function alertMentionCardOptions() {
+  return CONFIG.feishuMentionOpenId ? { mentionOpenId: CONFIG.feishuMentionOpenId } : {};
+}
+
+function sendAlertCard(sendCardFn, title, content, template) {
+  return sendCardFn(title, content, template, undefined, alertMentionCardOptions());
 }
 
 const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
@@ -3116,8 +3125,7 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
 
   const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
   const title = `${titlePrefix}Flap 链上金库注册变更`;
-  const messageId = await sendCardFn(title, content, "red");
-  if (messageId) await pinMessage(messageId);
+  const messageId = await sendAlertCard(sendCardFn, title, content, "red");
   return { changed: true, sent: Boolean(messageId), events: newEvents };
 }
 
@@ -3388,6 +3396,7 @@ async function enrichFactoryPoolMetadataAfterSend({
   title = "",
   template = "red",
   initialContent = "",
+  cardOpts = alertMentionCardOptions(),
   enrichFn = enrichFactoryPoolTokenMetadata,
   patchFn = patchCardViaApi,
   saveFn = saveFactoryPoolState,
@@ -3435,7 +3444,7 @@ async function enrichFactoryPoolMetadataAfterSend({
     log(`[Flap Factory 名称] ${title} 为分段卡片，仅更新名称缓存`);
     return { patched: false, metadataChanged };
   }
-  await patchFn(messageId, title, enrichedContent, template);
+  await patchFn(messageId, title, enrichedContent, template, undefined, cardOpts);
   log(`[Flap Factory 名称] 已更新原卡片 ${messageId}`);
   return { patched: true, metadataChanged };
 }
@@ -3464,7 +3473,6 @@ async function checkFlapFactoryPools(factoryPoolState, {
   scanConfig = {},
   scanFn = runFactoryPoolScan,
   saveStateFn = saveFactoryPoolState,
-  pinFn = pinMessage,
   scheduleMetadataFn = scheduleFactoryPoolMetadataEnrichment,
   awaitDelivery = true,
 } = {}) {
@@ -3557,7 +3565,7 @@ async function checkFlapFactoryPools(factoryPoolState, {
     const initialContent = buildFactoryPoolMonitorContent(pendingResult);
     let messageId;
     try {
-      messageId = await sendCardFn(title, initialContent, "red");
+      messageId = await sendAlertCard(sendCardFn, title, initialContent, "red");
     } catch (error) {
       await withFactoryPoolStateWrite(() => {
         factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(changesToSend, factoryPoolState.pendingChanges);
@@ -3590,8 +3598,8 @@ async function checkFlapFactoryPools(factoryPoolState, {
       messageId,
       title,
       initialContent,
+      cardOpts: alertMentionCardOptions(),
     });
-    void Promise.resolve(pinFn(messageId)).catch(err => log(`[Flap Factory] 卡片置顶失败：${err.message}`));
     return { ...result, sent: true };
   };
   if (factoryPoolDeliveryQueued) return { ...result, sent: false, deliveryQueued: true };
@@ -4466,10 +4474,9 @@ async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries,
   const vfTitle = buildVaultFactoryChangeTitle(vfChanges, `🏦 ${titlePrefix}`);
   appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
   const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
-  const vfMsgId = await sendCardFn(vfTitle, `${vfContent}${conflictNote}`, vfTemplate);
-  if (vfChanges.added.length > 0 && vfMsgId) {
-    await pinMessage(vfMsgId);
-  }
+  const vfMsgId = vfChanges.added.length > 0
+    ? await sendAlertCard(sendCardFn, vfTitle, `${vfContent}${conflictNote}`, vfTemplate)
+    : await sendCardFn(vfTitle, `${vfContent}${conflictNote}`, vfTemplate);
   snapshot.vaultFactories = currentVFMap;
   saveSnapshot(snapshot);
   return { sent: Boolean(vfMsgId), changed: true, changes: vfChanges };
@@ -5416,8 +5423,8 @@ async function sendCaStoreVaultChangeNotification(notification) {
     null,
     notification.url,
     aiIntroduceCaStoreVault,
+    alertMentionCardOptions(),
   );
-  if (messageId) await pinMessage(messageId);
   return messageId;
 }
 
@@ -6311,11 +6318,11 @@ async function deliverFlapContractIntegrityChanges(state, {
   sendCardFn = sendCardViaApi,
   saveStateFn = saveContractIntegrityState,
   acknowledgeFn = acknowledgeContractIntegrityChanges,
-  pinFn = pinMessage,
 } = {}) {
   const changes = [...(state.pendingChanges || [])];
   if (changes.length === 0) return { sent: false, changes: [] };
-  const messageId = await sendCardFn(
+  const messageId = await sendAlertCard(
+    sendCardFn,
     `${titlePrefix}Flap 合约与配置完整性变更`,
     buildContractIntegrityContent(changes, state),
     "red",
@@ -6323,7 +6330,6 @@ async function deliverFlapContractIntegrityChanges(state, {
   if (!messageId) return { sent: false, changes };
   acknowledgeFn(state, changes.map(change => change.id));
   saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
-  void Promise.resolve(pinFn(messageId)).catch(error => log(`[Flap 合约完整性] 卡片置顶失败：${error.message}`));
   return { sent: true, changes, messageId };
 }
 
@@ -6332,7 +6338,6 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
   sendCardFn = sendCardViaApi,
   saveStateFn = saveSafeProposalState,
   acknowledgeFn = acknowledgeSafeProposalChanges,
-  pinFn = pinMessage,
 } = {}) {
   const pending = [...(state.pendingChanges || [])];
   if (pending.length === 0) return { sent: false, changes: [] };
@@ -6350,19 +6355,15 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
       : ready
         ? `${titlePrefix}Flap 新底池即将开放`
         : `${titlePrefix}Flap 新底池准备开放`;
-    const messageId = await sendCardFn(
-      title,
-      buildSafeProposalContent(changes, factoryPoolState?.assets || {}),
-      invalidated ? "yellow" : "red",
-    );
+    const content = buildSafeProposalContent(changes, factoryPoolState?.assets || {});
+    const messageId = invalidated
+      ? await sendCardFn(title, content, "yellow")
+      : await sendAlertCard(sendCardFn, title, content, "red");
     if (!messageId) continue;
     acknowledgeFn(state, changes.map(change => change.id));
     saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
     delivered.push(...changes);
     messageIds.push(messageId);
-    if (!invalidated) {
-      void Promise.resolve(pinFn(messageId)).catch(error => log(`[Flap Safe 提案] 卡片置顶失败：${error.message}`));
-    }
   }
   return { sent: delivered.length > 0, changes: delivered, messageIds };
 }
@@ -6743,7 +6744,8 @@ async function startMonitor() {
       if (!canAttemptFeishuDelivery()) return { sent: false, deliveryDeferred: true };
       try {
         const changes = await enqueueContractIntegrityMutation(() => [...contractIntegrityState.pendingChanges]);
-        const messageId = await sendCardViaApi(
+        const messageId = await sendAlertCard(
+          sendCardViaApi,
           `${titlePrefix}Flap 合约与配置完整性变更`,
           buildContractIntegrityContent(changes, contractIntegrityState),
           "red",
@@ -6753,7 +6755,6 @@ async function startMonitor() {
           acknowledgeContractIntegrityChanges(contractIntegrityState, changes.map(change => change.id));
           saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
         });
-        void Promise.resolve(pinMessage(messageId)).catch(error => log(`[Flap 合约完整性] 卡片置顶失败：${error.message}`));
         return { sent: true };
       } catch (error) {
         log(`[Flap 合约完整性] 待发送变更已保留：${error.message}`);

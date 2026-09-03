@@ -73,6 +73,22 @@ test("ordinary card actions are removed and only an existing DIFF adds a button"
   assert.equal(buttons[0].behaviors[0].value.file, "/tmp/full.diff");
 });
 
+test("alert card mentions one configured user while ordinary cards stay quiet", () => {
+  const openId = "ou_test_recipient";
+  const alert = JSON.parse(buildCardJson("重点告警", "完整告警内容", "red", { mentionOpenId: openId }));
+  const ordinary = JSON.parse(buildCardJson("普通通知", "普通内容", "blue"));
+  assert.equal(alert.body.elements[0].element_id, "mention_1");
+  assert.equal(alert.body.elements[0].content, `<at id=${openId}></at>`);
+  assert.doesNotMatch(JSON.stringify(ordinary), /<at id=/);
+});
+
+test("invalid mention ids are ignored instead of entering card markdown", () => {
+  const card = JSON.parse(buildCardJson("告警", "内容", "red", {
+    mentionOpenId: "ou_bad\"></at><at id=all",
+  }));
+  assert.doesNotMatch(JSON.stringify(card), /<at id=/);
+});
+
 test("JSON 2.0 card padding uses Feishu-compatible one-or-four-value syntax", () => {
   const card = JSON.parse(buildCardJson("重启", "即将执行重启", "yellow"));
   const paddings = [];
