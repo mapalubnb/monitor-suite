@@ -6,8 +6,12 @@ import {
   QUOTE_CONFIG_SELECTOR,
   QUOTE_TOKEN_CREATION_DISABLED_SELECTOR,
 } from "./factory-pool-monitor.mjs";
+import { SET_QUOTE_CONFIG_SELECTOR, SET_QUOTE_ROUTE_SELECTOR, decodeQuoteConfigurationCall, decodeQuoteRoute, formatQuoteRoute } from "./quote-token-codec.mjs";
 
-export const SAFE_PROPOSAL_SCHEMA_VERSION = 1;
+export const SAFE_PROPOSAL_SCHEMA_VERSION = 3;
+export const VAULT_PORTAL = "0x90497450f2a706f1951b5bdda52b4e5d16f34c06";
+export const REGISTER_VAULT_FACTORY_SELECTOR = "0x4809625b";
+export const REGISTER_VAULT_FACTORY_CATEGORY_SELECTOR = "0xefa7595a";
 export const SAFE_NONCE_SELECTOR = "0xaffed0e0";
 export const SAFE_MULTISEND_SELECTOR = "0x8d80ff0a";
 export const SET_QUOTE_TOKEN_CREATION_DISABLED_SELECTOR = "0x8f9047e7";
@@ -21,6 +25,11 @@ const MAX_PROPOSAL_RECORDS = 500;
 const MAX_PENDING_CHANGES = 200;
 const MAX_MULTISEND_DEPTH = 4;
 const SAFE_API_STAGGER_MS = 350;
+const MULTISEND_ADDRESSES = new Set([
+  "0x9641d764fc13c8b624c04430c7356c1c7c8102e2",
+  "0x40a2accbd92bca938b02010e17a5b8929b49130d",
+]);
+const ACTIVE_STATUSES = ["pending", "ready", "confirming"];
 
 function nowIso(nowMs = Date.now()) {
   return new Date(nowMs).toISOString();
@@ -100,32 +109,59 @@ export function decodeMultiSendTransactions(data) {
   return transactions;
 }
 
-export function extractFlapEnableTargets(transaction, {
-  factoryAddress = FLAP_FACTORY_PROXY,
-  depth = 0,
-} = {}) {
+export function extractFlapEnableTargets(transaction, options = {}) {
+  return [...new Set(extractFlapProposalActions(transaction, options)
+    .filter(action => action.kind === "creation" && !action.disabled).map(action => action.quoteToken))];
+}
+
+export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_FACTORY_PROXY, depth = 0, path = "0" } = {}) {
   const to = normalizeAddress(transaction?.to);
   const data = `0x${stripHex(transaction?.data)}`;
-  const selector = data.slice(0, 10).toLowerCase();
-  const factory = normalizeAddress(factoryAddress);
-  if (!to || data === "0x" || !factory) return [];
-
-  if (to === factory && selector === SET_QUOTE_TOKEN_CREATION_DISABLED_SELECTOR) {
-    const body = data.slice(10);
-    if (body.length < 128) return [];
-    const quoteToken = addressFromWord(body.slice(0, 64));
-    const disabled = booleanFromWord(body.slice(64, 128));
-    return quoteToken && disabled === false ? [quoteToken] : [];
-  }
-
-  if (selector !== SAFE_MULTISEND_SELECTOR || Number(transaction?.operation) !== 1 || depth >= MAX_MULTISEND_DEPTH) return [];
-  const targets = new Set();
-  for (const nested of decodeMultiSendTransactions(data)) {
-    for (const quoteToken of extractFlapEnableTargets(nested, { factoryAddress: factory, depth: depth + 1 })) {
-      targets.add(quoteToken);
+  const selector = data.slice(0, 10);
+  const operation = Number(transaction?.operation ?? 0);
+  if (!to) return [];
+  if (to === VAULT_PORTAL && [REGISTER_VAULT_FACTORY_SELECTOR, REGISTER_VAULT_FACTORY_CATEGORY_SELECTOR].includes(selector)) {
+    const base = { to, selector, operation, callPath: path, quoteToken: "" };
+    try {
+      if (operation !== 0) throw new Error("Vault Portal 非 CALL 操作");
+      const hasCategory = selector === REGISTER_VAULT_FACTORY_CATEGORY_SELECTOR;
+      const argumentLength = (hasCategory ? 5 : 4) * 64;
+      const body = data.slice(10);
+      const words = body.slice(0, argumentLength).match(/.{1,64}/g) || [];
+      const vaultFactory = addressFromWord(words[0]);
+      if (words.length !== (hasCategory ? 5 : 4) || words.some(word => word.length !== 64) || !vaultFactory
+        || !/^0{63}[01]$/.test(words[1]) || !/^0{63}[01]$/.test(words[2])
+        || words.slice(3).some(word => !/^0{62}[a-f0-9]{2}$/.test(word))) throw new Error("Vault Factory 注册参数无效");
+      return [{ ...base, kind: "vaultFactory", vaultFactory, enabled: booleanFromWord(words[1]),
+        official: booleanFromWord(words[2]), riskLevel: decodeUintWord(words[3]),
+        category: hasCategory ? decodeUintWord(words[4]) : null,
+        extraData: body.length > argumentLength ? `0x${body.slice(argumentLength)}` : "" }];
+    } catch (error) {
+      return [{ ...base, kind: "unknown", reason: error.message }];
     }
   }
-  return [...targets];
+  if (to === normalizeAddress(factoryAddress)) {
+    const base = { to, selector, operation, callPath: path };
+    try {
+      if (operation !== 0) throw new Error("Factory 非 CALL 操作，不能按普通管理调用解释");
+      if (selector === SET_QUOTE_CONFIG_SELECTOR) return [{ ...base, kind: "configuration", ...decodeQuoteConfigurationCall(data.slice(10)) }];
+      if (selector === SET_QUOTE_ROUTE_SELECTOR) return [{ ...base, kind: "route", ...decodeQuoteRoute(data.slice(10)) }];
+      if (selector === SET_QUOTE_TOKEN_CREATION_DISABLED_SELECTOR) {
+        const body = data.slice(10);
+        const quoteToken = addressFromWord(body.slice(0, 64));
+        if (body.length !== 128 || !quoteToken || !/^0{63}[01]$/.test(body.slice(64))) throw new Error("创建开关参数无效");
+        return [{ ...base, kind: "creation", quoteToken, disabled: booleanFromWord(body.slice(64)) }];
+      }
+      return [{ ...base, kind: "unknown", quoteToken: "", reason: "未覆盖的 Factory 管理调用" }];
+    } catch (error) {
+      return [{ ...base, kind: "unknown", quoteToken: "", reason: error.message }];
+    }
+  }
+  if (selector !== SAFE_MULTISEND_SELECTOR || operation !== 1 || !MULTISEND_ADDRESSES.has(to)) return [];
+  if (depth >= MAX_MULTISEND_DEPTH) throw new Error("MultiSend 嵌套超过解析上限");
+  return decodeMultiSendTransactions(data).flatMap((nested, index) => extractFlapProposalActions(nested, {
+    factoryAddress, depth: depth + 1, path: `${path}.${index}`,
+  }));
 }
 
 function createSafeStatus(address) {
@@ -161,6 +197,7 @@ export function createSafeProposalState(safes = DEFAULT_FLAP_ADMIN_SAFES) {
     safes: Object.fromEntries(normalizedSafes.map(address => [address, createSafeStatus(address)])),
     proposals: {},
     pendingChanges: [],
+    executionCursor: 0,
     lastRunAt: "",
     lastSuccessAt: "",
     lastError: "",
@@ -176,7 +213,14 @@ export function migrateSafeProposalState(raw, safes = DEFAULT_FLAP_ADMIN_SAFES) 
     state.safes[address] = { ...createSafeStatus(address), ...(state.safes[address] || {}), address };
   }
   state.proposals = state.proposals && typeof state.proposals === "object" ? state.proposals : {};
+  for (const record of Object.values(state.proposals)) {
+    if (!Array.isArray(record.actions)) record.actions = record.quoteToken
+      ? [{ kind: "creation", quoteToken: record.quoteToken, disabled: false, legacy: true }] : [];
+  }
   state.pendingChanges = Array.isArray(state.pendingChanges) ? state.pendingChanges.slice(-MAX_PENDING_CHANGES) : [];
+  for (const change of state.pendingChanges) {
+    if (!Array.isArray(change.actions)) change.actions = state.proposals[change.key]?.actions || [];
+  }
   return state;
 }
 
@@ -202,7 +246,7 @@ function safeProposalKey(safeTxHash, quoteToken) {
 }
 
 function changeId(type, record) {
-  return hashText([type, record.safeTxHash, record.quoteToken, record.confirmations, record.required].join(":"));
+  return hashText([type, record.safeTxHash, record.vaultFactory ? `vault:${record.vaultFactory}` : record.quoteToken, record.confirmations, record.required].join(":"));
 }
 
 function appendPendingChange(state, type, record, detectedAt) {
@@ -224,7 +268,8 @@ function confirmationCount(proposal) {
 
 function normalizeProposal(proposal, safe, quoteToken, nowText) {
   const confirmations = confirmationCount(proposal);
-  const required = Math.max(1, Number(proposal?.confirmationsRequired) || 1);
+  const threshold = Number(proposal?.confirmationsRequired);
+  const required = Number.isInteger(threshold) && threshold > 0 ? threshold : 0;
   return {
     key: safeProposalKey(proposal?.safeTxHash, quoteToken),
     safeTxHash: normalizeHash(proposal?.safeTxHash),
@@ -235,7 +280,8 @@ function normalizeProposal(proposal, safe, quoteToken, nowText) {
     submissionDate: proposal?.submissionDate || "",
     confirmations,
     required,
-    status: confirmations >= required ? "ready" : "pending",
+    actions: [],
+    status: required > 0 && confirmations >= required ? "ready" : "pending",
     firstSeenAt: nowText,
     lastSeenAt: nowText,
     invalidatedAt: "",
@@ -270,11 +316,30 @@ export async function fetchSafeProposals({
   timeoutMs = 5_000,
   fetchFn = globalThis.fetch,
 } = {}) {
-  if (typeof fetchFn !== "function") throw new Error("Safe API fetch 不可用");
+  const results = [];
+  const firstUrl = buildSafeApiUrl(apiBaseUrl, safe, nonce);
+  let url = firstUrl;
+  const visited = new Set();
+  while (url) {
+    if (visited.has(url) || visited.size >= 10) throw new Error("Safe API 分页超过上限或循环");
+    const parsed = new URL(url, firstUrl);
+    if (parsed.origin !== new URL(firstUrl).origin || parsed.pathname !== new URL(firstUrl).pathname) throw new Error("Safe API 分页地址无效");
+    for (const [key, value] of new URL(firstUrl).searchParams) parsed.searchParams.set(key, value);
+    visited.add(url);
+    if (visited.size > 1) await new Promise(resolve => setTimeout(resolve, SAFE_API_STAGGER_MS));
+    const json = await fetchSafeJson(parsed.href, { apiKey, timeoutMs, fetchFn });
+    if (!Array.isArray(json?.results)) throw new Error("Safe API results 格式无效");
+    results.push(...json.results);
+    url = json.next || "";
+  }
+  return results;
+}
+
+async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetchFn(buildSafeApiUrl(apiBaseUrl, safe, nonce), {
+    const response = await fetchFn(url, {
       headers: {
         Accept: "application/json",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
@@ -288,9 +353,7 @@ export async function fetchSafeProposals({
       error.retryAfterMs = retryAfterMilliseconds(response);
       throw error;
     }
-    const json = await response.json();
-    if (!Array.isArray(json?.results)) throw new Error("Safe API results 格式无效");
-    return json.results;
+    return await response.json();
   } finally {
     clearTimeout(timer);
   }
@@ -327,8 +390,8 @@ function pruneProposalRecords(state) {
   if (entries.length <= MAX_PROPOSAL_RECORDS) return;
   const protectedKeys = new Set((state.pendingChanges || []).map(change => change.key));
   const sorted = entries.sort((left, right) => {
-    const leftActive = ["pending", "ready"].includes(left[1]?.status) || protectedKeys.has(left[0]);
-    const rightActive = ["pending", "ready"].includes(right[1]?.status) || protectedKeys.has(right[0]);
+    const leftActive = ACTIVE_STATUSES.includes(left[1]?.status) || protectedKeys.has(left[0]);
+    const rightActive = ACTIVE_STATUSES.includes(right[1]?.status) || protectedKeys.has(right[0]);
     if (leftActive !== rightActive) return leftActive ? -1 : 1;
     return Date.parse(right[1]?.lastSeenAt || right[1]?.invalidatedAt || "")
       - Date.parse(left[1]?.lastSeenAt || left[1]?.invalidatedAt || "");
@@ -413,28 +476,37 @@ export async function runSafeProposalScan({
     safeState.lastError = "";
     safeState.consecutiveFailures = 0;
     safeState.nextAttemptAtMs = 0;
-    const suppressForSafe = suppressNotifications || !outcome.value.baselineWasEstablished;
+    const suppressForSafe = suppressNotifications;
 
     for (const proposal of outcome.value.proposals) {
       const safeTxHash = normalizeHash(proposal?.safeTxHash);
       const proposalNonce = Number(proposal?.nonce);
-      if (!safeTxHash || !Number.isInteger(proposalNonce) || proposalNonce < outcome.value.currentNonce) continue;
-      let quoteTokens = [];
+      if (!safeTxHash || !Number.isInteger(proposalNonce) || proposalNonce < outcome.value.currentNonce || proposal.isExecuted
+        || normalizeAddress(proposal.safe) !== safe) continue;
+      let actions = [];
       try {
-        quoteTokens = extractFlapEnableTargets(proposal, { factoryAddress: factory });
+        actions = extractFlapProposalActions(proposal, { factoryAddress: factory });
       } catch (error) {
         errors.push(`${safe}: SafeTx ${safeTxHash} 解析失败：${error.message}`);
         continue;
       }
-      for (const quoteToken of quoteTokens) {
+      const actionTarget = action => action.vaultFactory ? `vault:${action.vaultFactory}` : action.quoteToken;
+      for (const target of new Set(actions.map(actionTarget))) {
+        const vaultFactory = target.startsWith("vault:") ? target.slice(6) : "";
+        const quoteToken = vaultFactory ? "" : target;
         const next = normalizeProposal(proposal, safe, quoteToken, runAt);
+        if (vaultFactory) {
+          next.vaultFactory = vaultFactory;
+          next.key = `${safeTxHash}:vault:${vaultFactory}`;
+        }
+        next.actions = actions.filter(action => actionTarget(action) === target);
         const previous = state.proposals[next.key];
         if (previous) next.firstSeenAt = previous.firstSeenAt || next.firstSeenAt;
         state.proposals[next.key] = next;
         if (suppressForSafe) continue;
-        if (!previous || ["executed", "invalidated"].includes(previous.status)) {
-          changes.push(appendPendingChange(state, next.status === "ready" ? "ready" : "proposed", next, runAt));
-        } else if (previous.confirmations < next.required && next.confirmations >= next.required) {
+        if (!previous) {
+          changes.push(appendPendingChange(state, !outcome.value.baselineWasEstablished ? "existing" : next.status === "ready" ? "ready" : "proposed", next, runAt));
+        } else if (next.required > 0 && previous.status !== "ready" && next.confirmations >= next.required) {
           changes.push(appendPendingChange(state, "ready", next, runAt));
         }
       }
@@ -442,27 +514,72 @@ export async function runSafeProposalScan({
   }
 
   const staleRecords = Object.values(state.proposals || {}).filter(record =>
-    ["pending", "ready"].includes(record?.status)
+    ACTIVE_STATUSES.includes(record?.status)
     && Number.isInteger(currentNonces.get(record.safe))
     && record.nonce < currentNonces.get(record.safe));
-  if (staleRecords.length > 0) {
+  const allStaleHashes = [...new Set(staleRecords.map(record => record.safeTxHash))];
+  const cursor = Math.max(0, Number(state.executionCursor) || 0) % Math.max(1, allStaleHashes.length);
+  const staleHashes = [...allStaleHashes.slice(cursor), ...allStaleHashes.slice(0, cursor)].slice(0, 10);
+  state.executionCursor = (cursor + staleHashes.length) % Math.max(1, allStaleHashes.length);
+  for (const safeTxHash of staleHashes) {
+    const records = staleRecords.filter(record => record.safeTxHash === safeTxHash);
+    const first = records[0];
+    const health = state.safes[first.safe];
+    for (const record of records) record.status = "confirming";
+    state.pendingChanges = state.pendingChanges.filter(change => !records.some(record => record.key === change.key));
+    if (Number(health.nextAttemptAtMs) > nowMs) continue;
     try {
-      const statusResults = await rpcBatch(factoryStatusCalls(staleRecords, factory), { requireAllResults: true });
-      for (let index = 0; index < staleRecords.length; index++) {
-        const record = staleRecords[index];
-        const configured = decodeUintWord(statusResults[index * 2]) === 1;
-        const creationDisabled = decodeUintWord(statusResults[index * 2 + 1]) !== 0;
-        const effectiveEnabled = configured && !creationDisabled;
-        record.status = effectiveEnabled ? "executed" : "invalidated";
-        record.invalidatedAt = effectiveEnabled ? "" : runAt;
+      await new Promise(resolve => setTimeout(resolve, SAFE_API_STAGGER_MS));
+      const options = { apiKey, timeoutMs, fetchFn };
+      const base = String(apiBaseUrl).replace(/\/+$/, "");
+      let detail = await fetchSafeJson(base + "/multisig-transactions/" + safeTxHash + "/", options);
+      if (normalizeHash(detail?.safeTxHash) !== safeTxHash || normalizeAddress(detail?.safe) !== first.safe
+        || Number(detail?.nonce) !== first.nonce) throw new Error("Safe 提案详情与请求不匹配");
+      if (!detail.isExecuted) {
+        // A consumed nonce alone cannot distinguish replacement from indexer lag.
+        const query = new URLSearchParams({ executed: "true", nonce: String(first.nonce), limit: "100" });
+        await new Promise(resolve => setTimeout(resolve, SAFE_API_STAGGER_MS));
+        const history = await fetchSafeJson(base + "/safes/" + apiAddressBySafe.get(first.safe) + "/multisig-transactions/?" + query, options);
+        const winner = history.results?.find(item => item.isExecuted && Number(item.nonce) === first.nonce
+          && normalizeAddress(item.safe) === first.safe && normalizeHash(item.transactionHash));
+        if (!winner) continue;
+        detail = winner;
+      }
+      const winnerHash = normalizeHash(detail.safeTxHash);
+      const transactionHash = normalizeHash(detail.transactionHash);
+      if (!winnerHash || !transactionHash || (detail.isSuccessful !== true && detail.isSuccessful !== false)) continue;
+      health.executionFailures = 0;
+      const status = winnerHash !== safeTxHash ? "invalidated" : detail.isSuccessful ? "executed" : "failed";
+      for (const record of records) {
+        record.status = status;
+        record.transactionHash = transactionHash;
+        record.resolvedBySafeTxHash = winnerHash;
         record.lastSeenAt = runAt;
-        const safeWasInitialized = state.safes[record.safe]?.baselineEstablished === true;
-        if (!effectiveEnabled && safeWasInitialized && !suppressNotifications) {
-          changes.push(appendPendingChange(state, "invalidated", record, runAt));
+        record.invalidatedAt = status === "invalidated" ? runAt : "";
+        record.chainVerification = "未复核";
+        if (status === "executed" && record.quoteToken) {
+          try {
+            const values = await rpcBatch(factoryStatusCalls([record], factory), { requireAllResults: true });
+            record.currentConfiguration = values[0];
+            record.currentCreationDisabled = decodeUintWord(values[1]) !== 0;
+            const config = record.actions?.filter(action => action.kind === "configuration").at(-1)?.config;
+            const creation = record.actions?.filter(action => action.kind === "creation").at(-1);
+            const expected = config && Object.values(config).map(value => BigInt(value).toString(16).padStart(64, "0")).join("");
+            const matches = (!config || String(values[0]).slice(2).toLowerCase() === expected)
+              && (!creation || record.currentCreationDisabled === creation.disabled);
+            record.chainVerification = matches ? "配置 getter 已复核（路径以交易事件为准）" : "当前配置与提案不同，可能已有后续变更";
+          } catch (error) { record.chainVerification = "执行已确认，当前配置复核失败：" + error.message; }
         }
+        // Do not deliver a stale 'waiting for signatures' alert after resolution.
+        state.pendingChanges = state.pendingChanges.filter(change => change.key !== record.key);
+        if (!suppressNotifications) changes.push(appendPendingChange(state, status, record, runAt));
       }
     } catch (error) {
-      errors.push(`失效提案链上复核失败：${error.message}`);
+      health.executionFailures = (Number(health.executionFailures) || 0) + 1;
+      health.nextAttemptAtMs = nowMs + Math.min(maxBackoffMs, Math.max(Number(error.retryAfterMs) || 0,
+        baseBackoffMs * 2 ** Math.min(6, health.executionFailures - 1)));
+      health.lastError = "执行结果待确认：" + error.message;
+      errors.push(health.lastError);
     }
   }
 
@@ -493,21 +610,37 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
   const lines = [];
   for (const change of changes) {
     const asset = factoryAssets?.[change.quoteToken] || {};
-    const name = asset.symbol || asset.name || "未知底池";
-    const status = change.type === "ready"
-      ? "Safe 签名已满足，等待链上执行"
-      : change.type === "invalidated"
-        ? "Safe nonce 已失效，且底池仍未开放"
-        : "Safe 提案已提交，等待其余签名";
-    lines.push(`**${name}｜${status}**`);
-    lines.push(`- 底池地址: [${change.quoteToken}](https://bscscan.com/address/${change.quoteToken})`);
-    lines.push(`- 确认进度: ${change.confirmations}/${change.required}`);
-    lines.push(`- Safe nonce: ${change.nonce}`);
-    lines.push(`- 管理 Safe: [${change.safe}](https://app.safe.global/transactions/queue?safe=bnb:${change.safe})`);
-    lines.push(`- SafeTxHash: ${change.safeTxHash}`);
-    lines.push(`- 提案时间: ${formatDate(change.submissionDate)}`);
+    const name = change.vaultFactory ? "Vault Factory 注册／配置更新" : asset.symbol || asset.name || (change.quoteToken ? "计价代币" : "管理调用");
+    const status = ({ ready: "签名已满足，等待执行", existing: "当前待执行提案", proposed: "发现管理提案",
+      invalidated: "已被同 nonce 交易替换", failed: "Safe 内层执行失败", executed: "Safe 执行成功" })[change.type] || "等待执行确认";
+    lines.push("**" + name + "｜" + status + "**");
+    if (change.quoteToken) lines.push("计价代币：[" + change.quoteToken + "](https://bscscan.com/address/" + change.quoteToken + ")");
+    if (change.vaultFactory) lines.push("Vault Factory：[" + change.vaultFactory + "](https://bscscan.com/address/" + change.vaultFactory + ")");
+    for (const action of change.actions || []) {
+      if (action.kind === "vaultFactory") {
+        const risks = ["未验证", "低风险", "中低风险", "中风险", "高风险"];
+        const categories = ["无分类", "AI Oracle 驱动"];
+        lines.push("提案参数：" + (action.enabled ? "启用" : "停用") + "｜官方标识：" + (action.official ? "是" : "否"));
+        lines.push("拟设风险等级：" + (risks[action.riskLevel] || "未知等级") + "（" + action.riskLevel + "）");
+        lines.push("拟设分类：" + (action.category === null ? "未提供（四参数版本）" : (categories[action.category] || "未知分类") + "（" + action.category + "）"));
+        lines.push("调用合约：[Vault Portal](https://bscscan.com/address/" + action.to + ")");
+        if (action.extraData) lines.push("附加调用数据：" + (action.extraData.length - 2) / 2 + " 字节（已保留，未解释）");
+      } else if (action.kind === "configuration") {
+        const c = action.config;
+        lines.push("拟设置配置：enabled=" + c.enabled + "｜默认曲线 " + c.defaultCurve + "｜备用曲线 " + c.alternativeCurve
+          + "｜兑换类型 " + c.nativeToQuoteSwapType + "｜DEX ID " + c.dexId);
+      } else if (action.kind === "route") lines.push(...formatQuoteRoute(action.hops));
+      else if (action.kind === "creation") lines.push("创建开关：" + (action.disabled ? "暂停创建" : "解除暂停创建"));
+      else lines.push("未解析调用：" + action.selector + "｜" + action.reason + "｜调用位置 " + action.callPath);
+    }
+    lines.push("确认进度：" + change.confirmations + "/" + (change.required || "未知") + "｜Safe nonce：" + change.nonce);
+    lines.push("管理 Safe：[" + change.safe + "](https://app.safe.global/transactions/queue?safe=bnb:" + change.safe + ")");
+    lines.push("SafeTxHash：" + change.safeTxHash);
+    lines.push("提案时间：" + formatDate(change.submissionDate));
+    if (change.transactionHash) lines.push("执行交易：[" + change.transactionHash + "](https://bscscan.com/tx/" + change.transactionHash + ")");
+    if (change.chainVerification) lines.push(change.chainVerification);
     lines.push("");
   }
-  lines.push("说明：Safe 提案是明确的开放意图，但仍可能取消或替换；以 Flap Factory 链上开放事件为最终依据。");
+  lines.push("说明：提案和签名满足均不代表已生效；可能取消、替换或执行失败，以链上执行和实际状态为准。风险等级和官方标识是提案参数，不代表独立安全评估。");
   return lines.join("\n");
 }

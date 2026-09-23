@@ -20,12 +20,14 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rea
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
   FACTORY_POOL_STATE_EVENT_TOPICS,
   FLAP_FACTORY_PROXY,
   classifyFactoryPoolChange,
+  assetFingerprint,
   createFactoryPoolState,
   createFactoryPoolWsHealth,
   loadFactoryPoolState,
@@ -3174,10 +3176,10 @@ function buildFactoryPoolMonitorContent(result) {
   const enabledCount = assets.filter(item => item?.effectiveEnabled).length;
   const pausedCount = assets.filter(item => item?.configured && item?.creationDisabled).length;
   const disabledCount = assets.filter(item => item && !item.configured).length;
-  const changeCounts = { added: 0, modified: 0, paused: 0, resumed: 0, disabled: 0 };
+  const changeCounts = { added: 0, modified: 0, paused: 0, resumed: 0, disabled: 0, route: 0 };
   for (const change of result.changes || []) changeCounts[change.type] = (changeCounts[change.type] || 0) + 1;
   const summary = [
-    `本次变更：新增支持 ${changeCounts.added} 个｜配置修改 ${changeCounts.modified} 个｜暂停 ${changeCounts.paused} 个｜恢复 ${changeCounts.resumed} 个｜停用 ${changeCounts.disabled} 个`,
+    `本次变更：新增支持 ${changeCounts.added} 个｜配置修改 ${changeCounts.modified} 个｜路径更新 ${changeCounts.route} 个｜暂停 ${changeCounts.paused} 个｜恢复 ${changeCounts.resumed} 个｜停用 ${changeCounts.disabled} 个`,
     `当前资产：支持创建 ${enabledCount} 个｜暂停创建 ${pausedCount} 个｜已停用 ${disabledCount} 个`,
   ];
   const primary = [];
@@ -3186,6 +3188,7 @@ function buildFactoryPoolMonitorContent(result) {
     const label = {
       added: "新增支持",
       modified: "配置修改",
+      route: "兑换路径更新",
       paused: "暂停创建",
       resumed: "恢复创建",
       disabled: "停用",
@@ -3193,6 +3196,8 @@ function buildFactoryPoolMonitorContent(result) {
     primary.push(`${label}：${formatFactoryPoolAssetName(item)}`);
     primary.push(`状态：${formatFactoryPoolAssetStatus(item)}`);
     primary.push(`地址：${addressLink(item.quoteToken)}`);
+    if (item.swapRoute) primary.push(...formatQuoteRoute(item.swapRoute));
+    if (change.type === "route" && item.routeEvidence?.txHash) primary.push(`交易：${item.routeEvidence.txHash}`);
   }
   if (result.implementationChange?.previous) {
     const upgrade = result.implementationChange;
@@ -3263,6 +3268,8 @@ function mergeFactoryPoolCandidate(current = {}, incoming = {}) {
   const latest = incomingBlock > currentBlock || (incomingBlock === currentBlock && incomingAttempt >= currentAttempt)
     ? incoming
     : current;
+  const routeState = [current, incoming].filter(item => item.routeEvidence).sort((a, b) =>
+    b.routeEvidence.blockNumber - a.routeEvidence.blockNumber || b.routeEvidence.logIndex - a.routeEvidence.logIndex)[0];
   const firstSeenBlocks = [current.firstSeenBlock, incoming.firstSeenBlock].filter(Number.isFinite);
   const lastSeenBlocks = [current.lastSeenBlock, incoming.lastSeenBlock].filter(Number.isFinite);
   return {
@@ -3271,6 +3278,7 @@ function mergeFactoryPoolCandidate(current = {}, incoming = {}) {
     firstSeenBlock: firstSeenBlocks.length > 0 ? Math.min(...firstSeenBlocks) : null,
     lastSeenBlock: lastSeenBlocks.length > 0 ? Math.max(...lastSeenBlocks) : null,
     sources: mergeUniqueFactoryPoolRecords(current.sources, incoming.sources, source => source.key),
+    ...(routeState ? { eventRoute: routeState.eventRoute, routeEvidence: routeState.routeEvidence } : {}),
   };
 }
 
@@ -3329,6 +3337,13 @@ function mergeFactoryPoolScanState(target, incoming) {
     const incomingVersion = Number(asset?.lastVerifiedAtMs) || 0;
     if (!current || incomingBlock > currentBlock || (incomingBlock === currentBlock && incomingVersion >= currentVersion)) {
       target.assets[address] = asset;
+    }
+    const routeAsset = [current, asset].filter(item => item?.routeEvidence).sort((a, b) =>
+      b.routeEvidence.blockNumber - a.routeEvidence.blockNumber || b.routeEvidence.logIndex - a.routeEvidence.logIndex)[0];
+    if (routeAsset) {
+      const selected = target.assets[address];
+      target.assets[address] = { ...selected, swapRoute: routeAsset.swapRoute, routeEvidence: routeAsset.routeEvidence,
+        fingerprint: assetFingerprint(selected.configurationFingerprint, selected.creationDisabled, routeAsset.swapRoute) };
     }
   }
   target.recentEvents = Object.fromEntries(mergeUniqueFactoryPoolRecords(
@@ -6341,20 +6356,17 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
 } = {}) {
   const pending = [...(state.pendingChanges || [])];
   if (pending.length === 0) return { sent: false, changes: [] };
-  const groups = [
-    pending.filter(change => change.type !== "invalidated"),
-    pending.filter(change => change.type === "invalidated"),
-  ].filter(group => group.length > 0);
+  const groups = [...new Set(pending.map(change => change.type))]
+    .map(type => pending.filter(change => change.type === type));
   const delivered = [];
   const messageIds = [];
   for (const changes of groups) {
-    const invalidated = changes.every(change => change.type === "invalidated");
-    const ready = changes.some(change => change.type === "ready");
-    const title = invalidated
-      ? `${titlePrefix}Flap 底池开放提案已失效`
-      : ready
-        ? `${titlePrefix}Flap 新底池即将开放`
-        : `${titlePrefix}Flap 新底池准备开放`;
+    const invalidated = ["invalidated", "failed"].includes(changes[0].type);
+    const suffix = ({ existing: "当前待执行", proposed: "已提交", ready: "签名已满足，等待执行",
+      executed: "执行成功", failed: "执行失败", invalidated: "已被替换" })[changes[0].type] || "状态更新";
+    const subject = changes.every(change => change.vaultFactory) ? "Vault Factory 注册／配置提案"
+      : changes.some(change => change.vaultFactory) ? "Safe 管理提案" : "计价代币管理提案";
+    const title = `${titlePrefix}Flap ${subject}：${suffix}`;
     const content = buildSafeProposalContent(changes, factoryPoolState?.assets || {});
     const messageId = invalidated
       ? await sendCardFn(title, content, "yellow")
@@ -6364,6 +6376,19 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
     saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
     delivered.push(...changes);
     messageIds.push(messageId);
+    const missingNames = [...new Set(changes.map(change => change.quoteToken).filter(address => address
+      && !factoryPoolState?.assets?.[address]?.name && !factoryPoolState?.assets?.[address]?.symbol))];
+    // Resolve new tokens after delivery, without requiring Factory catalog enrollment.
+    if (missingNames.length && sendCardFn === sendCardViaApi) {
+      void resolveFactoryPoolTokenMetadata(missingNames).then(async ({ metadata }) => {
+        if (!Object.keys(metadata).length) return;
+        const enriched = buildSafeProposalContent(changes, { ...factoryPoolState?.assets, ...metadata });
+        const limit = Number(process.env.FEISHU_CARD_CHUNK_LIMIT) || 3500;
+        if (content.length < limit - 40 && enriched.length < limit - 40) {
+          await patchCard(messageId, title, enriched, invalidated ? "yellow" : "red");
+        }
+      }).catch(error => log(`[Flap Safe 名称] 补充失败：${error.message}`));
+    }
   }
   return { sent: delivered.length > 0, changes: delivered, messageIds };
 }
@@ -6587,7 +6612,7 @@ function factoryPoolWssDisplay(state = {}) {
 
 function safeProposalDisplay(state = {}) {
   const safeStates = Object.values(state.safes || {});
-  const active = Object.values(state.proposals || {}).filter(proposal => ["pending", "ready"].includes(proposal?.status));
+  const active = Object.values(state.proposals || {}).filter(proposal => ["pending", "ready", "confirming"].includes(proposal?.status));
   const healthyCount = safeStates.filter(item => item?.baselineEstablished && !item?.lastError).length;
   const status = !CONFIG.safeProposalMonitor.enabled
     ? "未启用"
@@ -6704,10 +6729,10 @@ function buildFlapStartupContent(
     `核心批量校验：${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒｜扩展轮转：${CONFIG.contractIntegrityMonitor.extendedIntervalMs / 1000} 秒｜代码审计：${CONFIG.contractIntegrityMonitor.codeAuditIntervalMs / 1000} 秒`,
     `事件通道：精准地址 WSS + ${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒 HTTP 日志兜底`,
     "",
-    "**08｜Safe 开放提案预警**",
+    "**08｜Safe 计价代币管理提案预警**",
     `监控状态：${safeProposal.status}`,
     `轮询间隔：空闲 ${CONFIG.safeProposalMonitor.intervalMs / 1000} 秒｜活跃 ${CONFIG.safeProposalMonitor.activeIntervalMs / 1000} 秒｜健康 Safe ${safeProposal.healthyCount}/${safeProposal.safeStates.length}｜最后成功 ${safeProposal.lastSuccess}`,
-    `有效待执行目标：${safeProposal.active.length} 个`,
+    `跟踪中目标：${safeProposal.active.length} 个`,
     ...(safeProposal.usingCache ? [`数据状态：Safe API 限流，沿用最后成功快照｜下次重试 ${safeProposal.retryAt}`] : []),
     ...safeLines,
     ...(safeProposalState.lastError ? [`最近异常：${safeProposalState.lastError}`] : []),
@@ -6865,7 +6890,7 @@ async function startMonitor() {
         });
         saveSafeProposalState(CONFIG.safeProposalMonitor.stateFile, safeProposalState);
         for (const change of result.changes) {
-          log(`[Flap Safe 提案] ${change.type}｜${change.quoteToken}｜确认 ${change.confirmations}/${change.required}｜nonce ${change.nonce}`);
+          log(`[Flap Safe 提案] ${change.type}｜${change.vaultFactory || change.quoteToken}｜确认 ${change.confirmations}/${change.required}｜nonce ${change.nonce}`);
         }
         if (safeProposalState.lastError && safeProposalState.lastError !== previousError) {
           log(`[Flap Safe 提案] 部分检测异常：${safeProposalState.lastError}`);
@@ -7171,7 +7196,7 @@ async function startMonitor() {
         log(`[Flap Safe 提案] 检测失败：${error.message}`);
       }
       const hasActiveProposal = Object.values(safeProposalState.proposals || {})
-        .some(proposal => ["pending", "ready"].includes(proposal?.status));
+        .some(proposal => ["pending", "ready", "confirming"].includes(proposal?.status));
       const intervalMs = hasActiveProposal
         ? CONFIG.safeProposalMonitor.activeIntervalMs
         : CONFIG.safeProposalMonitor.intervalMs;

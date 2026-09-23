@@ -177,6 +177,7 @@ if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; th
   cp flap-monitor/compact-factory-pool-state.mjs "$FLAP_DIR/"
   cp flap-monitor/contract-integrity-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/safe-proposal-monitor.mjs "$FLAP_DIR/"
+  cp flap-monitor/quote-token-codec.mjs "$FLAP_DIR/"
   cp flap-monitor/package.json "$FLAP_DIR/"
   # 创建 shared 软链接
   ln -sfn "$SHARED_DIR" "$FLAP_DIR/../shared"
@@ -549,7 +550,7 @@ if [ -f "$SNAP" ]; then
     const integrityAssets=Object.keys(ci.trackedAssets||{}).length;
     const integrityWss=ci.wssHealth?.contracts||{};
     const safeStates=Object.values(sp.safes||{});
-    const activeSafeProposals=Object.values(sp.proposals||{}).filter(v=>v&&['pending','ready'].includes(v.status));
+    const activeSafeProposals=Object.values(sp.proposals||{}).filter(v=>v&&['pending','ready','confirming'].includes(v.status));
     const healthySafes=safeStates.filter(v=>v&&v.baselineEstablished&&!v.lastError).length;
     const poolAssets=Object.values(fp.assets||{}).sort((a,b)=>String(a.quoteToken||'').localeCompare(String(b.quoteToken||'')));
     const poolConfigured=v=>Boolean(v&&(v.configured??v.enabled));
@@ -608,7 +609,7 @@ if [ -f "$SNAP" ]; then
     console.log('页面：'+keys.length+' 个｜资源 '+totalAssets+' 个｜文案 '+totalText+' 字｜i18n '+totalI18n+' 键');
     console.log('金库工厂：总数 '+factoryItems.length+' 个｜CAStore 可见 '+visibleFactories+' 个｜已启用 '+enabledVisibleFactories+' 个｜链上金库 '+knownVaults.length+' 个');
     console.log('Factory 底池：资产 '+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
-    console.log('Safe 提案：健康 '+healthySafes+'/'+safeStates.length+'｜有效待执行目标 '+activeSafeProposals.length+' 个');
+    console.log('Safe 提案：健康 '+healthySafes+'/'+safeStates.length+'｜跟踪中目标 '+activeSafeProposals.length+' 个');
     console.log('');
 
     console.log('**03｜页面监控**');
@@ -673,10 +674,10 @@ if [ -f "$SNAP" ]; then
     if(ci.lastError) console.log('最近异常：'+ci.lastError);
     console.log('');
 
-    console.log('**09｜Safe 开放提案预警**');
+    console.log('**09｜Safe 计价代币管理提案预警**');
     const safeStatus=sp.lastError?'部分异常':safeStates.length&&safeStates.every(v=>v.baselineEstablished)?'运行正常':'尚未建立';
     console.log('监控状态：'+(safeStatus==='运行正常'?ok(safeStatus):warn(safeStatus)));
-    console.log('健康 Safe：'+healthySafes+'/'+safeStates.length+'｜有效待执行目标 '+activeSafeProposals.length+' 个｜待发送变更 '+((sp.pendingChanges||[]).length)+' 项');
+    console.log('健康 Safe：'+healthySafes+'/'+safeStates.length+'｜跟踪中目标 '+activeSafeProposals.length+' 个｜待发送变更 '+((sp.pendingChanges||[]).length)+' 项');
     for(const [index,v] of safeStates.entries()) console.log(String(index+1).padStart(2,'0')+'　Safe '+mdLink(v.address,'https://app.safe.global/transactions/queue?safe=bnb:'+v.address)+'｜nonce '+(v.currentNonce??'未知')+'｜'+(v.lastError?'异常':v.baselineEstablished?'基线完成':'等待基线'));
     if(sp.lastSuccessAt) console.log('最后成功：'+fmtTime(sp.lastSuccessAt));
     if(sp.lastError) console.log('最近异常：'+sp.lastError);

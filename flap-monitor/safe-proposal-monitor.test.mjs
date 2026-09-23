@@ -1,16 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
   SAFE_MULTISEND_SELECTOR,
+  VAULT_PORTAL,
   SET_QUOTE_TOKEN_CREATION_DISABLED_SELECTOR,
   acknowledgeSafeProposalChanges,
   createSafeProposalState,
   decodeMultiSendTransactions,
   extractFlapEnableTargets,
+  extractFlapProposalActions,
+  buildSafeProposalContent,
+  migrateSafeProposalState,
   fetchSafeProposals,
   loadSafeProposalState,
   runSafeProposalScan,
@@ -23,6 +27,10 @@ const CHECKSUM_SAFE = "0xc68f29BfE2f6c3D95AdB5685592B9F86680968f2";
 const TOKEN = "0xe87afb3076aeb0f9b14e368de8145ae6a2826a14";
 const OTHER = "0x1111111111111111111111111111111111111111";
 const SAFE_TX_HASH = `0x${"97".repeat(32)}`;
+const AWDH = JSON.parse(readFileSync(new URL("./fixtures/safe-awdh-proposal.json", import.meta.url), "utf8"));
+const MULTISEND = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
+const VAULT_CALLS = JSON.parse(readFileSync(new URL("./fixtures/safe-vault-factory-calls.json", import.meta.url), "utf8"));
+const jsonResponse = value => ({ ok: true, status: 200, json: async () => value });
 const word = value => {
   const hex = typeof value === "number" || typeof value === "bigint"
     ? BigInt(value).toString(16)
@@ -30,6 +38,7 @@ const word = value => {
   return hex.padStart(64, "0");
 };
 const uintResult = value => `0x${BigInt(value).toString(16).padStart(64, "0")}`;
+const vaultCall = (factory = TOKEN, category = null) => `0x${category === null ? "4809625b" : "efa7595a"}${word(factory)}${word(1)}${word(0)}${word(2)}${category === null ? "" : word(category)}`;
 const enableCall = (token = TOKEN, disabled = false) =>
   `${SET_QUOTE_TOKEN_CREATION_DISABLED_SELECTOR}${word(token)}${word(disabled ? 1 : 0)}`;
 
@@ -96,10 +105,10 @@ test("MultiSend recursively finds only Flap Factory enable calls", () => {
   ]);
   const decoded = decodeMultiSendTransactions(data);
   assert.equal(decoded.length, 3);
-  assert.deepEqual(extractFlapEnableTargets({ to: OTHER, data, operation: 1 }, { factoryAddress: FACTORY }), [TOKEN]);
+  assert.deepEqual(extractFlapEnableTargets({ to: "0x9641d764fc13c8b624c04430c7356c1c7c8102e2", data, operation: 1 }, { factoryAddress: FACTORY }), [TOKEN]);
 });
 
-test("first successful Safe poll establishes a baseline without historical alerts", async () => {
+test("first successful Safe poll announces currently pending proposals once", async () => {
   const state = createSafeProposalState([SAFE]);
   const result = await runSafeProposalScan({
     state,
@@ -109,10 +118,11 @@ test("first successful Safe poll establishes a baseline without historical alert
     fetchFn: async () => response([proposal()]),
     nowMs: Date.parse("2026-08-24T04:00:00Z"),
   });
-  assert.equal(result.changed, false);
+  assert.equal(result.changed, true);
+  assert.equal(result.changes[0].type, "existing");
   assert.equal(state.safes[SAFE].baselineEstablished, true);
   assert.equal(Object.values(state.proposals).length, 1);
-  assert.equal(state.pendingChanges.length, 0);
+  assert.equal(state.pendingChanges.length, 1);
 });
 
 test("new proposal and completed confirmations each alert once", async () => {
@@ -136,51 +146,6 @@ test("new proposal and completed confirmations each alert once", async () => {
   assert.deepEqual(ready.changes.map(item => item.type), ["ready"]);
   acknowledgeSafeProposalChanges(state, state.pendingChanges.map(item => item.id));
   assert.equal(state.pendingChanges.length, 0);
-});
-
-test("advanced Safe nonce alerts only when the quote token remains disabled", async () => {
-  const makeState = () => {
-    const state = createSafeProposalState([SAFE]);
-    state.safes[SAFE].baselineEstablished = true;
-    state.proposals[`${SAFE_TX_HASH}:${TOKEN}`] = {
-      ...proposal(), key: `${SAFE_TX_HASH}:${TOKEN}`, safe: SAFE, quoteToken: TOKEN,
-      status: "pending", confirmations: 1, required: 2, firstSeenAt: "2026-08-24T03:54:42Z",
-    };
-    return state;
-  };
-  const invalidatedState = makeState();
-  const invalidated = await runSafeProposalScan({
-    state: invalidatedState,
-    safes: [SAFE],
-    factoryAddress: FACTORY,
-    rpcBatch: rpcFixture({ nonce: 13, disabled: true }),
-    fetchFn: async () => response([]),
-    nowMs: 5_000,
-  });
-  assert.deepEqual(invalidated.changes.map(item => item.type), ["invalidated"]);
-
-  const executedState = makeState();
-  const executed = await runSafeProposalScan({
-    state: executedState,
-    safes: [SAFE],
-    factoryAddress: FACTORY,
-    rpcBatch: rpcFixture({ nonce: 13, disabled: false }),
-    fetchFn: async () => response([]),
-    nowMs: 5_000,
-  });
-  assert.equal(executed.changed, false);
-  assert.equal(Object.values(executedState.proposals)[0].status, "executed");
-
-  const unconfiguredState = makeState();
-  const unconfigured = await runSafeProposalScan({
-    state: unconfiguredState,
-    safes: [SAFE],
-    factoryAddress: FACTORY,
-    rpcBatch: rpcFixture({ nonce: 13, disabled: false, configured: false }),
-    fetchFn: async () => response([]),
-    nowMs: 5_000,
-  });
-  assert.deepEqual(unconfigured.changes.map(item => item.type), ["invalidated"]);
 });
 
 test("Safe API 429 preserves state and applies retry-after backoff", async () => {
@@ -266,4 +231,174 @@ test("Safe proposal state persists without losing its baseline", () => {
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+});
+
+test("real aWDH calldata groups configuration and two-hop route before execution", async () => {
+  const actions = extractFlapProposalActions(AWDH);
+  assert.deepEqual(actions.map(action => action.kind), ["configuration", "route"]);
+  assert.deepEqual(actions[0].config, { enabled: 1, defaultCurve: 48, alternativeCurve: 48, nativeToQuoteSwapType: 7, dexId: 0 });
+  assert.deepEqual(actions[1].hops.map(hop => [hop.poolType, hop.dexId, hop.fee, hop.tickSpacing]), [[1, 0, 100, 0], [2, 1, 9000, 90]]);
+  assert.equal(actions[1].hops[1].tokenOut, actions[0].quoteToken);
+  const state = createSafeProposalState([SAFE]);
+  state.safes[SAFE].baselineEstablished = true;
+  let sample = { ...AWDH, isExecuted: false, confirmations: AWDH.confirmations.slice(0, 1) };
+  const opts = { state, safes: [SAFE], rpcBatch: rpcFixture({ nonce: 118 }), fetchFn: async () => response([sample]) };
+  const first = await runSafeProposalScan(opts);
+  assert.deepEqual(first.changes.map(change => change.type), ["proposed"]);
+  assert.equal(first.changes[0].actions.length, 2);
+  assert.equal(Object.keys(state.proposals).length, 1);
+  assert.equal((await runSafeProposalScan(opts)).changed, false);
+  sample = { ...sample, confirmations: AWDH.confirmations };
+  assert.deepEqual((await runSafeProposalScan(opts)).changes.map(change => change.type), ["ready"]);
+  const card = buildSafeProposalContent(state.pendingChanges);
+  assert.match(card, /9000/);
+  assert.match(card, /48/);
+  assert.match(card, /签名已满足，等待执行/);
+  assert.doesNotMatch(card, /即将开放|明确的开放意图/);
+  assert.deepEqual(extractFlapEnableTargets(AWDH), []);
+});
+
+test("nested calls preserve order, pauses, unknown selectors and reject untrusted wrappers", () => {
+  const children = decodeMultiSendTransactions(AWDH.data);
+  const nested = { to: MULTISEND, operation: 1, data: encodeMultiSend([
+    children[1], { to: FACTORY, data: enableCall(TOKEN, true) }, children[0],
+    { to: FACTORY, data: "0x12345678" },
+  ]) };
+  const root = { to: MULTISEND, operation: 1, data: encodeMultiSend([nested]) };
+  assert.deepEqual(extractFlapProposalActions(root).map(action => action.kind), ["route", "creation", "configuration", "unknown"]);
+  assert.equal(extractFlapProposalActions(root)[1].disabled, true);
+  assert.deepEqual(extractFlapProposalActions({ ...root, to: OTHER }), []);
+  assert.equal(extractFlapProposalActions({ ...children[0], operation: 1 })[0].kind, "unknown");
+  assert.equal(extractFlapProposalActions({ ...children[1], data: children[1].data.slice(0, -64) })[0].kind, "unknown");
+});
+
+function trackedState() {
+  const state = createSafeProposalState([SAFE]);
+  state.safes[SAFE].baselineEstablished = true;
+  const record = { ...proposal(), key: `${SAFE_TX_HASH}:${TOKEN}`, safe: SAFE, quoteToken: TOKEN,
+    status: "ready", confirmations: 2, required: 2, actions: [{ kind: "creation", quoteToken: TOKEN, disabled: false }] };
+  state.proposals[record.key] = record;
+  state.pendingChanges = [{ ...record, type: "ready", id: "unsent-ready" }];
+  return state;
+}
+
+test("consumed nonce resolves by exact Safe transaction, not whether token happens to be enabled", async () => {
+  for (const status of ["executed", "failed", "invalidated", "confirming"]) {
+    const state = trackedState();
+    const detail = { ...proposal(), isExecuted: status === "executed" || status === "failed",
+      isSuccessful: status !== "failed", transactionHash: `0x${"ab".repeat(32)}` };
+    const winner = { ...detail, isExecuted: true, safeTxHash: `0x${"cd".repeat(32)}` };
+    const result = await runSafeProposalScan({ state, safes: [SAFE], rpcBatch: rpcFixture({ nonce: 13, disabled: false }),
+      fetchFn: async url => url.includes("/multisig-transactions/0x") ? jsonResponse(detail)
+        : response(url.includes("executed=true") && status === "invalidated" ? [winner] : []) });
+    assert.equal(Object.values(state.proposals)[0].status, status);
+    assert.deepEqual(result.changes.map(change => change.type), status === "confirming" ? [] : [status]);
+    assert.ok(state.pendingChanges.every(change => change.type !== "ready"));
+  }
+});
+
+test("execution result rate limits retain confirming state and block further API requests", async () => {
+  const state = trackedState();
+  await runSafeProposalScan({ state, safes: [SAFE], nowMs: 10000, rpcBatch: rpcFixture({ nonce: 13 }),
+    fetchFn: async url => url.includes("/multisig-transactions/0x")
+      ? response([], { status: 429, retryAfter: "120" }) : response([]) });
+  assert.equal(Object.values(state.proposals)[0].status, "confirming");
+  assert.equal(state.safes[SAFE].nextAttemptAtMs, 130000);
+  await runSafeProposalScan({ state, safes: [SAFE], nowMs: 20000, rpcBatch: rpcFixture({ nonce: 13 }),
+    fetchFn: async () => assert.fail("退避中不应查询详情或列表") });
+});
+
+test("pending proposal pagination retains nonce filter and refuses cross-origin next URLs", async () => {
+  let count = 0;
+  const base = "https://safe.test/api/v1";
+  const results = await fetchSafeProposals({ safe: SAFE, nonce: 12, apiBaseUrl: base,
+    fetchFn: async url => {
+      assert.match(url, /nonce__gte=12/);
+      return jsonResponse(count++ === 0 ? { results: [proposal()], next: `${base}/safes/${SAFE}/multisig-transactions/?offset=100` }
+        : { results: [proposal({ nonce: 13 })], next: null });
+    } });
+  assert.equal(results.length, 2);
+  await assert.rejects(fetchSafeProposals({ safe: SAFE, nonce: 12, apiBaseUrl: base,
+    fetchFn: async () => jsonResponse({ results: [], next: "https://other.test/collect" }) }), /分页地址无效/);
+});
+
+test("old state migration and restart preserve alerts without replaying executed history", async () => {
+  const state = trackedState();
+  state.schemaVersion = 1;
+  delete Object.values(state.proposals)[0].actions;
+  const migrated = migrateSafeProposalState(state, [SAFE]);
+  assert.equal(Object.values(migrated.proposals)[0].actions[0].kind, "creation");
+  assert.equal(migrated.pendingChanges.length, 1);
+  const dir = mkdtempSync(join(tmpdir(), "safe-restart-"));
+  try {
+    const path = join(dir, "state.json");
+    saveSafeProposalState(path, migrated);
+    const loaded = loadSafeProposalState(path, [SAFE]);
+    const result = await runSafeProposalScan({ state: loaded, safes: [SAFE], rpcBatch: rpcFixture(),
+      fetchFn: async () => response([proposal({ confirmations: 2 }), AWDH]) });
+    assert.equal(result.changed, false);
+    assert.equal(loaded.pendingChanges.length, 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("missing threshold is not reported as signature-complete", async () => {
+  const state = createSafeProposalState([SAFE]);
+  const result = await runSafeProposalScan({ state, safes: [SAFE], rpcBatch: rpcFixture(),
+    fetchFn: async () => response([{ ...proposal(), confirmationsRequired: null }]) });
+  assert.equal(result.changes[0].status, "pending");
+  assert.match(buildSafeProposalContent(result.changes), /1\/未知/);
+});
+
+test("historical Vault Factory registration overloads decode only at Vault Portal", () => {
+  for (const [index, call] of VAULT_CALLS.entries()) {
+    const [action] = extractFlapProposalActions(call);
+    assert.equal(action.kind, "vaultFactory");
+    assert.equal(action.vaultFactory, `0x${call.data.slice(34, 74)}`);
+    assert.equal(action.enabled, true);
+    assert.equal(action.category === null, index === 0);
+    if (index === 2) assert.ok(action.extraData.length > 2);
+    assert.deepEqual(extractFlapProposalActions({ ...call, to: OTHER }), []);
+    assert.equal(extractFlapProposalActions({ ...call, operation: 1 })[0].kind, "unknown");
+    assert.equal(extractFlapProposalActions({ ...call, data: call.data.slice(0, index === 0 ? 264 : 328) })[0].kind, "unknown");
+  }
+  const invalidBool = `0x4809625b${word(TOKEN)}${word(2)}${word(0)}${word(1)}`;
+  assert.equal(extractFlapProposalActions({ to: VAULT_PORTAL, data: invalidBool })[0].kind, "unknown");
+  assert.equal(extractFlapProposalActions({ to: VAULT_PORTAL, data: vaultCall(TOKEN, 256) })[0].kind, "unknown");
+});
+
+test("mixed MultiSend keeps each Vault Factory separate from quote tokens, deduplicates and tracks execution", async () => {
+  const state = createSafeProposalState([SAFE]);
+  const p = { ...proposal(), to: MULTISEND, operation: 1, data: encodeMultiSend([
+    { to: VAULT_PORTAL, data: vaultCall(TOKEN) },
+    { to: FACTORY, data: enableCall(TOKEN) },
+    { to: VAULT_PORTAL, data: vaultCall(OTHER, 1) },
+    { to: VAULT_PORTAL, data: vaultCall(TOKEN, 9) },
+  ]) };
+  const scan = confirmations => runSafeProposalScan({ state, safes: [SAFE], rpcBatch: rpcFixture(),
+    fetchFn: async () => response([{ ...p, confirmations: proposal({ confirmations }).confirmations }]) });
+  let result = await scan(1);
+  assert.equal(result.changes.length, 3);
+  assert.equal(new Set(result.changes.map(c => c.id)).size, 3);
+  const vault = result.changes.find(c => c.vaultFactory === TOKEN);
+  assert.equal(vault.quoteToken, "");
+  assert.equal(vault.actions.length, 2);
+  const card = buildSafeProposalContent([vault]);
+  assert.match(card, /Vault Factory 注册／配置更新/);
+  assert.match(card, /未提供（四参数版本）/);
+  assert.match(card, /未知分类（9）/);
+  assert.doesNotMatch(card, /计价代币：/);
+  result = await scan(1);
+  assert.equal(result.changes.length, 0);
+  result = await scan(2);
+  assert.deepEqual(result.changes.map(c => c.type), ["ready", "ready", "ready"]);
+  const restored = migrateSafeProposalState(JSON.parse(JSON.stringify(state)), [SAFE]);
+  let getterCalls = 0;
+  result = await runSafeProposalScan({ state: restored, safes: [SAFE],
+    rpcBatch: async calls => { getterCalls += calls.filter(c => c.params?.[0]?.data !== "0xaffed0e0").length; return rpcFixture({ nonce: 13 })(calls); },
+    fetchFn: async url => url.includes("/multisig-transactions/0x")
+      ? jsonResponse({ ...p, isExecuted: true, isSuccessful: true, transactionHash: `0x${"ab".repeat(32)}` }) : response([]) });
+  assert.equal(result.changes.length, 3);
+  assert.ok(result.changes.every(c => c.type === "executed"));
+  assert.equal(getterCalls, 2, "only the quote token uses quote configuration getters");
+  assert.equal(result.changes.filter(c => c.vaultFactory).length, 2);
 });

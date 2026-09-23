@@ -5,6 +5,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
+import { QUOTE_ROUTE_EVENT_TOPIC, decodeQuoteRoute } from "./quote-token-codec.mjs";
 
 process.env.FLAP_MONITOR_TEST = "1";
 
@@ -892,7 +893,7 @@ test("Factory schema migration removes historical state and preserves assets", (
       },
     },
   });
-  assert.equal(migrated.schemaVersion, 11);
+  assert.equal(migrated.schemaVersion, 12);
   assert.equal("historyStateEventCursor" in migrated, false);
   assert.equal("historyConfigEventCursor" in migrated, false);
   assert.equal(migrated.pendingChanges.length, 1);
@@ -2609,7 +2610,7 @@ test("Safe proposal delivery preserves unsent alerts and acknowledges successful
   assert.equal(sentState.pendingChanges.length, 0);
   assert.equal(saveCount, 1);
   assert.match(cardContent, /MSTRB/);
-  assert.match(cardContent, /确认进度: 1\/2/);
+  assert.match(cardContent, /确认进度：1\/2/);
   assert.deepEqual(sentCardOpts, { mentionOpenId: "ou_test_recipient" });
   __testables.CONFIG.feishuMentionOpenId = previousMentionOpenId;
 });
@@ -3118,4 +3119,112 @@ test("flap cards keep every readable copy change without truncation", () => {
   assert.match(content, new RegExp(`${longOld}-14`));
   assert.match(content, new RegExp(`${longNew}-14`));
   assert.doesNotMatch(content, /完整内容\.\.\.|完整内容…|还有 \d+ 处修改/);
+});
+
+const awdhFixture = JSON.parse(readFileSync(new URL('./fixtures/safe-awdh-proposal.json', import.meta.url), 'utf8'));
+const awdhConfigLog = awdhFixture.logs.find(log => log.topics[0] === QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC);
+const awdhRouteLog = awdhFixture.logs.find(log => log.topics[0] === QUOTE_ROUTE_EVENT_TOPIC);
+const awdhConfigResult = '0x' + awdhConfigLog.data.slice(66);
+const awdhRpc = async (method, params) => factoryGetterResult(method, params, awdhConfigResult, BOOLEAN_FALSE_RESULT);
+
+test('real aWDH route-only event notifies, preserves evidence and deduplicates after restart', async () => {
+  const state = createFactoryPoolState();
+  await ingestFactoryPoolEvent({ state, logEntry: awdhConfigLog, rpcCall: awdhRpc });
+  const result = await ingestFactoryPoolEvent({ state, logEntry: awdhRouteLog, rpcCall: awdhRpc });
+  assert.equal(result.changes.length, 1);
+  assert.equal(result.changes[0].type, 'route');
+  assert.equal(result.changes[0].current.swapRoute[1].fee, 9000);
+  assert.equal(result.changes[0].current.routeEvidence.txHash, awdhFixture.transactionHash);
+  const restored = migrateFactoryPoolState(JSON.parse(JSON.stringify(state)));
+  assert.equal(restored.assets[result.item.quoteToken].fingerprint, state.assets[result.item.quoteToken].fingerprint);
+  const duplicate = await ingestFactoryPoolEvent({ state: restored, logEntry: awdhRouteLog, rpcCall: awdhRpc });
+  assert.equal(duplicate.duplicate, true);
+  const card = __testables.buildFactoryPoolMonitorContent({ ...result, state });
+  assert.match(card, /兑换路径更新/);
+  assert.match(card, /tickSpacing 90/);
+  assert.ok(FACTORY_POOL_STATE_EVENT_TOPICS.includes(QUOTE_ROUTE_EVENT_TOPIC));
+});
+
+test('route evidence is persisted before failed getter and retained for retry', async () => {
+  const state = createFactoryPoolState();
+  let persisted;
+  const result = await ingestFactoryPoolEvent({ state, logEntry: awdhRouteLog,
+    rpcCall: async () => { throw new Error('node behind'); },
+    persistState: async value => { persisted = structuredClone(value); } });
+  assert.equal(result.changes.length, 0);
+  const token = decodeQuoteRoute(awdhRouteLog.data).quoteToken;
+  assert.equal(persisted.candidates[token].eventRoute.length, 2);
+  assert.equal(persisted.candidates[token].pendingVerification, true);
+  const restored = migrateFactoryPoolState(persisted);
+  restored.deploymentBlock = 1;
+  restored.deploymentTxChecked = true;
+  restored.currentImplementation = '0x1111111111111111111111111111111111111111';
+  restored.headLastScannedBlock = 123583332;
+  const retry = await runFactoryPoolScan({ state: restored, config: { scanCatchup: false },
+    rpcCall: async (method, params) => {
+      if (method === 'eth_chainId') return '0x38';
+      if (method === 'eth_blockNumber') return '0x75dbb65';
+      if (method === 'eth_getLogs') return [];
+      if (method === 'eth_getStorageAt') return '0x' + '0'.repeat(24) + restored.currentImplementation.slice(2);
+      return awdhRpc(method, params);
+    } });
+  assert.equal(retry.changes.length, 1);
+  assert.equal(restored.assets[token].swapRoute[1].fee, 9000);
+  assert.equal(restored.candidates[token].pendingVerification, false);
+});
+
+test('route updates survive Feishu failure and are acknowledged only after delivery', async () => {
+  const state = createFactoryPoolState();
+  await ingestFactoryPoolEvent({ state, logEntry: awdhConfigLog, rpcCall: awdhRpc });
+  const opts = { saveStateFn: () => {}, scheduleMetadataFn: () => {},
+    scanFn: async ({ state }) => {
+      const result = await ingestFactoryPoolEvent({ state, logEntry: awdhRouteLog, rpcCall: awdhRpc });
+      return { ...result, changed: result.changes.length > 0 };
+    } };
+  await __testables.checkFlapFactoryPools(state, { ...opts, sendCardFn: async () => null });
+  assert.equal(state.pendingChanges.length, 1);
+  assert.equal(state.pendingChanges[0].type, 'route');
+  const result = await __testables.checkFlapFactoryPools(state, { ...opts, sendCardFn: async () => 'route-card' });
+  assert.equal(result.sent, true);
+  assert.equal(state.pendingChanges.length, 0);
+});
+
+test('route decoder rejects truncated arrays and preserves signed values and extra slot', () => {
+  assert.throws(() => decodeQuoteRoute(awdhRouteLog.data.slice(0, -64)), /tuple/);
+  const words = awdhRouteLog.data.slice(2).match(/.{64}/g);
+  words[6] = ((1n << 256n) - 90n).toString(16);
+  words[8] = '1'.padStart(64, '0');
+  const route = decodeQuoteRoute('0x' + words.join(''));
+  assert.equal(route.hops[0].tickSpacing, -90);
+  assert.equal(route.hops[0].extraWord, '0x' + words[8]);
+});
+
+test('concurrent older getter snapshots cannot overwrite newer route evidence', async () => {
+  const state = createFactoryPoolState();
+  await ingestFactoryPoolEvent({ state, logEntry: awdhConfigLog, rpcCall: awdhRpc });
+  await ingestFactoryPoolEvent({ state, logEntry: awdhRouteLog, rpcCall: awdhRpc });
+  const token = decodeQuoteRoute(awdhRouteLog.data).quoteToken;
+  const stale = structuredClone(state);
+  stale.assets[token].lastVerifiedBlock = 123583400;
+  stale.assets[token].swapRoute = [];
+  stale.assets[token].routeEvidence = { blockNumber: 123583300, logIndex: 0 };
+  stale.candidates[token].eventRoute = [];
+  stale.candidates[token].routeEvidence = stale.assets[token].routeEvidence;
+  __testables.mergeFactoryPoolScanState(state, stale);
+  assert.equal(state.assets[token].swapRoute.length, 2);
+  assert.equal(state.candidates[token].eventRoute.length, 2);
+  assert.equal(state.assets[token].lastVerifiedBlock, 123583400);
+});
+
+test('out-of-order and removed route logs never roll back the stored route', async () => {
+  const state = createFactoryPoolState();
+  await ingestFactoryPoolEvent({ state, logEntry: awdhRouteLog, rpcCall: awdhRpc });
+  const token = decodeQuoteRoute(awdhRouteLog.data).quoteToken;
+  const emptyRouteData = '0x' + awdhRouteLog.data.slice(2, 130) + '0'.repeat(64);
+  const oldLog = { ...awdhRouteLog, data: emptyRouteData, blockNumber: '0x75dbb64', transactionHash: '0x' + 'ab'.repeat(32) };
+  const result = await ingestFactoryPoolEvent({ state, logEntry: oldLog, rpcCall: awdhRpc });
+  assert.equal(result.changes.length, 0);
+  assert.equal(state.assets[token].swapRoute.length, 2);
+  const removed = await ingestFactoryPoolEvent({ state, logEntry: { ...awdhRouteLog, removed: true }, rpcCall: awdhRpc });
+  assert.equal(removed.removed, true);
 });

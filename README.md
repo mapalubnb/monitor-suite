@@ -5,7 +5,7 @@
 ## ✨ 主要功能
 
 - **Four.meme**：底池、前端页面、公开 API、OpenFour 模板、GitHub、合约及链上参数。
-- **Flap.sh**：BNB CAStore、Robinhood CAStore、metadata schema、Vault Portal、Vault Factory、SwapRegistry、核心代理升级、Factory 底池状态，以及管理 Safe 的底池开放提案。
+- **Flap.sh**：BNB CAStore、Robinhood CAStore、metadata schema、Vault Portal、Vault Factory、SwapRegistry、核心代理升级、Factory 底池状态，以及管理 Safe 的计价币配置、兑换路径、创建开关和 Vault Factory 注册／配置提案。
 - **飞书卡片**：规则结果优先发送，AI 摘要异步补充；长文案、URL、地址和交易哈希完整保留。
 - **稳定低延迟**：支持 PM2、动态 RPC 竞速、短超时切换、断点补扫和去重；Factory 名称与飞书发送不阻塞后续扫描。
 - **前端增量抓取**：FourMeme 保留真实 `dpl` 部署 URL，同路径部署参数变化直接迁移缓存，只下载新增或路径变化的资源；部分失败会在下轮只补抓失败项。
@@ -83,7 +83,7 @@ pm2 status
 | Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | WSS 实时，HTTP 1 秒兜底，不等待确认块 |
 | Flap.sh | Factory 断点补扫 | 后台运行，自动找回停机或 RPC 故障期间的变化 |
 | Flap.sh | Factory 已知资产复核 | 后台轮转，补充发现 getter 状态变化 |
-| Flap.sh | 管理 Safe 底池开放提案 | 空闲 2 分钟，发现待执行提案后 30 秒；按链上 nonce 精确过滤 |
+| Flap.sh | 管理 Safe 计价代币及 Vault Factory 管理提案 | 空闲 2 分钟，发现待执行提案后 30 秒；按链上 nonce 精确过滤 |
 | Flap.sh | Factory / SwapRegistry / Vault Portal 核心完整性 | 精准地址 WSS；HTTP 批量校验 10 秒兜底 |
 | Flap.sh | Vault Factory 与已知资产黑名单/信任状态 | 60 秒轮转 |
 | Flap.sh | bytecode hash 与函数选择器审计 | 10 分钟 |
@@ -106,8 +106,8 @@ pm2 status
 - WSS 仅更新候选库、输出日志并复用现有飞书通知，不签名、不发送交易，也不改变任何自动发射逻辑。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。
 - Factory 不再从部署区块开始扫描完整历史。更新部署前已经存在、但当前 15 个基线资产之外的旧资产不会自动回溯；更新后的新事件和停机缺口仍会及时发现。
-- Safe 提案预警默认监控新旧两个 Flap 管理 Safe，只解析发往 Factory 的 `setQuoteTokenCreationDisabled(address,false)`，并递归解析 Safe `MultiSend`；首次运行只建立基线，不发送历史提案。
-- Safe API 查询使用链上 `nonce()` 作为下限，自动排除接口仍保留的废弃历史提案；`1/2` 确认提示准备开放，`2/2` 确认提示即将执行，Factory 链上事件仍是正式开放的最终依据。
+- Safe 提案预警默认监控新旧两个 Flap 管理 Safe，解析发往 Factory 的计价币配置（`0x23d89f95`）、兑换路径（`0x659e381f`）及创建暂停/恢复开关，以及发往 Vault Portal 的 Vault Factory 注册／配置更新。支持已验证 MultiSend 地址的递归批量调用，同一提案同一代币合并展示，保留内部调用顺序；未知 Factory 调用会提示选择器，不静默丢弃。首次运行提示仍待执行的提案一次，不补发已执行历史。
+- Safe API 查询使用链上 `nonce()` 作为下限并跟随分页，自动排除废弃历史提案。首次发现提示管理提案，签名满足提示“等待执行”，不推断已经开放。nonce 前进后按 `safeTxHash` 查执行详情；仅在确有同 nonce 执行记录时区分成功、内层失败和被替换，索引尚未同步时保留“执行结果待确认”。执行成功后复核配置 getter，当前状态不同不会被误判为该提案执行失败。
 - Safe 提案监控使用 `FLAP_SAFE_API_KEY` Bearer 认证；空闲时每 2 分钟查询，发现待执行提案后自动切换为 30 秒。它不订阅新区块、不读取完整交易，也不执行任何 Safe 操作；API 遇到 `429`、超时或网络失败时按 Safe 独立退避，429 最大退避 30 分钟并错开请求，不阻塞现有页面和链上监控。限流期间保留最后成功快照，并在状态卡片标明缓存状态与下次重试时间。
 - Factory 的升级/权限关键事件合并到原有 WSS 订阅；内置 SwapRegistry、Vault Portal 与链上验证过的 Vault Factory 使用相同 WSS 节点做精准地址订阅，不增加新区块订阅。
 - 前端资源提取到的合约地址只作为候选记录，不能直接进入 WSS；普通 Transfer、Deposit 等未知事件不会生成完整性告警。
@@ -127,6 +127,17 @@ pm2 status
 - 原需要置顶的 Flap 重点告警改为在首张卡片中提醒 `FEISHU_MENTION_OPEN_ID`；长卡片后续分片不重复提醒，留空则正常发送但不 @。
 - BNB 自定义金库链接统一使用 `vaultfactory=<地址>&chain=bnb&lang=zh`，Robinhood 使用对应的 `chain=robinhood` 参数。
 - 启动卡片与状态卡片显示 Factory WSS 订阅数、最后订阅/事件时间、短窗口回扫结果及 HTTP 扫描进度，不显示交易和内部配置字段。
+
+## 本次更新：1.3.36 / Flap 1.2.28
+
+- Safe 提前监控新增 Vault Factory 注册／配置更新，兼容四参数 `0x4809625b` 与五参数 `0xefa7595a`，展示启用、官方标识、风险等级和分类；按目标工厂分别跟踪签名和执行结果，四参数版本不推断分类。
+
+- 新增 Safe 计价代币配置、兑换路径、暂停/恢复提案预警，修复 aWDH 一类“配置 + 路径”批量提案未被识别的问题。
+- Factory WSS、HTTP 实时扫描与补扫新增路径事件，单独修改或清空路径也会通知；路径按区块和日志位置合并，避免旧结果覆盖新路径。
+- Safe 状态升级为 schema 3，Factory 状态升级为 schema 12，自动保留旧基线和待发送记录。无需删除状态文件；部署时需同时更新所有 Flap 模块（安装脚本已包含新增 codec）。
+- 路径编码通过区块 123583333 的真实 calldata 与事件交叉验证。当前支持每跳六个 ABI word 的布局，保留第六个扩展字段原值；新版完整 ABI 尚未取得，不擅自命名扩展字段或兑换类型 7。遇到不兼容布局会明确报解析异常，不写入错误路径。
+- 新代币先发送完整地址，再异步补充名称。签名满足不保证执行时间；未公开到 Safe Transaction Service 的提案无法提前获取。
+- 回归样本位于 `flap-monitor/fixtures/safe-awdh-proposal.json`，只含公开提案字段和链上日志，不含签名。
 
 ## 🧹 Factory 状态瘦身
 
@@ -158,7 +169,7 @@ fl-status
 - Factory 实时通道异常：检查 `fl-status` 的 WSS 已订阅数量；单节点断线会显示“部分可用”，全部断线会显示“需要关注”。短窗口回扫失败会单独显示，不与 WSS 连接错误混淆。
 - Factory 显示候选复核失败：候选地址和交易证据已保留，实时轮询会自动重试；检查 RPC getter 可用性即可。
 - 合约完整性异常：检查 `fl-status` 的合约目录、精准地址 WSS、核心校验、扩展轮转与代码审计时间；发送失败的变更会保留在 `contract-integrity-state.json`。
-- Safe 提案预警异常：检查 `fl-status` 的 Safe nonce、基线和最近错误；发送失败的预警会保留在 `safe-proposal-state.json`，Safe API 限流会自动恢复。
+- Safe 提案预警异常：检查 `fl-status` 的 Safe nonce、基线和最近错误；发送失败的预警会保留在 `safe-proposal-state.json`，Safe API 限流会自动恢复，执行详情查询也遵循退避。
 
 ## ✅ 本地验证
 

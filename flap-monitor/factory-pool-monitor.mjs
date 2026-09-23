@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
+import { QUOTE_ROUTE_EVENT_TOPIC, decodeQuoteRoute } from "./quote-token-codec.mjs";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
-export const FACTORY_POOL_SCHEMA_VERSION = 11;
+export const FACTORY_POOL_SCHEMA_VERSION = 12;
 export const BSC_CHAIN_ID = 56;
 export const BNB_QUOTE_TOKEN = "0x0000000000000000000000000000000000000000";
 export const FLAP_FACTORY_PROXY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -16,6 +17,7 @@ export const FACTORY_POOL_STATE_EVENT_TOPICS = [
   QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC,
   QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC,
   QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC,
+  QUOTE_ROUTE_EVENT_TOPIC,
 ];
 const FACTORY_POOL_STATE_EVENT_TOPIC_SET = new Set(FACTORY_POOL_STATE_EVENT_TOPICS);
 const MAX_FACTORY_POOL_CANDIDATES = 5_000;
@@ -132,8 +134,15 @@ export function extractAddressWords(data, { includeZero = true } = {}) {
 }
 
 export function extractFactoryLogCandidates(logEntry, proxy = FLAP_FACTORY_PROXY) {
+  if (logEntry?.removed) return [];
   if (normalizeAddress(logEntry?.address) !== normalizeAddress(proxy)) return [];
   const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
+  if (topic0 === QUOTE_ROUTE_EVENT_TOPIC) {
+    const route = decodeQuoteRoute(logEntry.data);
+    return [{ quoteToken: route.quoteToken, eventRoute: route.hops, topic0,
+      txHash: String(logEntry.transactionHash || "").toLowerCase(),
+      blockNumber: hexToNumber(logEntry.blockNumber), logIndex: hexToNumber(logEntry.logIndex), source: "event" }];
+  }
   if (topic0 === QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC || topic0 === QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC) {
     const data = String(logEntry?.data || "").replace(/^0x/i, "");
     const quoteToken = /^[a-fA-F0-9]{64,}$/.test(data)
@@ -210,7 +219,7 @@ function migrateFactoryPoolAsset(asset = {}) {
     creationDisabled,
     effectiveEnabled: configured && !creationDisabled,
     configurationFingerprint,
-    fingerprint: hashValue(`${configurationFingerprint}:${creationDisabled ? 1 : 0}`),
+    fingerprint: assetFingerprint(configurationFingerprint, creationDisabled, asset.swapRoute),
     enabled: Number(values[0] ?? asset.enabled ?? (configured ? 1 : 0)),
     officialCandidate: configured,
     defaultCurve: Number(values[1] ?? asset.defaultCurve ?? 0),
@@ -419,6 +428,11 @@ function rememberCandidate(state, item) {
     }
   }
   if (typeof item.eventDisabled === "boolean") current.disabled = item.eventDisabled;
+  if (item.eventRoute && (!current.routeEvidence || item.blockNumber > current.routeEvidence.blockNumber
+    || (item.blockNumber === current.routeEvidence.blockNumber && item.logIndex >= current.routeEvidence.logIndex))) {
+    current.eventRoute = item.eventRoute;
+    current.routeEvidence = { blockNumber: item.blockNumber, logIndex: item.logIndex, txHash: item.txHash };
+  }
   current.lastTxHash = String(item.txHash || current.lastTxHash || "").toLowerCase();
   current.lastSourceBlock = item.blockNumber ?? current.lastSourceBlock ?? null;
   current.pendingVerification = true;
@@ -559,7 +573,15 @@ export function classifyFactoryPoolChange(previous, current) {
   if (previous.configured && !current.configured) return "disabled";
   if (current.configured && !previous.creationDisabled && current.creationDisabled) return "paused";
   if (current.configured && previous.creationDisabled && !current.creationDisabled) return "resumed";
+  if (previous.configurationFingerprint === current.configurationFingerprint
+    && previous.creationDisabled === current.creationDisabled
+    && JSON.stringify(previous.swapRoute) !== JSON.stringify(current.swapRoute)) return "route";
   return "modified";
+}
+
+export function assetFingerprint(configurationFingerprint, disabled, swapRoute) {
+  const base = `${configurationFingerprint}:${disabled ? 1 : 0}`;
+  return hashValue(swapRoute ? `${base}:${JSON.stringify(swapRoute)}` : base);
 }
 
 async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", persistState, log }) {
@@ -632,9 +654,14 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
     candidate.creationDisabled = creationDisabled;
     candidate.disabled = creationDisabled;
     candidate.effectiveEnabled = decoded.configured && !creationDisabled;
-    if (!decoded.configurationPresent && !previous) continue;
+    if (!decoded.configurationPresent && !previous && !candidate.eventRoute) continue;
 
-    const fingerprint = hashValue(`${decoded.fingerprint}:${creationDisabled ? 1 : 0}`);
+    const routeSource = [{ swapRoute: candidate.eventRoute, routeEvidence: candidate.routeEvidence }, previous]
+      .filter(item => Array.isArray(item?.swapRoute)).sort((a, b) =>
+        (b.routeEvidence?.blockNumber || 0) - (a.routeEvidence?.blockNumber || 0)
+        || (b.routeEvidence?.logIndex || 0) - (a.routeEvidence?.logIndex || 0))[0];
+    const swapRoute = routeSource?.swapRoute;
+    const fingerprint = assetFingerprint(decoded.fingerprint, creationDisabled, swapRoute);
 
     const next = {
       quoteToken,
@@ -653,6 +680,7 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
       values: decoded.values,
       configurationFingerprint: decoded.fingerprint,
       fingerprint,
+      ...(swapRoute ? { swapRoute, routeEvidence: routeSource.routeEvidence } : {}),
       firstSeenAt: previous?.firstSeenAt || nowText(),
       firstSeenBlock: previous?.firstSeenBlock ?? source.blockNumber ?? null,
       lastChangedAt: previous?.fingerprint === fingerprint ? previous.lastChangedAt : nowText(),
@@ -698,6 +726,7 @@ export async function ingestFactoryPoolEvent({
   log,
 } = {}) {
   if (!state || typeof rpcCall !== "function") throw new Error("Factory WSS 事件处理缺少 state 或 rpcCall");
+  if (logEntry?.removed) return { processed: false, removed: true, changes: [], state };
   const items = extractFactoryLogCandidates(logEntry, state.proxy);
   if (items.length === 0) throw new Error(`无法解析 Factory 事件：${String(logEntry?.topics?.[0] || "未知 topic")}`);
   const key = factoryPoolEventKey(logEntry);
@@ -766,13 +795,22 @@ function dedupeChanges(changes) {
 
 function applyStateEventToAsset(asset, logEntry) {
   const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
+  if (topic0 === QUOTE_ROUTE_EVENT_TOPIC) {
+    if (asset.routeEvidence && (hexToNumber(logEntry.blockNumber) < asset.routeEvidence.blockNumber
+      || (hexToNumber(logEntry.blockNumber) === asset.routeEvidence.blockNumber
+        && hexToNumber(logEntry.logIndex) <= asset.routeEvidence.logIndex))) return asset;
+    const { hops: swapRoute } = decodeQuoteRoute(logEntry.data);
+    return { ...asset, swapRoute,
+      fingerprint: assetFingerprint(asset.configurationFingerprint, asset.creationDisabled, swapRoute),
+      routeEvidence: { blockNumber: hexToNumber(logEntry.blockNumber), logIndex: hexToNumber(logEntry.logIndex), txHash: logEntry.transactionHash } };
+  }
   if (topic0 === QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC) {
     const creationDisabled = decodeBooleanResult(logEntry.data);
     return {
       ...asset,
       creationDisabled,
       effectiveEnabled: Boolean(asset.configured) && !creationDisabled,
-      fingerprint: hashValue(`${asset.configurationFingerprint}:${creationDisabled ? 1 : 0}`),
+      fingerprint: assetFingerprint(asset.configurationFingerprint, creationDisabled, asset.swapRoute),
     };
   }
   if (topic0 !== QUOTE_TOKEN_CONFIGURATION_EVENT_TOPIC && topic0 !== QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC) return null;
@@ -787,7 +825,7 @@ function applyStateEventToAsset(asset, logEntry) {
     values: decoded.values,
     configurationFingerprint: decoded.fingerprint,
     effectiveEnabled: decoded.configured && !asset.creationDisabled,
-    fingerprint: hashValue(`${decoded.fingerprint}:${asset.creationDisabled ? 1 : 0}`),
+    fingerprint: assetFingerprint(decoded.fingerprint, asset.creationDisabled, asset.swapRoute),
   };
 }
 
@@ -835,7 +873,9 @@ async function scanStateEventRange({
     toBlock,
     [FACTORY_POOL_STATE_EVENT_TOPICS],
   );
-  const freshLogs = (logRange.logs || []).filter(logEntry => rememberFactoryPoolEvent(state, logEntry, "factory-http"));
+  // Parse before deduplication so malformed/new layouts never consume a cursor silently.
+  const validLogs = (logRange.logs || []).filter(logEntry => extractFactoryLogCandidates(logEntry, state.proxy).length > 0);
+  const freshLogs = validLogs.filter(logEntry => rememberFactoryPoolEvent(state, logEntry, "factory-http"));
   const items = freshLogs.flatMap(logEntry => extractFactoryLogCandidates(logEntry, state.proxy));
   if (retryPending) {
     for (const candidate of Object.values(state.candidates || {})) {

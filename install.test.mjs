@@ -110,6 +110,7 @@ test("separate Flap deployment copies every runtime module", () => {
     "compact-factory-pool-state.mjs",
     "contract-integrity-monitor.mjs",
     "safe-proposal-monitor.mjs",
+    "quote-token-codec.mjs",
     "package.json",
   ]) {
     assert.match(installSource, new RegExp(`cp flap-monitor/${file.replaceAll(".", "\\.")} \\"\\$FLAP_DIR/\\"`));
@@ -141,8 +142,8 @@ test("Flap status includes Safe proposal nonce baseline and pending targets", ()
     pendingChanges: [{ id: "proposal" }],
     lastSuccessAt: "2026-08-24T04:00:00.000Z",
   });
-  assert.match(output, /\*\*09｜Safe 开放提案预警\*\*/);
-  assert.match(output, /健康 Safe：1\/1｜有效待执行目标 1 个｜待发送变更 1 项/);
+  assert.match(output, /\*\*09｜Safe 计价代币管理提案预警\*\*/);
+  assert.match(output, /健康 Safe：1\/1｜跟踪中目标 1 个｜待发送变更 1 项/);
   assert.match(output, /nonce 12｜基线完成/);
 });
 
