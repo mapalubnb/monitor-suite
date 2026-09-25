@@ -341,3 +341,27 @@ test("early card omits boilerplate and misleading liquidity absence text", () =>
   const content = buildEarlySignalContent(state.pendingChanges, state);
   assert.doesNotMatch(content, /准备动作不等于开放|尚未确认有流动性|不代表 Factory 开放/);
 });
+
+test('real-time lane advances independently while historical scan remains backed off', async () => {
+  const state = createEarlySignalState(); state.cursor = 100; state.cursorHash = BH;
+  state.health.chain = { nextAttemptAtMs: nowMs + 60_000, lastError: 'archive unavailable' };
+  const rpc = async calls => calls.map(c => ({ eth_chainId: '0x38', eth_blockNumber: '0x3e8', eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] })[c.method]);
+  await runEarlySignalScan({ state, config: { mode: 'chain', realtime: true, nativeTransactions: false }, rpcBatch: rpc, nowMs });
+  assert.equal(state.realtimeCursor, 999);
+  assert.equal(state.cursor, 100);
+  assert.equal(state.historyEndBlock, 997);
+  assert.equal(state.health.realtime.lastError, '');
+  await runEarlySignalScan({ state, config: { mode: 'chain', nativeTransactions: false }, rpcBatch: rpc, nowMs });
+  assert.equal(state.cursor, 100);
+  rewindEarlySignals(state, 990, nowMs);
+  assert.equal(state.cursor, 100, 'reorg must not skip the historical gap');
+  assert.equal(state.realtimeCursor, 989);
+});
+
+test('historical lane stops at the saved realtime boundary without rescanning live events', async () => {
+  const state = createEarlySignalState(); state.cursor = 97; state.historyEndBlock = 99; state.realtimeCursor = 999;
+  const rpc = async calls => calls.map(c => ({ eth_chainId: '0x38', eth_blockNumber: '0x3e8', eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] })[c.method]);
+  await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
+  assert.equal(state.cursor, 99);
+  assert.equal(state.realtimeCursor, 999);
+});

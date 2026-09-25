@@ -329,6 +329,11 @@ export function switchProvider(providerName, modelOverride) {
  * @param {number} [opts.retries=1] - 重试次数
  * @returns {Promise<string|null>} AI 回复文本，失败返回 null
  */
+const providerCooldowns = new Map();
+export function aiFailurePolicy(status, body = "") {
+  const permanent = [401, 402, 403].includes(status) || /AccountOverdue|insufficient_quota|insufficient.balance/i.test(body);
+  return { retry: !permanent && (status === 408 || status === 429 || status >= 500), cooldownMs: permanent ? 30 * 60_000 : 0 };
+}
 export async function chatCompletion({
   systemPrompt,
   userMessage,
@@ -343,6 +348,8 @@ export async function chatCompletion({
     return null;
   }
 
+  const cooldownKey = [provider.name, provider.apiUrl, provider.apiKey].join("|");
+  if ((providerCooldowns.get(cooldownKey) || 0) > Date.now()) return null;
   const timeout = timeoutMs || provider.timeoutMs || 30_000;
   const isAnthropic = provider.format === "anthropic";
 
@@ -410,7 +417,10 @@ export async function chatCompletion({
 
       if (!res.ok) {
         const errText = await res.text().catch(() => "");
-        log(`[AI] 请求失败 HTTP ${res.status}: ${errText.slice(0, 200)}`);
+        const policy = aiFailurePolicy(res.status, errText);
+        log(`[AI] 请求失败 HTTP ${res.status}${policy.cooldownMs ? "，凭证或余额异常，暂停该提供商 30 分钟" : ""}`);
+        if (policy.cooldownMs) providerCooldowns.set(cooldownKey, Date.now() + policy.cooldownMs);
+        if (!policy.retry) return null;
         continue;
       }
 

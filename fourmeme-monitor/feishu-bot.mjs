@@ -384,7 +384,8 @@ function buildMonitorContext() {
         for (const nft of op.agentNfts) parts.push(`  ${nft}`);
       }
 
-      const actorState = snap.chainActorMonitor || {};
+      const actorHistory = snap.chainActorMonitor || {};
+      const actorState = actorHistory.realtime || actorHistory;
       const actorCount = actorState.actionActorCount
         ?? Object.values(actorState.actors || {}).filter(actor => actor.actionWatched).length;
       parts.push(`\n创建者动作监听: ${actorCount} 个地址`);
@@ -395,6 +396,7 @@ function buildMonitorContext() {
       if (actorState.creatorApiLookupEnabled) lookupModes.push("Etherscan API备用");
       if (lookupModes.length === 0) lookupModes.push("仅缓存/手动配置");
       parts.push(`  创建者来源: ${lookupModes.join(" + ")} | 缓存 ${cachedCreators} 个`);
+      if (actorHistory.historyEndBlock) parts.push("  历史补扫：" + actorHistory.lastBlock + " / " + actorHistory.historyEndBlock + (actorHistory.historyError ? "｜" + actorHistory.historyError : ""));
       if (actorState.lastBlock) parts.push(`  已扫描至确认块: ${actorState.lastBlock}`);
     } catch (err) {
       parts.push(`Four.meme 快照读取失败: ${err.message}`);

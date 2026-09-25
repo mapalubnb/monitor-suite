@@ -374,3 +374,21 @@ test("HTTP event fallback advances a compact cursor and preserves pending alerts
   acknowledgeContractIntegrityChanges(state, [state.pendingChanges[0].id]);
   assert.equal(state.pendingChanges.length, 0);
 });
+
+test('contract live cursor progresses even when archived logs are unavailable', async () => {
+  const state = createContractIntegrityState(); state.httpEventLastBlock = 100;
+  const rpcCall = async (method, params) => {
+    if (method === 'eth_getLogs') {
+      if (Number(params[0].fromBlock) < 900) throw new Error('archive unavailable');
+      return [];
+    }
+    throw new Error(method);
+  };
+  await scanContractIntegrityEvents({ state, rpcCall, latestBlock: 1000, realtime: true, maxBlocks: 50 });
+  assert.equal(state.httpRealtimeLastBlock, 1000);
+  assert.equal(state.httpEventLastBlock, 100);
+  assert.equal(state.eventHistoryEndBlock, 980);
+  await assert.rejects(scanContractIntegrityEvents({ state, rpcCall, latestBlock: 1000 }), /archive/);
+  assert.equal(state.httpRealtimeLastBlock, 1000);
+  assert.equal(state.httpEventLastBlock, 100);
+});

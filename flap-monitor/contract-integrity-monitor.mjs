@@ -503,15 +503,20 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
   return { processed: true, change };
 }
 
-export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock = 0, maxBlocks = 2_000, suppressFactoryUpgrade = false } = {}) {
-  const latest = latestBlock || hexToNumber(await rpcCall("eth_blockNumber", []));
-  if (!state.httpEventLastBlock) {
-    state.httpEventLastBlock = latest;
-    return { changed: false, changes: [], initialized: true, latest };
+export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock = 0, maxBlocks = 2_000, realtime = false, suppressFactoryUpgrade = false } = {}) {
+  const cursorKey = realtime ? "httpRealtimeLastBlock" : "httpEventLastBlock";
+  const latest = Math.min(latestBlock || hexToNumber(await rpcCall("eth_blockNumber", [])), realtime ? Infinity : state.eventHistoryEndBlock ?? Infinity);
+  if (!state[cursorKey]) {
+    if (!realtime) {
+      state[cursorKey] = latest;
+      return { changed: false, changes: [], initialized: true, latest };
+    }
+    state[cursorKey] = Math.max(0, latest - 20);
+    state.eventHistoryEndBlock ??= state[cursorKey];
   }
-  if (state.httpEventLastBlock >= latest) return { changed: false, changes: [], latest };
-  const fromBlock = state.httpEventLastBlock + 1;
-  const toBlock = Math.min(latest, state.httpEventLastBlock + Math.max(1, maxBlocks));
+  if (state[cursorKey] >= latest) return { changed: false, changes: [], latest };
+  const fromBlock = state[cursorKey] + 1;
+  const toBlock = Math.min(latest, state[cursorKey] + Math.max(1, maxBlocks));
   const otherAddresses = contractIntegritySubscriptionAddresses(state);
   const filters = [
     { address: FLAP_CORE_CONTRACTS.factory, topics: [CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS], fromBlock: numberToHex(fromBlock), toBlock: numberToHex(toBlock) },
@@ -524,7 +529,7 @@ export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock 
     const result = ingestContractIntegrityEvent(state, entry, "http-backfill", { suppressFactoryUpgrade });
     if (result.change) changes.push(result.change);
   }
-  state.httpEventLastBlock = toBlock;
+  state[cursorKey] = toBlock;
   return { changed: changes.length > 0, changes, latest, fromBlock, toBlock };
 }
 

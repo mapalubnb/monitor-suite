@@ -359,7 +359,8 @@ if [ -f "$SNAP" ]; then
     const fpKeys=Object.keys(fp);
     const op=s.onchainParams||{};
     const nfts=op.agentNfts||[];
-    const am=s.chainActorMonitor||{};
+    const actorHistory=s.chainActorMonitor||{};
+    const am=actorHistory.realtime||actorHistory;
     const allActors=am.actors||{};
     const actors=Object.keys(allActors).filter(a=>allActors[a]?.actionWatched);
     const cachedCreators=Object.values(am.creators||{}).filter(x=>x&&x.creator).length;
@@ -379,6 +380,7 @@ if [ -f "$SNAP" ]; then
     const bad=(text)=>color(text,'red');
     const lag=am.actorLagBlocks??(am.safeLatestBlock?Math.max(0,am.safeLatestBlock-am.lastBlock):'-');
     const health=[];
+    if(actorHistory.historyError) health.push(warn('创建者历史补扫异常'));
     if(pendingRoutes>0) health.push(warn('新路由待确认 '+pendingRoutes));
     if(feed.enabled!==undefined&&!feed.connected) health.push(warn('新区块 WS 未连接'));
     if(typeof lag==='number'&&lag>120) health.push(warn('扫链延迟 '+lag+' 块'));
@@ -401,6 +403,7 @@ if [ -f "$SNAP" ]; then
     console.log('**04｜性能指标**');
     const mem=runtime.memory||{};
     console.log('进程内存：RSS '+(mem.rss?Math.round(mem.rss/1024/1024)+' MB':'未知')+'｜堆使用 '+(mem.heapUsed?Math.round(mem.heapUsed/1024/1024)+' MB':'未知'));
+    console.log('创建者历史补扫：'+(actorHistory.lastBlock??'未知')+' / '+(actorHistory.historyEndBlock??'未知')+(actorHistory.historyError?'｜'+actorHistory.historyError:''));
     console.log('创建者扫描：'+(runtime.actorScanMode==='validatedBlockBatch'?'区块完整性校验':runtime.actorScanMode==='rawBlockPreFilter'?'原始区块快速过滤':runtime.actorScanMode==='rawBlockParsed'?'监听地址命中并完整解析':runtime.actorScanMode==='batchFallback'?'标准 RPC 兼容模式':'等待指标')+'｜快速跳过 '+(runtime.actorFastSkips??0)+'｜回退 '+(runtime.actorFallbacks??0));
     if(s._notificationOutbox?.length) console.log('待发送通知：'+s._notificationOutbox.length+' 条｜失败后自动重试');
     const sw=runtime.snapshotWrites||{};
@@ -543,7 +546,7 @@ if [ -f "$SNAP" ]; then
     const sp=fs.existsSync('$SAFE_STATE')?JSON.parse(fs.readFileSync('$SAFE_STATE','utf-8')):{};
     const es=fs.existsSync('$EARLY_STATE')?JSON.parse(fs.readFileSync('$EARLY_STATE','utf-8')):{};
     console.log('**底池提前信号**');
-    console.log('扫描区块：'+(es.cursor??'未建立')+'｜最新 '+(es.latestBlock??'未知')+'｜候选资产 '+Object.keys(es.tokens||{}).length+'｜待推送 '+(es.pendingChanges||[]).length);
+    console.log('实时扫描：'+(es.realtimeCursor??'未建立')+'｜历史补扫 '+(es.cursor??'未建立')+' / '+(es.historyEndBlock??'未知')+'｜最新 '+(es.latestBlock??'未知')+'｜候选资产 '+Object.keys(es.tokens||{}).length+'｜待推送 '+(es.pendingChanges||[]).length);
     for(const [name,h] of Object.entries(es.health||{})) if(h.lastError) console.log(name+'：'+h.lastError+'｜下次重试 '+new Date(h.nextAttemptAtMs||0).toISOString());
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+(chain==='robinhood'?'robinhood':'bnb')+'&lang=zh');
@@ -605,6 +608,7 @@ if [ -f "$SNAP" ]; then
     if(enabledVisibleFactories<visibleFactories) health.push(warn('有可见金库未启用'));
     if(wssNeedsAttention) health.push(warn('Factory 实时通道异常'));
     if(ci.lastError) health.push(warn('合约完整性检测异常'));
+    if(ci.eventHistoryError) health.push(warn('历史合约日志补扫受限'));
     if(sp.lastError) health.push(warn('Safe 提案检测异常'));
 
     const pageStats=keys.map(k=>{
@@ -684,6 +688,8 @@ if [ -f "$SNAP" ]; then
     console.log('监控状态：'+(integrityStatus==='运行正常'?ok(integrityStatus):warn(integrityStatus)));
     console.log('合约目录：'+integrityCatalog+' 个｜已知资产 '+integrityAssets+' 个｜待发送变更 '+((ci.pendingChanges||[]).length)+' 项');
     console.log('精准地址 WSS：'+(integrityWss.status||'尚未建立')+'｜已订阅 '+(Number(integrityWss.subscribedCount)||0)+'/'+(Number(integrityWss.configuredCount)||0));
+    console.log('事件实时扫描：'+(ci.httpRealtimeLastBlock??'未建立')+'｜历史补扫 '+(ci.httpEventLastBlock??'未建立')+' / '+(ci.eventHistoryEndBlock??'未知'));
+    if(ci.eventHistoryError) console.log('历史查询：'+ci.eventHistoryError);
     console.log('核心校验：'+(ci.lastCoreScanAt?fmtTime(ci.lastCoreScanAt):'尚未建立')+'｜扩展轮转 '+(ci.lastExtendedScanAt?fmtTime(ci.lastExtendedScanAt):'尚未建立')+'｜代码审计 '+(ci.lastCodeAuditAt?fmtTime(ci.lastCodeAuditAt):'尚未建立'));
     if(ci.lastError) console.log('最近异常：'+ci.lastError);
     console.log('');

@@ -3648,6 +3648,13 @@ function registerGlobalI18nResourceWatch(state, group) {
   return { item, isNew: !prev, changed: true };
 }
 
+function i18nSearchIndex(strings, cache) {
+  if (!cache.has(strings)) {
+    const text = strings.join("\n");
+    cache.set(strings, { text, lowerText: text.toLowerCase(), normalizedText: normalizeI18nSearchText(text) });
+  }
+  return cache.get(strings);
+}
 function globalI18nWatchKeywords(item = {}) {
   const namespaces = item.namespaces?.length ? item.namespaces : [item.primaryNamespace].filter(Boolean);
   const keys = (item.changes || []).map(c => c.key).filter(Boolean);
@@ -3666,21 +3673,28 @@ function routeMatchesGlobalI18nWatch(route, item) {
   return globalI18nWatchKeywords(item).namespaces.some(ns => ns && normalized.includes(ns.toLowerCase()));
 }
 
-function assetStringsMatchGlobalI18nWatch(strings = [], item) {
-  const text = strings.join("\n");
+function assetStringsMatchGlobalI18nWatch(strings = [], item, cache = new Map()) {
+  const { text, lowerText, normalizedText } = i18nSearchIndex(strings, cache);
   if (!text) return null;
-  const lowerText = text.toLowerCase();
   const { namespaces, keys, sampleValues } = globalI18nWatchKeywords(item);
   const namespaceHits = namespaces.filter(ns => ns && lowerText.includes(ns.toLowerCase()));
   const keyHits = keys.filter(key => lowerText.includes(String(key).toLowerCase())).slice(0, 5);
-  const valueHits = sampleValues.filter(value => normalizeI18nSearchText(text).includes(normalizeI18nSearchText(value))).slice(0, 5);
+  const valueHits = sampleValues.filter(value => normalizedText.includes(normalizeI18nSearchText(value))).slice(0, 5);
   if (namespaceHits.length > 0 && (keyHits.length > 0 || valueHits.length > 0)) {
     return { namespaceHits, keyHits, valueHits };
   }
   return null;
 }
 
-function detectGlobalI18nResourceEvidence(item, pages = {}) {
+function finishSearchSteps(iterator) {
+  let step;
+  do { step = iterator.next(); } while (!step.done);
+  return step.value;
+}
+function detectGlobalI18nResourceEvidence(item, pages = {}, cache = new Map()) {
+  return finishSearchSteps(globalI18nResourceSteps(item, pages, cache));
+}
+function* globalI18nResourceSteps(item, pages = {}, cache = new Map()) {
   const evidence = [];
   const seen = new Set();
 
@@ -3700,6 +3714,7 @@ function detectGlobalI18nResourceEvidence(item, pages = {}) {
   }
 
   for (const page of Object.values(pages || {})) {
+    yield;
     if (!page) continue;
     const pageText = page.textContent || "";
     for (const change of item.changes || []) {
@@ -3713,11 +3728,12 @@ function detectGlobalI18nResourceEvidence(item, pages = {}) {
         addEvidence(type, page, route, type === "route" ? "strong" : "medium");
       }
     }
-    const allStrings = [];
-    for (const data of Object.values(page.assetContents || {})) {
-      if (Array.isArray(data?.strings)) allStrings.push(...data.strings);
+    let allStrings = cache.get(page);
+    if (!allStrings) {
+      allStrings = Object.values(page.assetContents || {}).flatMap(data => data?.strings || []);
+      cache.set(page, allStrings);
     }
-    const assetHit = assetStringsMatchGlobalI18nWatch(allStrings, item);
+    const assetHit = assetStringsMatchGlobalI18nWatch(allStrings, item, cache);
     if (assetHit) {
       const parts = [];
       if (assetHit.namespaceHits.length) parts.push(`namespace=${assetHit.namespaceHits.join(",")}`);
@@ -3788,17 +3804,36 @@ function buildGlobalI18nResourceConfirmNotification(item) {
   };
 }
 
-function confirmGlobalI18nResourceWatches(state, pages = {}) {
+function confirmGlobalI18nResourceWatches(state, pages = {}, options = {}) {
+  return finishSearchSteps(globalI18nWatchSteps(state, pages, options));
+}
+async function confirmGlobalI18nResourceWatchesAsync(state, pages = {}, options = {}) {
+  const iterator = globalI18nWatchSteps(state, pages, options);
+  let deadline = Date.now() + 15;
+  while (true) {
+    const step = iterator.next();
+    if (step.done) return step.value;
+    if (Date.now() >= deadline) {
+      await new Promise(resolve => setImmediate(resolve));
+      deadline = Date.now() + 15;
+    }
+  }
+}
+function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity } = {}) {
+  const cache = new Map();
   const watch = ensureGlobalI18nResourceWatchState(state);
   const notifications = [];
   let changed = false;
   const now = Date.now();
-  for (const item of Object.values(watch)) {
-    if (!item || item.status === "confirmed") continue;
+  const pending = Object.values(watch).filter(item => item && item.status !== "confirmed");
+  const start = (state._globalI18nWatchCursor || 0) % Math.max(1, pending.length);
+  const selected = [...pending.slice(start), ...pending.slice(0, start)].slice(0, maxItems);
+  if (Number.isFinite(maxItems)) state._globalI18nWatchCursor = start + selected.length;
+  for (const item of selected) {
     item.lastCheckedAt = now;
     const evidence = [
-      ...detectGlobalI18nResourceEvidence(item, pages),
-      ...detectGlobalI18nStaticEvidence(item, state),
+      ...(yield* globalI18nResourceSteps(item, pages, cache)),
+      ...(yield* globalI18nStaticSteps(item, state, cache)),
     ];
     if (!isGlobalI18nResourceEvidenceSufficient(evidence)) {
       if (evidence.length > 0) item.evidence = evidence;
@@ -4055,7 +4090,10 @@ async function refreshFrontendStaticIndex(state, pages = {}, assetCache = null) 
   return { changed, assetsFetched: fetched };
 }
 
-function detectGlobalI18nStaticEvidence(item, state = snapshot) {
+function detectGlobalI18nStaticEvidence(item, state = snapshot, cache = new Map()) {
+  return finishSearchSteps(globalI18nStaticSteps(item, state, cache));
+}
+function* globalI18nStaticSteps(item, state = snapshot, cache = new Map()) {
   const index = state?._frontendStaticIndex;
   if (!index?.assets) return [];
   const evidence = [];
@@ -4077,10 +4115,10 @@ function detectGlobalI18nStaticEvidence(item, state = snapshot) {
   }
 
   for (const asset of Object.values(index.assets)) {
+    yield;
     const strings = asset.strings || [];
-    const text = strings.join("\n");
-    const normalizedText = normalizeI18nSearchText(text);
-    const keyHits = keys.filter(key => text.toLowerCase().includes(String(key).toLowerCase())).slice(0, 5);
+    const { text, lowerText, normalizedText } = i18nSearchIndex(strings, cache);
+    const keyHits = keys.filter(key => lowerText.includes(String(key).toLowerCase())).slice(0, 5);
     const valueHits = sampleValues.filter(value => normalizedText.includes(normalizeI18nSearchText(value))).slice(0, 5);
     const routeHits = (asset.routes || []).filter(route => routeMatchesGlobalI18nWatch(route, item)).slice(0, 5);
     const pathHit = namespaces.some(ns => ns && asset.path.toLowerCase().includes(ns.toLowerCase()));
@@ -8707,8 +8745,23 @@ function shouldLogActorCatchup(state, lagBefore, lagAfter) {
 }
 
 async function runActorCheck() {
+  await runActorLane(true);
+  const root = ensureActorMonitorState();
+  if (Date.now() < (root.historyNextAt || 0)) return;
+  try {
+    await runActorLane(false);
+    root.historyError = "";
+    root.historyNextAt = Date.now() + 10_000;
+  } catch (error) {
+    root.historyError = error.message;
+    root.historyNextAt = Date.now() + 60_000;
+    log("[创建者补扫] " + error.message);
+  }
+}
+async function runActorLane(realtime) {
   if (!CONFIG.actorMonitor.enabled) return;
-  const state = ensureActorMonitorState();
+  const root = ensureActorMonitorState();
+  const state = realtime ? (root.realtime ||= { creators: root.creators || {}, creatorLookup: root.creatorLookup || {}, seenTxs: [] }) : root;
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
     log("[创建者] 尚无合约指纹，等待合约模块建立基线");
@@ -8716,9 +8769,10 @@ async function runActorCheck() {
   }
 
   const latest = await fetchLatestBlockForActorCheck();
-  const safeLatest = Math.max(0, latest - CONFIG.actorMonitor.confirmations);
+  const safeLatest = Math.min(Math.max(0, latest - CONFIG.actorMonitor.confirmations), realtime ? Infinity : root.historyEndBlock ?? Infinity);
   if (!state.lastBlock) {
     state.lastBlock = Math.max(0, safeLatest - CONFIG.actorMonitor.bootstrapLookbackBlocks);
+    if (realtime && root.historyEndBlock == null) root.historyEndBlock = state.lastBlock;
     log(`[创建者] 初始化区块游标：${state.lastBlock}（最新块=${latest}，确认块=${safeLatest}）`);
   }
 
@@ -8757,9 +8811,7 @@ async function runActorCheck() {
   const lagBefore = Math.max(0, safeLatest - state.lastBlock);
 
   const runStart = Date.now();
-  const maxBlocksThisRun = lagBefore > CONFIG.actorMonitor.maxBlocksPerRun
-    ? CONFIG.actorMonitor.catchupMaxBlocksPerRun
-    : CONFIG.actorMonitor.maxBlocksPerRun;
+  const maxBlocksThisRun = realtime ? CONFIG.actorMonitor.maxBlocksPerRun : Math.min(80, CONFIG.actorMonitor.maxBlocksPerRun);
   let remainingBlocks = maxBlocksThisRun;
   let scannedBlocks = 0;
   let scannedBatches = 0;
@@ -9636,7 +9688,10 @@ async function runFrontendCheck() {
   }
   const staticIndexResult = await refreshFrontendStaticIndex(snapshot, confirmationPages);
   if (staticIndexResult.changed) snapshotDirty = true;
-  const globalI18nConfirm = confirmGlobalI18nResourceWatches(snapshot, confirmationPages);
+  const globalI18nConfirm = Date.now() - (snapshot._globalI18nConfirmAt || 0) >= 30_000
+    ? await confirmGlobalI18nResourceWatchesAsync(snapshot, confirmationPages, { maxItems: 4 })
+    : { notifications: [], changed: false };
+  if (globalI18nConfirm.changed) snapshot._globalI18nConfirmAt = Date.now();
   if (globalI18nConfirm.changed) snapshotDirty = true;
   if (globalI18nConfirm.notifications.length > 0) {
     notifications.push(...globalI18nConfirm.notifications);
@@ -10060,6 +10115,7 @@ export const __testables = {
   globalI18nWatchKey,
   registerGlobalI18nResourceWatch,
   confirmGlobalI18nResourceWatches,
+  confirmGlobalI18nResourceWatchesAsync,
   extractStaticAssetPathsFromText,
   mergeStaticAssetIndexFromPages,
   collectStaticAssetExpansionPaths,

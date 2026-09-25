@@ -1546,3 +1546,13 @@ test("overdue module scheduling skips expired ticks without changing the configu
   assert.equal(__testables.calculateNextModuleDueAt(1_000, 2_000, 2_500), 3_000);
   assert.equal(__testables.calculateNextModuleDueAt(1_000, 2_000, 7_500), 9_000);
 });
+
+test('background i18n confirmation rotates bounded work without dropping pending items', async () => {
+  const state = { _globalI18nResourceWatch: Object.fromEntries(Array.from({length: 9}, (_, i) => [String(i), { status: 'pending', changes: [{type: 'added', key: 'common.new'+i, value: 'unreleased '+i}], namespaces: ['common'] }])) };
+  const first = await __testables.confirmGlobalI18nResourceWatchesAsync(state, {}, { maxItems: 4 });
+  assert.equal(first.notifications.length, 0);
+  assert.equal(Object.values(state._globalI18nResourceWatch).filter(x => x.lastCheckedAt).length, 4);
+  await __testables.confirmGlobalI18nResourceWatchesAsync(state, {}, { maxItems: 4 });
+  await __testables.confirmGlobalI18nResourceWatchesAsync(state, {}, { maxItems: 4 });
+  assert.equal(Object.values(state._globalI18nResourceWatch).filter(x => x.lastCheckedAt).length, 9);
+});

@@ -58,6 +58,7 @@ export function loadEarlySignalState(path) {
     state.pendingChanges = state.pendingChanges.filter(e => !invalid(e));
     for (const [id, e] of Object.entries(state.events)) if (invalid(e)) delete state.events[id];
   }
+  if (state.health.chain) state.health.chain.nextAttemptAtMs = Math.min(state.health.chain.nextAttemptAtMs || 0, Date.now() + 60_000);
   pruneDiscoveryPools(state);
   return state;
 }
@@ -288,7 +289,7 @@ async function sourcePass(state, name, fn, nowMs, intervalMs = 0) {
   } catch (error) {
     health.failures = (health.failures || 0) + 1;
     health.lastError = error.message;
-    health.nextAttemptAtMs = nowMs + Math.max(Number(error.retryAfterMs) || 0, Math.min(1800000, 5000 * 2 ** Math.min(9, health.failures - 1)));
+    health.nextAttemptAtMs = nowMs + Math.max(Number(error.retryAfterMs) || 0, Math.min(name === "chain" || name === "realtime" ? 60_000 : 1800000, 5000 * 2 ** Math.min(9, health.failures - 1)));
   }
 }
 
@@ -395,7 +396,9 @@ export function rewindEarlySignals(state, fromBlock, nowMs = Date.now()) {
     delete meta.configurationCheckedAt;
   }
   emit(state, { id: `reorg:${state.cursorHash}:${fromBlock}`, kind: "reorg", source: "chain", detail: `检测到链重组：撤回 ${invalid.size} 条本地信号并从区块 ${fromBlock} 重扫；此前相关通知暂不作为确认依据` }, { nowMs });
-  state.cursor = fromBlock - 1;
+  state.cursor = Math.min(state.cursor ?? fromBlock - 1, fromBlock - 1);
+  if (state.realtimeCursor != null) state.realtimeCursor = Math.min(state.realtimeCursor, fromBlock - 1);
+  state.realtimeCursorHash = "";
   state.cursorHash = "";
 }
 
@@ -454,21 +457,23 @@ export async function refreshNativeBalances(state, config, rpcBatch, nowMs) {
   }
 }
 export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
+  const cursorKey = config.realtime ? "realtimeCursor" : "cursor";
+  const hashKey = config.realtime ? "realtimeCursorHash" : "cursorHash";
   const chain = await strictRpc(rpcBatch, "eth_chainId", []);
   if (Number(chain) !== 56) throw new Error("RPC chainId 不是 BSC 56");
   const latest = Number(await strictRpc(rpcBatch, "eth_blockNumber", []));
   state.latestBlock = latest;
   const confirmations = config.confirmations ?? 1;
-  const head = latest - confirmations;
+  const head = Math.min(latest - confirmations, config.realtime ? Infinity : state.historyEndBlock ?? Infinity);
   await validateFastBlocks(state, head, rpcBatch, nowMs);
-  const bootstrap = state.cursor == null;
-  let scanCursor = bootstrap ? Math.max(0, head - (config.bootstrapBlocks ?? 2)) : state.cursor;
+  const bootstrap = state[cursorKey] == null;
+  let scanCursor = bootstrap ? Math.max(0, head - (config.bootstrapBlocks ?? 2)) : state[cursorKey];
   if (scanCursor > head) return;
-  if (state.cursorHash) {
-    const previous = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(state.cursor), false]);
-    if (lower(previous.hash) !== state.cursorHash) {
-      rewindEarlySignals(state, Math.max(1, state.cursor - REORG_WINDOW), nowMs);
-      scanCursor = state.cursor;
+  if (state[hashKey]) {
+    const previous = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(state[cursorKey]), false]);
+    if (lower(previous.hash) !== state[hashKey]) {
+      rewindEarlySignals(state, Math.max(1, state[cursorKey] - REORG_WINDOW), nowMs);
+      scanCursor = state[cursorKey];
     }
   }
   const from = scanCursor + 1;
@@ -526,8 +531,9 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
         transactionHash: lower(tx.hash), detail: `BNB 直接转账 ${tx.from} → ${tx.to}｜wei ${BigInt(tx.value).toString()}（不含内部调用）` }, { nowMs, silent: bootstrap });
     }
   }
-  draft.cursor = to;
-  draft.cursorHash = lower(boundary.hash);
+  if (config.realtime && bootstrap && draft.historyEndBlock == null) draft.historyEndBlock = scanCursor;
+  draft[cursorKey] = to;
+  draft[hashKey] = lower(boundary.hash);
   draft.chainBaselineAt ||= iso(nowMs);
   for (const block of Object.keys(draft.fastBlocks || {})) if (Number(block) <= to) delete draft.fastBlocks[block];
   // Source health entries can be held by a concurrent API pass across an await.
@@ -668,7 +674,7 @@ function prune(state, nowMs) {
 export async function runEarlySignalScan({ state, config = {}, rpcBatch, fetchFn = globalThis.fetch, safeState, nowMs = Date.now() }) {
   if (!state || typeof rpcBatch !== "function") throw new Error("缺少提前监控状态或 RPC");
   syncEarlyProposals(state, safeState, nowMs);
-  if (config.mode !== "external") await sourcePass(state, "chain", () => scanEarlyChain(state, config, rpcBatch, nowMs), nowMs);
+  if (config.mode !== "external") await sourcePass(state, config.realtime ? "realtime" : "chain", () => scanEarlyChain(state, config, rpcBatch, nowMs), nowMs);
   if (config.mode !== "chain") {
     const enabled = source => !config.sources || config.sources.includes(source);
     const periodicInterval = config.scheduledSource ? 0 : 10000;
