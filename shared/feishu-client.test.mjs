@@ -1,5 +1,36 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { isAuthorizedSender, sendCard } from './feishu-client.mjs';
+
+test('bot authorization denies an empty whitelist and unknown operators', () => {
+  assert.equal(isAuthorizedSender('ou_one', []), false);
+  assert.equal(isAuthorizedSender('', ['ou_one']), false);
+  assert.equal(isAuthorizedSender('ou_other', ['ou_one']), false);
+  assert.equal(isAuthorizedSender('ou_one', [' ou_one ']), true);
+});
+
+test('card retries resume unsent parts with stable request ids', async () => {
+  let saved = [];
+  let fail = true;
+  const requests = [];
+  const transport = {
+    withToken: async () => ({}), pause: async () => {},
+    client: { im: { message: { create: async request => {
+      requests.push(request.data.uuid);
+      if (requests.length === 2 && fail) throw new Error('offline');
+      return { code: 0, data: { message_id: `message-${requests.length}` } };
+    } } } },
+  };
+  const options = () => ({ chatId: 'test-chat', deliveryId: 'stable-alert', sentParts: [...saved], onPartSent: async parts => { saved = [...parts]; } });
+  await assert.rejects(sendCard('test', 'x'.repeat(5000), 'red', options(), transport), /offline/);
+  assert.equal(saved.length, 1);
+  fail = false;
+  const first = await sendCard('test', 'x'.repeat(5000), 'red', options(), transport);
+  assert.equal(first, 'message-1');
+  assert.equal(requests.length, 3);
+  assert.equal(requests[1], requests[2]);
+  assert.notEqual(requests[0], requests[1]);
+});
 
 import { assertFeishuResponse, balanceCardFontTags, buildCardJson, splitMessageContent } from "./feishu-client.mjs";
 

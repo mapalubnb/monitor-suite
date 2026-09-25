@@ -11,11 +11,17 @@
  */
 
 import * as lark from "@larksuiteoapi/node-sdk";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+export function isAuthorizedSender(senderId, allowedSenders) {
+  return typeof senderId === "string" && senderId.length > 0
+    && allowedSenders.map(id => String(id).trim()).filter(Boolean).includes(senderId);
+}
 
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
@@ -563,16 +569,18 @@ async function pauseBetweenChunks(index, total) {
  * @param {string} [opts.diffFilePath] - Diff 文件路径（卡片内嵌下载按钮）
  * @returns {Promise<string>} message_id
  */
-export async function sendCard(title, content, template = "red", opts = {}) {
-  const client = getClient();
+export async function sendCard(title, content, template = "red", opts = {}, transport = {}) {
+  const client = transport.client || getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
   const chunks = balanceCardFontTags(splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT - 40));
-  const tokenOpt = await withToken();
-  let firstMessageId = "";
+  const tokenOpt = await (transport.withToken || withToken)();
+  const sentParts = opts.sentParts || [];
+  let firstMessageId = sentParts[0] || "";
   for (let i = 0; i < chunks.length; i++) {
+    if (sentParts[i]) continue;
     const cardJson = buildCardJson(
       partTitle(title, i + 1, chunks.length),
       chunks[i],
@@ -585,13 +593,17 @@ export async function sendCard(title, content, template = "red", opts = {}) {
         receive_id: targetChatId,
         content: cardJson,
         msg_type: "interactive",
+        ...(opts.deliveryId ? { uuid: createHash("sha256").update(`${opts.deliveryId}:${i}`).digest("hex").slice(0, 40) } : {}),
       },
     }, tokenOpt);
     if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
     const messageId = res.data?.message_id;
+    if (!messageId) throw new Error("飞书发送成功响应缺少 message_id");
+    sentParts[i] = messageId;
+    if (opts.onPartSent) await opts.onPartSent(sentParts);
     if (!firstMessageId) firstMessageId = messageId;
     log(`[飞书 SDK] 卡片已发送${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""} → ${messageId}`);
-    await pauseBetweenChunks(i + 1, chunks.length);
+    await (transport.pause || pauseBetweenChunks)(i + 1, chunks.length);
   }
   return firstMessageId;
 }

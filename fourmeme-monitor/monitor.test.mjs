@@ -1,9 +1,122 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 process.env.FOURMEME_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
+
+test('real module runner atomically persists its state and notification and rolls back failed scans', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fourmeme-transaction-'));
+  const config = __testables.CONFIG;
+  const originalPath = config.snapshotFile;
+  try {
+    config.snapshotFile = join(dir, 'snapshot.json');
+    const state = __testables.setSnapshotForTests({ poolConfig: { revision: 1 } });
+    await __testables.saveSnapshot();
+    const read = () => JSON.parse(readFileSync(config.snapshotFile, 'utf8'));
+    const runner = __testables.createModuleRunner('pool', async () => {
+      state.poolConfig.revision = 2;
+      await __testables.saveSnapshot();
+      assert.equal(read().poolConfig.revision, 1);
+      await __testables.sendNotificationMaybeAi({ title: 'pool update', content: 'test', skipAi: true });
+    }, 2000);
+    await runner.run();
+    assert.equal(read().poolConfig.revision, 2);
+    assert.equal(read()._notificationOutbox.length, 1);
+    assert.equal(read()._atomicNotifications, true);
+    await __testables.createModuleRunner('pool', async () => {
+      state.poolConfig.revision = 3;
+      await __testables.saveSnapshot();
+      throw new Error('simulated read failure');
+    }, 2000).run();
+    assert.equal(read().poolConfig.revision, 2);
+    assert.equal(state.poolConfig.revision, 2);
+  } finally {
+    config.snapshotFile = originalPath;
+    __testables.setSnapshotForTests({});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('atomic snapshot migration ignores stale actor checkpoint and rejects corrupt snapshots', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fourmeme-snapshot-'));
+  const config = __testables.CONFIG;
+  const previous = { snapshotFile: config.snapshotFile, actorStateFile: config.actorStateFile };
+  try {
+    config.snapshotFile = join(dir, 'snapshot.json');
+    config.actorStateFile = join(dir, 'actor-state.json');
+    writeFileSync(config.snapshotFile, JSON.stringify({ _atomicNotifications: true, chainActorMonitor: { lastBlock: 200 } }));
+    writeFileSync(config.actorStateFile, JSON.stringify({ chainActorMonitor: { lastBlock: 100 } }));
+    assert.equal(__testables.loadSnapshot().chainActorMonitor.lastBlock, 200);
+    writeFileSync(config.snapshotFile, '{broken');
+    assert.throws(() => __testables.loadSnapshot(), /快照读取失败/);
+  } finally {
+    Object.assign(config, previous);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("GitHub six commits are unique and pagination covers more than 100 commits", async () => {
+  const commits = Array.from({ length: 106 }, (_, i) => ({ sha: `sha${i}` }));
+  const pages = [];
+  const result = await __testables.checkGithub('sha105', async (size, page) => {
+    pages.push(page); return commits.slice((page - 1) * size, page * size);
+  }, async sha => ({ sha, files: [] }), async () => {});
+  assert.deepEqual(pages, [1, 2]);
+  assert.equal(result.newCommits.length, 105);
+  assert.equal(new Set(result.newCommits.map(c => c.sha)).size, 105);
+  const six = await __testables.checkGithub('old', async () => commits.slice(0, 6), async sha => ({ sha }), async () => {});
+  assert.equal(six.newCommits.length, 6);
+});
+
+test("missing actor blocks and mixed forks cannot advance a scan", async () => {
+  await assert.rejects(__testables.fetchActorBlockActions(1, 1, { actors: new Map() }, { seenTxs: [] }, async () => [null]), /不完整/);
+  const hash = `0x${'1'.repeat(64)}`;
+  const calls = [1, 2].map(n => ({ params: [`0x${n}`, true] }));
+  assert.throws(() => __testables.validateActorBlocks(calls, [
+    { number: '0x1', hash, transactions: [] },
+    { number: '0x2', hash, parentHash: 'wrong', transactions: [] },
+  ]), /分叉/);
+  await assert.rejects(__testables.fetchValidatedActorBlocks(
+    calls.slice(0, 1), ['0x1111111111111111111111111111111111111111'],
+    async (_, __, options) => options.parseResponse({ text: async () => '[{"id":1,"result":null}]' }),
+    async () => [null],
+  ), /不完整/);
+});
+
+test("OpenFour failed count and truncated preset pages never become removals", async () => {
+  await assert.rejects(__testables.fetchOpenFourPresetIds(async () => [null]), /数量读取失败/);
+  let calls = 0;
+  await assert.rejects(__testables.fetchOpenFourPresetIds(async () => ++calls === 1 ? [`0x${'1'.padStart(64, '0')}`] : [null]), /列表读取失败/);
+});
+
+test("HTTP timeout includes stalled response body after headers", async () => {
+  let headersSent = false;
+  const server = createServer((_, res) => { res.writeHead(200); res.flushHeaders(); headersSent = true; res.write('partial'); });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await assert.rejects(__testables.fetchWithTimeout(`http://127.0.0.1:${server.address().port}/`, {}, 150), /abort/i);
+    assert.equal(headersSent, true);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("contract code cache preserves fast slot checks and expires for periodic audit", async () => {
+  const cache = new Map();
+  const calls = [{ method: 'eth_getStorageAt', params: ['0x1'] }, { method: 'eth_getCode', params: ['0x1'] }];
+  const batches = [];
+  const rpc = async batch => { batches.push(batch.map(c => c.method)); return batch.map(c => c.method === 'eth_getCode' ? '0x6000' : `0x${'0'.repeat(64)}`); };
+  await __testables.cachedContractBatch(calls, rpc, cache, 1);
+  await __testables.cachedContractBatch(calls, rpc, cache, 2);
+  await __testables.cachedContractBatch(calls, rpc, cache, 600_001);
+  assert.deepEqual(batches, [['eth_getStorageAt', 'eth_getCode'], ['eth_getStorageAt'], ['eth_getStorageAt', 'eth_getCode']]);
+});
 
 test("default fourmeme frontend and api cadences are fast but bounded", () => {
   assert.equal(__testables.CONFIG.intervals.pool, 2_000);
@@ -130,7 +243,7 @@ test("actor raw prefilter does not retry through batch when all RPC nodes back o
   error.code = "BSC_RPC_ALL_BACKED_OFF";
   let fallbackCalls = 0;
   await assert.rejects(
-    __testables.fetchActorBlocksWithRawPrefilter(
+    __testables.fetchValidatedActorBlocks(
       [{ method: "eth_getBlockByNumber", params: ["latest", true] }],
       ["0x1111111111111111111111111111111111111111"],
       async () => { throw error; },
@@ -1411,10 +1524,4 @@ test("host limiter spaces request starts without waiting for the previous respon
 test("overdue module scheduling skips expired ticks without changing the configured interval", () => {
   assert.equal(__testables.calculateNextModuleDueAt(1_000, 2_000, 2_500), 3_000);
   assert.equal(__testables.calculateNextModuleDueAt(1_000, 2_000, 7_500), 9_000);
-});
-
-test("actor raw block prefilter detects watched addresses without parsing JSON", () => {
-  const actor = "0x0000000000000000000000000000000000000001";
-  assert.equal(__testables.rawRpcPayloadContainsActor(`{"result":{"transactions":[{"from":"${actor}"}]}}`, [actor]), true);
-  assert.equal(__testables.rawRpcPayloadContainsActor('{"result":{"transactions":[]}}', [actor]), false);
 });

@@ -20,7 +20,7 @@ import { promisify } from "node:util";
 import {
   replyText as _sdkReplyText, replyCard as _sdkReplyCard,
   replyFile as _sdkReplyFile, uploadFile as _sdkUploadFile,
-  lark,
+  lark, isAuthorizedSender,
 } from "../shared/feishu-client.mjs";
 import { AI, chatCompletion, listProviders, listRemoteModels, switchProvider } from "../shared/ai-client.mjs";
 
@@ -55,7 +55,7 @@ const CONFIG = {
   execMaxBuffer: Number(process.env.FEISHU_BOT_EXEC_MAX_BUFFER || 16 * 1024 * 1024),
 
   // 允许的发送者（open_id）白名单
-  allowedSenders: (process.env.FEISHU_ALLOWED_SENDERS || "").split(",").filter(Boolean),
+  allowedSenders: (process.env.FEISHU_ALLOWED_SENDERS || "").split(",").map(id => id.trim()).filter(Boolean),
 };
 
 /* ══════════════════════════════════════════
@@ -1162,6 +1162,11 @@ async function handleFrontendRouteAction(data) {
 }
 
 async function handleCardAction(data) {
+  const senderId = data?.operator?.open_id || data?.event?.operator?.open_id || "";
+  if (!isAuthorizedSender(senderId, CONFIG.allowedSenders)) {
+    log(`[鉴权] 拒绝未授权卡片操作：${senderId || "未知用户"}`);
+    return;
+  }
   const val = parseActionValue(data?.action?.value ?? data?.event?.action?.value);
   if (["frontend_add_route", "frontend_ignore_route"].includes(val.action)) {
     await handleFrontendRouteAction(data);
@@ -1200,7 +1205,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 
       // 发送者鉴权
       const senderId = data?.sender?.sender_id?.open_id || "";
-      if (CONFIG.allowedSenders.length > 0 && !CONFIG.allowedSenders.includes(senderId)) {
+      if (!isAuthorizedSender(senderId, CONFIG.allowedSenders)) {
         log(`未授权用户：${senderId}`);
         return;
       }

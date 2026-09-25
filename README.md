@@ -11,7 +11,7 @@
 - **前端增量抓取**：FourMeme 保留真实 `dpl` 部署 URL，同路径部署参数变化直接迁移缓存，只下载新增或路径变化的资源；部分失败会在下轮只补抓失败项。
 - **前端抗风控**：同一进程使用稳定浏览器标识，脚本和样式请求携带正确的资源类型与页面来源；同域请求只错开启动时间，慢响应不会串行阻塞页面和 API 监控。
 - **Factory 防漏检**：新候选先保存再复核，getter 暂时失败会持续重试；RPC 空日志需双节点确认，避免错误推进游标。
-- **低资源运行**：不使用 `newHeads`，不枚举未知 mapping；精准事件配合状态复核。提前监控默认读取短窗口完整区块，过滤关联钱包的直接 BNB 交易，可用 `FLAP_EARLY_NATIVE_TX_SCAN=false` 关闭。
+- **低资源运行**：精准日志与 `newHeads` 按需触发复核，不枚举未知 mapping；HTTP 保留断线兜底。提前监控默认读取短窗口完整区块，过滤关联钱包的直接 BNB 交易，可用 `FLAP_EARLY_NATIVE_TX_SCAN=false` 关闭。
 
 > ℹ️ 项目不包含心跳检测和日报，只推送启动、变更、异常与恢复消息。
 
@@ -41,6 +41,8 @@ FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
 ```
 
 AI 摘要可选，填写 `DOUBAO_API_KEY`、`DEEPSEEK_API_KEY`、`QWEN_API_KEY` 或 `OPENAI_API_KEY` 中任意一个即可。
+
+使用机器人命令和卡片操作时，必须配置 `FEISHU_ALLOWED_SENDERS`（当前应用下的用户 open_id，逗号分隔）。留空会拒绝全部交互操作；自动监控和告警发送不受影响。
 
 所有可配置项及说明见 [.env.example](./.env.example)。
 
@@ -78,8 +80,10 @@ pm2 status
 | Four.meme | 前端页面、文案、i18n、路由与资源 | 7 秒 |
 | Four.meme | 公开 API 结构与值 | 10 秒 |
 | Four.meme | 创建者链上动作 | WebSocket 实时，HTTP 8 秒兜底 |
+| Four.meme | OpenFour Registry 模块与 preset 注册 | WSS 实时，重连复查，HTTP 30 秒兜底 |
+| Four.meme | 合约字节码完整审计 | 10 分钟；代理槽仍每 2 秒，新 implementation 立即读取 |
 | Four.meme | GitHub 提交 | 有 Token 30 秒，无 Token 90 秒 |
-| Flap.sh | 页面与 Vault Portal 注册事件 | 页面 1 秒；注册事件沿用现有低频确认扫描 |
+| Flap.sh | 页面与 Vault Portal 注册事件 | 页面 1 秒；注册事件独立 WSS + HTTP 1 秒，保留确认块 |
 | Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | WSS 实时，HTTP 1 秒兜底，不等待确认块 |
 | Flap.sh | Factory 断点补扫 | 后台运行，自动找回停机或 RPC 故障期间的变化 |
 | Flap.sh | Factory 已知资产复核 | 后台轮转，补充发现 getter 状态变化 |
@@ -128,7 +132,19 @@ pm2 status
 - BNB 自定义金库链接统一使用 `vaultfactory=<地址>&chain=bnb&lang=zh`，Robinhood 使用对应的 `chain=robinhood` 参数。
 - 启动卡片与状态卡片显示 Factory WSS 订阅数、最后订阅/事件时间、短窗口回扫结果及 HTTP 扫描进度，不显示交易和内部配置字段。
 
-## 本次更新：1.5.0 / Flap 1.4.0
+## 本次更新：1.6.0 / Four.meme 1.1.0
+
+- Four.meme 每轮扫描隔离修改的快照字段；快照与待发送通知通过同一次原子替换写入。扫描或写盘失败保留旧状态，并发写入同一字段时重试，避免游标先行、通知丢失。
+- 待发送通知保存在 `snapshot.json` 的 `_notificationOutbox`，发送与扫描分离；失败指数退避，重启后续发，不截断积压。分片发送记录进度并使用稳定请求 ID；`fm-status` 在积压时显示数量。
+- 创建者扫描校验区块编号、哈希、父块与回执；缺块不推进游标。检测到游标所在区块变化时回退 64 块，按交易及区块哈希去重。旧 `actor-state.json` 仅在首次迁移时读取，之后以原子主快照为准。
+- OpenFour 增加 30 秒兜底及 WSS 重连复查，RPC 错误不再转换成空 preset 列表。底池移除的 10 分钟确认等待跨重启保留。
+- GitHub 修复超过 5 条提交的重复汇总，按页追溯到上次 SHA；单轮最多 2000 条，超过上限保留游标并报错。最多补全 30 条提交详情，其余保留提交摘要。
+- HTTP 超时覆盖响应正文；启动时并行建立基线，慢模块和启动卡片不阻塞其他监控。合约代码缓存 10 分钟，代理槽保持 2 秒，新实现地址立即读取。
+- 机器人消息与卡片统一检查发送者白名单，默认拒绝未配置白名单的交互操作。升级前填写 `FEISHU_ALLOWED_SENDERS`。
+
+升级需更新整个项目并重新运行安装脚本，新增共享文件 `shared/transactional-outbox.mjs` 会自动复制。保留已有状态文件；不要将新版原子快照与旧 `actor-state.json` 人工合并。卡片发送采用持久化重试；飞书的 [请求 ID 去重窗口为 1 小时](https://larksuite.github.io/oapi-sdk-java/com/lark/oapi/service/im/v1/model/CreateMessageReqBody.Builder.html)，远端已接收但本地尚未落盘的极端故障不能保证永久恰好一次。HTTP 状态轮询仍无法还原两次采样之间已经消失的中间状态。
+
+## 上次更新：1.5.0 / Flap 1.4.0
 
 - 提前信号新增 WSS 回执快速通道，保留确认块、规范链校验、HTTP 补扫和双通道去重；新区块触发确认复核，新资产／池动态更新订阅。
 - CoW、资产复核、LP 仓位、余额和地址发现各自独立调度；相关事件优先复核资产。扫描不再等待飞书发送，重入触发合并后续执行。

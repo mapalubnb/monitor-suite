@@ -21,6 +21,7 @@
  * 信号：kill -USR1 <PID>  立即触发全量检测
  */
 
+import { createTransactionalOutbox } from "../shared/transactional-outbox.mjs";
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mkdirSync, readdirSync, unlinkSync, statSync } from "node:fs";
@@ -609,7 +610,7 @@ function scheduleRuntimeMetricsWrite() {
           ? Math.round(snapshotWriteMetrics.totalDurationMs / snapshotWriteMetrics.writes)
           : 0,
       },
-      actorScanMode: actorRawScanState.lastMode || "rawBlockPreFilter",
+      actorScanMode: actorRawScanState.lastMode || "validatedBlockBatch",
       actorFastSkips: actorRawScanState.fastSkips,
       actorFallbacks: actorRawScanState.fallbacks,
       frontend: {
@@ -687,12 +688,11 @@ const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? nu
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
 const CURRENT_SCHEMA_VERSION = 9;
-let snapshotWriteQueue = Promise.resolve();
-let actorStateWriteQueue = Promise.resolve();
 let runtimeMetricsWriteQueue = Promise.resolve();
 let frontendSnapshotRevision = 0;
 let cachedFrontendDiskRevision = -1;
 let cachedFrontendDiskSections = null;
+let cachedFrontendDiskSourcePages = null;
 const snapshotWriteMetrics = { writes: 0, actorWrites: 0, lastDurationMs: 0, totalDurationMs: 0 };
 
 const REMOVED_FRONTEND_URLS = new Set([
@@ -735,7 +735,7 @@ function loadSnapshot() {
       const data = JSON.parse(readFileSync(CONFIG.snapshotFile, "utf-8"));
       const migrated = migrateSnapshot(data);
       try {
-        if (existsSync(CONFIG.actorStateFile)) {
+        if (!data._atomicNotifications && existsSync(CONFIG.actorStateFile)) {
           const actorState = JSON.parse(readFileSync(CONFIG.actorStateFile, "utf-8"));
           if (actorState?.chainActorMonitor) migrated.chainActorMonitor = actorState.chainActorMonitor;
         }
@@ -744,7 +744,7 @@ function loadSnapshot() {
       }
       return migrated;
     }
-  } catch { /* ignore */ }
+  } catch (err) { throw new Error(`快照读取失败，停止启动以保护待发送通知：${err.message}`); }
   return null;
 }
 
@@ -892,45 +892,24 @@ function mergeExternalFrontendRouteState(data = snapshot) {
   return changed;
 }
 
-function saveSnapshot(data) {
-  if (moduleMetricContext.getStore()?.moduleName === "frontend") frontendSnapshotRevision++;
-  snapshotWriteQueue = snapshotWriteQueue.then(() => {
-    const startedAt = Date.now();
-    try {
-      mergeExternalFrontendRouteState(data);
-      data._schemaVersion = CURRENT_SCHEMA_VERSION;
-      data.lastCheck = ts();
-      // 紧凑且延后序列化，避免写队列堆积多份大快照字符串。
-      const serialized = JSON.stringify(compactFrontendSnapshotForDisk(data));
-      const tmpFile = CONFIG.snapshotFile + ".tmp";
-      writeFileSync(tmpFile, serialized, "utf-8");
-      renameSync(tmpFile, CONFIG.snapshotFile);
-      snapshotWriteMetrics.writes++;
-    } catch (err) {
-      log(`[快照] 写入失败：${err.message}`);
-    } finally {
-      const durationMs = Date.now() - startedAt;
-      snapshotWriteMetrics.lastDurationMs = durationMs;
-      snapshotWriteMetrics.totalDurationMs += durationMs;
-    }
-  });
-  return snapshotWriteQueue;
+let persistedFrontendPages;
+function persistMonitorSnapshot(data) {
+  if (data.frontendPages !== persistedFrontendPages) frontendSnapshotRevision++;
+  const startedAt = Date.now();
+  mergeExternalFrontendRouteState(data);
+  data._schemaVersion = CURRENT_SCHEMA_VERSION;
+  data._atomicNotifications = true;
+  data.lastCheck = ts();
+  const tmpFile = CONFIG.snapshotFile + ".tmp";
+  writeFileSync(tmpFile, JSON.stringify(compactFrontendSnapshotForDisk(data)), "utf-8");
+  renameSync(tmpFile, CONFIG.snapshotFile);
+  persistedFrontendPages = data.frontendPages;
+  snapshotWriteMetrics.writes++;
+  snapshotWriteMetrics.lastDurationMs = Date.now() - startedAt;
+  snapshotWriteMetrics.totalDurationMs += snapshotWriteMetrics.lastDurationMs;
 }
-
-function saveActorCheckpoint(data = snapshot) {
-  const actorState = data?.chainActorMonitor;
-  if (!actorState) return actorStateWriteQueue;
-  actorStateWriteQueue = actorStateWriteQueue.then(() => {
-    try {
-      const tmpFile = CONFIG.actorStateFile + ".tmp";
-      writeFileSync(tmpFile, JSON.stringify({ chainActorMonitor: actorState, updatedAt: ts() }), "utf-8");
-      renameSync(tmpFile, CONFIG.actorStateFile);
-      snapshotWriteMetrics.actorWrites++;
-    } catch (err) {
-      log(`[创建者] 独立状态写入失败：${err.message}`);
-    }
-  });
-  return actorStateWriteQueue;
+async function saveSnapshot() {
+  monitorStore.flush();
 }
 
 /* ── 飞书消息（SDK 统一通道） ── */
@@ -958,6 +937,7 @@ async function sendFeishu(title, content, template = "red", _retries = 2) {
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
 async function sendCardViaApi(title, content, template = "red", diffFilePath, retries = 2, cardOpts = {}) {
+  if (cardOpts.deliveryId) retries = 0;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
       return await sendCard(title, content, template, { ...cardOpts, diffFilePath });
@@ -1015,13 +995,13 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
   const initialContent = urlLine + content;
   // 1. 立即推送裸 diff（秒级送达）
   let messageId = await sendCardViaApi(title, initialContent, template, diffFilePath, 2, cardOpts);
-  if (!messageId) {
+  if (!messageId && !cardOpts.deliveryId) {
     log(`[推送] 即时通道失败，切换队列兜底：${title}`);
     messageId = await sendCardQueued(title, initialContent, template, { ...cardOpts, diffFilePath });
   }
 
   // 2. 异步调用 AI → 编辑原消息补充摘要（不阻塞调用方）
-  if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
+  if (messageId && AI_CONFIG.enabled && AI_CONFIG.apiKey) {
     summarizeWithRetry(aiInput || content, moduleContext).then(async (summary) => {
       if (!summary) return;
       const enriched = enrichFn
@@ -1127,13 +1107,15 @@ function shouldUseAiForNotification({ title = "", content = "", moduleContext = 
   return true;
 }
 
-async function sendNotificationMaybeAi({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, cardOpts = {}, skipAi = false }) {
+async function sendNotificationMaybeAi(payload) { return monitorStore.enqueue(payload); }
+
+async function deliverNotification({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, cardOpts = {}, skipAi = false }) {
   if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
     const urlLine = url ? `🔗 [查看详情](${url})\n\n` : "";
     let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath, 2, cardOpts || {});
-    if (!messageId) {
+    if (!messageId && !cardOpts.deliveryId) {
       log(`[推送] AI 已跳过，立即通道失败，切换队列兜底：${title}`);
-      await sendCardQueued(title, urlLine + content, template, { ...(cardOpts || {}), diffFilePath });
+      messageId = await sendCardQueued(title, urlLine + content, template, { ...(cardOpts || {}), diffFilePath });
     } else {
       log(`[AI] 已跳过：${title}`);
     }
@@ -1257,7 +1239,9 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
       recordCurrentModuleRequest();
-      return await fetch(url, { ...opts, signal: ctrl.signal });
+      const res = await fetch(url, { ...opts, signal: opts?.signal ? AbortSignal.any([opts.signal, ctrl.signal]) : ctrl.signal });
+      const body = res.body ? await res.arrayBuffer() : null;
+      return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
     } finally {
       clearTimeout(timer);
     }
@@ -2657,7 +2641,7 @@ function hydrateFrontendSnapshotAssets(data) {
 function compactFrontendSnapshotForDisk(data) {
   if (!data?.frontendPages) return data;
   const diskData = { ...data, frontendPages: {}, _frontendAssetStore: {} };
-  if (cachedFrontendDiskSections && cachedFrontendDiskRevision === frontendSnapshotRevision) {
+  if (cachedFrontendDiskSections && cachedFrontendDiskRevision === frontendSnapshotRevision && cachedFrontendDiskSourcePages === data.frontendPages) {
     diskData.frontendPages = cachedFrontendDiskSections.frontendPages;
     diskData._frontendAssetStore = cachedFrontendDiskSections.assetStore;
     return diskData;
@@ -2682,6 +2666,7 @@ function compactFrontendSnapshotForDisk(data) {
   }
 
   cachedFrontendDiskRevision = frontendSnapshotRevision;
+  cachedFrontendDiskSourcePages = data.frontendPages;
   cachedFrontendDiskSections = {
     frontendPages: diskData.frontendPages,
     assetStore: diskData._frontendAssetStore,
@@ -6627,15 +6612,17 @@ function nonZeroAddress(addr) {
   return normalized && normalized !== ZERO_ADDRESS ? normalized : "";
 }
 
-async function fetchOpenFourPresetIds() {
+async function fetchOpenFourPresetIds(rpcBatchFn = bscRpcBatch) {
   const registry = normalizeAddress(CONFIG.contracts.openFourRegistry);
   if (!registry) return [];
-  const [countHex] = await bscRpcBatch([{
+  const [countHex] = await rpcBatchFn([{
     method: "eth_call",
     params: [{ to: registry, data: OPEN_FOUR_REGISTRY_SELECTORS.getPresetIdsCount }, "latest"],
   }]);
-  const count = Number(decodeUint256(countHex || "0x0"));
-  if (!Number.isFinite(count) || count <= 0) return [];
+  if (!isValidRpcHex(countHex, { bytes: 32 })) throw new Error("OpenFour preset 数量读取失败");
+  const count = Number(decodeUint256(countHex));
+  if (!Number.isSafeInteger(count) || count < 0 || count > 100_000) throw new Error("OpenFour preset 数量无效");
+  if (count === 0) return [];
 
   const calls = [];
   const batchSize = 50;
@@ -6652,8 +6639,11 @@ async function fetchOpenFourPresetIds() {
       }, "latest"],
     });
   }
-  const results = await bscRpcBatch(calls);
-  return [...new Set(results.flatMap(r => decodeUintArray(r || "0x")))].sort((a, b) => {
+  const results = await rpcBatchFn(calls);
+  if (results.length !== calls.length || results.some(r => !isValidRpcHex(r) || r.length < 130)) throw new Error("OpenFour preset 列表读取失败");
+  const ids = results.flatMap(r => decodeUintArray(r));
+  if (ids.length !== count || new Set(ids).size !== count) throw new Error("OpenFour preset 列表不完整");
+  return [...new Set(ids)].sort((a, b) => {
     const ai = BigInt(a), bi = BigInt(b);
     return ai < bi ? -1 : ai > bi ? 1 : 0;
   });
@@ -6702,9 +6692,10 @@ async function fetchOpenFourDiscoveredModules() {
   }
 
   const results = await bscRpcBatch(calls);
+  if (results.length !== calls.length) throw new Error("OpenFour 模块批量响应不完整");
   for (let i = 0; i < results.length; i++) {
     const hex = results[i];
-    if (!hex) continue;
+    if (!isValidRpcHex(hex) || hex.length < (callMeta[i].type === "tokenImpl" ? 66 : 2 + 64 * (OPEN_FOUR_MODULE_ROLES.length + 1))) throw new Error("OpenFour 模块实现读取失败");
     const meta = callMeta[i];
     if (meta.type === "tokenImpl") {
       addOpenFourModuleEntry(byAddress, decodeAddress(hex, 0), "tokenImpl", meta.presetId);
@@ -6847,8 +6838,8 @@ function githubHeaders() {
   return h;
 }
 
-async function fetchLatestCommits(perPage = 30) {
-  const url = `${GITHUB_API}/repos/${CONFIG.githubRepo}/commits?sha=${CONFIG.githubApiBranch}&per_page=${perPage}`;
+async function fetchLatestCommits(perPage = 100, page = 1) {
+  const url = `${GITHUB_API}/repos/${CONFIG.githubRepo}/commits?sha=${CONFIG.githubApiBranch}&per_page=${perPage}&page=${page}`;
   const headers = githubHeaders();
 
   const res = await fetchSafe(url, { headers }, 10_000);
@@ -7107,10 +7098,18 @@ function buildGithubFullDiff(newCommits) {
   return lines.join("\n");
 }
 
-async function checkGithub(lastSha) {
-  const commits = await fetchLatestCommits(30);
+async function checkGithub(lastSha, fetchPage = fetchLatestCommits, fetchDetail = fetchCommitDetail, delay = sleep) {
+  const commits = [];
+  for (let page = 1; ; page++) {
+    const batch = await fetchPage(100, page);
+    if (!Array.isArray(batch)) throw new Error("GitHub 提交列表无效");
+    commits.push(...batch);
+    if (!lastSha || batch.some(c => c.sha === lastSha) || batch.length < 100) break;
+    if (page >= 20) throw new Error("GitHub 提交积压超过 2000 条，保留游标，需检查分支历史");
+  }
   if (!commits || commits.length === 0) return { newSha: lastSha, newCommits: [] };
   const latestSha = commits[0].sha;
+  if (!lastSha) return { newSha: latestSha, newCommits: [] };
   if (latestSha === lastSha) return { newSha: lastSha, newCommits: [] };
 
   const newCommits = [];
@@ -7124,9 +7123,9 @@ async function checkGithub(lastSha) {
   const detailed = [];
   const detailLimit = Math.min(newCommits.length, GITHUB_COMMIT_DETAIL_LIMIT);
   const detailTasks = newCommits.slice(0, detailLimit).map((c, i) => {
-    return sleep(i * 250).then(async () => {
+    return delay(i * 250).then(async () => {
       try {
-        return await fetchCommitDetail(c.sha);
+        return await fetchDetail(c.sha);
       } catch (err) {
         log(`[GitHub] 获取提交详情失败 ${c.sha.slice(0, 8)}：${err.message}`);
         return c;
@@ -7137,7 +7136,7 @@ async function checkGithub(lastSha) {
   for (const r of detailResults) {
     detailed.push(r.status === "fulfilled" ? r.value : newCommits[detailed.length]);
   }
-  for (const c of newCommits.slice(5)) detailed.push(c);
+  for (const c of newCommits.slice(detailLimit)) detailed.push(c);
 
   return { newSha: latestSha, newCommits: detailed };
 }
@@ -7527,7 +7526,41 @@ function isValidRpcHex(value, { bytes } = {}) {
   return bytes == null || value.length === 2 + bytes * 2;
 }
 
-async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bscRpcBatch) {
+const contractCodeCache = new Map();
+const contractCodeSummaries = new Map();
+async function cachedContractBatch(calls, rpcBatchFn, cache, now = Date.now()) {
+  const pending = [], indexes = [], result = [];
+  calls.forEach((call, i) => {
+    const key = call.params[0]?.toLowerCase();
+    const entry = call.method === "eth_getCode" ? cache.get(key) : null;
+    if (entry && now - entry.at < 600_000) result[i] = entry.code;
+    else { pending.push(call); indexes.push(i); }
+  });
+  if (pending.length) {
+    const values = await rpcBatchFn(pending);
+    if (values.length !== pending.length) throw new Error("合约 RPC 批量响应不完整");
+    values.forEach((value, j) => {
+      const call = pending[j];
+      result[indexes[j]] = value;
+      if (call.method === "eth_getCode" && isValidRpcHex(value) && value !== "0x") {
+        cache.set(call.params[0].toLowerCase(), { code: value, at: now });
+      }
+    });
+  }
+  while (cache.size > 512) cache.delete(cache.keys().next().value);
+  return result;
+}
+function summarizeContractCode(code) {
+  let summary = contractCodeSummaries.get(code);
+  if (!summary) {
+    summary = { hash: md5(code), size: Math.floor((code.length - 2) / 2), selectors: extractSelectors(code) };
+    contractCodeSummaries.set(code, summary);
+    while (contractCodeSummaries.size > 512) contractCodeSummaries.delete(contractCodeSummaries.keys().next().value);
+  }
+  return summary;
+}
+
+async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bscRpcBatch, cache = rpcBatchFn === bscRpcBatch ? contractCodeCache : new Map()) {
   const result = {};
 
   // 主合约代码与代理槽在同一批读取，避免不兼容的 eth_getProof 增加一次往返。
@@ -7536,7 +7569,7 @@ async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bs
     calls.push({ method: "eth_getStorageAt", params: [c.addr, CONFIG.eip1967Slot, "latest"] });
     calls.push({ method: "eth_getCode", params: [c.addr, "latest"] });
   }
-  const batchResults = await rpcBatchFn(calls);
+  const batchResults = await cachedContractBatch(calls, rpcBatchFn, cache);
 
   for (let i = 0; i < bscContracts.length; i++) {
     const c = bscContracts[i];
@@ -7549,10 +7582,10 @@ async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bs
       throw new Error(`合约 ${c.label} 字节码读取失败，保留上一轮快照`);
     }
     result[c.label] = {
-      codeHash: md5(code),
-      codeSize: Math.floor((code.length - 2) / 2),
+      codeHash: summarizeContractCode(code).hash,
+      codeSize: summarizeContractCode(code).size,
       address: c.addr,
-      selectors: extractSelectors(code),
+      selectors: summarizeContractCode(code).selectors,
       source: c.source || "static",
       networkCode: c.networkCode || CONFIG.networkCode,
     };
@@ -7567,7 +7600,7 @@ async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bs
 
   const implItems = Object.entries(result).filter(([, item]) => item.implAddress);
   const implCodes = implItems.length > 0
-    ? await rpcBatchFn(implItems.map(([, item]) => ({ method: "eth_getCode", params: [item.implAddress, "latest"] })))
+    ? await cachedContractBatch(implItems.map(([, item]) => ({ method: "eth_getCode", params: [item.implAddress, "latest"] })), rpcBatchFn, cache)
     : [];
   for (let i = 0; i < implItems.length; i++) {
     const [label, item] = implItems[i];
@@ -7575,9 +7608,9 @@ async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bs
     if (!isValidRpcHex(code)) {
       throw new Error(`合约 ${label} implementation 字节码读取失败，保留上一轮快照`);
     }
-    item.implCodeHash = md5(code);
-    item.implCodeSize = Math.floor((code.length - 2) / 2);
-    item.implSelectors = extractSelectors(code);
+    item.implCodeHash = summarizeContractCode(code).hash;
+    item.implCodeSize = summarizeContractCode(code).size;
+    item.implSelectors = summarizeContractCode(code).selectors;
   }
 
   return result;
@@ -8354,16 +8387,9 @@ function classifyActorTx(tx, context) {
   };
 }
 
-const actorRawScanState = { lastMode: "rawBlockPreFilter", fastSkips: 0, fallbacks: 0 };
+const actorRawScanState = { lastMode: "validatedBlockBatch", fastSkips: 0, fallbacks: 0 };
 
-function rawRpcPayloadContainsActor(payload, actorAddresses) {
-  const addresses = (actorAddresses || []).map(address => String(address || "").trim()).filter(Boolean);
-  if (addresses.length === 0) return false;
-  const pattern = addresses.map(address => address.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-  return new RegExp(pattern, "i").test(String(payload || ""));
-}
-
-async function fetchActorBlocksWithRawPrefilter(
+async function fetchValidatedActorBlocks(
   blockCalls,
   actorAddresses,
   rpcRequestFn = requestBscRpcPayload,
@@ -8380,21 +8406,12 @@ async function fetchActorBlocksWithRawPrefilter(
     return await rpcRequestFn(payload, 15_000, {
       parseResponse: async res => {
         const raw = await res.text();
-        if (!rawRpcPayloadContainsActor(raw, actorAddresses)) {
-          if (/"error"\s*:/i.test(raw) || !/"result"\s*:/i.test(raw)) {
-            throw new Error(`区块 RPC 返回异常：${raw.slice(0, 200)}`);
-          }
-          actorRawScanState.lastMode = "rawBlockPreFilter";
-          actorRawScanState.fastSkips++;
-          return [];
-        }
         const parsed = JSON.parse(raw);
-        if (!Array.isArray(parsed) || parsed.some(item => item?.error)) {
-          throw new Error(`区块 RPC 返回无效：${raw.slice(0, 200)}`);
-        }
-        parsed.sort((a, b) => a.id - b.id);
-        actorRawScanState.lastMode = "rawBlockParsed";
-        return parsed.map(item => item.result);
+        if (!Array.isArray(parsed) || parsed.length !== blockCalls.length || new Set(parsed.map(item => item.id)).size !== blockCalls.length) throw new Error("区块 RPC 批量响应不完整");
+        const blocks = normalizeBscRpcBatchResults(blockCalls, parsed);
+        validateActorBlocks(blockCalls, blocks);
+        actorRawScanState.lastMode = "validatedBlockBatch";
+        return blocks;
       },
       dedupeKeySuffix: `actor-raw:${[...actorAddresses].sort().join(",")}`,
     });
@@ -8402,9 +8419,19 @@ async function fetchActorBlocksWithRawPrefilter(
     if (err?.code === "BSC_RPC_ALL_BACKED_OFF") throw err;
     actorRawScanState.lastMode = "batchFallback";
     actorRawScanState.fallbacks++;
-    log(`[创建者] 原始区块预过滤不可用，回退标准 RPC 解析：${err?.message || "未知错误"}`);
-    return rpcBatchFn(blockCalls);
+    log(`[创建者] 区块读取或校验失败，回退标准 RPC：${err?.message || "未知错误"}`);
+    const blocks = await rpcBatchFn(blockCalls);
+    validateActorBlocks(blockCalls, blocks);
+    return blocks;
   }
+}
+
+function validateActorBlocks(calls, blocks) {
+  if (!Array.isArray(blocks) || blocks.length !== calls.length) throw new Error("区块 RPC 缺块，保留游标");
+  blocks.forEach((block, i) => {
+    if (!block || !Array.isArray(block.transactions) || !/^0x[0-9a-f]{64}$/i.test(block.hash || "") || BigInt(block.number || -1) !== BigInt(calls[i].params[0])) throw new Error("区块 RPC 数据不完整，保留游标");
+    if (i && block.parentHash !== blocks[i - 1].hash) throw new Error("区块 RPC 分叉不一致，保留游标");
+  });
 }
 
 async function fetchActorBlockActions(fromBlock, toBlock, context, state, rpcBatchFn = bscRpcBatch) {
@@ -8417,19 +8444,23 @@ async function fetchActorBlockActions(fromBlock, toBlock, context, state, rpcBat
     .map(([address]) => normalizeAddress(address))
     .filter(Boolean);
   const blocks = rpcBatchFn === bscRpcBatch
-    ? await fetchActorBlocksWithRawPrefilter(blockCalls, actorAddresses)
+    ? await fetchValidatedActorBlocks(blockCalls, actorAddresses)
     : await rpcBatchFn(blockCalls);
+  if (actorAddresses.length || rpcBatchFn !== bscRpcBatch) validateActorBlocks(blockCalls, blocks);
+  if (state.lastBlockHash && blocks[0] && blocks[0].parentHash !== state.lastBlockHash) throw new Error("创建者批次与游标分叉不一致");
   const seen = new Set(state.seenTxs || []);
   const actions = [];
   for (const block of blocks) {
     if (!block?.transactions) continue;
     for (const tx of block.transactions) {
       const hash = String(tx.hash || "").toLowerCase();
-      if (!hash || seen.has(hash)) continue;
+      const seenKey = `${hash}:${block.hash}`;
+      if (!hash || seen.has(hash) || seen.has(seenKey)) continue;
       const action = classifyActorTx(tx, context);
       if (!action) continue;
+      action.blockHash = block.hash;
       actions.push(action);
-      seen.add(hash);
+      seen.add(seenKey);
     }
   }
 
@@ -8437,16 +8468,18 @@ async function fetchActorBlockActions(fromBlock, toBlock, context, state, rpcBat
     const receiptResults = await rpcBatchFn(actions.map(a => ({ method: "eth_getTransactionReceipt", params: [a.hash] })));
     for (let i = 0; i < actions.length; i++) {
       const receipt = receiptResults[i];
-      actions[i].status = receipt?.status || "";
+      if (!receipt || !["0x0", "0x1"].includes(receipt.status) || receipt.transactionHash?.toLowerCase() !== actions[i].hash || !blocks.some(block => block.hash === receipt.blockHash)) throw new Error("创建者交易回执缺失或分叉，保留游标");
+      actions[i].status = receipt.status;
       actions[i].contractAddress = normalizeAddress(receipt?.contractAddress);
       actions[i].logsCount = Array.isArray(receipt?.logs) ? receipt.logs.length : 0;
     }
   }
+  Object.defineProperty(actions, "blockHash", { value: blocks.at(-1)?.hash });
   return actions;
 }
 
 function rememberActorTxs(state, actions) {
-  const merged = [...(state.seenTxs || []), ...actions.map(a => a.hash).filter(Boolean)];
+  const merged = [...(state.seenTxs || []), ...actions.map(a => a.hash && `${a.hash}:${a.blockHash}`).filter(Boolean)];
   state.seenTxs = [...new Set(merged)].slice(-500);
 }
 
@@ -8531,10 +8564,9 @@ function scheduleOpenFourModuleDiscovery(context) {
   openFourRegistryLogState.discoveryTimer = setTimeout(async () => {
     openFourRegistryLogState.discoveryTimer = null;
     openFourRegistryLogState.discoveryRunning = true;
-    const pending = openFourRegistryLogState.pendingContext || { reason: "OpenFourRegistry log" };
     openFourRegistryLogState.pendingContext = null;
     try {
-      await runOpenFourModuleDiscoveryCheck(pending);
+      await openFourDiscoveryRunner.run();
     } catch (err) {
       openFourRegistryLogState.lastError = err.message || String(err);
       log(`[OpenFourRegistry] 新模块发现检查失败：${openFourRegistryLogState.lastError}`);
@@ -8553,6 +8585,7 @@ function handleOpenFourRegistryLogMessage(raw) {
     openFourRegistryLogState.connected = true;
     openFourRegistryLogState.reconnectAttempts = 0;
     log(`[OpenFourRegistry] 已订阅 Registry logs：${msg.result}`);
+    scheduleOpenFourModuleDiscovery({ reason: "connected" });
     return;
   }
   const event = msg.params?.result;
@@ -8695,8 +8728,6 @@ function shouldLogActorCatchup(state, lagBefore, lagAfter) {
 async function runActorCheck() {
   if (!CONFIG.actorMonitor.enabled) return;
   const state = ensureActorMonitorState();
-  const stateBefore = JSON.stringify(state);
-  let persistedActorStateSignature = stateBefore;
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
     log("[创建者] 尚无合约指纹，等待合约模块建立基线");
@@ -8710,10 +8741,20 @@ async function runActorCheck() {
     log(`[创建者] 初始化区块游标：${state.lastBlock}（最新块=${latest}，确认块=${safeLatest}）`);
   }
 
+  if (state.lastBlockHash && state.lastBlock) {
+    const [anchor] = await bscRpcBatch([{ method: "eth_getBlockByNumber", params: [blockTag(state.lastBlock), false] }]);
+    if (!anchor?.hash) throw new Error("创建者游标区块校验失败");
+    if (anchor.hash !== state.lastBlockHash) {
+      state.lastBlock = Math.max(0, state.lastBlock - 64);
+      state.lastBlockHash = "";
+      state.lastBlockTimestamp = 0;
+      log("[创建者] 检测到链重组，回退 64 块重新扫描");
+    }
+  }
   state.latestBlock = latest;
   state.safeLatestBlock = safeLatest;
   state.actorLagBlocks = Math.max(0, safeLatest - state.lastBlock);
-  state.actorLagSecondsApprox = state.actorLagBlocks * 3;
+  state.actorLagSecondsApprox = Number.isFinite(state.blockIntervalSeconds) ? Math.round(state.actorLagBlocks * state.blockIntervalSeconds) : null;
   state.contractCount = contractEntries.length;
   state.creatorChainLookupEnabled = CONFIG.actorMonitor.creatorChainLookupEnabled;
   state.creatorPageLookupEnabled = CONFIG.actorMonitor.creatorPageLookupEnabled;
@@ -8742,7 +8783,6 @@ async function runActorCheck() {
   let scannedBlocks = 0;
   let scannedBatches = 0;
   let anyActions = false;
-  let lastActorProgressSaveAt = Date.now();
 
   while (state.lastBlock < safeLatest && remainingBlocks > 0) {
     const fromBlock = state.lastBlock + 1;
@@ -8754,10 +8794,19 @@ async function runActorCheck() {
     const toBlock = fromBlock + batchSize - 1;
     const actions = await fetchActorBlockActions(fromBlock, toBlock, context, state);
 
+    const [anchor] = await bscRpcBatch([{ method: "eth_getBlockByNumber", params: [blockTag(toBlock), false] }]);
+    if (!anchor?.hash) throw new Error("创建者扫描结束区块缺失");
+    if (actions.blockHash && anchor.hash !== actions.blockHash) throw new Error("创建者扫描期间发生重组，保留游标");
+    if (state.lastBlockTimestamp && toBlock > state.lastBlock) {
+      const interval = (hexToNumber(anchor.timestamp || "0x0") - state.lastBlockTimestamp) / (toBlock - state.lastBlock);
+      if (interval > 0 && interval < 60) state.blockIntervalSeconds = interval;
+    }
+    state.lastBlockTimestamp = hexToNumber(anchor.timestamp || "0x0");
+    state.lastBlockHash = anchor.hash;
     state.lastBlock = toBlock;
     state.lastBlockAt = ts();
     state.actorLagBlocks = Math.max(0, safeLatest - state.lastBlock);
-    state.actorLagSecondsApprox = state.actorLagBlocks * 3;
+    state.actorLagSecondsApprox = Number.isFinite(state.blockIntervalSeconds) ? Math.round(state.actorLagBlocks * state.blockIntervalSeconds) : null;
     state.lastRunScannedBlocks = scannedBlocks + batchSize;
     state.lastRunBatches = scannedBatches + 1;
     state.lastRunAt = ts();
@@ -8766,13 +8815,6 @@ async function runActorCheck() {
     scannedBlocks += batchSize;
     scannedBatches++;
     remainingBlocks -= batchSize;
-    const shouldPersistProgress = actions.length > 0
-      || Date.now() - lastActorProgressSaveAt >= 10_000;
-    if (shouldPersistProgress) {
-      await saveActorCheckpoint(snapshot);
-      persistedActorStateSignature = JSON.stringify(state);
-      lastActorProgressSaveAt = Date.now();
-    }
 
     if (actions.length > 0) {
       anyActions = true;
@@ -8792,7 +8834,7 @@ async function runActorCheck() {
   }
 
   state.actorLagBlocks = Math.max(0, safeLatest - state.lastBlock);
-  state.actorLagSecondsApprox = state.actorLagBlocks * 3;
+  state.actorLagSecondsApprox = Number.isFinite(state.blockIntervalSeconds) ? Math.round(state.actorLagBlocks * state.blockIntervalSeconds) : null;
   state.lastRunScannedBlocks = scannedBlocks;
   state.lastRunBatches = scannedBatches;
   state.lastRunAt = ts();
@@ -8818,9 +8860,6 @@ async function runActorCheck() {
   } else {
     // 追块期间创建者补全会拖慢实时扫链；进度日志由 shouldLogActorCatchup 节流输出。
   }
-
-  const finalActorStateSignature = JSON.stringify(state);
-  if (persistedActorStateSignature !== finalActorStateSignature) await saveActorCheckpoint(snapshot);
 
   if (anyActions) {
     try {
@@ -8873,7 +8912,8 @@ function handleActorBlockFeedMessage(actorRunner, raw) {
   const headHex = msg?.params?.result?.number;
   if (!headHex) return;
   const headBlock = hexToNumber(headHex);
-  if (!headBlock || headBlock <= actorBlockFeedState.latestHeadBlock) return;
+  if (!headBlock || (headBlock === actorBlockFeedState.latestHeadBlock && msg.params.result.hash === actorBlockFeedState.latestHeadHash)) return;
+  actorBlockFeedState.latestHeadHash = msg.params.result.hash;
 
   actorBlockFeedState.latestHeadBlock = headBlock;
   actorBlockFeedState.lastHeadAt = Date.now();
@@ -8949,9 +8989,16 @@ function startActorBlockFeed(actorRunner) {
    ══════════════════════════════════════════ */
 
 /* ── 全局状态 ── */
-let snapshot = loadSnapshot();
+const monitorStore = createTransactionalOutbox({
+  initial: loadSnapshot() || {},
+  persist: persistMonitorSnapshot,
+  deliver: (payload, deliveryOptions) => deliverNotification({ ...payload, cardOpts: { ...payload.cardOpts, ...deliveryOptions } }),
+  onError: err => log(`[待发送] 发送失败，已保留并退避重试：${err.message}`),
+});
+let snapshot = monitorStore.state;
+let outboxTimer = null;
+let monitorStopping = false;
 let startTime = Date.now();
-let modulePollCounts = { pool: 0, frontend: 0, api: 0, openfourTemplates: 0, github: 0, contract: 0, onchain: 0, actor: 0 };
 const moduleMetrics = createModuleMetricsState();
 const apiEmptyArrayLogState = new Map();
 const frontendMetrics = {
@@ -8964,7 +9011,13 @@ const frontendMetrics = {
 };
 
 /* ── 已移除底池缓存（防止 API 短暂返回不完整数据导致误报）── */
-const removedPoolsCache = new Map(); // poolKey -> { data, expireAt }
+const removedPoolsCache = {
+  get values() { return snapshot._pendingPoolRemovals ||= {}; },
+  set(key, value) { this.values[key] = value; },
+  get(key) { return this.values[key]; },
+  delete(key) { delete this.values[key]; },
+  [Symbol.iterator]() { return Object.entries(this.values)[Symbol.iterator](); },
+};
 const REMOVED_POOLS_TTL = 600_000; // 10 分钟
 
 function cacheRemovedPools(removedChanges, oldList) {
@@ -9053,7 +9106,7 @@ async function flushExpiredPoolRemovals() {
 
 // 定期刷新过期移除缓存
 if (!IS_TEST_MODE) {
-  setInterval(() => { flushExpiredPoolRemovals().catch(e => log(`[底池] 移除缓存刷新异常：${e.message}`)); }, 120_000);
+  setInterval(() => { (monitorStopping ? Promise.resolve() : monitorStore.transaction(flushExpiredPoolRemovals)).catch(e => log(`[底池] 移除缓存刷新异常：${e.message}`)); }, 120_000);
 }
 
 /* ── [已移除] 资源/路由抖动缓存和去重缓存 ──
@@ -9108,6 +9161,7 @@ function createModuleRunner(name, fn, intervalMs) {
   let pending = false;
   let backoffSkips = 0;
   const run = async () => {
+    if (monitorStopping) return;
     if (running) {
       pending = true;
       return;
@@ -9119,10 +9173,9 @@ function createModuleRunner(name, fn, intervalMs) {
         const metricSample = { moduleName: name, durationMs: 0, requestCount: 0, backoffCount: 0, errorCount: 0 };
         const startedAt = Date.now();
         try {
-          await moduleMetricContext.run(metricSample, fn);
+          await moduleMetricContext.run(metricSample, () => monitorStore.transaction(fn));
           metricSample.durationMs = Date.now() - startedAt;
           recordModuleMetric(moduleMetrics, name, metricSample);
-          modulePollCounts[name]++;
           // warn if recovering from backoff skips (only notify if significant)
           if (backoffSkips > 0) {
             const skipped = backoffSkips;
@@ -9138,8 +9191,11 @@ function createModuleRunner(name, fn, intervalMs) {
             }
           }
           clearModuleError(name);
-          try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
+          if (!IS_TEST_MODE) {
+            try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
+          }
         } catch (err) {
+          if (name === "github") githubReposETag = "";
           metricSample.durationMs = Date.now() - startedAt;
           if (err.message?.includes("[退避中]")) {
             metricSample.backoffCount = 1;
@@ -9155,7 +9211,7 @@ function createModuleRunner(name, fn, intervalMs) {
             recordModuleError(name, err.message);
           }
         }
-      } while (pending);
+      } while (pending && !monitorStopping);
     } finally {
       running = false;
     }
@@ -9824,6 +9880,8 @@ const modules = [
   createModuleRunner("actor",    runActorCheck,     CONFIG.actorMonitor.wsEnabled ? CONFIG.actorMonitor.httpFallbackMs : CONFIG.intervals.actor),
 ];
 const actorRunner = modules.find(m => m.name === "actor");
+const openFourDiscoveryRunner = createModuleRunner("openfourDiscovery", () => CONFIG.openFourRegistryLogMonitor.enabled ? runOpenFourModuleDiscoveryCheck() : undefined, 30_000);
+modules.push(openFourDiscoveryRunner);
 
 function calculateNextModuleDueAt(nextDueAt, intervalMs, now = Date.now()) {
   let next = nextDueAt + intervalMs;
@@ -9839,7 +9897,7 @@ function buildStartupProgressContent() {
   return [
     `**01｜运行状态**`,
     `状态：监控启动中`,
-    `进度：进程已启动，正在依次建立或刷新全部模块基线`,
+    `进度：进程已启动，正在并行建立或刷新全部模块基线`,
     `完成条件：底池、前端、API、OpenFour、GitHub、合约、链上参数和创建者动作完成首轮检查`,
     ``,
     `**02｜模块频率**`,
@@ -9906,7 +9964,7 @@ function buildStartupReadyContent() {
     ``,
     `**05｜性能基线**`,
     `内存：RSS ${Math.round(memory.rss / 1024 / 1024)} MB｜堆使用 ${Math.round(memory.heapUsed / 1024 / 1024)} MB`,
-    `创建者扫描：完整区块原始文本预过滤｜无命中跳过 JSON 解析`,
+    `创建者扫描：区块完整性校验｜游标分叉回查｜失败保留进度`,
     ...performanceLines,
   ].join("\n");
 }
@@ -9925,25 +9983,20 @@ async function startAllModules() {
     printPoolList(snapshot.poolConfig);
   }
 
-  const startupMessageId = await sendStartupCard(
+  const startupMessagePromise = sendStartupCard(
     "Four.meme 全面监控 v2 启动中",
     buildStartupProgressContent(),
     "blue"
   );
 
-  // 首次启动：所有模块依次执行一次（建立基线）
-  for (const m of modules) {
-    await m.run();
-    await sleep(500); // 各模块间隔 500ms，避免同时大量请求
-  }
-  if (CONFIG.openFourRegistryLogMonitor.enabled) {
-    try {
-      await runOpenFourModuleDiscoveryCheck({ reason: "startup" });
-    } catch (err) {
-      log(`[OpenFour模块] 启动基线建立失败：${err.message}`);
-    }
-  }
+  outboxTimer = setInterval(() => monitorStore.drain().catch(err => log(`[待发送] 落盘失败：${err.message}`)), 1_000);
+  void monitorStore.drain().catch(err => log(err.message));
+  if (actorRunner && CONFIG.actorMonitor.enabled) global.__actorBlockFeed = startActorBlockFeed(actorRunner);
+  if (CONFIG.openFourRegistryLogMonitor.enabled) global.__openFourRegistryLogFeed = startOpenFourRegistryLogFeed();
+  startModuleTimers();
+  await Promise.all(modules.map(async (m, index) => { await sleep(index * 100); await m.run(); }));
 
+  const startupMessageId = await startupMessagePromise;
   const startupReadyContent = buildStartupReadyContent();
   const startupPatched = await patchStartupCard(
     startupMessageId,
@@ -9955,14 +10008,9 @@ async function startAllModules() {
     await sendStartupCard("Four.meme 全面监控 v2 已启动", startupReadyContent, "green");
   }
 
-  // WebSocket 新区块订阅只负责触发创建者动作检测；HTTP 定时器继续作为断线/漏事件兜底。
-  if (actorRunner && CONFIG.actorMonitor.enabled) {
-    global.__actorBlockFeed = startActorBlockFeed(actorRunner);
-  }
-  if (CONFIG.openFourRegistryLogMonitor.enabled) {
-    global.__openFourRegistryLogFeed = startOpenFourRegistryLogFeed();
-  }
+}
 
+function startModuleTimers() {
   // 启动各模块独立定时器（递归 setTimeout 实现 per-tick 抖动）
   const moduleTimers = []; // 存储定时器 ID，供优雅退出时清理
   for (const m of modules) {
@@ -9974,6 +10022,7 @@ async function startAllModules() {
       else moduleTimers.push({ name: m.name, timerId });
     }
     function scheduleModule(delayMs = 0) {
+      if (monitorStopping) return;
       const timerId = setTimeout(async () => {
         await m.run();
         nextDueAt = calculateNextModuleDueAt(nextDueAt, m.intervalMs);
@@ -10016,10 +10065,9 @@ if (!IS_TEST_MODE) {
   });
 }
 
-let isShuttingDown = false;
 async function gracefulShutdown(signal) {
-  if (isShuttingDown) return;
-  isShuttingDown = true;
+  if (monitorStopping) return;
+  monitorStopping = true;
   log(`收到 ${signal}，正在优雅退出...`);
   // 停止所有模块定时器，防止退出期间继续生产新通知
   if (global.__moduleTimers) {
@@ -10038,12 +10086,12 @@ async function gracefulShutdown(signal) {
     global.__openFourRegistryLogFeed.stop();
     log("已停止 OpenFourRegistry WebSocket 日志订阅");
   }
+  if (outboxTimer) clearInterval(outboxTimer);
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   // 保存最终快照
   try {
     persistFrontendAssetFailureDiagnostics();
-    await saveActorCheckpoint(snapshot);
     await saveSnapshot(snapshot);
     await runtimeMetricsWriteQueue;
   } catch {}
@@ -10056,12 +10104,21 @@ if (!IS_TEST_MODE) {
 
 function setSnapshotForTests(value) {
   if (!IS_TEST_MODE) return snapshot;
-  snapshot = migrateSnapshot(value || {});
+  monitorStore.replace(migrateSnapshot(value || {}));
   return snapshot;
 }
 
 export const __testables = {
   CONFIG,
+  createModuleRunner,
+  sendNotificationMaybeAi,
+  saveSnapshot,
+  loadSnapshot,
+  cachedContractBatch,
+  validateActorBlocks,
+  checkGithub,
+  fetchWithTimeout,
+  fetchOpenFourPresetIds,
   urlToKey,
   canonicalFrontendUrl,
   getFrontendMonitorUrls,
@@ -10138,7 +10195,7 @@ export const __testables = {
   bscRpcCall,
   bscRpcBatch,
   normalizeBscRpcBatchResults,
-  fetchActorBlocksWithRawPrefilter,
+  fetchValidatedActorBlocks,
   fetchStaticAssetSafe,
   nextUA,
   browserHeaders,
@@ -10165,7 +10222,6 @@ export const __testables = {
   createHostLimiter,
   calculateNextModuleDueAt,
   fetchActorBlockActions,
-  rawRpcPayloadContainsActor,
   buildStartupProgressContent,
   buildStartupReadyContent,
   diffApiStructures,

@@ -123,6 +123,7 @@ CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/ai-client.mjs "$SHARED_DIR/"
   cp shared/feishu-client.mjs "$SHARED_DIR/"
+  cp shared/transactional-outbox.mjs "$SHARED_DIR/"
   cp .env.example "$SUITE_DIR/.env.example"
   if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
     cp ai-models.json "$SUITE_DIR/"
@@ -300,7 +301,7 @@ if [ -f "$SNAP" ]; then
     const s=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
     const actorPath='$SNAP'.replace(/snapshot\.json$/,'actor-state.json');
     const metricsPath='$SNAP'.replace(/snapshot\.json$/,'runtime-metrics.json');
-    try{if(fs.existsSync(actorPath)){const a=JSON.parse(fs.readFileSync(actorPath,'utf-8'));if(a.chainActorMonitor)s.chainActorMonitor=a.chainActorMonitor}}catch{}
+    try{if(!s._atomicNotifications&&fs.existsSync(actorPath)){const a=JSON.parse(fs.readFileSync(actorPath,'utf-8'));if(a.chainActorMonitor)s.chainActorMonitor=a.chainActorMonitor}}catch{}
     let runtime={};try{if(fs.existsSync(metricsPath))runtime=JSON.parse(fs.readFileSync(metricsPath,'utf-8'))}catch{}
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const isAddr=(v)=>/^0x[a-fA-F0-9]{40}$/.test(String(v||''));
@@ -399,7 +400,8 @@ if [ -f "$SNAP" ]; then
     console.log('**04｜性能指标**');
     const mem=runtime.memory||{};
     console.log('进程内存：RSS '+(mem.rss?Math.round(mem.rss/1024/1024)+' MB':'未知')+'｜堆使用 '+(mem.heapUsed?Math.round(mem.heapUsed/1024/1024)+' MB':'未知'));
-    console.log('创建者扫描：'+(runtime.actorScanMode==='rawBlockPreFilter'?'原始区块快速过滤':runtime.actorScanMode==='rawBlockParsed'?'监听地址命中并完整解析':runtime.actorScanMode==='batchFallback'?'标准 RPC 兼容模式':'等待指标')+'｜快速跳过 '+(runtime.actorFastSkips??0)+'｜回退 '+(runtime.actorFallbacks??0));
+    console.log('创建者扫描：'+(runtime.actorScanMode==='validatedBlockBatch'?'区块完整性校验':runtime.actorScanMode==='rawBlockPreFilter'?'原始区块快速过滤':runtime.actorScanMode==='rawBlockParsed'?'监听地址命中并完整解析':runtime.actorScanMode==='batchFallback'?'标准 RPC 兼容模式':'等待指标')+'｜快速跳过 '+(runtime.actorFastSkips??0)+'｜回退 '+(runtime.actorFallbacks??0));
+    if(s._notificationOutbox?.length) console.log('待发送通知：'+s._notificationOutbox.length+' 条｜失败后自动重试');
     const sw=runtime.snapshotWrites||{};
     console.log('快照写入：主快照 '+(sw.writes??0)+' 次｜创建者小状态 '+(sw.actorWrites??0)+' 次｜平均 '+(sw.averageDurationMs??0)+'ms');
     for(const [name,m] of Object.entries(runtime.modules||{})) console.log(name+'：间隔 '+((m.intervalMs||0)/1000)+'s｜最近 '+(m.lastDurationMs??0)+'ms｜平均 '+(m.avgDurationMs??0)+'ms｜请求 '+(m.requestCount??0)+'｜错误 '+(m.errorCount??0));

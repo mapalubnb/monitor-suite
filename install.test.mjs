@@ -1,4 +1,10 @@
 import test from "node:test";
+
+test('separate deployment includes the durable outbox runtime', async () => {
+  const { readFileSync } = await import('node:fs');
+  const source = readFileSync(new URL('./install.sh', import.meta.url), 'utf8');
+  assert.match(source, /cp shared\/transactional-outbox\.mjs "\$SHARED_DIR\/"/);
+});
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
