@@ -2722,16 +2722,24 @@ function dedupeBscLogs(logs = []) {
 }
 
 const logRpcCooldowns = new Map();
-let activeLogRequests = 0;
+let activeLogRequests = 0, activeHistoryLogRequests = 0;
 const logRequestWaiters = [];
-async function executeBscGetLogsRequest(params, options = {}) {
-  if (activeLogRequests >= 2) await new Promise(resolve => logRequestWaiters.push(resolve));
-  else activeLogRequests++;
-  try { return await queryBscLogs(params, options); }
-  finally {
-    const next = logRequestWaiters.shift();
-    if (next) next(); else activeLogRequests--;
+function pumpLogRequests() {
+  while (activeLogRequests < 2) {
+    let index = logRequestWaiters.findIndex(item => !item.history);
+    if (index < 0 && activeHistoryLogRequests === 0) index = logRequestWaiters.findIndex(item => item.history);
+    if (index < 0) break;
+    const item = logRequestWaiters.splice(index, 1)[0];
+    activeLogRequests++;
+    if (item.history) activeHistoryLogRequests++;
+    item.resolve();
   }
+}
+async function executeBscGetLogsRequest(params, options = {}) {
+  const history = options.history || bscRpcPreferenceKey("eth_getLogs", params).endsWith(":history");
+  await new Promise(resolve => { logRequestWaiters.push({ history, resolve }); pumpLogRequests(); });
+  try { return await queryBscLogs(params, options); }
+  finally { activeLogRequests--; if (history) activeHistoryLogRequests--; pumpLogRequests(); }
 }
 async function queryBscLogs(params, options) {
   const urls = options.rpcUrls || (IS_TEST_MODE ? CONFIG.bscRpcUrls : [...new Set([
@@ -2744,8 +2752,10 @@ async function queryBscLogs(params, options) {
   for (const url of urls) {
     const from = Number(params[0]?.fromBlock || 0), to = Number(params[0]?.toBlock || 0);
     // Pruned archives and unsupported wide windows must not quarantine current blocks.
-    const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + (to - from > 49 ? "wide" : "narrow");
-    if ((logRpcCooldowns.get(key) || 0) > Date.now()) continue;
+    const filterClass = JSON.stringify({ address: params[0]?.address || null, topics: params[0]?.topics || [] });
+    const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + (to - from > 49 ? "wide" : "narrow") + ":" + filterClass;
+    const cooling = logRpcCooldowns.get(key);
+    if (cooling?.until > Date.now()) { errors.push(cooling.message); continue; }
     try {
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getLogs", params }), signal: AbortSignal.timeout(timeoutMs) });
@@ -2762,7 +2772,8 @@ async function queryBscLogs(params, options) {
     } catch (error) {
       errors.push(error.message);
       const cooldown = /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 30_000;
-      logRpcCooldowns.set(key, Date.now() + cooldown);
+      logRpcCooldowns.set(key, { until: Date.now() + cooldown, message: error.message });
+      if (logRpcCooldowns.size > 256) for (const [cached, entry] of logRpcCooldowns) if (entry.until <= Date.now()) logRpcCooldowns.delete(cached);
     }
   }
   throw new Error((emptyProviders.size ? "eth_getLogs 仅一个节点返回空结果，未达到双节点一致；" : "eth_getLogs 无可用节点；") + [...new Set(errors)].join("；"));

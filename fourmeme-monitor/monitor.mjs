@@ -1500,9 +1500,15 @@ async function requestBscRpcPayload(payload, timeoutMs, {
 
 // --- 单次 RPC ---
 async function bscRpcCall(method, params) {
-  const json = await requestBscRpcPayload({ jsonrpc: "2.0", id: 1, method, params }, 8_000);
-  if (json?.error) throw new Error(`RPC error: ${json.error.message || JSON.stringify(json.error)}`);
-  if (!json || !("result" in json)) throw new Error("RPC 返回缺少 result");
+  const json = await requestBscRpcPayload({ jsonrpc: "2.0", id: 1, method, params }, 8_000, {
+    parseResponse: async response => {
+      const value = await response.json();
+      if (value?.error) throw new Error(`RPC error: ${value.error.message || JSON.stringify(value.error)}`);
+      if (!value || !("result" in value)) throw new Error("RPC 返回缺少 result");
+      if (method === "eth_getBlockByNumber" && !value.result?.hash) throw new Error("RPC 尚未提供请求区块");
+      return value;
+    },
+  });
   return json.result;
 }
 
@@ -8753,7 +8759,7 @@ async function runActorCheck() {
 async function runActorHistoryCheck() {
   const root = ensureActorMonitorState();
   if (root.historyEndBlock == null) return;
-  const history = snapshot.chainActorHistory ||= { ...root, realtime: undefined };
+  const history = snapshot.chainActorHistory ||= { ...structuredClone(root), realtime: undefined };
   if (Date.now() < (history.historyNextAt || 0)) return;
   try {
     await runActorLane(false);
