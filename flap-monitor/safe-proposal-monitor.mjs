@@ -22,7 +22,7 @@ export const DEFAULT_SAFE_API_BASE_URL = "https://api.safe.global/tx-service/bnb
 export const DEFAULT_FLAP_ADMIN_SAFES = CORE_SAFES.map(([address]) => address);
 
 const MAX_PROPOSAL_RECORDS = 500;
-const MAX_PENDING_CHANGES = 200;
+const MAX_PENDING_CHANGES = 2000;
 const MAX_MULTISEND_DEPTH = 4;
 const SAFE_API_STAGGER_MS = 350;
 const MULTISEND_ADDRESSES = new Set([
@@ -226,7 +226,7 @@ export function migrateSafeProposalState(raw, safes = DEFAULT_FLAP_ADMIN_SAFES) 
     if (!Array.isArray(record.actions)) record.actions = record.quoteToken
       ? [{ kind: "creation", quoteToken: record.quoteToken, disabled: false, legacy: true }] : [];
   }
-  state.pendingChanges = Array.isArray(state.pendingChanges) ? state.pendingChanges.slice(-MAX_PENDING_CHANGES) : [];
+  state.pendingChanges = Array.isArray(state.pendingChanges) ? state.pendingChanges : [];
   for (const change of state.pendingChanges) {
     if (!Array.isArray(change.actions)) change.actions = state.proposals[change.key]?.actions || [];
   }
@@ -263,7 +263,6 @@ function appendPendingChange(state, type, record, detectedAt) {
   const change = { ...record, type, detectedAt };
   change.id = changeId(type, change);
   if (!state.pendingChanges.some(item => item.id === change.id)) state.pendingChanges.push(change);
-  state.pendingChanges = state.pendingChanges.slice(-MAX_PENDING_CHANGES);
   return change;
 }
 
@@ -453,6 +452,10 @@ export async function runSafeProposalScan({
 } = {}) {
   if (!state || typeof state !== "object") throw new Error("缺少 Safe 提案状态");
   if (typeof rpcBatch !== "function") throw new Error("缺少 Safe 提案 RPC 批量读取函数");
+  if (state.pendingChanges?.length >= MAX_PENDING_CHANGES) {
+    state.lastError = "Safe 通知积压达到上限，等待投递后恢复扫描";
+    return { changed: false, changes: [], state, successfulSafes: 0, configuredSafes: safes.length, errors: [state.lastError] };
+  }
   const safeEntries = normalizeSafeEntries(safes);
   const normalizedSafes = safeEntries.map(entry => entry.address);
   const apiAddressBySafe = new Map(safeEntries.map(entry => [entry.address, entry.apiAddress]));
@@ -531,6 +534,7 @@ export async function runSafeProposalScan({
           rawData: proposal.data, reason: error.message, callPath: "0" }];
       }
       const actionTarget = action => action.vaultFactory ? `vault:${action.vaultFactory}` : action.quoteToken || "";
+      let executionCheck = null;
       for (const target of new Set(actions.map(actionTarget))) {
         const vaultFactory = target.startsWith("vault:") ? target.slice(6) : "";
         const quoteToken = vaultFactory ? "" : target;
@@ -542,7 +546,8 @@ export async function runSafeProposalScan({
         next.currentNonce = outcome.value.currentNonce;
         next.nonceBlocked = next.nonce > next.currentNonce;
         next.executionCheck = { status: next.nonceBlocked ? "blocked" : "unverified", checkedAt: runAt };
-        if (next.status === "ready" && !next.nonceBlocked) {
+        if (executionCheck) next.executionCheck = { ...executionCheck };
+        else if (next.status === "ready" && !next.nonceBlocked) {
           try {
             const data = actions.some(action => action.callPath?.includes(".safe")) ? null : encodeSafeExecutionSimulation(proposal);
             if (data) {
@@ -551,6 +556,7 @@ export async function runSafeProposalScan({
             }
           } catch { /* A failed RPC/simulation is not evidence that the proposal was cancelled. */ }
         }
+        executionCheck = { ...next.executionCheck };
         next.actions = actions.filter(action => actionTarget(action) === target);
         const previous = state.proposals[next.key];
         if (previous) next.firstSeenAt = previous.firstSeenAt || next.firstSeenAt;
@@ -668,7 +674,10 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
     const name = change.vaultFactory ? "Vault Factory 注册／配置更新" : asset.symbol || asset.name || (change.quoteToken ? "计价代币" : "资金／权限／管理操作");
     const status = ({ ready: "签名已满足，等待执行", existing: "当前待执行提案", proposed: "发现管理提案", signatures: "签名进度更新",
       invalidated: "已被同 nonce 交易替换", failed: "Safe 内层执行失败", executed: "Safe 执行成功" })[change.type] || "等待执行确认";
-    lines.push("**" + name + "｜" + status + "**");
+    const color = ["failed", "invalidated"].includes(change.type) ? "red" : change.type === "executed" ? "green" : "orange";
+    const icon = color === "red" ? "🔴" : color === "green" ? "🟢" : "🟠";
+    const escapedName = String(name).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    lines.push(`**${escapedName}**`, `<font color='${color}'>${icon} ${status}</font>`);
     if (change.quoteToken) lines.push("计价代币：[" + change.quoteToken + "](https://bscscan.com/address/" + change.quoteToken + ")");
     if (change.vaultFactory) lines.push("Vault Factory：[" + change.vaultFactory + "](https://bscscan.com/address/" + change.vaultFactory + ")");
     for (const action of change.actions || []) {
@@ -688,9 +697,9 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
       else if (action.kind === "creation") lines.push("创建开关：" + (action.disabled ? "暂停创建" : "解除暂停创建"));
       else lines.push(describeOperationalAction(action));
     }
-    if (change.nonceBlocked) lines.push("尚有前序 nonce 未执行；签名满足不代表立即可执行。");
-    if (change.executionCheck?.status === "passed") lines.push("只读执行模拟于 " + formatDate(change.executionCheck.checkedAt) + " 通过；该时点具备尝试执行条件，后续状态变化仍可能导致失败。");
-    else if (change.status === "ready") lines.push("执行模拟未确认，不能据此判断时间锁及其他执行条件已满足。");
+    if (change.nonceBlocked) lines.push("⏳ 前序 nonce 未执行");
+    if (change.executionCheck?.status === "passed") lines.push("✅ 只读执行模拟通过｜" + formatDate(change.executionCheck.checkedAt));
+    else if (change.status === "ready") lines.push("⏳ 执行条件未核实");
     lines.push("首次观测：" + formatDate(change.firstSeenAt));
     lines.push("确认进度：" + change.confirmations + "/" + (change.required || "未知") + "｜Safe nonce：" + change.nonce);
     lines.push("管理 Safe：[" + change.safe + "](https://app.safe.global/transactions/queue?safe=bnb:" + change.safe + ")");
@@ -700,6 +709,5 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
     if (change.chainVerification) lines.push(change.chainVerification);
     lines.push("");
   }
-  lines.push("说明：提案和签名满足均不代表已生效；可能取消、替换或执行失败，以链上执行和实际状态为准。风险等级和官方标识是提案参数，不代表独立安全评估。");
   return lines.join("\n");
 }

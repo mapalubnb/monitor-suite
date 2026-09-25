@@ -20,6 +20,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, appendFileSync, rea
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
+import { parseHTML } from "linkedom";
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
 import {
@@ -86,10 +87,10 @@ function readPositiveIntEnv(name, fallback, min = 1) {
 /* ── 配置 ── */
 const CONFIG = {
   urls: [
-    "https://flap.sh/bnb/CAstore",
+    "https://flap.sh/bnb/CAstore?lang=zh",
     "https://flap.sh/robinhood/CAstore?lang=zh",
-    "https://flap.sh/launch",
-    "https://flap.sh/create",
+    "https://flap.sh/launch?chain=bnb&lang=zh",
+    "https://flap.sh/create?chain=bnb&lang=zh",
   ],
   // 飞书 API（用于发送 diff 文件附件）
   feishuAppId: process.env.FEISHU_APP_ID || "",
@@ -807,8 +808,8 @@ function emptyFlapChangeMeta() {
 
 /* ── 快照读写 ── */
 const CURRENT_SCHEMA_VERSION = 6;
-const CA_STORE_VAULT_SCHEMA_VERSION = 3;
-const ASSET_ANALYSIS_SCHEMA_VERSION = 2;
+const CA_STORE_VAULT_SCHEMA_VERSION = 4;
+const ASSET_ANALYSIS_SCHEMA_VERSION = 3;
 const METADATA_SCHEMA_FIELDS = Object.freeze([
   "creator", "description", "website", "telegram", "twitter", "github", "youtube", "debox", "buy",
   "name", "symbol", "image", "sell",
@@ -830,6 +831,13 @@ function loadSnapshot() {
  * 快照版本迁移
  */
 function migrateSnapshot(data) {
+  data.pages ||= {};
+  for (const url of CONFIG.urls) {
+    const previousUrl = url.startsWith("https://flap.sh/robinhood/") ? url : url.split("?")[0];
+    const previous = data.pages[urlToKey(previousUrl)];
+    if (!data.pages[urlToKey(url)] && previous) data.pages[urlToKey(url)] = previous;
+    if (previousUrl !== url) delete data.pages[urlToKey(previousUrl)];
+  }
   const ver = data._schemaVersion || 1;
   if (ver < 2) {
     // v1 → v2: 页面缺少 assetContents 字段
@@ -1027,7 +1035,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
   const initialContent = buildCardUrlPrefix(url, content) + content;
   const messageId = await sendCardViaApi(title, initialContent, template, diffFilePath, cardOpts);
 
-  if (AI_CONFIG.enabled && AI_CONFIG.apiKey) {
+  if (messageId && AI_CONFIG.enabled && AI_CONFIG.apiKey) {
     const summarize = summarizeFn || aiSummarize;
     summarize(aiInput || initialContent, moduleContext).then(async (summary) => {
       if (!summary) return;
@@ -1035,20 +1043,16 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
         ? enrichFn(summary)
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
       const enrichedContent = buildCardUrlPrefix(url, enriched) + enriched;
-      if (messageId) {
-        try {
-          if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
-            log(`[AI 摘要] ${title} 正文较长，保留完整变更卡片，另发 AI 摘要卡片`);
-            await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
-          } else {
-            await patchCardViaApi(messageId, title, enrichedContent, template, diffFilePath, cardOpts);
-            log(`[AI 摘要→卡片更新] ${title} 已补充 AI 摘要`);
-          }
-        } catch (err) {
-          log(`[AI 摘要→卡片更新] 编辑失败(${err.message})，追加发送`);
+      try {
+        if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
+          log(`[AI 摘要] ${title} 正文较长，保留完整变更卡片，另发 AI 摘要卡片`);
           await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
+        } else {
+          await patchCardViaApi(messageId, title, enrichedContent, template, diffFilePath, cardOpts);
+          log(`[AI 摘要→卡片更新] ${title} 已补充 AI 摘要`);
         }
-      } else {
+      } catch (err) {
+        log(`[AI 摘要→卡片更新] 编辑失败(${err.message})，追加发送`);
         await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
       }
     }).catch(err => log(`[AI 摘要] 异步摘要异常：${err.message}`));
@@ -1069,8 +1073,7 @@ async function sendNotificationMaybeAi({ title, content, template = "red", modul
   if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
     const cardContent = buildCardUrlPrefix(url, content) + content;
     const messageId = await sendCardViaApi(title, cardContent, template, diffFilePath, cardOpts);
-    if (!messageId) await sendFeishu(title, cardContent, template, cardOpts);
-    else log(`[AI] 已跳过：${title}`);
+    if (messageId) log(`[AI] 已跳过：${title}`);
     return messageId;
   }
   return sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, aiSummarize, cardOpts);
@@ -1138,7 +1141,7 @@ function formatFlapSection(title, lines = []) {
     "金库文案": "🏦",
   };
   const icon = icons[title] ? `${icons[title]} ` : "";
-  return [`**${icon}${title}**`, ...body, ""];
+  return [...(title ? [`**${icon}${title}**`] : []), ...body, ""];
 }
 
 function buildFlapCardContent({ summary = [], primaryTitle = "重点信息", primary = [], scope = [], details = [], detailsTitle = "详情", ai = "" } = {}) {
@@ -1750,7 +1753,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
     scope: [affectedPageLinks],
     detailsTitle: "资源统计",
     details: [formatFlapResourceStats(assetStats)],
-    ai: "AI 分析异步生成中，变更已先推送。",
+    ai: "",
   });
 
   const fullDiffLines = [
@@ -1825,10 +1828,6 @@ function applyBusinessPriorityTitle(notification, { titlePrefix = "" } = {}) {
 }
 
 function enrichExistingCardContentWithAi(content, summary) {
-  const placeholder = "AI 分析异步生成中，变更已先推送。";
-  if (String(content || "").includes(placeholder)) {
-    return String(content).replace(placeholder, summary);
-  }
   return `${content}\n\n---\n\n**AI 分析:**\n${summary}`;
 }
 
@@ -1856,10 +1855,11 @@ async function sendFlapChangeNotification(notification, { moduleContext = "Flap.
   const diffFilePath = saveDiffLocally(n.title, fullDiff);
   const aiInput = n.skipAi ? briefingInput : fullDiff;
   const cardOpts = { diffButtonText: "下载完整 DIFF" };
-  await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput, enrichFn: (summary) => {
+  const messageId = await sendNotificationMaybeAi({ title: n.title, content: cardContent, template: n.template, moduleContext: n.moduleContext || moduleContext, aiInput, enrichFn: (summary) => {
     if (n.content) return enrichExistingCardContentWithAi(n.content, summary);
     return buildCardBriefing(n.url, summary, n.meta.assetStats, n.meta.textChangeCount, n.meta.i18nChangeCount, n.meta.i18nDiffs, n.meta.textChanges, n.meta.caStoreVaultDiffs);
   }, diffFilePath, url: n.url, skipAi: n.skipAi, cardOpts });
+  if (!messageId) throw new Error("页面变更消息未送达，保留快照等待重试");
   return n;
 }
 
@@ -2509,7 +2509,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
     scope: scopeLines,
     detailsTitle: "资源统计",
     details: detailLines,
-    ai: aiSummary || "AI 分析异步生成中，变更已先推送。",
+    ai: aiSummary || "",
   });
 }
 
@@ -2576,8 +2576,10 @@ async function fetchSafe(url, opts = {}) {
         recordFail(backoffKey, res.status);
         throw new Error(`HTTP ${res.status} (服务端错误，重试${maxRetries}次仍失败)`);
       }
+      // Keep the timeout alive until the body finishes, not just response headers.
+      const body = await res.text();
       if (res.ok) recordSuccess(backoffKey);
-      return res;
+      return { ok: res.ok, status: res.status, headers: res.headers, url: res.url, text: async () => body };
     } catch (err) {
       if (err.name === "AbortError") {
         if (attempt < maxRetries) {
@@ -3126,10 +3128,11 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
   const contractSet = new Set(await filterContractAddresses(candidates.map(c => c.vault)));
   state.knownVaults = state.knownVaults || {};
   const newEvents = [];
+  const nextKnownVaults = { ...state.knownVaults };
   for (const event of candidates) {
     if (!contractSet.has(event.vault)) continue;
-    if (state.knownVaults[event.vault]) continue;
-    state.knownVaults[event.vault] = {
+    if (nextKnownVaults[event.vault]) continue;
+    nextKnownVaults[event.vault] = {
       firstSeenAt: ts(),
       txHash: event.txHash,
       blockNumber: event.blockNumber,
@@ -3138,14 +3141,17 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
     newEvents.push(event);
   }
 
+  let messageId = null;
+  if (newEvents.length) {
+    const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
+    const title = `${titlePrefix}Flap 链上金库注册变更`;
+    messageId = await sendAlertCard(sendCardFn, title, content, "green");
+    if (!messageId) throw new Error("金库注册消息未送达，保留区块游标等待重试");
+  }
+  state.knownVaults = nextKnownVaults;
   state.lastBlock = toBlock;
   state.lastBlockAt = ts();
   state.lagBlocks = Math.max(0, safeLatest - state.lastBlock);
-  if (newEvents.length === 0) return { changed: true, sent: false, events: [] };
-
-  const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
-  const title = `${titlePrefix}Flap 链上金库注册变更`;
-  const messageId = await sendAlertCard(sendCardFn, title, content, "red");
   return { changed: true, sent: Boolean(messageId), events: newEvents };
 }
 
@@ -3197,7 +3203,7 @@ function buildFactoryPoolMonitorContent(result) {
   const changeCounts = { added: 0, modified: 0, paused: 0, resumed: 0, disabled: 0, route: 0 };
   for (const change of result.changes || []) changeCounts[change.type] = (changeCounts[change.type] || 0) + 1;
   const summary = [
-    `本次变更：新增支持 ${changeCounts.added} 个｜配置修改 ${changeCounts.modified} 个｜路径更新 ${changeCounts.route} 个｜暂停 ${changeCounts.paused} 个｜恢复 ${changeCounts.resumed} 个｜停用 ${changeCounts.disabled} 个`,
+    `📋 本次变更：${Object.entries({ added: "新增支持", modified: "配置修改", route: "路径更新", paused: "暂停", resumed: "恢复", disabled: "停用" }).filter(([key]) => changeCounts[key]).map(([key, label]) => `${label} ${changeCounts[key]} 个`).join("｜") || "合约升级"}`,
     `当前资产：支持创建 ${enabledCount} 个｜暂停创建 ${pausedCount} 个｜已停用 ${disabledCount} 个`,
   ];
   const primary = [];
@@ -3211,11 +3217,13 @@ function buildFactoryPoolMonitorContent(result) {
       resumed: "恢复创建",
       disabled: "停用",
     }[change.type] || "配置修改";
-    primary.push(`${label}：${formatFactoryPoolAssetName(item)}`);
-    primary.push(`状态：${formatFactoryPoolAssetStatus(item)}`);
+    const color = !item.configured || item.creationDisabled ? "red" : "green";
+    const icon = ({ added: "🟢", resumed: "🟢", paused: "⏸️", disabled: "🔴", route: "🔀", modified: "⚙️" })[change.type] || "⚙️";
+    primary.push(`**${icon} ${label}：${formatFactoryPoolAssetName(item)}**`);
+    primary.push(`<font color='${color}'>状态：${formatFactoryPoolAssetStatus(item)}</font>`);
     primary.push(`地址：${addressLink(item.quoteToken)}`);
     if (item.swapRoute) primary.push(...formatQuoteRoute(item.swapRoute));
-    if (change.type === "route" && item.routeEvidence?.txHash) primary.push(`交易：${item.routeEvidence.txHash}`);
+    if (change.type === "route" && item.routeEvidence?.txHash) primary.push(`🔗 [查看交易](https://bscscan.com/tx/${item.routeEvidence.txHash})`);
   }
   if (result.implementationChange?.previous) {
     const upgrade = result.implementationChange;
@@ -3225,7 +3233,7 @@ function buildFactoryPoolMonitorContent(result) {
   }
   return buildFlapCardContent({
     summary,
-    primaryTitle: "Factory 底池资产链上变更",
+    primaryTitle: "",
     primary,
   });
 }
@@ -4481,7 +4489,7 @@ function collectRoundVaultFactory(roundEntries, url, features) {
   return map;
 }
 
-async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries, titlePrefix = "", sendCardFn = sendCardViaApi } = {}) {
+async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries, titlePrefix = "", sendCardFn = sendCardViaApi, saveSnapshotFn = saveSnapshot, appendHistoryFn = appendHistory } = {}) {
   if (!roundVaultFactoryEntries?.length) return { sent: false, changed: false };
   const { map: currentVFMap, conflicts } = mergeRoundVaultFactoryMaps(roundVaultFactoryEntries);
   const oldVFMap = snapshot.vaultFactories || {};
@@ -4503,17 +4511,15 @@ async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries,
 
   log(`[金库工厂 VaultFactory] 检测到变更：新增 ${vfChanges.added.length}，移除 ${vfChanges.removed.length}，修改 ${vfChanges.modified.length}`);
   const vfContent = formatVaultFactoryChanges(vfChanges);
-  const conflictNote = conflicts.length > 0
-    ? `\n\n**提取说明**\n- 本轮 ${conflicts.length} 个字段在不同页面资源中不一致，已按 CAstore > launch > create 优先级合并后推送，避免重复震荡。`
-    : "";
   const vfTitle = buildVaultFactoryChangeTitle(vfChanges, `🏦 ${titlePrefix}`);
-  appendHistory("vault-factory", vfTitle, vfContent.slice(0, 500));
-  const vfTemplate = vfChanges.added.length > 0 ? "red" : "orange";
+  appendHistoryFn("vault-factory", vfTitle, vfContent.slice(0, 500));
+  const vfTemplate = vfChanges.removed.length > 0 ? "red" : vfChanges.added.length > 0 ? "green" : "orange";
   const vfMsgId = vfChanges.added.length > 0
-    ? await sendAlertCard(sendCardFn, vfTitle, `${vfContent}${conflictNote}`, vfTemplate)
-    : await sendCardFn(vfTitle, `${vfContent}${conflictNote}`, vfTemplate);
+    ? await sendAlertCard(sendCardFn, vfTitle, vfContent, vfTemplate)
+    : await sendCardFn(vfTitle, vfContent, vfTemplate);
+  if (!vfMsgId) return { sent: false, changed: true, changes: vfChanges };
   snapshot.vaultFactories = currentVFMap;
-  saveSnapshot(snapshot);
+  saveSnapshotFn(snapshot);
   return { sent: Boolean(vfMsgId), changed: true, changes: vfChanges };
 }
 
@@ -4521,7 +4527,6 @@ function buildOperationalNoticeContent({ status, url, severity = "orange", reaso
   return buildFlapCardContent({
     summary: [
       `- 状态: ${status || "Flap 监控状态变化"}`,
-      severity ? `- 级别: ${severity}` : "",
       consecutiveFailures ? `- 连续失败: ${consecutiveFailures} 次` : "",
       skipped ? `- 跳过检测: ${skipped} 次` : "",
     ],
@@ -4622,6 +4627,9 @@ function buildVaultFactoryChangeTitle(changes, prefix = "") {
   if (visibleAdded.length > 0 && hiddenModified.length > 0) {
     return `${prefix}CAStore 金库变更：新增可见 ${visibleAdded.length} / 下架 ${hiddenModified.length} (${visibleAdded.map(v => v.name).join(", ")})`;
   }
+  if (visibleAdded.length > 0 && hiddenAdded.length > 0) {
+    return `${prefix}新增金库工厂：可见 ${visibleAdded.length} 个 / 隐藏 ${hiddenAdded.length} 个 (${names})`;
+  }
   if (visibleAdded.length > 0) {
     return `${prefix}新增可见金库 (${visibleAdded.map(v => v.name).join(", ")})`;
   }
@@ -4631,14 +4639,8 @@ function buildVaultFactoryChangeTitle(changes, prefix = "") {
   if (visibleModified.length > 0) {
     return `${prefix}CAStore 金库上架 (${visibleModified.map(v => v.name).join(", ")})`;
   }
-  if (visibleAdded.length > 0 && hiddenAdded.length > 0) {
-    return `${prefix}新增金库工厂：可见 ${visibleAdded.length} 个 / 隐藏 ${hiddenAdded.length} 个 (${names})`;
-  }
   if (hiddenAdded.length > 0) {
     return `${prefix}新增隐藏金库工厂 (${hiddenAdded.map(v => v.name).join(", ")})`;
-  }
-  if (visibleAdded.length > 0) {
-    return `${prefix}新增可见金库工厂 (${visibleAdded.map(v => v.name).join(", ")})`;
   }
   return `${prefix}金库工厂配置变更`;
 }
@@ -4833,6 +4835,7 @@ function buildMetadataSchemaWarningContent(url, diffs) {
   });
 }
 
+const assetRetryCache = new Map();
 async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", options = {}) {
   const results = {};
   const BATCH = 6;
@@ -4846,6 +4849,10 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", op
         try {
           const url = baseUrl + path;
           const cacheKey = url.split("?")[0];
+          if (!options.fetchAsset) {
+            const cached = assetRetryCache.get(url);
+            if (cached && Date.now() - cached.at < 300_000) return cached.entry;
+          }
           if (roundAssetCache?.has(cacheKey)) return await roundAssetCache.get(cacheKey);
           const loadPromise = (async () => {
             const res = await fetchAsset(url, {
@@ -4864,6 +4871,11 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", op
               ext,
             };
             if (ext === "js") {
+              const i18n = content.includes("JSON.parse('") ? parseI18nFromChunk(content) : null;
+              if (i18n && typeof i18n === "object") {
+                const strings = flattenI18n(i18n, "");
+                if (Object.keys(strings).length >= 50) entry.i18nStrings = strings;
+              }
               entry.metadataSchemas = extractMetadataSchemasFromAsset(content, filename);
               entry.contractHints = extractContractHintsFromAsset(content, filename);
               entry.analysisSchemaVersion = ASSET_ANALYSIS_SCHEMA_VERSION;
@@ -4887,6 +4899,10 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", op
           })();
           if (roundAssetCache) roundAssetCache.set(cacheKey, loadPromise);
           const entry = await loadPromise;
+          if (entry && !options.fetchAsset) {
+            assetRetryCache.set(url, { entry, at: Date.now() });
+            while (assetRetryCache.size > 256) assetRetryCache.delete(assetRetryCache.keys().next().value);
+          }
           if (roundAssetCache) roundAssetCache.set(cacheKey, entry);
           return entry;
         } catch { return null; }
@@ -4902,9 +4918,14 @@ async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", op
   return results;
 }
 
+function hasCompleteAssetContents(features) {
+  return features?.assetAnalysisSchemaVersion === ASSET_ANALYSIS_SCHEMA_VERSION
+    && (features.assetFiles || []).every(path => Boolean(features.assetContents?.[assetPathToFilename(path)]));
+}
+
 async function hydrateAssetContents(features, oldFeatures = null, options = {}) {
   if (oldFeatures?.assetContents && oldFeatures.assetHash === features.assetHash
-    && oldFeatures.assetAnalysisSchemaVersion === ASSET_ANALYSIS_SCHEMA_VERSION) {
+    && hasCompleteAssetContents(oldFeatures)) {
     features.assetContents = oldFeatures.assetContents;
     features.assetAnalysisSchemaVersion = oldFeatures.assetAnalysisSchemaVersion;
     features.metadataSchemas = oldFeatures.metadataSchemas || [];
@@ -4915,6 +4936,8 @@ async function hydrateAssetContents(features, oldFeatures = null, options = {}) 
   }
   const plan = planAssetContentDownload(oldFeatures, features);
   const downloaded = await downloadAssetContents(plan.toDownload, "https://flap.sh", options);
+  const missing = plan.toDownload.filter(path => !downloaded[assetPathToFilename(path)]);
+  if (missing.length) throw new Error(`静态资源未完整：${missing.length}/${plan.toDownload.length} 个下载失败，保留旧快照`);
   features.assetContents = { ...plan.reusedContents, ...downloaded };
   applyFrontendAssetAnalysis(features);
   return { downloaded: Object.keys(downloaded).length, reused: plan.reuseFilenames.length };
@@ -5038,30 +5061,11 @@ function flattenI18n(obj, prefix) {
 async function fetchI18nStrings(assetFiles, baseUrl = "https://flap.sh") {
   const candidates = findI18nChunkCandidates(assetFiles);
   if (candidates.length === 0) return null;
-
-  // 并行下载所有候选 chunk
-  const tasks = candidates.map(async (chunkPath, idx) => {
-    await sleep(idx * 100);
-    try {
-      const url = baseUrl + chunkPath;
-      const res = await fetchSafe(url, { headers: browserHeaders() });
-      if (!res.ok) return null;
-      const jsContent = await res.text();
-      if (!jsContent.includes("JSON.parse('")) return null;
-      const data = parseI18nFromChunk(jsContent);
-      if (!data || typeof data !== "object") return null;
-      const strings = flattenI18n(data, "");
-      if (Object.keys(strings).length < 50) return null;
-      return { i18nStrings: strings, i18nHash: md5(JSON.stringify(strings)), i18nChunk: chunkPath };
-    } catch { return null; }
-  });
-
-  const results = await Promise.allSettled(tasks);
-  for (const r of results) {
-    if (r.status === "fulfilled" && r.value) {
-      log(`  [国际化 i18n] 从 ${r.value.i18nChunk.split("/").pop()} 提取到 ${Object.keys(r.value.i18nStrings).length} 个 UI 字符串`);
-      return r.value;
-    }
+  // Share bounded downloads and successful retry cache with asset analysis.
+  const contents = await downloadAssetContents(candidates, baseUrl);
+  for (const path of candidates) {
+    const strings = contents[assetPathToFilename(path)]?.i18nStrings;
+    if (strings) return { i18nStrings: strings, i18nHash: md5(JSON.stringify(strings)), i18nChunk: path };
   }
   return null;
 }
@@ -5152,6 +5156,25 @@ function extractVaultFactoryAddress(text) {
 function extractCaStoreVaultSections(html, options = {}) {
   const sourceUrl = String(options.url || "");
   const chain = /\/robinhood\//i.test(sourceUrl) ? "robinhood" : /\/bnb\//i.test(sourceUrl) ? "bnb" : "";
+  // Current CAStore exposes card boundaries. Names are not a reliable type filter
+  // (e.g. FOMOX and 动态空投), and the FAQ also contains the word 金库.
+  const { document } = parseHTML(html);
+  const cards = [...document.querySelectorAll('[data-ca-vault-card="true"]')];
+  if (cards.length) {
+    const occurrences = new Map();
+    return cards.map((card, index) => {
+      const name = card.querySelector('h3')?.textContent.trim() || "";
+      const description = [...card.querySelectorAll('p')].map(p => p.textContent.trim()).join("\n");
+      const nameKey = normalizeVaultName(name);
+      const occurrence = (occurrences.get(nameKey) || 0) + 1;
+      occurrences.set(nameKey, occurrence);
+      return { name, description, nameKey, area: "精选金库模板", areaKey: "featured vaults", occurrence,
+        position: index + 1, key: `featured vaults::${nameKey}#${occurrence}`,
+        factory: extractVaultFactoryAddress(card.outerHTML)
+          || (chain === "robinhood" && /^(币股|幣股)$/.test(name) ? ROBINHOOD_INDEX_VAULT_FACTORY : null),
+        chain, sourceUrl, signature: md5(`${name}\n${description}`) };
+    }).filter(card => card.name);
+  }
   const headings = [];
   const headingRe = /<h([1-4])[^>]*>([\s\S]*?)<\/h\1>/gi;
   let m;
@@ -5165,6 +5188,7 @@ function extractCaStoreVaultSections(html, options = {}) {
   let currentArea = "Featured Vaults";
   for (let i = 0; i < headings.length; i++) {
     const h = headings[i];
+    if (/faq|常见问题|常見問題|[?？]|^(精选金库模板|精選金庫模板)$/i.test(h.name)) continue;
     if (!isCaStoreVaultHeading(h.name)) {
       if (isCaStoreAreaHeading(h.name)) currentArea = h.name;
       continue;
@@ -5398,13 +5422,13 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
     ],
     primaryTitle: "金库文案",
     primary: [`- ${cardText(copy)}`],
-    ai: "AI 分析异步生成中，变更已先推送。",
+    ai: "",
   });
 
   return {
     title: `${titlePrefix}${change?.chain === "robinhood" ? "Robinhood " : ""}CAstore 金库变更：${name}`,
     content,
-    template: change?.type === "removed" ? "orange" : "red",
+    template: change?.type === "removed" ? "red" : change?.type === "added" ? "green" : "orange",
     url: launchUrl || change?.sourceUrl || "https://flap.sh/bnb/CAstore",
     moduleContext: "Flap.sh CAstore 金库内容介绍",
     aiInput: buildCaStoreVaultAiInput(change, factory, launchUrl),
@@ -5460,6 +5484,7 @@ async function sendCaStoreVaultChangeNotification(notification) {
     aiIntroduceCaStoreVault,
     alertMentionCardOptions(),
   );
+  if (!messageId) throw new Error("CAStore 变更消息未送达，保留快照等待重试");
   return messageId;
 }
 
@@ -6319,6 +6344,7 @@ async function runFlapContractIntegrityPass(state, {
   saveStateFn = saveContractIntegrityState,
 } = {}) {
   if (!CONFIG.contractIntegrityMonitor.enabled) return { changed: false, changes: [], state };
+  const existingPendingIds = new Set(state.pendingChanges.map(change => change.id));
   syncFlapContractIntegrityCatalog(state, snapshot, factoryPoolState);
   const stateResult = await runContractIntegrityStateScan({
     state,
@@ -6337,7 +6363,7 @@ async function runFlapContractIntegrityPass(state, {
     suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
   });
   if (suppressNotifications && state.pendingChanges.length > 0) {
-    acknowledgeContractIntegrityChanges(state, state.pendingChanges.map(change => change.id));
+    acknowledgeContractIntegrityChanges(state, state.pendingChanges.filter(change => !existingPendingIds.has(change.id)).map(change => change.id));
   }
   saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
   return {
@@ -6354,7 +6380,7 @@ async function deliverFlapContractIntegrityChanges(state, {
   saveStateFn = saveContractIntegrityState,
   acknowledgeFn = acknowledgeContractIntegrityChanges,
 } = {}) {
-  const changes = [...(state.pendingChanges || [])];
+  const changes = (state.pendingChanges || []).slice(0, 8);
   if (changes.length === 0) return { sent: false, changes: [] };
   const messageId = await sendAlertCard(
     sendCardFn,
@@ -6415,6 +6441,7 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
 
 function earlySignalConfig() {
   return { ...CONFIG.earlySignalMonitor, safes: CONFIG.safeProposalMonitor.safes,
+    factoryAddress: CONFIG.factoryPoolMonitor.proxy,
     safeApiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl, safeApiKey: CONFIG.safeProposalMonitor.apiKey };
 }
 async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState } = {}) {
@@ -6945,13 +6972,14 @@ async function startMonitor() {
         suppressNotifications,
       }));
       await refreshContractIntegrityWsFeed();
-      if (!suppressNotifications) void scheduleContractIntegrityDelivery();
     } catch (error) {
       await enqueueContractIntegrityMutation(() => {
         contractIntegrityState.lastError = error.message;
         saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
       });
       log(`[Flap 合约完整性] 检测失败：${error.message}`);
+    } finally {
+      if (!suppressNotifications) void scheduleContractIntegrityDelivery();
     }
   }
 
@@ -7392,7 +7420,7 @@ async function startMonitor() {
 
           // 仅当 assetHash 未变且旧数据完整时才复用缓存（节省带宽）
           if (oldQuality?.valid && oldFeatures.assetContents && oldFeatures.assetHash === features.assetHash
-            && oldFeatures.assetAnalysisSchemaVersion === ASSET_ANALYSIS_SCHEMA_VERSION) {
+            && hasCompleteAssetContents(oldFeatures)) {
             features.assetContents = oldFeatures.assetContents;
             features.assetAnalysisSchemaVersion = oldFeatures.assetAnalysisSchemaVersion;
             features.metadataSchemas = oldFeatures.metadataSchemas || [];
@@ -7674,6 +7702,7 @@ if (!IS_TEST_MODE) {
 }
 
 export const __testables = {
+  extractCaStoreVaultSections,
   CONFIG,
   deliverFlapEarlySignals,
   earlySignalConfig,
@@ -7689,6 +7718,9 @@ export const __testables = {
   extractPageFeatures,
   extractStrings,
   downloadAssetContents,
+  hydrateAssetContents,
+  hasCompleteAssetContents,
+  sendRoundVaultFactoryChange,
   planAssetContentDownload,
   applyFrontendAssetAnalysis,
   diffMetadataSchemas,

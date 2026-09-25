@@ -42,7 +42,13 @@ export function loadEarlySignalState(path) {
     if (!state[name] || typeof state[name] !== "object" || Array.isArray(state[name])) throw new Error(`提前监控状态 ${name} 无效`);
   }
   if (!Array.isArray(state.pendingChanges)) throw new Error("提前监控队列无效");
+  pruneDiscoveryPools(state);
   return state;
+}
+function pruneDiscoveryPools(state) {
+  const unrelated = Object.values(state.pools).filter(pool => !pool.tokens?.some(token => state.tokens[token]));
+  unrelated.sort((a, b) => (b.blockNumber || 0) - (a.blockNumber || 0));
+  for (const pool of unrelated.slice(512)) delete state.pools[pool.address];
 }
 export function saveEarlySignalState(path, state) {
   writeFileSync(`${path}.tmp`, JSON.stringify(state), "utf8");
@@ -64,7 +70,11 @@ function emit(state, event, { silent = false, nowMs = Date.now() } = {}) {
 function trackToken(state, token, reason, nowMs) {
   token = normalizeAddress(token);
   if (!token || BASE_ASSETS.has(token)) return;
-  if (!state.tokens[token] && keys(state.tokens).length >= MAX_TOKENS) throw new Error("候选资产达到上限，请审查名单");
+  if (!state.tokens[token] && keys(state.tokens).length >= MAX_TOKENS) {
+    // Preserve the event, but do not let unsolicited dust permanently stall the cursor.
+    state.health.capacity = { lastError: `候选资产达到 ${MAX_TOKENS} 个，新资产仅保留事件，需审查名单` };
+    return;
+  }
   state.tokens[token] ||= { address: token, firstSeenAt: iso(nowMs), reason };
   state.tokens[token].lastSeenAt = iso(nowMs);
 }
@@ -83,9 +93,9 @@ export function watchedWallets(config = {}) {
 export function earlyLogFilters(state, config = {}) {
   const wallets = watchedWallets(config).map(pad);
   const operationAddresses = uniq([...watchedWallets(config), ALLOWANCE_MODULE, ...PROXY_ADMINS,
-    FLAP_FACTORY_PROXY, "0x90497450f2a706f1951b5bdda52b4e5d16f34c06",
+    config.factoryAddress || FLAP_FACTORY_PROXY, "0x90497450f2a706f1951b5bdda52b4e5d16f34c06",
     DEX.v2Factory, DEX.v3Factory,
-    ...keys(state.pools).filter(a => /^0x[a-f0-9]{40}$/.test(a))]);
+    ...Object.values(state.pools).filter(p => /^0x[a-f0-9]{40}$/.test(p.address) && p.tokens?.some(t => state.tokens[t])).map(p => p.address)]);
   return [
     { topics: [[TOPICS.Transfer, TOPICS.Approval], wallets] },
     { topics: [TOPICS.Transfer, null, wallets.filter(a => a !== pad(FEE_SAFE))] },
@@ -135,7 +145,10 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
       pool.tokens = [addressTopic(l.topics[offset]), addressTopic(l.topics[offset + 1])];
       pool.blockNumber = Number(l.blockNumber || receipt.blockNumber);
       if (!related && !pool.tokens.some(x => state.tokens[x])) {
-        if (keys(state.pools).length < 5000) state.pools[pool.address] = pool;
+        // A bounded discovery cache is useful when a token is observed shortly afterwards.
+        // Cached unrelated pools must never enter active liquidity subscriptions.
+        state.pools[pool.address] = pool;
+        pruneDiscoveryPools(state);
         continue;
       }
       state.pools[pool.address] = pool;
@@ -242,17 +255,18 @@ export function ingestCowOrders(state, owner, orders, { nowMs = Date.now(), boot
     if (!/^0x[a-f0-9]{112}$/i.test(order.uid || "")) continue;
     if (lower(order.owner) !== lower(owner)) throw new Error("CoW 订单 owner 不匹配");
     const previous = state.orders[order.uid];
-    const fingerprint = [order.status, order.executedSellAmount, order.executedBuyAmount].join(":");
+    const status = ["open", "presignaturePending"].includes(order.status) && Number(order.validTo) * 1000 <= nowMs ? "expired" : order.status;
+    const fingerprint = [status, order.executedSellAmount, order.executedBuyAmount].join(":");
     const next = { uid: order.uid, owner: lower(owner), buyToken: lower(order.buyToken), sellToken: lower(order.sellToken),
-      fingerprint, status: order.status, creationDate: order.creationDate, validTo: order.validTo, lastSeenAt: iso(nowMs) };
+      fingerprint, status, revision: (previous?.revision || 0) + (previous?.fingerprint === fingerprint ? 0 : 1), creationDate: order.creationDate, validTo: order.validTo, lastSeenAt: iso(nowMs) };
     const active = ["open", "presignaturePending"].includes(order.status) && Number(order.validTo) * 1000 > nowMs;
     if (bootstrap && !active || previous?.fingerprint === fingerprint) { state.orders[order.uid] = next; continue; }
     const token = lower(order.buyToken);
     trackToken(state, token, "CoW 采购目标", nowMs);
-    const stage = ["fulfilled", "open", "presignaturePending"].includes(order.status) ? "stocking" : "observation";
-    emit(state, { id: `cow:${order.uid}:${fingerprint}`, source: "cow", kind: "order", token, stage,
-      orderUid: order.uid, status: order.status, sourceTime: order.creationDate,
-      detail: `CoW ${order.status}｜${owner}｜卖出 ${order.sellToken} → 买入 ${token}｜原始卖出数量 ${order.sellAmount}｜有效期 ${iso(Number(order.validTo) * 1000)}` }, { nowMs });
+    const stage = ["fulfilled", "open", "presignaturePending"].includes(status) ? "stocking" : "observation";
+    emit(state, { id: `cow:${order.uid}:${next.revision}:${fingerprint}`, source: "cow", kind: "order", token, stage,
+      orderUid: order.uid, status, sourceTime: order.creationDate,
+      detail: `CoW ${status}｜${owner}｜卖出 ${order.sellToken} → 买入 ${token}｜原始卖出数量 ${order.sellAmount}｜有效期 ${iso(Number(order.validTo) * 1000)}` }, { nowMs });
     state.orders[order.uid] = next;
   }
 }
@@ -276,7 +290,7 @@ export async function scanCowOrders(state, config, fetchFn, nowMs) {
 
 export function syncEarlyProposals(state, safeState, nowMs = Date.now()) {
   for (const record of Object.values(safeState?.proposals || {})) {
-    const fp = [record.status, record.confirmations, record.required, record.nonceBlocked, record.executionCheck?.status].join(":");
+    const fp = [record.status, record.confirmations, record.required, record.nonceBlocked, record.executionCheck?.status, hash(JSON.stringify(record.actions || []))].join(":");
     if (state.proposalVersions[record.key] === fp) continue;
     state.proposalVersions[record.key] = fp;
     for (const a of record.actions || []) {
@@ -402,13 +416,16 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   const confirmations = config.confirmations ?? 1;
   const head = latest - confirmations;
   const bootstrap = state.cursor == null;
-  if (bootstrap) state.cursor = Math.max(0, head - (config.bootstrapBlocks ?? 2));
-  if (state.cursor > head) return;
+  let scanCursor = bootstrap ? Math.max(0, head - (config.bootstrapBlocks ?? 2)) : state.cursor;
+  if (scanCursor > head) return;
   if (state.cursorHash) {
     const previous = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(state.cursor), false]);
-    if (lower(previous.hash) !== state.cursorHash) rewindEarlySignals(state, Math.max(1, state.cursor - REORG_WINDOW), nowMs);
+    if (lower(previous.hash) !== state.cursorHash) {
+      rewindEarlySignals(state, Math.max(1, state.cursor - REORG_WINDOW), nowMs);
+      scanCursor = state.cursor;
+    }
   }
-  const from = state.cursor + 1;
+  const from = scanCursor + 1;
   const to = Math.min(head, from + (config.maxBlocksPerRun || 10) - 1);
   if (from > to) return;
   const boundary = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(to), false]);
@@ -468,8 +485,8 @@ export async function refreshEarlyAssets(state, config, rpcBatch, nowMs) {
   for (const token of selected) {
     const values = await rpcBatch([
       { method: "eth_call", params: [{ to: token, data: "0x38d52e0f" }, "latest"] },
-      { method: "eth_call", params: [{ to: FLAP_FACTORY_PROXY, data: QUOTE_CONFIG_SELECTOR + token.slice(2).padStart(64, "0") }, "latest"] },
-      { method: "eth_call", params: [{ to: FLAP_FACTORY_PROXY, data: QUOTE_TOKEN_CREATION_DISABLED_SELECTOR + token.slice(2).padStart(64, "0") }, "latest"] },
+      { method: "eth_call", params: [{ to: config.factoryAddress || FLAP_FACTORY_PROXY, data: QUOTE_CONFIG_SELECTOR + token.slice(2).padStart(64, "0") }, "latest"] },
+      { method: "eth_call", params: [{ to: config.factoryAddress || FLAP_FACTORY_PROXY, data: QUOTE_TOKEN_CREATION_DISABLED_SELECTOR + token.slice(2).padStart(64, "0") }, "latest"] },
     ]);
     const meta = state.tokens[token];
     const underlying = addressTopic(values[0]);
@@ -517,7 +534,9 @@ export function buildEarlySignalContent(changes, state) {
   const lines = [];
   for (const [key, events] of groups) {
     const token = events[0].token;
-    lines.push(`**${token ? stageLabel(earlyAssetStage(state, token)) : "关联操作"}**`);
+    const stage = token ? earlyAssetStage(state, token) : "observation";
+    const color = stage === "opened" ? "green" : stage === "disabled" ? "red" : "orange";
+    lines.push(`**🔎 <font color='${color}'>${token ? stageLabel(stage) : "关联操作"}</font>**`);
     if (token) lines.push(`资产：[${token}](https://bscscan.com/address/${token})`);
     if (state.tokens[token]?.underlying) lines.push(`原始资产：${state.tokens[token].underlying}`);
     if (state.tokens[token]?.configurationCheckedAt) lines.push(`链上状态最后复核：${state.tokens[token].configurationCheckedAt}`);
@@ -530,7 +549,7 @@ export function buildEarlySignalContent(changes, state) {
     }
     lines.push("");
   }
-  lines.push("资金、订单、铸造和加池仅表示准备动作；公开提案仍可能被替换或执行失败。支持创建以链上状态为准。");
+  lines.push("💡 准备动作不等于开放；支持创建以链上状态为准。");
   return lines.join("\n");
 }
 function prune(state, nowMs) {

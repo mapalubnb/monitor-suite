@@ -53,13 +53,13 @@ export function decodeQuoteRoute(data) {
 
 export function formatQuoteRoute(hops = []) {
   if (!hops.length) return ["兑换路径：清空"];
-  const lines = [`兑换路径：${hops.length} 跳`];
+  const lines = [`🧭 兑换路径：${hops.length} 跳`];
   let from = "WBNB";
   for (const [index, hop] of hops.entries()) {
     const pool = ({ 0: "V2", 1: "V3", 2: "V4" })[hop.poolType] || `类型 ${hop.poolType}`;
     lines.push(`第 ${index + 1} 跳：${from} → ${hop.tokenOut}`);
     lines.push(`池类型 ${pool}｜DEX ID ${hop.dexId}｜fee ${hop.fee}｜tickSpacing ${hop.tickSpacing}`);
-    lines.push(`扩展字段（原值）：${hop.extraWord}`);
+    if (hop.extraWord && !/^0x0{64}$/i.test(hop.extraWord)) lines.push(`扩展字段（原值）：${hop.extraWord}`);
     from = hop.tokenOut;
   }
   return lines;

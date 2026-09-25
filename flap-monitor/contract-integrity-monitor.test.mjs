@@ -98,6 +98,14 @@ test("EIP-1967 values and ABI return values decode without losing addresses", ()
   assert.equal(decodeContractValue(stringResult("Flap v7"), "string"), "Flap v7");
 });
 
+test("integrity migration preserves backlog beyond the old 500 item limit", () => {
+  const original = createContractIntegrityState();
+  original.pendingChanges = Array.from({ length: 550 }, (_, i) => ({ id: `pending-${i}`, type: "field" }));
+  const migrated = migrateContractIntegrityState(original);
+  assert.equal(migrated.pendingChanges.length, 550);
+  assert.equal(migrated.pendingChanges[0].id, "pending-0");
+});
+
 test("state migration keeps built-in core contract types authoritative", () => {
   const state = migrateContractIntegrityState({
     catalog: {

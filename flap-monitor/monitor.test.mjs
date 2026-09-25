@@ -5,11 +5,53 @@ import { mkdtempSync, readFileSync, rmSync, statSync, truncateSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
-import { QUOTE_ROUTE_EVENT_TOPIC, decodeQuoteRoute } from "./quote-token-codec.mjs";
+import { QUOTE_ROUTE_EVENT_TOPIC, decodeQuoteRoute, formatQuoteRoute } from "./quote-token-codec.mjs";
 
 process.env.FLAP_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
+
+test("incomplete frontend downloads never become a reusable baseline and recover on retry", async () => {
+  const old = { assetHash: "same", assetAnalysisSchemaVersion: __testables.ASSET_ANALYSIS_SCHEMA_VERSION,
+    assetFiles: ["/_next/static/chunks/missing.js"], assetContents: {} };
+  const next = { assetHash: "same", assetFiles: [...old.assetFiles] };
+  assert.equal(__testables.hasCompleteAssetContents(old), false);
+  await assert.rejects(__testables.hydrateAssetContents(next, old, {
+    fetchAsset: async () => ({ ok: false }),
+  }), /静态资源未完整/);
+  assert.equal(next.assetContents, undefined);
+  await __testables.hydrateAssetContents(next, old, {
+    fetchAsset: async () => ({ ok: true, text: async () => 'const label="Factory configuration updated";' }),
+  });
+  assert.equal(__testables.hasCompleteAssetContents(next), true);
+  assert.deepEqual(old.assetContents, {});
+});
+
+test("actual CAStore card boundaries retain FOMOX and dynamic airdrop while excluding FAQ", () => {
+  const html = '<div data-ca-vault-card="true"><h3><span>FOMOX</span></h3><p>固定为 2 小时。</p></div>'
+    + '<div data-ca-vault-card="true"><h3>动态空投</h3><p>按持仓分配</p></div><h3>什么是金库？</h3><p>问答说明</p>';
+  const cards = __testables.extractCaStoreVaultSections(html, { url: "https://flap.sh/bnb/CAstore?lang=zh" });
+  assert.deepEqual(cards.map(c => c.name), ["FOMOX", "动态空投"]);
+  assert.equal(cards[0].description, "固定为 2 小时。");
+  assert.equal(cards[1].description, "按持仓分配");
+});
+
+test("Vault Factory failed delivery retains baseline until successful retry", async () => {
+  const address = "0x0000000000000000000000000000000000000001";
+  const old = { name: "Gift", enabled: true, showInCAStore: true };
+  const snapshot = { vaultFactories: { [address]: old } };
+  const entries = [{ url: "https://flap.sh/bnb/CAstore", map: { [address]: { ...old, enabled: false } } }];
+  let saves = 0;
+  const options = { snapshot, roundVaultFactoryEntries: entries, saveSnapshotFn: () => saves++, appendHistoryFn: () => {} };
+  const failed = await __testables.sendRoundVaultFactoryChange({ ...options, sendCardFn: async () => null });
+  assert.equal(failed.sent, false);
+  assert.equal(snapshot.vaultFactories[address].enabled, true);
+  assert.equal(saves, 0);
+  const sent = await __testables.sendRoundVaultFactoryChange({ ...options, sendCardFn: async () => "message-1" });
+  assert.equal(sent.sent, true);
+  assert.equal(snapshot.vaultFactories[address].enabled, false);
+  assert.equal(saves, 1);
+});
 const {
   BNB_QUOTE_TOKEN,
   FACTORY_POOL_STATE_EVENT_TOPICS,
@@ -257,7 +299,8 @@ test("Factory pool change card keeps only readable asset status and full address
   assert.doesNotMatch(content, /区块|交易|Implementation|选择器/);
   assert.doesNotMatch(content, /字段 [1-5]:/);
   assert.doesNotMatch(content, /(^|\n)-\s/m);
-  assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
+  assert.match(content, /🟢 新增支持/);
+  assert.match(content, /<font color='green'>状态：支持创建<\/font>/);
 });
 
 test("Factory pool change card sends immediately with full address while name is syncing", () => {
@@ -1842,7 +1885,7 @@ test("shared business resource diffs across pages are coalesced into one site-wi
   assert.match(grouped[0].content, /Create an account and generate a wallet/);
   assert.match(grouped[0].content, /fees：<font color="red">\(新增\)<\/font> → <font color="green">void<\/font>/);
   assert.doesNotMatch(grouped[0].content, /8101-025ad0379fc93d08\.js/);
-  assert.match(grouped[0].content, /\*\*🤖 AI 分析\*\*/);
+  assert.doesNotMatch(grouped[0].content, /AI 分析异步生成中/);
   assert.equal(grouped[0].skipBusinessPriorityTitle, true);
   assert.equal(grouped[0].skipAi, false);
   assert.equal(grouped[0].useFullDiffForAi, true);
@@ -2357,7 +2400,7 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   assert.match(notification.content, /<font color="green">新增金库<\/font>/);
   assert.equal(notification.launchUrl, "https://flap.sh/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh");
   assert.match(notification.content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh\)/);
-  assert.match(notification.content, /AI 分析异步生成中/);
+  assert.doesNotMatch(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
   const pageNotification = {
@@ -2564,6 +2607,27 @@ test("contract integrity delivery acknowledges state only after a successful car
   assert.equal(saveCount, 1);
   assert.deepEqual(sentCardOpts, { mentionOpenId: "ou_test_recipient" });
   __testables.CONFIG.feishuMentionOpenId = previousMentionOpenId;
+});
+
+test("integrity delivery drains a bounded batch without dropping remaining changes", async () => {
+  const state = { pendingChanges: Array.from({ length: 20 }, (_, i) => ({
+    id: `change-${i}`, type: "getter", address: "0x1111111111111111111111111111111111111111",
+    field: "version", previous: "1", current: "2",
+  })) };
+  const result = await __testables.deliverFlapContractIntegrityChanges(state, {
+    sendCardFn: async () => "sent", saveStateFn: () => {},
+  });
+  assert.equal(result.changes.length, 8);
+  assert.equal(state.pendingChanges.length, 12);
+  assert.equal(state.pendingChanges[0].id, "change-8");
+});
+
+test("route cards hide zero extension words but preserve nonzero unknown values", () => {
+  const hop = { poolType: 1, dexId: 0, fee: 2500, tickSpacing: 0,
+    tokenOut: "0x4ebf5fd25b02022afad96e2fa25da54a246fded0", extraWord: `0x${"0".repeat(64)}` };
+  assert.doesNotMatch(formatQuoteRoute([hop]).join("\n"), /扩展字段/);
+  const nonzero = `0x${"0".repeat(63)}1`;
+  assert.ok(formatQuoteRoute([{ ...hop, extraWord: nonzero }]).join("\n").includes(nonzero));
 });
 
 test("Safe proposal delivery preserves unsent alerts and acknowledges successful cards", async () => {
@@ -2800,7 +2864,8 @@ test("page change card puts concrete page link and important copy before ai anal
 
   assert(content.startsWith("**🌐 影响页面**"));
   assert.match(content, /- 页面: \[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
-  assert(content.indexOf("**🎯 重点变更**") < content.indexOf("**🤖 AI 分析**"));
+  assert.match(content, /\*\*🎯 重点变更\*\*/);
+  assert.doesNotMatch(content, /\*\*🤖 AI 分析\*\*/);
   assert.match(content, /\*\*资源统计\*\*[\s\S]*不变 28 \/ 重命名 0 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
   assert.doesNotMatch(content, /结论摘要|证据详情|打开页面|卡片仅展示|完整旧\/新文本/);
   assert.doesNotMatch(content, /- 概览: 修改/);
@@ -2810,7 +2875,7 @@ test("page change card puts concrete page link and important copy before ai anal
   assert.match(content, /旧配置说明 旧配置说明 旧配置说明/);
   assert.match(content, /新配置说明 新配置说明 新配置说明/);
   assert.doesNotMatch(content, /\.\.\.|…/);
-  assert.match(content, /AI 分析异步生成中，变更已先推送/);
+  assert.doesNotMatch(content, /AI 分析异步生成中，变更已先推送/);
 });
 
 test("launch text card summarizes anti-farmer duration changes and keeps full source copy", () => {
@@ -2865,7 +2930,8 @@ test("site-wide asset card keeps only page scope resource stats and ai", () => {
 
   assert(notification.content.startsWith("**🌐 影响页面**"));
   assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**资源统计**"));
-  assert(notification.content.indexOf("**资源统计**") < notification.content.indexOf("**🤖 AI 分析**"));
+  assert.match(notification.content, /\*\*资源统计\*\*/);
+  assert.doesNotMatch(notification.content, /\*\*🤖 AI 分析\*\*/);
   assert.match(notification.content, /\[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
   assert.match(notification.content, /不变 28 \/ 重命名 0 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
   assert.doesNotMatch(notification.content, /结论摘要|证据详情|本地初筛|重点变更/);

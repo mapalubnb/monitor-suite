@@ -23,6 +23,47 @@ const TX = "0x" + "cd".repeat(32);
 const log = (address, topics, data, index = 0) => ({ address, topics, data, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logIndex: `0x${index.toString(16)}` });
 const receipt = logs => ({ status: "0x1", from: OWNER, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logs });
 
+test("unrelated pool discovery never expands recurring log filters", () => {
+  const state = createEarlySignalState();
+  state.pools[POOL] = { address: POOL, tokens: [TOKEN] };
+  assert.equal(earlyLogFilters(state).some(f => Array.isArray(f.address) && f.address.includes(POOL)), false);
+  state.tokens[TOKEN] = { address: TOKEN };
+  assert.equal(earlyLogFilters(state).some(f => Array.isArray(f.address) && f.address.includes(POOL)), true);
+});
+
+test("failed initial chain scan retains null bootstrap cursor", async () => {
+  const state = createEarlySignalState();
+  const rpc = async calls => {
+    if (calls.some(c => c.method === "eth_getLogs")) throw new Error("timeout");
+    return calls.map(c => ({ eth_chainId: "0x38", eth_blockNumber: "0x65", eth_getBlockByNumber: { hash: BH, transactions: [] } })[c.method]);
+  };
+  await assert.rejects(scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs), /timeout/);
+  assert.equal(state.cursor, null);
+  assert.equal(state.pendingChanges.length, 0);
+});
+
+test("candidate capacity preserves new evidence without blocking receipt processing", () => {
+  const state = createEarlySignalState();
+  for (let i = 1; i <= 500; i++) state.tokens['0x' + i.toString(16).padStart(40, '0')] = { address: i };
+  decodeEarlyReceipt(history.liquidityReceipt, state, { nowMs, transaction: history.liquidityTransaction });
+  assert.equal(Object.keys(state.tokens).length, 500);
+  assert.ok(state.pendingChanges.some(e => e.token === TOKEN));
+  assert.match(state.health.capacity.lastError, /500/);
+});
+
+test("CoW cancellation, reopening and expiry each retain their lifecycle event", () => {
+  const original = history.orders.find(o => o.creationDate.startsWith("2026-09-25T01:33"));
+  const state = createEarlySignalState();
+  const order = { ...original, status: "open", validTo: nowMs / 1000 + 600 };
+  ingestCowOrders(state, OWNER, [order], { nowMs });
+  ingestCowOrders(state, OWNER, [{ ...order, status: "cancelled" }], { nowMs: nowMs + 1 });
+  ingestCowOrders(state, OWNER, [order], { nowMs: nowMs + 2 });
+  assert.equal(state.pendingChanges.length, 3);
+  ingestCowOrders(state, OWNER, [order], { nowMs: nowMs + 601000 });
+  assert.equal(state.orders[order.uid].status, "expired");
+  assert.equal(earlyAssetStage(state, order.buyToken), "observation");
+});
+
 test("real wPOPMTx pool creation/mint is preparation, not opening; replay is idempotent", () => {
   const state = createEarlySignalState();
   decodeEarlyReceipt(history.liquidityReceipt, state, { nowMs, transaction: history.liquidityTransaction });

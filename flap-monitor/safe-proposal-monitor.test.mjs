@@ -32,6 +32,14 @@ const AWDH = JSON.parse(readFileSync(new URL("./fixtures/safe-awdh-proposal.json
 const MULTISEND = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
 const VAULT_CALLS = JSON.parse(readFileSync(new URL("./fixtures/safe-vault-factory-calls.json", import.meta.url), "utf8"));
 const jsonResponse = value => ({ ok: true, status: 200, json: async () => value });
+
+test("Safe migration preserves delivery backlog beyond the old 200 item limit", () => {
+  const original = createSafeProposalState([SAFE]);
+  original.pendingChanges = Array.from({ length: 250 }, (_, i) => ({ id: `pending-${i}`, type: "ready" }));
+  const migrated = migrateSafeProposalState(original, [SAFE]);
+  assert.equal(migrated.pendingChanges.length, 250);
+  assert.equal(migrated.pendingChanges[0].id, "pending-0");
+});
 const word = value => {
   const hex = typeof value === "number" || typeof value === "bigint"
     ? BigInt(value).toString(16)

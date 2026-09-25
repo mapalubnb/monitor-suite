@@ -209,7 +209,7 @@ export function migrateContractIntegrityState(raw) {
   state.pendingChanges = Array.isArray(state.pendingChanges)
     ? state.pendingChanges.filter(change => (
       change?.type !== "event" || Boolean(EVENT_LABELS[String(change?.topic0 || "").toLowerCase()])
-    )).slice(-500)
+    ))
     : [];
   return state;
 }
@@ -288,7 +288,6 @@ function appendChange(state, change) {
   const item = { detectedAt: nowIso(), ...change };
   item.id ||= changeId(item);
   if (!state.pendingChanges.some(existing => existing.id === item.id)) state.pendingChanges.push(item);
-  if (state.pendingChanges.length > 500) state.pendingChanges.splice(0, state.pendingChanges.length - 500);
   return item;
 }
 
@@ -335,6 +334,7 @@ export async function runContractIntegrityStateScan({
   suppressFactoryImplementationChange = false,
 } = {}) {
   const changes = [];
+  if (state.pendingChanges.length >= 2000) throw new Error("合约通知积压达到上限，等待投递后恢复扫描");
   const [chainIdHex, latestHex] = await Promise.all([rpcCall("eth_chainId", []), rpcCall("eth_blockNumber", [])]);
   const chainId = hexToNumber(chainIdHex);
   if (chainId !== BSC_CHAIN_ID) throw new Error(`Flap 合约完整性 RPC chainId 错误：${chainId}`);
@@ -467,6 +467,7 @@ function pruneRecentEvents(state) {
 }
 
 export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { suppressFactoryUpgrade = false } = {}) {
+  if (state.pendingChanges.length >= 2000) throw new Error("合约通知积压达到上限，保留游标等待重试");
   const address = normalizeAddress(logEntry?.address);
   if (!address || !state.catalog[address]) return { processed: false, change: null };
   const key = eventKey(logEntry);
@@ -542,30 +543,28 @@ export function acknowledgeContractIntegrityChanges(state, ids = []) {
 }
 
 function shortValue(value) {
-  if (Array.isArray(value)) return `${value.length} 项`;
-  const text = String(value ?? "");
-  return text.length > 100 ? `${text.slice(0, 97)}...` : text || "(空)";
+  return (Array.isArray(value) ? value.join(", ") : String(value ?? ""))
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") || "(空)";
 }
 
 export function buildContractIntegrityContent(changes = [], state = {}) {
   const lines = [
-    `- 发现 Flap 合约完整性变更 ${changes.length} 项`,
-    `- 链上区块: ${state.latestBlock || changes.map(change => change.blockNumber || 0).sort((a, b) => b - a)[0] || "未知"}`,
+    `🔧 合约变更 ${changes.length} 项`,
+    `区块：${state.latestBlock || Math.max(0, ...changes.map(change => change.blockNumber || 0)) || "未知"}`,
     "",
-    "**合约变更**",
   ];
   for (const change of changes) {
     const contract = state.catalog?.[change.address];
     const label = contract?.label || change.address || "未知合约";
     lines.push(`- ${label}: [${change.address}](https://bscscan.com/address/${change.address})`);
     if (change.type === "event") {
-      lines.push(`  ${change.field}: ${change.topic0}`);
+      lines.push(`  🟠 ${change.field}`);
       if (change.txHash) lines.push(`  交易: [${change.txHash}](https://bscscan.com/tx/${change.txHash})`);
     } else if (change.type === "selectors") {
       if (change.added?.length) lines.push(`  新增函数选择器: ${change.added.join(", ")}`);
       if (change.removed?.length) lines.push(`  移除函数选择器: ${change.removed.join(", ")}`);
     } else {
-      lines.push(`  ${change.field}: ${shortValue(change.previous)} -> ${shortValue(change.current)}`);
+      lines.push(`  **${change.field}**`, `  <font color='red'>− ${shortValue(change.previous)}</font>`, `  <font color='green'>+ ${shortValue(change.current)}</font>`);
     }
   }
   return lines.join("\n");
