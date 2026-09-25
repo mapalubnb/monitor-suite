@@ -6770,7 +6770,11 @@ async function startMonitor() {
   };
   const startupNotifier = createStartupNotifier({
     render: () => buildFlapRestartCard(snapshot, startupChecks, factoryPoolState),
-    send: (card, opts) => sendCardViaApi(card.title, card.content, card.template, undefined, opts),
+    send: async (card, opts) => {
+      const messageId = await sendCardViaApi(card.title, card.content, card.template, undefined, opts);
+      log(`[Flap 启动通知] 已发送：${messageId}`);
+      return messageId;
+    },
     patch: (id, card) => patchCard(id, card.title, card.content, card.template),
     onError: error => log(`[Flap 启动通知] 将自动重试：${error.message}`),
   });
@@ -7639,27 +7643,6 @@ async function startMonitor() {
    入口
    ══════════════════════════════════════════ */
 
-const command = process.argv[2];
-
-if (!IS_TEST_MODE) {
-  if (command === "check") {
-    runCheck().then(() => process.exit(0)).catch((err) => { log(`检测异常：${err.message}`); process.exit(1); });
-  } else if (command === "help" || command === "-h" || command === "--help") {
-    console.log(`用法:
-  node monitor.mjs          启动持续监控（守护进程模式）
-  node monitor.mjs check    手动触发一次检测
-  node monitor.mjs help     显示帮助
-
-信号:
-  kill -USR1 <PID>           立即触发一次检测`);
-  } else {
-    startMonitor().catch(err => {
-      log(`监控启动异常：${err.message}`);
-      process.exit(1);
-    });
-  }
-}
-
 // ── 优雅退出：等待通知队列排空 ──
 let isShuttingDown = false;
 async function gracefulShutdown(signal) {
@@ -7791,4 +7774,26 @@ if (!IS_TEST_MODE) {
   process.on("unhandledRejection", (err) => {
     log(`[未捕获异常] ${err?.message || err}`);
   });
+}
+
+// 所有模块级状态与退出处理器初始化后，再进入真实启动路径。
+const command = process.argv[2];
+
+if (!IS_TEST_MODE) {
+  if (command === "check") {
+    runCheck().then(() => process.exit(0)).catch((err) => { log(`检测异常：${err.message}`); process.exit(1); });
+  } else if (command === "help" || command === "-h" || command === "--help") {
+    console.log(`用法:
+  node monitor.mjs          启动持续监控（守护进程模式）
+  node monitor.mjs check    手动触发一次检测
+  node monitor.mjs help     显示帮助
+
+信号:
+  kill -USR1 <PID>           立即触发一次检测`);
+  } else {
+    startMonitor().catch(err => {
+      log(`监控启动异常：${err.message}`);
+      process.exit(1);
+    });
+  }
 }
