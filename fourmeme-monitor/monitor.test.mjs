@@ -9,6 +9,34 @@ process.env.FOURMEME_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
 
+test('first scan completion does not wait for the queued WSS follow-up scan', async () => {
+  let releaseFirst, releaseSecond;
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const secondGate = new Promise(resolve => { releaseSecond = resolve; });
+  let count = 0, idle = false;
+  const runner = __testables.createModuleRunner('startup-test', async () => {
+    if (++count === 1) await firstGate;
+    else await secondGate;
+  }, 1000);
+  const running = runner.run().then(() => { idle = true; });
+  await runner.run();
+  releaseFirst();
+  assert.equal(await runner.firstRun, 'complete');
+  assert.equal(idle, false);
+  assert.equal(count, 2);
+  releaseSecond();
+  await running;
+});
+
+test('failed first scan settles startup progress without claiming success', async () => {
+  const runner = __testables.createModuleRunner('startup-failure', async () => {
+    throw new Error('simulated source unavailable');
+  }, 1000);
+  await runner.run();
+  assert.equal(await runner.firstRun, 'failed');
+  assert.equal(runner.firstRunStatus, 'failed');
+});
+
 test('real module runner atomically persists its state and notification and rolls back failed scans', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fourmeme-transaction-'));
   const config = __testables.CONFIG;
@@ -295,21 +323,14 @@ test("contract fingerprint RPC failure cannot become empty bytecode", async () =
   );
 });
 
-test("startup card copy reflects active frontend and api cadences", () => {
-  const progress = __testables.buildStartupProgressContent();
-  const ready = __testables.buildStartupReadyContent();
-  assert.match(progress, /前端页面：每 7 秒｜当前快照 \d+ 个页面/);
-  assert.match(progress, /公开 API：每 10 秒/);
-  assert.match(ready, /\*\*01｜运行状态\*\*[\s\S]*\*\*02｜监控概览\*\*[\s\S]*\*\*03｜前端监控入口\*\*[\s\S]*\*\*04｜运行参数\*\*/);
-  assert.match(ready, /状态：监控运行中/);
-  assert.match(ready, /前端页面：[\s\S]*每 7 秒/);
-  assert.match(ready, /公开 API：[\s\S]*每 10 秒/);
-  for (const url of __testables.CONFIG.monitorUrls) assert.match(ready, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.doesNotMatch(`${progress}\n${ready}`, /操作入口|更新时间：/);
-  assert.doesNotMatch(ready, /每 \d+s/);
-  assert.doesNotMatch(`${progress}\n${ready}`, /[\p{Extended_Pictographic}]/u);
-  assert.doesNotMatch(`${progress}\n${ready}`, /(^|\n)-\s/m);
-  assert.doesNotMatch(ready, /心跳|日报/);
+test("restart card reports process and baseline separately within one card", () => {
+  const card = __testables.buildFourmemeRestartCard();
+  assert.equal(card.title, "Four.meme 监控已启动");
+  assert.match(card.content, /进程已启动/);
+  assert.match(card.content, /前端：每 7 秒｜API：每 10 秒/);
+  assert.match(card.content, /首轮检查：完成 0\/9/);
+  assert.doesNotMatch(card.content, /全部模块首轮检查完成|监控启动中/);
+  assert.ok(card.content.length < 460);
 });
 
 test("canonicalFrontendUrl normalizes tracking params, hash, query order, and trailing slash", () => {

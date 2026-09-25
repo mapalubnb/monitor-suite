@@ -79,6 +79,7 @@ async function ensureTenantToken() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
+      signal: AbortSignal.timeout(10_000),
     });
     const json = await res.json();
     if (json.code === 0 && json.tenant_access_token) {

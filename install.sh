@@ -124,6 +124,7 @@ if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/ai-client.mjs "$SHARED_DIR/"
   cp shared/feishu-client.mjs "$SHARED_DIR/"
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
+  cp shared/startup-notifier.mjs "$SHARED_DIR/"
   cp .env.example "$SUITE_DIR/.env.example"
   if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
     cp ai-models.json "$SUITE_DIR/"

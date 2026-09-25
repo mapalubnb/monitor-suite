@@ -21,6 +21,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { parseHTML } from "linkedom";
+import { createStartupNotifier, buildStartupCard } from "../shared/startup-notifier.mjs";
 import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.mjs";
 import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
@@ -6744,116 +6745,12 @@ function safeProposalDisplay(state = {}) {
   };
 }
 
-function buildFlapStartupContent(
-  snapshot = {},
-  hostname = "未知",
-  factoryPoolState = createFactoryPoolState(CONFIG.factoryPoolMonitor.proxy),
-  contractIntegrityState = {},
-  safeProposalState = createSafeProposalState(CONFIG.safeProposalMonitor.safes),
-  earlySignalState = createEarlySignalState(),
-) {
-  const pages = Object.values(snapshot.pages || {});
-  const factories = Object.values(snapshot.vaultFactories || {}).filter(factory => factory?.showInCAStore === true);
-  const registry = snapshot.registryMonitor || {};
-  const pageLines = CONFIG.urls.map((url, index) => {
-    const page = pages.find(item => item?.originalUrl === url) || {};
-    const assets = page.assetFiles?.length || 0;
-    const i18n = Object.keys(page.i18nStrings || {}).length;
-    return `${String(index + 1).padStart(2, "0")}　[${url}](${url})｜资源 ${assets} 个｜i18n ${i18n} 条`;
-  });
-  const factoryLines = factories.length > 0
-    ? factories.map((factory, index) => {
-        const name = factory.name || factory.id || "未命名金库";
-        const address = factory.factory || factory.address || "无地址";
-        const launch = vaultLaunchLink(address, "打开金库");
-        return `${String(index + 1).padStart(2, "0")}　${name}｜状态 ${factory.enabled ? "已启用" : "未启用"}｜地址 ${addressLink(address)}${launch ? `｜金库 ${launch}` : ""}`;
-      })
-    : ["当前没有配置为 CAStore 展示的金库"];
-  const robinhoodLaunchUrl = buildVaultFactoryLaunchUrl(ROBINHOOD_INDEX_VAULT_FACTORY, { chain: "robinhood" });
-  const poolAssets = Object.values(factoryPoolState.assets || {}).sort((a, b) => a.quoteToken.localeCompare(b.quoteToken));
-  const factoryRealtimeLag = Math.max(0, (factoryPoolState.safeLatestBlock || 0) - (factoryPoolState.headLastScannedBlock || 0));
-  const factoryWss = factoryPoolWssDisplay(factoryPoolState);
-  const factoryStatus = factoryPoolState.lastError
-    ? "需要关注"
-    : factoryWss.statusCode === "reconnecting" || factoryWss.statusCode === "stopped" || factoryWss.backfillStatus === "failed"
-      ? "需要关注"
-      : factoryWss.statusCode === "connecting"
-        ? "连接中"
-        : factoryWss.statusCode === "degraded"
-          ? "部分可用"
-          : factoryRealtimeLag > CONFIG.factoryPoolMonitor.realtimeMaxBlocksPerRun ? "存在延迟" : "运行正常";
-  const poolAssetLines = poolAssets.length > 0
-    ? poolAssets.map((asset, index) =>
-        `${String(index + 1).padStart(2, "0")}　${formatFactoryPoolAssetName(asset)}｜状态 ${formatFactoryPoolAssetStatus(asset)}｜地址 ${addressLink(asset.quoteToken)}`)
-    : ["尚未发现已配置的 Factory 底池资产"];
-  const safeProposal = safeProposalDisplay(safeProposalState);
-  const safeLines = safeProposal.safeStates.length > 0
-    ? safeProposal.safeStates.map((item, index) =>
-        `${String(index + 1).padStart(2, "0")}　Safe ${addressLink(item.address)}｜nonce ${item.currentNonce ?? "未知"}｜${item.lastError ? "异常" : item.baselineEstablished ? "基线完成" : "等待基线"}`)
-    : ["尚未配置 Flap 管理 Safe"];
-  return [
-    "**01｜运行状态**",
-    "状态：监控运行中",
-    `服务器：${hostname}`,
-    `轮询间隔：${CONFIG.pollIntervalMs}ms｜请求抖动 ±${CONFIG.jitterMs}ms｜请求超时 ${CONFIG.fetchTimeoutMs}ms`,
-    `连续失败告警阈值：${CONFIG.failThreshold} 次`,
-    "",
-    "**02｜页面监控**",
-    ...pageLines,
-    "",
-    "**03｜CAStore 金库**",
-    `展示数量：${factories.length}`,
-    ...factoryLines,
-    "",
-    "**04｜Robinhood CAStore**",
-    `页面：[https://flap.sh/robinhood/CAstore?lang=zh](https://flap.sh/robinhood/CAstore?lang=zh)`,
-    "模板：币股（IndexVault）｜状态 监控中",
-    `Factory：${flapLink(ROBINHOOD_INDEX_VAULT_FACTORY, robinhoodLaunchUrl)}`,
-    `金库入口：${flapLink(robinhoodLaunchUrl, robinhoodLaunchUrl)}`,
-    "",
-    "**05｜Factory 底池资产**",
-    `Factory Proxy：${addressLink(factoryPoolState.proxy || CONFIG.factoryPoolMonitor.proxy)}`,
-    `监控状态：${factoryStatus}`,
-    `实时通道：${factoryWss.status}｜已订阅 ${factoryWss.subscribed}｜最后订阅 ${factoryWss.lastSubscribed}｜最后事件 ${factoryWss.lastEvent}`,
-    `HTTP 兜底：已扫 ${factoryPoolState.headLastScannedBlock ?? "尚未建立"}｜最新 ${factoryPoolState.latestBlock ?? factoryPoolState.safeLatestBlock ?? "尚未建立"}｜延迟 ${factoryRealtimeLag} 块`,
-    `短窗口回扫：${factoryWss.backfill}`,
-    ...(factoryWss.wssError ? [`实时通道异常：${factoryWss.wssError}`] : []),
-    ...(factoryWss.backfillError ? [`短窗口回扫异常：${factoryWss.backfillError}`] : []),
-    `资产数量：${poolAssets.length}｜支持创建 ${poolAssets.filter(asset => asset.effectiveEnabled).length}｜暂停创建 ${poolAssets.filter(asset => asset.configured && asset.creationDisabled).length}｜已停用 ${poolAssets.filter(asset => !asset.configured).length}`,
-    ...poolAssetLines,
-    "",
-    "**06｜Vault Portal 链上注册**",
-    `Vault Portal：${addressLink(CONFIG.registryMonitor.address)}`,
-    `独立扫描：${CONFIG.registryMonitor.intervalMs / 1000} 秒｜WSS 唤醒：${CONFIG.registryMonitor.wsEnabled ? "已启用" : "未启用"}`,
-    `确认块：${CONFIG.registryMonitor.confirmations}`,
-    `启动回溯：${CONFIG.registryMonitor.bootstrapLookbackBlocks} 块`,
-    `单轮最大扫描：${CONFIG.registryMonitor.maxBlocksPerRun} 块`,
-    `已扫描区块：${registry.lastBlock ?? "尚未建立"}｜安全区块 ${registry.safeLatestBlock ?? "尚未建立"}｜最新区块 ${registry.latestBlock ?? "尚未建立"}`,
-    `已知链上金库：${Object.keys(registry.knownVaults || {}).length} 个`,
-    "",
-    "**07｜合约与配置完整性**",
-    `监控状态：${CONFIG.contractIntegrityMonitor.enabled ? (contractIntegrityState.lastError ? "需要关注" : "运行正常") : "未启用"}`,
-    `合约目录：${Object.keys(contractIntegrityState.catalog || {}).length} 个｜已知资产：${Object.keys(contractIntegrityState.trackedAssets || {}).length} 个`,
-    `核心批量校验：${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒｜扩展轮转：${CONFIG.contractIntegrityMonitor.extendedIntervalMs / 1000} 秒｜代码审计：${CONFIG.contractIntegrityMonitor.codeAuditIntervalMs / 1000} 秒`,
-    `事件通道：精准地址 WSS + ${CONFIG.contractIntegrityMonitor.coreIntervalMs / 1000} 秒 HTTP 日志兜底`,
-    "",
-    "**08｜Safe 计价代币管理提案预警**",
-    `监控状态：${safeProposal.status}`,
-    `轮询间隔：空闲 ${CONFIG.safeProposalMonitor.intervalMs / 1000} 秒｜活跃 ${CONFIG.safeProposalMonitor.activeIntervalMs / 1000} 秒｜健康 Safe ${safeProposal.healthyCount}/${safeProposal.safeStates.length}｜最后成功 ${safeProposal.lastSuccess}`,
-    `跟踪中目标：${safeProposal.active.length} 个`,
-    ...(safeProposal.usingCache ? [`数据状态：Safe API 限流，沿用最后成功快照｜下次重试 ${safeProposal.retryAt}`] : []),
-    ...safeLines,
-    ...(safeProposalState.lastError ? [`最近异常：${safeProposalState.lastError}`] : []),
-    "",
-    "【底池提前信号】",
-    "事件通道：WSS 快速回执／新区块确认 + HTTP 断点补扫｜外部数据独立调度",
-    `启用：${CONFIG.earlySignalMonitor.enabled ? "是" : "否"}｜扫描区块：${earlySignalState.cursor ?? "未建立"}｜最新区块：${earlySignalState.latestBlock ?? "未知"}`,
-    `候选资产：${Object.keys(earlySignalState.tokens || {}).length}｜观察地址：${Object.keys(earlySignalState.candidates || {}).length}｜待推送：${earlySignalState.pendingChanges?.length || 0}`,
-    ...Object.entries(earlySignalState.health || {}).filter(([,h]) => h.lastError).map(([name,h]) => `异常 ${name}：${h.lastError}`),
-    "",
-    "**09｜RPC 节点**",
-    ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
-  ].join("\n");
+function buildFlapRestartCard(snapshot, checks, factoryState) {
+  return buildStartupCard("Flap", checks, [
+    `页面 ${Object.keys(snapshot.pages || {}).length} 个｜金库工厂 ${Object.keys(snapshot.vaultFactories || {}).length} 个`,
+    `底池资产 ${Object.keys(factoryState.assets || {}).length} 个｜实时区块 ${factoryState.headLastScannedBlock ?? "待检查"}`,
+    `页面轮询：${CONFIG.pollIntervalMs / 1000} 秒｜Safe 提案：${CONFIG.safeProposalMonitor.intervalMs / 1000} 秒`,
+  ]);
 }
 
 async function startMonitor() {
@@ -6865,6 +6762,20 @@ async function startMonitor() {
     CONFIG.safeProposalMonitor.safes,
   );
   const earlySignalState = loadEarlySignalState(CONFIG.earlySignalMonitor.stateFile);
+  const startupChecks = {
+    pages: "pending",
+    factory: CONFIG.factoryPoolMonitor.enabled ? "pending" : "disabled",
+    integrity: CONFIG.contractIntegrityMonitor.enabled ? "pending" : "disabled",
+    safe: CONFIG.safeProposalMonitor.enabled ? "pending" : "disabled",
+  };
+  const startupNotifier = createStartupNotifier({
+    render: () => buildFlapRestartCard(snapshot, startupChecks, factoryPoolState),
+    send: (card, opts) => sendCardViaApi(card.title, card.content, card.template, undefined, opts),
+    patch: (id, card) => patchCard(id, card.title, card.content, card.template),
+    onError: error => log(`[Flap 启动通知] 将自动重试：${error.message}`),
+  });
+  global.__startupNotifier = startupNotifier;
+  void startupNotifier.refresh();
   const receiptHints = new Map(), priorityTokens = new Set(), externalJobs = new Map();
   let earlyDeliveryPromise = null;
   function deliverEarly() {
@@ -7176,6 +7087,8 @@ async function startMonitor() {
       return { key, features, i18n, dlCount };
     }));
     const results = await Promise.allSettled(tasks);
+    startupChecks.pages = results.some(r => r.status === "rejected") ? "failed" : "complete";
+    void startupNotifier.refresh();
     const initVaultFactoryEntries = [];
     for (const r of results) {
       if (r.status === "fulfilled") {
@@ -7204,10 +7117,13 @@ async function startMonitor() {
         suppressNotifications: !hasFactoryBaseline,
         scanConfig: { scanRealtime: true, scanCatchup: false, scanAssets: false },
       });
+      startupChecks.factory = "complete";
     } catch (err) {
+      startupChecks.factory = "failed";
       try { await recordFactoryPoolScanError(factoryPoolState, err); } catch {}
       log(`[Flap Factory] 启动检测失败：${err.message}`);
     }
+    void startupNotifier.refresh();
   }
 
 
@@ -7218,16 +7134,22 @@ async function startMonitor() {
       forceExtended: true,
       forceCodeAudit: true,
     });
+    startupChecks.integrity = contractIntegrityState.lastError ? "failed" : "complete";
+    void startupNotifier.refresh();
     if (hasIntegrityBaseline) void scheduleContractIntegrityDelivery();
   }
 
   if (CONFIG.safeProposalMonitor.enabled) {
     try {
       await safeProposalPoll();
+      startupChecks.safe = safeProposalState.lastError ? "failed" : "complete";
     } catch (error) {
+      startupChecks.safe = "failed";
       log(`[Flap Safe 提案] 启动检测失败：${error.message}`);
     }
   }
+
+  void startupNotifier.refresh();
 
   const factoryPoolEventQueue = createFactoryPoolEventQueue(factoryPoolState);
   global.__factoryPoolEventQueueDrain = factoryPoolEventQueue.drain;
@@ -7292,19 +7214,6 @@ async function startMonitor() {
   await refreshContractIntegrityWsFeed();
 
   await Promise.race([firstFactoryWsSubscription, sleep(2_500)]);
-
-  await sendFeishu(
-    "Flap 监控 v2 已启动",
-    buildFlapStartupContent(
-      snapshot,
-      (await import("node:os")).hostname(),
-      factoryPoolState,
-      contractIntegrityState,
-      safeProposalState,
-      earlySignalState,
-    ),
-    "blue"
-  );
 
   let isFactoryRealtimeScanning = false;
   let isFactoryCatchupScanning = false;
@@ -7682,6 +7591,10 @@ async function startMonitor() {
       log(`轮询异常：${err.message}`);
     } finally {
       isPolling = false;
+      if (startupChecks.pages === "pending") {
+        startupChecks.pages = Object.values(failCounts).some(item => item.count > 0) ? "failed" : "complete";
+        void startupNotifier.refresh();
+      }
       // 如果在轮询期间有新的检测请求，立即执行一次
       if (pendingPoll) {
         pendingPoll = false;
@@ -7752,6 +7665,7 @@ let isShuttingDown = false;
 async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
+  global.__startupNotifier?.stop();
   log(`收到 ${signal}，正在优雅退出……`);
   if (global.__factoryPoolWsFeed) {
     global.__factoryPoolWsFeed.stop();
@@ -7792,6 +7706,7 @@ if (!IS_TEST_MODE) {
 }
 
 export const __testables = {
+  buildFlapRestartCard,
   checkFlapRegistryLogs,
   fetchPage,
   extractCaStoreVaultSections,
@@ -7825,7 +7740,6 @@ export const __testables = {
   buildBriefingInput,
   buildCardBriefing,
   buildOperationalNoticeContent,
-  buildFlapStartupContent,
   safeProposalDisplay,
   collectSnapshotContractHints,
   syncFlapContractIntegrityCatalog,

@@ -21,6 +21,7 @@
  * 信号：kill -USR1 <PID>  立即触发全量检测
  */
 
+import { createStartupNotifier, buildStartupCard } from "../shared/startup-notifier.mjs";
 import { createTransactionalOutbox } from "../shared/transactional-outbox.mjs";
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
@@ -947,26 +948,6 @@ async function sendCardViaApi(title, content, template = "red", diffFilePath, re
     }
   }
   return null;
-}
-
-async function sendStartupCard(title, content, template = "blue") {
-  let messageId = await sendCardViaApi(title, content, template, undefined, 2);
-  if (messageId) return messageId;
-  log(`[启动通知] 即时通道失败，切换队列兜底：${title}`);
-  messageId = await sendCardQueued(title, content, template);
-  if (!messageId) log(`[启动通知] 发送失败：${title}`);
-  return messageId;
-}
-
-async function patchStartupCard(messageId, title, content, template = "blue") {
-  if (!messageId) return false;
-  try {
-    await patchCardViaApi(messageId, title, content, template);
-    return true;
-  } catch (err) {
-    log(`[启动通知] 更新启动卡片失败：${err.message}`);
-    return false;
-  }
 }
 
 /**
@@ -8997,6 +8978,7 @@ const monitorStore = createTransactionalOutbox({
 });
 let snapshot = monitorStore.state;
 let outboxTimer = null;
+let startupNotifier = null;
 let monitorStopping = false;
 let startTime = Date.now();
 const moduleMetrics = createModuleMetricsState();
@@ -9157,6 +9139,9 @@ function clearModuleError(name) {
  * 创建防重入的模块运行器
  */
 function createModuleRunner(name, fn, intervalMs) {
+  let firstRunStatus = "pending";
+  let resolveFirstRun;
+  const firstRun = new Promise(resolve => { resolveFirstRun = resolve; });
   let running = false;
   let pending = false;
   let backoffSkips = 0;
@@ -9174,6 +9159,7 @@ function createModuleRunner(name, fn, intervalMs) {
         const startedAt = Date.now();
         try {
           await moduleMetricContext.run(metricSample, () => monitorStore.transaction(fn));
+          if (firstRunStatus === "pending") firstRunStatus = "complete";
           metricSample.durationMs = Date.now() - startedAt;
           recordModuleMetric(moduleMetrics, name, metricSample);
           // warn if recovering from backoff skips (only notify if significant)
@@ -9195,6 +9181,7 @@ function createModuleRunner(name, fn, intervalMs) {
             try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
           }
         } catch (err) {
+          if (firstRunStatus === "pending") firstRunStatus = "failed";
           if (name === "github") githubReposETag = "";
           metricSample.durationMs = Date.now() - startedAt;
           if (err.message?.includes("[退避中]")) {
@@ -9210,13 +9197,16 @@ function createModuleRunner(name, fn, intervalMs) {
             log(`[${name}] 异常：${err.message}`);
             recordModuleError(name, err.message);
           }
+        } finally {
+          // A first pass is complete even if WSS has already queued another pass.
+          resolveFirstRun(firstRunStatus);
         }
       } while (pending && !monitorStopping);
     } finally {
       running = false;
     }
   };
-  return { name, run, intervalMs };
+  return { name, run, intervalMs, firstRun, get firstRunStatus() { return firstRunStatus; } };
 }
 
 /* ══════════════════════════════════════════
@@ -9892,81 +9882,11 @@ function calculateNextModuleDueAt(nextDueAt, intervalMs, now = Date.now()) {
   return next;
 }
 
-function buildStartupProgressContent() {
-  const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
-  return [
-    `**01｜运行状态**`,
-    `状态：监控启动中`,
-    `进度：进程已启动，正在并行建立或刷新全部模块基线`,
-    `完成条件：底池、前端、API、OpenFour、GitHub、合约、链上参数和创建者动作完成首轮检查`,
-    ``,
-    `**02｜模块频率**`,
-    `底池配置：${formatInterval(CONFIG.intervals.pool)}`,
-    `前端页面：${formatInterval(CONFIG.intervals.frontend)}｜当前快照 ${pageCount} 个页面`,
-    `公开 API：${formatInterval(CONFIG.intervals.api)}`,
-    `OpenFour 模板：${formatInterval(CONFIG.intervals.openfourTemplates)}`,
-    `GitHub：${formatInterval(CONFIG.intervals.github)}`,
-    `合约代码：${formatInterval(CONFIG.intervals.contract)}`,
-    `链上参数：${formatInterval(CONFIG.intervals.onchain)}`,
-    `创建者动作：WebSocket 实时触发｜HTTP ${formatInterval(actorRunner?.intervalMs)}兜底`,
-    ``,
-    `**03｜监控入口**`,
-    ...CONFIG.monitorUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
-  ].join("\n");
-}
-
-function buildStartupReadyContent() {
-  const poolCount = buildPoolMap(snapshot?.poolConfig).size;
-  const pageCount = Object.keys(snapshot?.frontendPages || {}).length;
-  const entryPageCount = CONFIG.monitorUrls.length;
-  const contractCount = Object.keys(snapshot?.contractFingerprints || {}).length;
-  const githubRepoCount = Object.keys(snapshot?.githubRepos || {}).length;
-  const openFourTemplateCount = Object.keys(snapshot?.openFourTemplates || {}).length;
-  const openFourModuleCount = Object.keys(snapshot?.openFourModules?.byAddress || {}).length;
-  const apiCount = Object.keys(snapshot?.apiStructure || {}).length;
-  const githubSha = snapshot?.githubSha || "未知";
-  const actorCount = snapshot?.chainActorMonitor?.actionActorCount
-    ?? Object.values(snapshot?.chainActorMonitor?.actors || {}).filter(actor => actor.actionWatched).length;
-  const registryTrigger = CONFIG.openFourRegistryLogMonitor.enabled ? "**Registry Logs 实时触发**" : "Registry Logs 关闭";
-  const pendingRouteCount = Object.values(snapshot?._frontendPendingRoutes || {}).filter(route => route?.status === "pending").length;
-  const approvedRouteCount = Object.values(snapshot?._frontendRouteApprovals || {}).filter(route => route?.status === "approved").length;
-  const presetCount = snapshot?.openFourModules?.presetIds?.length || 0;
-  const memory = process.memoryUsage();
-  const performanceLines = modules.map((module) => {
-    const metric = summarizeModuleMetrics(moduleMetrics, module.name);
-    return `${module.name}：最近 ${metric.lastDurationMs}ms｜平均 ${metric.avgDurationMs}ms｜请求 ${metric.requestCount}`;
-  });
-  return [
-    `**01｜运行状态**`,
-    `状态：监控运行中`,
-    `基线：全部模块首轮检查完成`,
-    `调度：独立定时器｜RPC Batch｜并行抓取｜按域名自适应退避`,
-    ``,
-    `**02｜监控概览**`,
-    `底池配置：BSC ${poolCount} 个｜${formatInterval(CONFIG.intervals.pool)}`,
-    `前端页面：${pageCount} 个｜固定入口 ${entryPageCount} 个｜待确认路由 ${pendingRouteCount} 个｜已批准路由 ${approvedRouteCount} 个｜${formatInterval(CONFIG.intervals.frontend)}`,
-    `公开 API：${apiCount} 个端点｜${formatInterval(CONFIG.intervals.api)}`,
-    `OpenFour：模板 ${openFourTemplateCount} 个｜模块 ${openFourModuleCount} 个｜presetIds ${presetCount} 个｜${registryTrigger}｜模板轮询 ${formatInterval(CONFIG.intervals.openfourTemplates)}`,
-    `GitHub：${githubRepoCount} 个仓库｜最新提交 ${githubSha}｜${formatInterval(CONFIG.intervals.github)}`,
-    `合约代码：${contractCount} 个｜${formatInterval(CONFIG.intervals.contract)}`,
-    `链上参数：AgentNFT ${snapshot?.onchainParams?.agentNftCount ?? "未知"} 个｜${formatInterval(CONFIG.intervals.onchain)}`,
-    `创建者动作：${actorCount} 个地址｜WebSocket 实时监听｜HTTP ${formatInterval(actorRunner?.intervalMs)}兜底`,
-    ``,
-    `**03｜前端监控入口**`,
-    ...CONFIG.monitorUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
-    ``,
-    `**04｜运行参数**`,
-    `HTML 并发：${readPositiveIntEnv("FOURMEME_FRONTEND_HTML_CONCURRENCY", 6)}`,
-    `资源并发：${readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6)}`,
-    `异常资源复查：${formatDuration(CONFIG.frontendAssetJitter.quickConfirmDelayMs)}`,
-    `请求策略：稳定 UA｜资源 Referer｜请求抖动｜同域限速｜条件请求｜失败退避`,
-    `链上策略：tx.from 过滤｜确认块保护｜命中后合约复查`,
-    ``,
-    `**05｜性能基线**`,
-    `内存：RSS ${Math.round(memory.rss / 1024 / 1024)} MB｜堆使用 ${Math.round(memory.heapUsed / 1024 / 1024)} MB`,
-    `创建者扫描：区块完整性校验｜游标分叉回查｜失败保留进度`,
-    ...performanceLines,
-  ].join("\n");
+function buildFourmemeRestartCard() {
+  return buildStartupCard("Four.meme", Object.fromEntries(modules.map(m => [m.name, m.firstRunStatus])), [
+    `底池 ${buildPoolMap(snapshot?.poolConfig).size} 个｜页面 ${Object.keys(snapshot?.frontendPages || {}).length} 个｜合约 ${Object.keys(snapshot?.contractFingerprints || {}).length} 个`,
+    `前端：${formatInterval(CONFIG.intervals.frontend)}｜API：${formatInterval(CONFIG.intervals.api)}`,
+  ]);
 }
 
 async function startAllModules() {
@@ -9983,29 +9903,21 @@ async function startAllModules() {
     printPoolList(snapshot.poolConfig);
   }
 
-  const startupMessagePromise = sendStartupCard(
-    "Four.meme 全面监控 v2 启动中",
-    buildStartupProgressContent(),
-    "blue"
-  );
-
+  startupNotifier = createStartupNotifier({
+    render: () => buildFourmemeRestartCard(),
+    send: (card, opts) => sendCard(card.title, card.content, card.template, opts),
+    patch: (id, card) => patchCard(id, card.title, card.content, card.template),
+    onError: error => log(`[启动通知] 将自动重试：${error.message}`),
+  });
+  void startupNotifier.refresh();
   outboxTimer = setInterval(() => monitorStore.drain().catch(err => log(`[待发送] 落盘失败：${err.message}`)), 1_000);
   void monitorStore.drain().catch(err => log(err.message));
   if (actorRunner && CONFIG.actorMonitor.enabled) global.__actorBlockFeed = startActorBlockFeed(actorRunner);
   if (CONFIG.openFourRegistryLogMonitor.enabled) global.__openFourRegistryLogFeed = startOpenFourRegistryLogFeed();
   startModuleTimers();
-  await Promise.all(modules.map(async (m, index) => { await sleep(index * 100); await m.run(); }));
-
-  const startupMessageId = await startupMessagePromise;
-  const startupReadyContent = buildStartupReadyContent();
-  const startupPatched = await patchStartupCard(
-    startupMessageId,
-    "Four.meme 全面监控 v2 已启动",
-    startupReadyContent,
-    "green"
-  );
-  if (!startupPatched) {
-    await sendStartupCard("Four.meme 全面监控 v2 已启动", startupReadyContent, "green");
+  for (const [index, module] of modules.entries()) {
+    void sleep(index * 100).then(() => module.run()).catch(err => log(err.message));
+    void module.firstRun.then(() => startupNotifier.refresh());
   }
 
 }
@@ -10086,6 +9998,7 @@ async function gracefulShutdown(signal) {
     global.__openFourRegistryLogFeed.stop();
     log("已停止 OpenFourRegistry WebSocket 日志订阅");
   }
+  startupNotifier?.stop();
   if (outboxTimer) clearInterval(outboxTimer);
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
@@ -10110,6 +10023,7 @@ function setSnapshotForTests(value) {
 
 export const __testables = {
   CONFIG,
+  buildFourmemeRestartCard,
   createModuleRunner,
   sendNotificationMaybeAi,
   saveSnapshot,
@@ -10222,8 +10136,6 @@ export const __testables = {
   createHostLimiter,
   calculateNextModuleDueAt,
   fetchActorBlockActions,
-  buildStartupProgressContent,
-  buildStartupReadyContent,
   diffApiStructures,
   buildMergedFrontendAssetNotification,
   formatFrontendTextChanges,

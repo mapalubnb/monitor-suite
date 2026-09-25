@@ -230,72 +230,14 @@ test("Factory eth_getLogs ignores one empty RPC when another returns logs", asyn
   }
 });
 
-test("Flap startup card is complete and uses no emoji or bullet list markers", () => {
-  const content = __testables.buildFlapStartupContent({
-    pages: Object.fromEntries(__testables.CONFIG.urls.map((url, index) => [url, {
-      originalUrl: url,
-      assetFiles: [`asset-${index}.js`],
-      i18nStrings: { title: `页面 ${index}` },
-    }])),
-    vaultFactories: {
-      first: { name: "完整金库", factory: "0x0000000000000000000000000000000000000001", enabled: true, showInCAStore: true },
-      hidden: { name: "隐藏金库", factory: "0x0000000000000000000000000000000000000002", enabled: true, showInCAStore: false },
-    },
-    registryMonitor: { lastBlock: 100, safeLatestBlock: 105, latestBlock: 110, knownVaults: { one: {} } },
-  }, "monitor-host", {
-    proxy: FLAP_FACTORY_PROXY,
-    currentImplementation: "0x150103da235bc6caef37a7ca31373bbdf40ccd2e",
-    deploymentBlock: 39980228,
-    headLastScannedBlock: 105,
-    lastScannedBlock: 100,
-    safeLatestBlock: 105,
-    latestBlock: 105,
-    wssHealth: {
-      enabled: true,
-      configuredCount: 2,
-      subscribedCount: 2,
-      status: "healthy",
-      lastSubscribedAt: "2026-08-10T01:01:03.000Z",
-      lastEventAt: "2026-08-10T01:02:03.000Z",
-      backfill: { status: "completed", fromBlock: 95, toBlock: 105, eventCount: 1 },
-    },
-    historyLastScannedBlock: 90,
-    assets: {
-      [BNB_QUOTE_TOKEN]: { quoteToken: BNB_QUOTE_TOKEN, configured: true, creationDisabled: false, effectiveEnabled: true, values: ["1", "2", "3", "4", "5"] },
-      "0x21caef8a43163eea865baee23b9c2e327696a3bf": {
-        quoteToken: "0x21caef8a43163eea865baee23b9c2e327696a3bf",
-        name: "Tether Gold",
-        symbol: "XAUt",
-        configured: true,
-        creationDisabled: true,
-        effectiveEnabled: false,
-      },
-    },
-  });
-  for (const url of __testables.CONFIG.urls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  for (const url of __testables.CONFIG.bscRpcUrls) assert.match(content, new RegExp(url.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
-  assert.match(content, /0x0000000000000000000000000000000000000001/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x0000000000000000000000000000000000000001&chain=bnb&lang=zh/);
-  assert.doesNotMatch(content, /隐藏金库|0x0000000000000000000000000000000000000002/);
-  assert.match(content, /展示数量：1/);
-  assert.match(content, /\*\*04｜Robinhood CAStore\*\*/);
-  assert.match(content, /https:\/\/flap\.sh\/robinhood\/CAstore\?lang=zh/);
-  assert.match(content, /币股（IndexVault）｜状态 监控中/);
-  assert.match(content, /0xe6ca297D1d963b6F00d5b216986123CAeB883AF6/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
-  assert.match(content, /\*\*05｜Factory 底池资产\*\*/);
-  assert.match(content, /监控状态：运行正常/);
-  assert.match(content, /实时通道：运行正常｜已订阅 2\/2｜最后订阅 .*｜最后事件/);
-  assert.match(content, /HTTP 兜底：已扫 105｜最新 105｜延迟 0 块/);
-  assert.match(content, /短窗口回扫：已完成/);
-  assert.match(content, /资产数量：2｜支持创建 1｜暂停创建 1｜已停用 0/);
-  assert.match(content, new RegExp(BNB_QUOTE_TOKEN));
-  assert.match(content, /Tether Gold \(XAUt\)｜状态 暂停创建｜地址/);
-  assert.match(content, /0x21caef8a43163eea865baee23b9c2e327696a3bf/);
-  assert.doesNotMatch(content, /字段 [1-5]：/);
-  assert.doesNotMatch(content, /操作入口|更新时间：|CAStore 展示/);
-  assert.doesNotMatch(content, /[\p{Extended_Pictographic}]/u);
-  assert.doesNotMatch(content, /(^|\n)-\s/m);
+test("Flap restart card can render before network baselines and shows failures", () => {
+  const card = __testables.buildFlapRestartCard({ pages: {}, vaultFactories: {} },
+    { pages: "pending", factory: "complete", integrity: "failed", safe: "disabled" }, { assets: {} });
+  assert.equal(card.title, "Flap 监控已启动");
+  assert.match(card.content, /完成 2\/3｜异常 1/);
+  assert.match(card.content, /后台检查/);
+  assert.equal(card.template, "orange");
+  assert.ok(card.content.length < 460);
 });
 
 test("Factory getter call and five-word response preserve complete values", () => {

@@ -1,6 +1,6 @@
 {
   "name": "flap-monitor",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Flap 页面、金库、底池配置及 Safe／资金／CoW 订单／包装资产／流动性提前监控",
   "type": "module",
   "private": true,
