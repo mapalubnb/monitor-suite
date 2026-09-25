@@ -282,3 +282,62 @@ test("persisted outbox survives restart and acknowledgement is selective", () =>
     assert.equal(earlyAssetStage(loaded, TOKEN), "prepared");
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test("public Flap pair cannot promote its new token or alert for an opened quote", () => {
+  const state = createEarlySignalState();
+  const quote = '0x205812cdbed920aff76c6580abd681a46d11efc7';
+  const meme = '0x418257fbbc9832793d1a043c4311cd4afe407777';
+  state.tokens[quote] = { reason: 'Safe 配置提案', effectiveEnabled: true };
+  const logs = [log(DEX.v2Factory, [TOPICS.PairCreated, topic(quote), topic(meme)], '0x' + word(POOL) + word(1)),
+    log(POOL, [TOPICS.V2Mint, topic(OWNER)], '0x' + word(10) + word(10), 1)];
+  const publicReceipt = { ...receipt(logs), from: meme };
+  decodeEarlyReceipt(publicReceipt, state, { nowMs });
+  assert.equal(state.tokens[meme], undefined);
+  assert.equal(state.pendingChanges.length, 0);
+  assert.equal(shouldPrioritizeEarlyLog(logs[0], state), false);
+  assert.equal(earlyLogFilters(state).some(f => Array.isArray(f.address) && f.address.includes(POOL)), false);
+  state.tokens[quote].effectiveEnabled = false;
+  decodeEarlyReceipt(publicReceipt, state, { nowMs });
+  assert.ok(state.pendingChanges.length > 0);
+  assert.ok(state.pendingChanges.every(e => e.token === quote));
+  assert.equal(state.tokens[meme], undefined);
+});
+
+test("incoming dust to an executor does not turn a public pool into official preparation", () => {
+  const state = createEarlySignalState();
+  const stranger = '0x418257fbbc9832793d1a043c4311cd4afe407777';
+  const logs = [log(DEX.v2Factory, [TOPICS.PairCreated, topic(TOKEN), topic(stranger)], '0x' + word(POOL) + word(1)),
+    log(TOKEN, [TOPICS.Transfer, topic(stranger), topic(OWNER)], '0x' + word(1), 1)];
+  decodeEarlyReceipt({ ...receipt(logs), from: stranger }, state, { nowMs });
+  assert.equal(state.pendingChanges.some(e => e.kind === 'poolCreated'), false);
+  assert.equal(state.tokens[stranger], undefined);
+});
+
+test("legacy pool-only candidates and queued alerts are removed without deleting independent evidence", () => {
+  const dir = mkdtempSync(join(tmpdir(), 'flap-filter-test-'));
+  try {
+    const file = join(dir, 'state.json'), state = createEarlySignalState();
+    state.schemaVersion = 1;
+    state.tokens[TOKEN] = { reason: '已核验 DEX 建池' };
+    state.tokens[OWNER] = { reason: 'CoW 采购目标' };
+    state.events.pool = { id: 'pool', kind: 'poolCreated', token: TOKEN };
+    state.events.config = { id: 'config', kind: 'configuration', token: TOKEN };
+    state.events.order = { id: 'order', kind: 'order', token: OWNER };
+    state.pendingChanges = Object.values(state.events);
+    saveEarlySignalState(file, state);
+    const loaded = loadEarlySignalState(file);
+    assert.equal(loaded.tokens[TOKEN], undefined);
+    assert.ok(loaded.tokens[OWNER]);
+    assert.deepEqual(loaded.pendingChanges.map(e => e.id), ['order']);
+    assert.equal(loaded.schemaVersion, 2);
+    saveEarlySignalState(file, loaded);
+    assert.deepEqual(loadEarlySignalState(file), loaded);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("early card omits boilerplate and misleading liquidity absence text", () => {
+  const state = createEarlySignalState();
+  decodeEarlyReceipt(history.liquidityReceipt, state, { nowMs });
+  const content = buildEarlySignalContent(state.pendingChanges, state);
+  assert.doesNotMatch(content, /准备动作不等于开放|尚未确认有流动性|不代表 Factory 开放/);
+});
