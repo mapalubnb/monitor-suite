@@ -38,3 +38,6 @@ Thumbs.db
 *~
 .vscode/
 .idea/
+
+early-signal-state.json
+early-signal-state.json.tmp

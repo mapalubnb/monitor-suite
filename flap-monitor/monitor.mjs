@@ -59,6 +59,10 @@ import {
   saveSafeProposalState,
 } from "./safe-proposal-monitor.mjs";
 
+import { EXECUTION_WALLETS } from "./early-signal-catalog.mjs";
+import { createEarlySignalState, loadEarlySignalState, saveEarlySignalState, runEarlySignalScan,
+  earlyLogFilters, acknowledgeEarlySignals, buildEarlySignalContent } from "./early-signal-monitor.mjs";
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
 
@@ -159,13 +163,27 @@ const CONFIG = {
   safeProposalMonitor: {
     enabled: process.env.FLAP_SAFE_PROPOSAL_MONITOR !== "false",
     stateFile: join(__dirname, "safe-proposal-state.json"),
-    intervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_INTERVAL_MS", 120_000, 30_000),
-    activeIntervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_ACTIVE_INTERVAL_MS", 30_000, 10_000),
+    intervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_INTERVAL_MS", 10_000, 5_000),
+    activeIntervalMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_ACTIVE_INTERVAL_MS", 5_000, 3_000),
     requestTimeoutMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_TIMEOUT_MS", 5_000, 500),
     apiBaseUrl: process.env.FLAP_SAFE_API_BASE_URL || "https://api.safe.global/tx-service/bnb/api/v1",
     apiKey: String(process.env.FLAP_SAFE_API_KEY || "").trim(),
-    safes: [...new Set((process.env.FLAP_ADMIN_SAFE_ADDRESSES || DEFAULT_FLAP_ADMIN_SAFES.join(","))
+    safes: [...new Set(([process.env.FLAP_ADMIN_SAFE_ADDRESSES || "", process.env.FLAP_SAFE_INCLUDE_CORE === "false" ? "" : DEFAULT_FLAP_ADMIN_SAFES.join(",")].filter(Boolean).join(","))
       .split(",").map(value => value.trim()).filter(value => /^0x[a-fA-F0-9]{40}$/.test(value)))],
+  },
+
+  earlySignalMonitor: {
+    enabled: process.env.FLAP_EARLY_SIGNAL_MONITOR !== "false",
+    stateFile: join(__dirname, "early-signal-state.json"),
+    intervalMs: readPositiveIntEnv("FLAP_EARLY_INTERVAL_MS", 1_000, 500),
+    cowIntervalMs: readPositiveIntEnv("FLAP_EARLY_COW_INTERVAL_MS", 10_000, 5_000),
+    discoveryIntervalMs: readPositiveIntEnv("FLAP_EARLY_DISCOVERY_INTERVAL_MS", 86_400_000, 60_000),
+    maxBlocksPerRun: readPositiveIntEnv("FLAP_EARLY_MAX_BLOCKS", 20, 1),
+    nativeTransactions: process.env.FLAP_EARLY_NATIVE_TX_SCAN !== "false",
+    confirmations: Math.max(0, Number.parseInt(process.env.FLAP_EARLY_CONFIRMATIONS || "1", 10) || 0),
+    wallets: (process.env.FLAP_EARLY_WALLETS || EXECUTION_WALLETS.join(",")).split(",").map(s => s.trim()).filter(s => /^0x[a-f0-9]{40}$/i.test(s)),
+    cowApiBaseUrl: process.env.FLAP_COW_API_BASE_URL || "https://api.cow.fi/bnb/api/v1",
+    wsEnabled: process.env.FLAP_EARLY_WS_ENABLED !== "false", timeoutMs: 5_000,
   },
 
   // 反风控
@@ -3631,6 +3649,7 @@ function createFactoryPoolWsFeed({
   urls,
   proxy,
   topics,
+  topicFilter,
   label = "Flap Factory WSS",
   onEvent,
   onSubscribed,
@@ -3731,7 +3750,8 @@ function createFactoryPoolWsFeed({
       endpoint.connectedAt = nowIso();
       emitStatus();
       const filter = { address: proxy };
-      if (Array.isArray(topics) && topics.length > 0) filter.topics = [topics];
+      if (topicFilter !== undefined) filter.topics = topicFilter;
+      else if (Array.isArray(topics) && topics.length > 0) filter.topics = [topics];
       ws.send(JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -6363,9 +6383,9 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
   for (const changes of groups) {
     const invalidated = ["invalidated", "failed"].includes(changes[0].type);
     const suffix = ({ existing: "当前待执行", proposed: "已提交", ready: "签名已满足，等待执行",
-      executed: "执行成功", failed: "执行失败", invalidated: "已被替换" })[changes[0].type] || "状态更新";
+      signatures: "签名进度更新", executed: "执行成功", failed: "执行失败", invalidated: "已被替换" })[changes[0].type] || "状态更新";
     const subject = changes.every(change => change.vaultFactory) ? "Vault Factory 注册／配置提案"
-      : changes.some(change => change.vaultFactory) ? "Safe 管理提案" : "计价代币管理提案";
+      : changes.every(change => change.quoteToken) ? "计价代币管理提案" : "Safe 资金／权限／管理提案";
     const title = `${titlePrefix}Flap ${subject}：${suffix}`;
     const content = buildSafeProposalContent(changes, factoryPoolState?.assets || {});
     const messageId = invalidated
@@ -6391,6 +6411,21 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
     }
   }
   return { sent: delivered.length > 0, changes: delivered, messageIds };
+}
+
+function earlySignalConfig() {
+  return { ...CONFIG.earlySignalMonitor, safes: CONFIG.safeProposalMonitor.safes,
+    safeApiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl, safeApiKey: CONFIG.safeProposalMonitor.apiKey };
+}
+async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState } = {}) {
+  // Bound each card; acknowledge only successful sends and retain the remaining queue.
+  const changes = state.pendingChanges.slice(0, 8);
+  if (!changes.length) return { sent: false };
+  const id = await sendCardFn("Flap 底池提前信号", buildEarlySignalContent(changes, state), "orange");
+  if (!id) return { sent: false };
+  acknowledgeEarlySignals(state, changes.map(e => e.id));
+  saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+  return { sent: true };
 }
 
 /* ══════════════════════════════════════════
@@ -6555,6 +6590,18 @@ async function runCheck() {
     log(`[Flap 合约完整性] 手动检测失败：${err.message}`);
   }
 
+  try {
+  if (CONFIG.earlySignalMonitor.enabled) {
+    const early = loadEarlySignalState(CONFIG.earlySignalMonitor.stateFile);
+    const safe = loadSafeProposalState(CONFIG.safeProposalMonitor.stateFile, CONFIG.safeProposalMonitor.safes);
+    const result = await runEarlySignalScan({ state: early, config: earlySignalConfig(), rpcBatch: bscRpcBatch, safeState: safe });
+    saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, early);
+    if (result.changed) hasDetectedChange = true;
+    if ((await deliverFlapEarlySignals(early)).sent) hasNotifiedChange = true;
+    for (const error of result.errors) log("[Flap 提前信号] " + error);
+  }
+  } catch (error) { log("[Flap 提前信号] 手动检测失败：" + error.message); }
+
   for (const n of coalesceFlapNotifications(notifications, { titlePrefix: "手动检测 — " })) {
     for (const diff of getStandaloneCaStoreVaultDiffs(n)) {
       const card = buildCaStoreVaultChangeNotification(diff, snapshot.vaultFactories || {}, { titlePrefix: "手动检测 — " });
@@ -6644,6 +6691,7 @@ function buildFlapStartupContent(
   factoryPoolState = createFactoryPoolState(CONFIG.factoryPoolMonitor.proxy),
   contractIntegrityState = {},
   safeProposalState = createSafeProposalState(CONFIG.safeProposalMonitor.safes),
+  earlySignalState = createEarlySignalState(),
 ) {
   const pages = Object.values(snapshot.pages || {});
   const factories = Object.values(snapshot.vaultFactories || {}).filter(factory => factory?.showInCAStore === true);
@@ -6737,6 +6785,11 @@ function buildFlapStartupContent(
     ...safeLines,
     ...(safeProposalState.lastError ? [`最近异常：${safeProposalState.lastError}`] : []),
     "",
+    "【底池提前信号】",
+    `启用：${CONFIG.earlySignalMonitor.enabled ? "是" : "否"}｜扫描区块：${earlySignalState.cursor ?? "未建立"}｜最新区块：${earlySignalState.latestBlock ?? "未知"}`,
+    `候选资产：${Object.keys(earlySignalState.tokens || {}).length}｜观察地址：${Object.keys(earlySignalState.candidates || {}).length}｜待推送：${earlySignalState.pendingChanges?.length || 0}`,
+    ...Object.entries(earlySignalState.health || {}).filter(([,h]) => h.lastError).map(([name,h]) => `异常 ${name}：${h.lastError}`),
+    "",
     "**09｜RPC 节点**",
     ...CONFIG.bscRpcUrls.map((url, index) => `${String(index + 1).padStart(2, "0")}　[${url}](${url})`),
   ].join("\n");
@@ -6750,6 +6803,55 @@ async function startMonitor() {
     CONFIG.safeProposalMonitor.stateFile,
     CONFIG.safeProposalMonitor.safes,
   );
+  const earlySignalState = loadEarlySignalState(CONFIG.earlySignalMonitor.stateFile);
+  let earlyPromise = null, earlyTimer = null, earlyExternalPromise = null, earlyExternalTimer = null;
+  const earlyFeeds = [];
+  async function earlyPoll() {
+    if (!CONFIG.earlySignalMonitor.enabled || isShuttingDown) return;
+    if (earlyPromise) return earlyPromise;
+    earlyPromise = (async () => {
+      const previous = JSON.stringify(Object.entries(earlySignalState.health).map(([name,h]) => [name,h.lastError]));
+      try {
+        const result = await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain" }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
+        saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
+        if (result.errors.length && previous !== JSON.stringify(Object.entries(earlySignalState.health).map(([name,h]) => [name,h.lastError]))) log("[Flap 提前信号] " + result.errors.join("；"));
+        if (canAttemptFeishuDelivery()) await deliverFlapEarlySignals(earlySignalState);
+      } catch (error) { log("[Flap 提前信号] " + error.message); }
+    })().finally(() => { earlyPromise = null; });
+    return earlyPromise;
+  }
+  async function earlyExternalPoll() {
+    if (!CONFIG.earlySignalMonitor.enabled || isShuttingDown || earlyExternalPromise) return;
+    earlyExternalPromise = runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "external" }, rpcBatch: bscRpcBatch, safeState: safeProposalState })
+      .then(() => saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState))
+      .catch(error => log("[Flap 提前信号 API] " + error.message))
+      .finally(() => { earlyExternalPromise = null; });
+    await earlyExternalPromise;
+    if (!isShuttingDown) earlyExternalTimer = setTimeout(earlyExternalPoll, CONFIG.earlySignalMonitor.cowIntervalMs);
+  }
+  function scheduleEarly() {
+    if (!CONFIG.earlySignalMonitor.enabled || isShuttingDown) return;
+    earlyTimer = setTimeout(async () => { await earlyPoll(); scheduleEarly(); }, CONFIG.earlySignalMonitor.intervalMs);
+  }
+  if (CONFIG.earlySignalMonitor.enabled) {
+    // Start independently; slow discovery APIs cannot hold up the existing factory initialization.
+    void earlyPoll().then(scheduleEarly);
+    void earlyExternalPoll();
+    if (CONFIG.earlySignalMonitor.wsEnabled) for (const filter of earlyLogFilters(earlySignalState, earlySignalConfig())) {
+      earlyFeeds.push(createFactoryPoolWsFeed({ urls: CONFIG.factoryPoolMonitor.wsUrls, proxy: filter.address,
+        topics: filter.topics, topicFilter: filter.topics, label: "Flap 提前信号 WSS",
+        onEvent: () => { void earlyPoll(); }, onSubscribed: () => { void earlyPoll(); },
+        onStatus: health => { earlySignalState.wssHealth = health; } }).start());
+    }
+  }
+  global.__earlySignalDrain = async () => {
+    clearTimeout(earlyTimer);
+    clearTimeout(earlyExternalTimer);
+    earlyFeeds.forEach(feed => feed.stop());
+    if (earlyPromise) await earlyPromise;
+    if (earlyExternalPromise) await earlyExternalPromise;
+    saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
+  };
   let contractIntegrityMutationQueue = Promise.resolve();
   let contractIntegrityDeliveryPromise = null;
   let contractIntegrityWsFeed = null;
@@ -6984,6 +7086,7 @@ async function startMonitor() {
     }
   }
 
+
   if (CONFIG.contractIntegrityMonitor.enabled) {
     const hasIntegrityBaseline = Object.keys(contractIntegrityState.contracts || {}).length > 0;
     await contractIntegrityPoll({
@@ -7074,6 +7177,7 @@ async function startMonitor() {
       factoryPoolState,
       contractIntegrityState,
       safeProposalState,
+      earlySignalState,
     ),
     "blue"
   );
@@ -7556,6 +7660,9 @@ async function gracefulShutdown(signal) {
   if (global.__safeProposalDrain) {
     try { await global.__safeProposalDrain(); } catch {}
   }
+  if (global.__earlySignalDrain) {
+    try { await global.__earlySignalDrain(); } catch (error) { log("提前信号停机保存失败：" + error.message); }
+  }
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   try { saveSnapshot(loadSnapshot() || {}); } catch {}
@@ -7568,6 +7675,8 @@ if (!IS_TEST_MODE) {
 
 export const __testables = {
   CONFIG,
+  deliverFlapEarlySignals,
+  earlySignalConfig,
   ASSET_ANALYSIS_SCHEMA_VERSION,
   FACTORY_BACKGROUND_TASK_ORDER,
   emptyFlapChangeMeta,

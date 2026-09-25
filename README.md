@@ -5,13 +5,13 @@
 ## ✨ 主要功能
 
 - **Four.meme**：底池、前端页面、公开 API、OpenFour 模板、GitHub、合约及链上参数。
-- **Flap.sh**：BNB CAStore、Robinhood CAStore、metadata schema、Vault Portal、Vault Factory、SwapRegistry、核心代理升级、Factory 底池状态，以及管理 Safe 的计价币配置、兑换路径、创建开关和 Vault Factory 注册／配置提案。
+- **Flap.sh**：BNB CAStore、Robinhood CAStore、metadata schema、Vault Portal、Vault Factory、SwapRegistry、核心代理升级、Factory 底池状态，以及 Safe 提案、采购订单、资金、包装资产、LP 仓位与流动性提前信号。
 - **飞书卡片**：规则结果优先发送，AI 摘要异步补充；长文案、URL、地址和交易哈希完整保留。
 - **稳定低延迟**：支持 PM2、动态 RPC 竞速、短超时切换、断点补扫和去重；Factory 名称与飞书发送不阻塞后续扫描。
 - **前端增量抓取**：FourMeme 保留真实 `dpl` 部署 URL，同路径部署参数变化直接迁移缓存，只下载新增或路径变化的资源；部分失败会在下轮只补抓失败项。
 - **前端抗风控**：同一进程使用稳定浏览器标识，脚本和样式请求携带正确的资源类型与页面来源；同域请求只错开启动时间，慢响应不会串行阻塞页面和 API 监控。
 - **Factory 防漏检**：新候选先保存再复核，getter 暂时失败会持续重试；RPC 空日志需双节点确认，避免错误推进游标。
-- **低资源运行**：不使用 `newHeads`，不读取完整区块交易，不枚举未知 mapping；精准合约事件配合低频批量状态校验，状态文件独立保存并自动剪枝。
+- **低资源运行**：不使用 `newHeads`，不枚举未知 mapping；精准事件配合状态复核。提前监控默认读取短窗口完整区块，过滤关联钱包的直接 BNB 交易，可用 `FLAP_EARLY_NATIVE_TX_SCAN=false` 关闭。
 
 > ℹ️ 项目不包含心跳检测和日报，只推送启动、变更、异常与恢复消息。
 
@@ -83,7 +83,7 @@ pm2 status
 | Flap.sh | Factory 底池新增、修改、暂停、恢复与停用快通道 | WSS 实时，HTTP 1 秒兜底，不等待确认块 |
 | Flap.sh | Factory 断点补扫 | 后台运行，自动找回停机或 RPC 故障期间的变化 |
 | Flap.sh | Factory 已知资产复核 | 后台轮转，补充发现 getter 状态变化 |
-| Flap.sh | 管理 Safe 计价代币及 Vault Factory 管理提案 | 空闲 2 分钟，发现待执行提案后 30 秒；按链上 nonce 精确过滤 |
+| Flap.sh | 管理 Safe 计价代币及 Vault Factory 管理提案 | 默认 10 秒，活跃提案 5 秒；按链上 nonce 过滤并独立退避 |
 | Flap.sh | Factory / SwapRegistry / Vault Portal 核心完整性 | 精准地址 WSS；HTTP 批量校验 10 秒兜底 |
 | Flap.sh | Vault Factory 与已知资产黑名单/信任状态 | 60 秒轮转 |
 | Flap.sh | bytecode hash 与函数选择器审计 | 10 分钟 |
@@ -106,9 +106,9 @@ pm2 status
 - WSS 仅更新候选库、输出日志并复用现有飞书通知，不签名、不发送交易，也不改变任何自动发射逻辑。
 - Factory 实时、断点补扫和资产复核可以并行请求，扫描结果、游标、状态文件和通知队列按单写顺序合并，不会互相覆盖。
 - Factory 不再从部署区块开始扫描完整历史。更新部署前已经存在、但当前 15 个基线资产之外的旧资产不会自动回溯；更新后的新事件和停机缺口仍会及时发现。
-- Safe 提案预警默认监控新旧两个 Flap 管理 Safe，解析发往 Factory 的计价币配置（`0x23d89f95`）、兑换路径（`0x659e381f`）及创建暂停/恢复开关，以及发往 Vault Portal 的 Vault Factory 注册／配置更新。支持已验证 MultiSend 地址的递归批量调用，同一提案同一代币合并展示，保留内部调用顺序；未知 Factory 调用会提示选择器，不静默丢弃。首次运行提示仍待执行的提案一次，不补发已执行历史。
+- Safe 提案预警默认监控八个已核验核心/核心关联 Safe（旧配置的两个地址自动合并），新增资金、授权、LP NFT、CoW 预签名与额度模块操作；，解析发往 Factory 的计价币配置（`0x23d89f95`）、兑换路径（`0x659e381f`）及创建暂停/恢复开关，以及发往 Vault Portal 的 Vault Factory 注册／配置更新。支持已验证 MultiSend 地址的递归批量调用，同一提案同一代币合并展示，保留内部调用顺序；未知 Factory 调用会提示选择器，不静默丢弃。首次运行提示仍待执行的提案一次，不补发已执行历史。
 - Safe API 查询使用链上 `nonce()` 作为下限并跟随分页，自动排除废弃历史提案。首次发现提示管理提案，签名满足提示“等待执行”，不推断已经开放。nonce 前进后按 `safeTxHash` 查执行详情；仅在确有同 nonce 执行记录时区分成功、内层失败和被替换，索引尚未同步时保留“执行结果待确认”。执行成功后复核配置 getter，当前状态不同不会被误判为该提案执行失败。
-- Safe 提案监控使用 `FLAP_SAFE_API_KEY` Bearer 认证；空闲时每 2 分钟查询，发现待执行提案后自动切换为 30 秒。它不订阅新区块、不读取完整交易，也不执行任何 Safe 操作；API 遇到 `429`、超时或网络失败时按 Safe 独立退避，429 最大退避 30 分钟并错开请求，不阻塞现有页面和链上监控。限流期间保留最后成功快照，并在状态卡片标明缓存状态与下次重试时间。
+- Safe 提案监控使用 `FLAP_SAFE_API_KEY` Bearer 认证；默认每 10 秒查询，发现待执行提案后自动切换为 5 秒。Safe 模块本身不订阅新区块，也不签名或广播交易；普通 EOA 签名齐备且 nonce 可用时执行只读模拟；API 遇到 `429`、超时或网络失败时按 Safe 独立退避，429 最大退避 30 分钟并错开请求，不阻塞现有页面和链上监控。限流期间保留最后成功快照，并在状态卡片标明缓存状态与下次重试时间。
 - Factory 的升级/权限关键事件合并到原有 WSS 订阅；内置 SwapRegistry、Vault Portal 与链上验证过的 Vault Factory 使用相同 WSS 节点做精准地址订阅，不增加新区块订阅。
 - 前端资源提取到的合约地址只作为候选记录，不能直接进入 WSS；普通 Transfer、Deposit 等未知事件不会生成完整性告警。
 - 核心代理 implementation/admin/beacon 槽与关键 getter 默认每 10 秒合并成批量 RPC；已知底池资产的 `isSpammerBlocked`、`isBlacklisted`、信任等级和计价币许可按 60 秒轮转。
@@ -128,7 +128,15 @@ pm2 status
 - BNB 自定义金库链接统一使用 `vaultfactory=<地址>&chain=bnb&lang=zh`，Robinhood 使用对应的 `chain=robinhood` 参数。
 - 启动卡片与状态卡片显示 Factory WSS 订阅数、最后订阅/事件时间、短窗口回扫结果及 HTTP 扫描进度，不显示交易和内部配置字段。
 
-## 本次更新：1.3.36 / Flap 1.2.28
+## 本次更新：1.4.0 / Flap 1.3.0
+
+- Safe 监控扩展至八个核心地址，新增资金、授权、LP 仓位、CoW 预签名、额度模块及升级权限解析，支持已知 Safe 的嵌套调用；未知操作保留原始 calldata。签名进度、前序 nonce 阻塞和只读执行模拟分开展示。
+- 新增独立的 BSC 提前信号模块：采购订单、关联资产收支、包装资产映射、V2/V3/V4/Infinity 建池及流动性变化、模块执行、直接 BNB 转账与余额净变动、每日关联 Safe 发现。候选地址不自动标为官方。
+- API 与链上扫描独立运行，WSS 唤醒 HTTP 扫描，持久化游标并支持断线补扫、重组更正、通知失败保留和分来源退避。首次不补发历史成交和链上动作，仍提示有效待执行订单和 Safe 提案。
+- 新增 `early-signal-state.json`；Safe schema 4 保留旧状态。安装脚本、启动卡、`fl-status` 同步升级。完整范围、配置和边界见 [提前监控说明](flap-monitor/MONITORING.md)。
+- 检测均为只读；包装/加池不等于确定开放，公开提案也不保证执行。跨链未核验地址仍属于后续调查范围。
+
+## 上次更新：1.3.36 / Flap 1.2.28
 
 - Safe 提前监控新增 Vault Factory 注册／配置更新，兼容四参数 `0x4809625b` 与五参数 `0xefa7595a`，展示启用、官方标识、风险等级和分类；按目标工厂分别跟踪签名和执行结果，四参数版本不推断分类。
 

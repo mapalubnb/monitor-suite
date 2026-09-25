@@ -64,8 +64,8 @@ test("default Flap polling interval remains fast and configurable", () => {
     "wss://bsc.publicnode.com",
   ]);
   assert.equal(__testables.CONFIG.factoryPoolMonitor.wsBackfillBlocks, 10_000);
-  assert.equal(__testables.CONFIG.safeProposalMonitor.intervalMs, 120_000);
-  assert.equal(__testables.CONFIG.safeProposalMonitor.activeIntervalMs, 30_000);
+  assert.equal(__testables.CONFIG.safeProposalMonitor.intervalMs, 10_000);
+  assert.equal(__testables.CONFIG.safeProposalMonitor.activeIntervalMs, 5_000);
 });
 
 test("Factory RPC hedging uses the first valid low-latency node", async () => {
@@ -3227,4 +3227,20 @@ test('out-of-order and removed route logs never roll back the stored route', asy
   assert.equal(state.assets[token].swapRoute.length, 2);
   const removed = await ingestFactoryPoolEvent({ state, logEntry: { ...awdhRouteLog, removed: true }, rpcCall: awdhRpc });
   assert.equal(removed.removed, true);
+});
+
+
+test("early signal delivery retains failed cards and acknowledges only the delivered snapshot", async () => {
+  const state = { pendingChanges: [{ id: "first", kind: "observation", detail: "备货", observedAt: "2026-09-25" }], tokens: {}, events: {}, health: {} };
+  let saved = 0;
+  const fail = await __testables.deliverFlapEarlySignals(state, { sendCardFn: async () => null, saveStateFn: () => { saved++; } });
+  assert.equal(fail.sent, false);
+  assert.equal(state.pendingChanges.length, 1);
+  const ok = await __testables.deliverFlapEarlySignals(state, { sendCardFn: async () => {
+    state.pendingChanges.push({ id: "during-send", kind: "observation", detail: "后续动作" });
+    return "message-id";
+  }, saveStateFn: () => { saved++; } });
+  assert.equal(ok.sent, true);
+  assert.deepEqual(state.pendingChanges.map(x => x.id), ["during-send"]);
+  assert.equal(saved, 1);
 });

@@ -8,7 +8,10 @@ import {
 } from "./factory-pool-monitor.mjs";
 import { SET_QUOTE_CONFIG_SELECTOR, SET_QUOTE_ROUTE_SELECTOR, decodeQuoteConfigurationCall, decodeQuoteRoute, formatQuoteRoute } from "./quote-token-codec.mjs";
 
-export const SAFE_PROPOSAL_SCHEMA_VERSION = 3;
+import { CORE_SAFES } from "./early-signal-catalog.mjs";
+import { abiBytes, abiAddress, hexWords, decodeOperationalCall, describeOperationalAction } from "./operational-call-codec.mjs";
+
+export const SAFE_PROPOSAL_SCHEMA_VERSION = 4;
 export const VAULT_PORTAL = "0x90497450f2a706f1951b5bdda52b4e5d16f34c06";
 export const REGISTER_VAULT_FACTORY_SELECTOR = "0x4809625b";
 export const REGISTER_VAULT_FACTORY_CATEGORY_SELECTOR = "0xefa7595a";
@@ -16,10 +19,7 @@ export const SAFE_NONCE_SELECTOR = "0xaffed0e0";
 export const SAFE_MULTISEND_SELECTOR = "0x8d80ff0a";
 export const SET_QUOTE_TOKEN_CREATION_DISABLED_SELECTOR = "0x8f9047e7";
 export const DEFAULT_SAFE_API_BASE_URL = "https://api.safe.global/tx-service/bnb/api/v1";
-export const DEFAULT_FLAP_ADMIN_SAFES = [
-  "0xc68f29BfE2f6c3D95AdB5685592B9F86680968f2",
-  "0xA04Aa4575bA2327D28869cdD5F0E9165a8EC2CF5",
-];
+export const DEFAULT_FLAP_ADMIN_SAFES = CORE_SAFES.map(([address]) => address);
 
 const MAX_PROPOSAL_RECORDS = 500;
 const MAX_PENDING_CHANGES = 200;
@@ -114,7 +114,7 @@ export function extractFlapEnableTargets(transaction, options = {}) {
     .filter(action => action.kind === "creation" && !action.disabled).map(action => action.quoteToken))];
 }
 
-export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_FACTORY_PROXY, depth = 0, path = "0" } = {}) {
+export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_FACTORY_PROXY, depth = 0, path = "0", includeOperations = false, safeAddresses = DEFAULT_FLAP_ADMIN_SAFES } = {}) {
   const to = normalizeAddress(transaction?.to);
   const data = `0x${stripHex(transaction?.data)}`;
   const selector = data.slice(0, 10);
@@ -141,7 +141,7 @@ export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_
     }
   }
   if (to === normalizeAddress(factoryAddress)) {
-    const base = { to, selector, operation, callPath: path };
+    const base = { to, selector, operation, callPath: path, rawData: data };
     try {
       if (operation !== 0) throw new Error("Factory 非 CALL 操作，不能按普通管理调用解释");
       if (selector === SET_QUOTE_CONFIG_SELECTOR) return [{ ...base, kind: "configuration", ...decodeQuoteConfigurationCall(data.slice(10)) }];
@@ -157,10 +157,19 @@ export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_
       return [{ ...base, kind: "unknown", quoteToken: "", reason: error.message }];
     }
   }
-  if (selector !== SAFE_MULTISEND_SELECTOR || operation !== 1 || !MULTISEND_ADDRESSES.has(to)) return [];
+  if (includeOperations && selector === "0x6a761202" && safeAddresses.some(address => normalizeAddress(address) === to) && operation === 0) {
+    if (depth >= MAX_MULTISEND_DEPTH) throw new Error("Safe 嵌套超过解析上限");
+    const w = hexWords(data.slice(10));
+    return extractFlapProposalActions({ to: abiAddress(w[0]), value: BigInt("0x" + w[1]).toString(),
+      data: abiBytes(data.slice(10), 2), operation: Number(BigInt("0x" + w[3])) },
+    { factoryAddress, depth: depth + 1, path: path + ".safe", includeOperations, safeAddresses });
+  }
+  if (selector !== SAFE_MULTISEND_SELECTOR || operation !== 1 || !MULTISEND_ADDRESSES.has(to)) {
+    return includeOperations ? [decodeOperationalCall(transaction, path)] : [];
+  }
   if (depth >= MAX_MULTISEND_DEPTH) throw new Error("MultiSend 嵌套超过解析上限");
   return decodeMultiSendTransactions(data).flatMap((nested, index) => extractFlapProposalActions(nested, {
-    factoryAddress, depth: depth + 1, path: `${path}.${index}`,
+    factoryAddress, depth: depth + 1, path: `${path}.${index}`, includeOperations, safeAddresses,
   }));
 }
 
@@ -185,7 +194,7 @@ function normalizeSafeEntries(safes) {
     const address = normalizeAddress(rawSafe);
     if (!address || seen.has(address)) continue;
     seen.add(address);
-    entries.push({ address, apiAddress: String(rawSafe).trim() });
+    entries.push({ address, apiAddress: DEFAULT_FLAP_ADMIN_SAFES.find(safe => normalizeAddress(safe) === address) || String(rawSafe).trim() });
   }
   return entries;
 }
@@ -226,7 +235,7 @@ export function migrateSafeProposalState(raw, safes = DEFAULT_FLAP_ADMIN_SAFES) 
 
 export function loadSafeProposalState(path, safes = DEFAULT_FLAP_ADMIN_SAFES) {
   if (!existsSync(path)) return createSafeProposalState(safes);
-  if (statSync(path).size > 4 * 1024 * 1024) throw new Error("Safe 提案状态文件超过 4MB");
+  if (statSync(path).size > 16 * 1024 * 1024) throw new Error("Safe 提案状态文件超过 16MB");
   try {
     return migrateSafeProposalState(JSON.parse(readFileSync(path, "utf8")), safes);
   } catch (error) {
@@ -246,7 +255,8 @@ function safeProposalKey(safeTxHash, quoteToken) {
 }
 
 function changeId(type, record) {
-  return hashText([type, record.safeTxHash, record.vaultFactory ? `vault:${record.vaultFactory}` : record.quoteToken, record.confirmations, record.required].join(":"));
+  return hashText([type, record.safeTxHash, record.vaultFactory ? `vault:${record.vaultFactory}` : record.quoteToken,
+    record.confirmations, record.required, Boolean(record.nonceBlocked), record.executionCheck?.status || ""].join(":"));
 }
 
 function appendPendingChange(state, type, record, detectedAt) {
@@ -264,6 +274,33 @@ export function acknowledgeSafeProposalChanges(state, ids = []) {
 
 function confirmationCount(proposal) {
   return new Set((proposal?.confirmations || []).map(item => normalizeAddress(item?.owner)).filter(Boolean)).size;
+}
+
+// Read-only simulation. Contract signatures and approved-hash signatures need a different
+// signer context; leave them unverified rather than constructing a misleading transaction.
+export function encodeSafeExecutionSimulation(proposal) {
+  const confirmations = [...(proposal.confirmations || [])].sort((a, b) => normalizeAddress(a.owner).localeCompare(normalizeAddress(b.owner)));
+  if (!confirmations.length || confirmations.some(c => !/^0x[a-f0-9]{130}$/i.test(c.signature || "")
+    || ![27, 28, 31, 32].includes(parseInt(c.signature.slice(-2), 16)))) return null;
+  const word = value => {
+    const n = BigInt(value || 0);
+    if (n < 0n || n >= 1n << 256n) throw new Error("Safe 参数越界");
+    return n.toString(16).padStart(64, "0");
+  };
+  const address = value => {
+    const a = normalizeAddress(value || "0x" + "0".repeat(40));
+    if (!a) throw new Error("Safe 模拟地址无效");
+    return a.slice(2).padStart(64, "0");
+  };
+  const bytes = value => {
+    const h = stripHex(value);
+    return word(h.length / 2) + h.padEnd(Math.ceil(h.length / 64) * 64, "0");
+  };
+  const data = bytes(proposal.data);
+  const signatures = bytes("0x" + confirmations.map(c => c.signature.slice(2)).join(""));
+  return "0x6a761202" + [address(proposal.to), word(proposal.value), word(320), word(proposal.operation),
+    word(proposal.safeTxGas), word(proposal.baseGas), word(proposal.gasPrice), address(proposal.gasToken),
+    address(proposal.refundReceiver), word(320 + data.length / 2)].join("") + data + signatures;
 }
 
 function normalizeProposal(proposal, safe, quoteToken, nowText) {
@@ -411,6 +448,7 @@ export async function runSafeProposalScan({
   baseBackoffMs = 5_000,
   maxBackoffMs = 1_800_000,
   suppressNotifications = false,
+  includeOperations = true,
   nowMs = Date.now(),
 } = {}) {
   if (!state || typeof state !== "object") throw new Error("缺少 Safe 提案状态");
@@ -425,8 +463,10 @@ export async function runSafeProposalScan({
   const migrated = migrateSafeProposalState(state, normalizedSafes);
   Object.assign(state, migrated);
   const runAt = nowIso(nowMs);
-  const nonceResults = await rpcBatch(safeNonceCalls(normalizedSafes), { requireAllResults: true });
-  const currentNonces = new Map(normalizedSafes.map((safe, index) => [safe, decodeUintWord(nonceResults[index])]));
+  const nonceResults = await rpcBatch(safeNonceCalls(normalizedSafes));
+  const currentNonces = new Map(normalizedSafes.map((safe, index) => {
+    try { return [safe, decodeUintWord(nonceResults[index])]; } catch { return [safe, null]; }
+  }));
   const changes = [];
   const errors = [];
   let successfulSafes = 0;
@@ -435,6 +475,7 @@ export async function runSafeProposalScan({
     const safeState = state.safes[safe] || createSafeStatus(safe);
     state.safes[safe] = safeState;
     const currentNonce = currentNonces.get(safe);
+    if (currentNonce === null) throw new Error("Safe nonce 读取失败，保留该 Safe 的上次快照");
     safeState.currentNonce = currentNonce;
     safeState.lastNonceAt = runAt;
     if (Number(safeState.nextAttemptAtMs) > nowMs) return { safe, skipped: true, currentNonce };
@@ -459,10 +500,8 @@ export async function runSafeProposalScan({
     if (outcome.status === "rejected") {
       safeState.consecutiveFailures = (Number(safeState.consecutiveFailures) || 0) + 1;
       const retryAfterMs = Number(outcome.reason?.retryAfterMs) || 0;
-      const backoffMs = Math.min(maxBackoffMs, Math.max(
-        retryAfterMs,
-        baseBackoffMs * (2 ** Math.min(6, safeState.consecutiveFailures - 1)),
-      ));
+      const backoffMs = Math.max(retryAfterMs, Math.min(maxBackoffMs,
+        baseBackoffMs * (2 ** Math.min(9, safeState.consecutiveFailures - 1))));
       safeState.nextAttemptAtMs = nowMs + backoffMs;
       safeState.lastError = outcome.reason?.message || "Safe API 请求失败";
       errors.push(`${safe}: ${safeState.lastError}`);
@@ -485,12 +524,13 @@ export async function runSafeProposalScan({
         || normalizeAddress(proposal.safe) !== safe) continue;
       let actions = [];
       try {
-        actions = extractFlapProposalActions(proposal, { factoryAddress: factory });
+        actions = extractFlapProposalActions(proposal, { factoryAddress: factory, includeOperations, safeAddresses: safes });
       } catch (error) {
         errors.push(`${safe}: SafeTx ${safeTxHash} 解析失败：${error.message}`);
-        continue;
+        actions = [{ kind: "unknown", quoteToken: "", to: normalizeAddress(proposal.to), selector: String(proposal.data || "0x").slice(0, 10),
+          rawData: proposal.data, reason: error.message, callPath: "0" }];
       }
-      const actionTarget = action => action.vaultFactory ? `vault:${action.vaultFactory}` : action.quoteToken;
+      const actionTarget = action => action.vaultFactory ? `vault:${action.vaultFactory}` : action.quoteToken || "";
       for (const target of new Set(actions.map(actionTarget))) {
         const vaultFactory = target.startsWith("vault:") ? target.slice(6) : "";
         const quoteToken = vaultFactory ? "" : target;
@@ -499,6 +539,18 @@ export async function runSafeProposalScan({
           next.vaultFactory = vaultFactory;
           next.key = `${safeTxHash}:vault:${vaultFactory}`;
         }
+        next.currentNonce = outcome.value.currentNonce;
+        next.nonceBlocked = next.nonce > next.currentNonce;
+        next.executionCheck = { status: next.nonceBlocked ? "blocked" : "unverified", checkedAt: runAt };
+        if (next.status === "ready" && !next.nonceBlocked) {
+          try {
+            const data = actions.some(action => action.callPath?.includes(".safe")) ? null : encodeSafeExecutionSimulation(proposal);
+            if (data) {
+              const [result] = await rpcBatch([{ method: "eth_call", params: [{ to: safe, data }, "latest"] }]);
+              next.executionCheck.status = /^0x0{63}1$/i.test(result || "") ? "passed" : "unverified";
+            }
+          } catch { /* A failed RPC/simulation is not evidence that the proposal was cancelled. */ }
+        }
         next.actions = actions.filter(action => actionTarget(action) === target);
         const previous = state.proposals[next.key];
         if (previous) next.firstSeenAt = previous.firstSeenAt || next.firstSeenAt;
@@ -506,8 +558,11 @@ export async function runSafeProposalScan({
         if (suppressForSafe) continue;
         if (!previous) {
           changes.push(appendPendingChange(state, !outcome.value.baselineWasEstablished ? "existing" : next.status === "ready" ? "ready" : "proposed", next, runAt));
-        } else if (next.required > 0 && previous.status !== "ready" && next.confirmations >= next.required) {
+        } else if (next.required > 0 && (previous.status !== "ready" || Boolean(previous.nonceBlocked) !== next.nonceBlocked
+          || previous.executionCheck?.status !== "passed" && next.executionCheck.status === "passed") && next.confirmations >= next.required) {
           changes.push(appendPendingChange(state, "ready", next, runAt));
+        } else if (previous.confirmations !== next.confirmations || previous.required !== next.required) {
+          changes.push(appendPendingChange(state, "signatures", next, runAt));
         }
       }
     }
@@ -610,8 +665,8 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
   const lines = [];
   for (const change of changes) {
     const asset = factoryAssets?.[change.quoteToken] || {};
-    const name = change.vaultFactory ? "Vault Factory 注册／配置更新" : asset.symbol || asset.name || (change.quoteToken ? "计价代币" : "管理调用");
-    const status = ({ ready: "签名已满足，等待执行", existing: "当前待执行提案", proposed: "发现管理提案",
+    const name = change.vaultFactory ? "Vault Factory 注册／配置更新" : asset.symbol || asset.name || (change.quoteToken ? "计价代币" : "资金／权限／管理操作");
+    const status = ({ ready: "签名已满足，等待执行", existing: "当前待执行提案", proposed: "发现管理提案", signatures: "签名进度更新",
       invalidated: "已被同 nonce 交易替换", failed: "Safe 内层执行失败", executed: "Safe 执行成功" })[change.type] || "等待执行确认";
     lines.push("**" + name + "｜" + status + "**");
     if (change.quoteToken) lines.push("计价代币：[" + change.quoteToken + "](https://bscscan.com/address/" + change.quoteToken + ")");
@@ -631,8 +686,12 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
           + "｜兑换类型 " + c.nativeToQuoteSwapType + "｜DEX ID " + c.dexId);
       } else if (action.kind === "route") lines.push(...formatQuoteRoute(action.hops));
       else if (action.kind === "creation") lines.push("创建开关：" + (action.disabled ? "暂停创建" : "解除暂停创建"));
-      else lines.push("未解析调用：" + action.selector + "｜" + action.reason + "｜调用位置 " + action.callPath);
+      else lines.push(describeOperationalAction(action));
     }
+    if (change.nonceBlocked) lines.push("尚有前序 nonce 未执行；签名满足不代表立即可执行。");
+    if (change.executionCheck?.status === "passed") lines.push("只读执行模拟于 " + formatDate(change.executionCheck.checkedAt) + " 通过；该时点具备尝试执行条件，后续状态变化仍可能导致失败。");
+    else if (change.status === "ready") lines.push("执行模拟未确认，不能据此判断时间锁及其他执行条件已满足。");
+    lines.push("首次观测：" + formatDate(change.firstSeenAt));
     lines.push("确认进度：" + change.confirmations + "/" + (change.required || "未知") + "｜Safe nonce：" + change.nonce);
     lines.push("管理 Safe：[" + change.safe + "](https://app.safe.global/transactions/queue?safe=bnb:" + change.safe + ")");
     lines.push("SafeTxHash：" + change.safeTxHash);

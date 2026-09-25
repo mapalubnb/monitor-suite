@@ -39,7 +39,7 @@ function renderFourmemeStatus(snapshot) {
   }
 }
 
-function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safeProposalState = {}) {
+function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safeProposalState = {}, earlyState = {}) {
   const source = extractHeredoc("fl-status");
   const script = extractNodeEvalScripts(source).find(item => item.includes("vaultLink"));
   assert.ok(script, "未找到 Flap 快照状态渲染器");
@@ -48,16 +48,19 @@ function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safe
   const factoryStatePath = join(dir, "factory-pool-state.json");
   const integrityStatePath = join(dir, "contract-integrity-state.json");
   const safeProposalStatePath = join(dir, "safe-proposal-state.json");
+  const earlyStatePath = join(dir, "early-signal-state.json");
   try {
     writeFileSync(snapshotPath, JSON.stringify(snapshot), "utf-8");
     writeFileSync(factoryStatePath, JSON.stringify(factoryState), "utf-8");
     writeFileSync(integrityStatePath, JSON.stringify(integrityState), "utf-8");
     writeFileSync(safeProposalStatePath, JSON.stringify(safeProposalState), "utf-8");
+    writeFileSync(earlyStatePath, JSON.stringify(earlyState), "utf-8");
     const runnable = script
       .replaceAll("'$SNAP'", JSON.stringify(snapshotPath))
       .replaceAll("'$FACTORY_STATE'", JSON.stringify(factoryStatePath))
       .replaceAll("'$INTEGRITY_STATE'", JSON.stringify(integrityStatePath))
-      .replaceAll("'$SAFE_STATE'", JSON.stringify(safeProposalStatePath));
+      .replaceAll("'$SAFE_STATE'", JSON.stringify(safeProposalStatePath))
+      .replaceAll("'$EARLY_STATE'", JSON.stringify(earlyStatePath));
     const result = spawnSync(process.execPath, ["-e", runnable], { encoding: "utf-8" });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
@@ -111,6 +114,10 @@ test("separate Flap deployment copies every runtime module", () => {
     "contract-integrity-monitor.mjs",
     "safe-proposal-monitor.mjs",
     "quote-token-codec.mjs",
+    "early-signal-monitor.mjs",
+    "early-signal-catalog.mjs",
+    "early-signal-topics.mjs",
+    "operational-call-codec.mjs",
     "package.json",
   ]) {
     assert.match(installSource, new RegExp(`cp flap-monitor/${file.replaceAll(".", "\\.")} \\"\\$FLAP_DIR/\\"`));
@@ -305,4 +312,13 @@ test("full Four.meme status keeps useful OpenFour content and removes repetitive
   assert.match(JSON.stringify(tables), /Launch Agent/);
   assert.match(JSON.stringify(tables), /Trading Assistant/);
   assert.ok(tables.every(table => table.columns.every(column => /^\d+px$/.test(column.width))));
+});
+
+
+test("Flap status resolves its own early state and exposes lag and source errors", () => {
+  assert.match(extractHeredoc("fl-status"), /EARLY_STATE=/);
+  assert.doesNotMatch(extractHeredoc("fm-status"), /EARLY_STATE=/);
+  const text = renderFlapStatus({pages:{}}, {}, {}, {}, {cursor:123, latestBlock:130, tokens:{one:{}}, pendingChanges:[{}], health:{chain:{lastError:"RPC 限流",nextAttemptAtMs:1}}});
+  assert.match(text, /已扫|扫描区块：123/);
+  assert.match(text, /RPC 限流/);
 });

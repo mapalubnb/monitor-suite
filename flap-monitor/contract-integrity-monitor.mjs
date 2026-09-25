@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
+import { PROXY_ADMINS } from "./early-signal-catalog.mjs";
+
 export const CONTRACT_INTEGRITY_SCHEMA_VERSION = 2;
 export const BSC_CHAIN_ID = 56;
 export const EIP1967_IMPLEMENTATION_SLOT = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc";
@@ -162,6 +164,9 @@ export function decodeContractValue(raw, type = "bytes32") {
 
 function staticCatalog() {
   return {
+    ...Object.fromEntries(PROXY_ADMINS.map(address => [address, {
+      address, label: "Flap 升级 ProxyAdmin", kind: "proxy-admin", proxy: false, source: "builtin", verified: true,
+    }])),
     [FLAP_CORE_CONTRACTS.factory]: { address: FLAP_CORE_CONTRACTS.factory, label: "Flap Factory", kind: "factory", proxy: true, source: "builtin", verified: true },
     [FLAP_CORE_CONTRACTS.swapRegistry]: { address: FLAP_CORE_CONTRACTS.swapRegistry, label: "Flap SwapRegistry", kind: "swapRegistry", proxy: true, source: "builtin", verified: true },
     [FLAP_CORE_CONTRACTS.vaultPortal]: { address: FLAP_CORE_CONTRACTS.vaultPortal, label: "Flap Vault Portal", kind: "vaultPortal", proxy: true, source: "builtin", verified: true },

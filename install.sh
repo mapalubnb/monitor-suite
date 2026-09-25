@@ -178,6 +178,10 @@ if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; th
   cp flap-monitor/contract-integrity-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/safe-proposal-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/quote-token-codec.mjs "$FLAP_DIR/"
+  cp flap-monitor/early-signal-monitor.mjs "$FLAP_DIR/"
+  cp flap-monitor/early-signal-catalog.mjs "$FLAP_DIR/"
+  cp flap-monitor/early-signal-topics.mjs "$FLAP_DIR/"
+  cp flap-monitor/operational-call-codec.mjs "$FLAP_DIR/"
   cp flap-monitor/package.json "$FLAP_DIR/"
   # 创建 shared 软链接
   ln -sfn "$SHARED_DIR" "$FLAP_DIR/../shared"
@@ -523,6 +527,8 @@ INTEGRITY_STATE="/root/monitor-suite/flap-monitor/contract-integrity-state.json"
 [ -f "$INTEGRITY_STATE" ] || INTEGRITY_STATE="/root/flap-monitor/contract-integrity-state.json"
 SAFE_STATE="/root/monitor-suite/flap-monitor/safe-proposal-state.json"
 [ -f "$SAFE_STATE" ] || SAFE_STATE="/root/flap-monitor/safe-proposal-state.json"
+EARLY_STATE="/root/monitor-suite/flap-monitor/early-signal-state.json"
+[ -f "$EARLY_STATE" ] || EARLY_STATE="/root/flap-monitor/early-signal-state.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
@@ -531,6 +537,10 @@ if [ -f "$SNAP" ]; then
     const fp=fs.existsSync('$FACTORY_STATE')?JSON.parse(fs.readFileSync('$FACTORY_STATE','utf-8')):{};
     const ci=fs.existsSync('$INTEGRITY_STATE')?JSON.parse(fs.readFileSync('$INTEGRITY_STATE','utf-8')):{};
     const sp=fs.existsSync('$SAFE_STATE')?JSON.parse(fs.readFileSync('$SAFE_STATE','utf-8')):{};
+    const es=fs.existsSync('$EARLY_STATE')?JSON.parse(fs.readFileSync('$EARLY_STATE','utf-8')):{};
+    console.log('**底池提前信号**');
+    console.log('扫描区块：'+(es.cursor??'未建立')+'｜最新 '+(es.latestBlock??'未知')+'｜候选资产 '+Object.keys(es.tokens||{}).length+'｜待推送 '+(es.pendingChanges||[]).length);
+    for(const [name,h] of Object.entries(es.health||{})) if(h.lastError) console.log(name+'：'+h.lastError+'｜下次重试 '+new Date(h.nextAttemptAtMs||0).toISOString());
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+(chain==='robinhood'?'robinhood':'bnb')+'&lang=zh');
     const robinhoodPage='https://flap.sh/robinhood/CAstore?lang=zh';

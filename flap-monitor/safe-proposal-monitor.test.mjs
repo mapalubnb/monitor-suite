@@ -19,6 +19,7 @@ import {
   loadSafeProposalState,
   runSafeProposalScan,
   saveSafeProposalState,
+  encodeSafeExecutionSimulation,
 } from "./safe-proposal-monitor.mjs";
 
 const FACTORY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -401,4 +402,36 @@ test("mixed MultiSend keeps each Vault Factory separate from quote tokens, dedup
   assert.ok(result.changes.every(c => c.type === "executed"));
   assert.equal(getterCalls, 2, "only the quote token uses quote configuration getters");
   assert.equal(result.changes.filter(c => c.vaultFactory).length, 2);
+});
+
+
+test("EOA signature simulation encodes dynamic arguments without storing or broadcasting signatures", async () => {
+  const p = proposal({ confirmations: 2 });
+  p.confirmations.forEach(c => { c.signature = "0x" + "11".repeat(64) + "1b"; });
+  const data = encodeSafeExecutionSimulation(p);
+  assert.ok(data.startsWith("0x6a761202"));
+  assert.equal(BigInt("0x" + data.slice(10 + 2 * 64, 10 + 3 * 64)), 320n);
+  const state = createSafeProposalState([SAFE]);
+  const callsSeen = [];
+  await runSafeProposalScan({ state, safes: [SAFE], fetchFn: async () => response([p]), rpcBatch: async calls => {
+    callsSeen.push(...calls);
+    return calls.map(c => uintResult(c.params[0].data.startsWith("0x6a761202") ? 1 : 12));
+  } });
+  assert.ok(callsSeen.every(c => c.method === "eth_call"));
+  assert.equal(Object.values(state.proposals)[0].executionCheck.status, "passed");
+  assert.equal(JSON.stringify(state).includes(p.confirmations[0].signature), false);
+  p.confirmations[0].signature = "0x" + "11".repeat(64) + "00";
+  assert.equal(encodeSafeExecutionSimulation(p), null);
+});
+
+test("future nonce prevents executable claim and one missing nonce does not block another Safe", async () => {
+  const state = createSafeProposalState([SAFE, OTHER]);
+  const p = proposal({ confirmations: 2, nonce: 13 });
+  await runSafeProposalScan({ state, safes: [SAFE, OTHER], fetchFn: async () => response([p]),
+    rpcBatch: async () => [uintResult(12), null] });
+  const record = Object.values(state.proposals)[0];
+  assert.equal(record.nonceBlocked, true);
+  assert.equal(record.executionCheck.status, "blocked");
+  assert.match(state.safes[OTHER].lastError, /nonce/);
+  assert.equal(state.safes[SAFE].baselineEstablished, true);
 });
