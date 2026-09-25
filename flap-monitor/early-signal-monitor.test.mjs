@@ -5,7 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEarlySignalState, decodeEarlyReceipt, ingestCowOrders, earlyAssetStage, syncEarlyProposals,
   rewindEarlySignals, scanEarlyChain, refreshEarlyAssets, buildEarlySignalContent, loadEarlySignalState,
-  saveEarlySignalState, acknowledgeEarlySignals, runEarlySignalScan, earlyLogFilters } from "./early-signal-monitor.mjs";
+  saveEarlySignalState, acknowledgeEarlySignals, runEarlySignalScan, earlyLogFilters,
+  processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
 import { extractFlapProposalActions, DEFAULT_FLAP_ADMIN_SAFES } from "./safe-proposal-monitor.mjs";
 import { DEX, EXECUTION_WALLETS, CORE_SAFES, ALLOWANCE_MODULE } from "./early-signal-catalog.mjs";
 import { TOPICS } from "./early-signal-topics.mjs";
@@ -22,6 +23,71 @@ const BH = "0x" + "ab".repeat(32);
 const TX = "0x" + "cd".repeat(32);
 const log = (address, topics, data, index = 0) => ({ address, topics, data, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logIndex: `0x${index.toString(16)}` });
 const receipt = logs => ({ status: "0x1", from: OWNER, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logs });
+
+test("fast receipt lane waits for confirmations, deduplicates replay and never advances scan cursor", async () => {
+  const state = createEarlySignalState(), r = history.liquidityReceipt;
+  const block = Number(r.blockNumber);
+  state.cursor = block - 1; state.chainBaselineAt = new Date(nowMs).toISOString();
+  const hints = [{ transactionHash: r.transactionHash, blockNumber: r.blockNumber }];
+  let latest = block;
+  const rpc = async calls => calls.map(c => ({ eth_chainId: "0x38", eth_blockNumber: `0x${latest.toString(16)}`,
+    eth_getTransactionReceipt: r, eth_getBlockByNumber: { hash: r.blockHash }, eth_call: "0x", eth_getLogs: r.logs })[c.method]);
+  const waiting = await processEarlyReceiptHints(state, hints, { confirmations: 1 }, rpc, nowMs);
+  assert.equal(waiting.processed.length, 0);
+  assert.equal(state.pendingChanges.length, 0);
+  latest++;
+  const result = await processEarlyReceiptHints(state, hints, { confirmations: 1 }, rpc, nowMs);
+  assert.equal(result.processed.length, 1);
+  assert.ok(result.tokens.includes(TOKEN));
+  assert.equal(state.cursor, block - 1);
+  assert.equal(state.fastBlocks[block], r.blockHash.toLowerCase());
+  const count = state.pendingChanges.length;
+  await processEarlyReceiptHints(state, hints, { confirmations: 1 }, rpc, nowMs);
+  await scanEarlyChain(state, { confirmations: 1, nativeTransactions: false }, rpc, nowMs);
+  assert.equal(state.pendingChanges.length, count);
+  assert.equal(state.cursor, block);
+  assert.equal(Object.keys(state.fastBlocks).length, 0);
+});
+
+test("out-of-order HTTP backfill cannot overwrite the latest fast-lane liquidity stage", () => {
+  const state = createEarlySignalState();
+  state.events.new = { kind: "liquidityRemoved", token: TOKEN, blockNumber: 102, logIndex: 1 };
+  state.events.old = { kind: "liquidityAdded", token: TOKEN, blockNumber: 101, logIndex: 3 };
+  assert.equal(earlyAssetStage(state, TOKEN), "observation");
+});
+
+test("fast receipt anchors detect reorg before HTTP cursor reaches that block", async () => {
+  const state = createEarlySignalState(), r = history.liquidityReceipt;
+  const block = Number(r.blockNumber);
+  state.cursor = block - 1; state.chainBaselineAt = new Date(nowMs).toISOString();
+  state.fastBlocks[block] = r.blockHash.toLowerCase();
+  decodeEarlyReceipt(r, state, { nowMs });
+  const rpc = async calls => calls.map(c => ({ eth_chainId: "0x38", eth_blockNumber: `0x${(block + 1).toString(16)}`,
+    eth_getBlockByNumber: { hash: BH } })[c.method]);
+  await processEarlyReceiptHints(state, [], { confirmations: 1 }, rpc, nowMs);
+  assert.equal(Object.keys(state.fastBlocks).length, 0);
+  assert.ok(state.pendingChanges.some(e => e.kind === "reorg"));
+  assert.equal(state.pendingChanges.some(e => e.kind === "liquidityAdded"), false);
+  assert.equal(state.cursor, block - 1);
+});
+
+test("unrelated global pool logs stay off the fast lane until a token becomes relevant", () => {
+  const state = createEarlySignalState();
+  const event = { topics: [TOPICS.PoolCreated, topic(TOKEN), topic(OWNER)] };
+  assert.equal(shouldPrioritizeEarlyLog(event, state), false);
+  state.tokens[TOKEN] = {};
+  assert.equal(shouldPrioritizeEarlyLog(event, state), true);
+  assert.equal(shouldPrioritizeEarlyLog({ topics: [TOPICS.Transfer] }, state), true);
+});
+
+test("asset-only external pass never calls the slow CoW or discovery endpoints", async () => {
+  const state = createEarlySignalState();
+  await runEarlySignalScan({ state, config: { mode: "external", sources: ["assets"] }, nowMs,
+    rpcBatch: async () => { throw new Error("no assets need RPC"); },
+    fetchFn: async () => { throw new Error("unexpected external request"); } });
+  assert.equal(state.health.assets.lastError, "");
+  assert.equal(state.health.discovery, undefined);
+});
 
 test("unrelated pool discovery never expands recurring log filters", () => {
   const state = createEarlySignalState();

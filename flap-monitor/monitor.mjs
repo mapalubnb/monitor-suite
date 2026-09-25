@@ -21,6 +21,8 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { parseHTML } from "linkedom";
+import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.mjs";
+import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
 import {
@@ -115,6 +117,8 @@ const CONFIG = {
     .split(",").map(s => s.trim()).filter(Boolean)
     .concat(process.env.FLAP_FACTORY_ARCHIVE_RPC_URL || "https://bsc-mainnet.public.blastapi.io"))],
   registryMonitor: {
+    intervalMs: readPositiveIntEnv("FLAP_REGISTRY_INTERVAL_MS", 1_000, 500),
+    wsEnabled: process.env.FLAP_REGISTRY_WS_ENABLED !== "false" && process.env.FLAP_FACTORY_WS_ENABLED !== "false",
     enabled: process.env.FLAP_REGISTRY_MONITOR !== "false",
     address: (process.env.FLAP_REGISTRY_ADDRESS || "0x90497450f2a706f1951b5bdda52b4e5d16f34c06").toLowerCase(),
     confirmations: Number.parseInt(process.env.FLAP_REGISTRY_CONFIRMATIONS || "5", 10),
@@ -2595,10 +2599,25 @@ async function fetchSafe(url, opts = {}) {
   }
 }
 
-async function fetchPage(url) {
-  const res = await fetchSafe(url, { headers: browserHeaders() });
+const pageResponseCache = new Map();
+async function fetchPage(url, { fetchFn = fetchSafe, cache = pageResponseCache } = {}) {
+  const previous = cache.get(url);
+  const headers = browserHeaders();
+  if (previous?.etag) headers["If-None-Match"] = previous.etag;
+  else if (previous?.lastModified) headers["If-Modified-Since"] = previous.lastModified;
+  const res = await fetchFn(url, { headers });
+  if (res.status === 304) {
+    if (!previous) throw new Error("页面返回 304 但无本地缓存");
+    return previous.body;
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return await res.text();
+  const body = await res.text();
+  // Do not cache region restrictions or error pages returned with HTTP 200.
+  if (!FLAP_ERROR_PAGE_PATTERNS.some(pattern => pattern.test(body))) {
+    cache.set(url, { body, etag: res.headers?.get("etag"), lastModified: res.headers?.get("last-modified") });
+    while (cache.size > 16) cache.delete(cache.keys().next().value);
+  }
+  return body;
 }
 
 /**
@@ -3088,10 +3107,16 @@ function formatVaultContractLinks(value) {
     .join(", ");
 }
 
-async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, titlePrefix = "" } = {}) {
+let registryScanQueue = Promise.resolve();
+function checkFlapRegistryLogs(snapshot, options = {}) {
+  const run = registryScanQueue.then(() => scanFlapRegistryLogs(snapshot, options));
+  registryScanQueue = run.catch(() => {});
+  return run;
+}
+async function scanFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, titlePrefix = "", rpcCallFn = bscRpcCall, filterContractsFn = filterContractAddresses } = {}) {
   if (!CONFIG.registryMonitor.enabled) return { changed: false, sent: false };
   const state = snapshot.registryMonitor || (snapshot.registryMonitor = {});
-  const latest = hexToNumber(await bscRpcCall("eth_blockNumber", []));
+  const latest = hexToNumber(await rpcCallFn("eth_blockNumber", []));
   const safeLatest = Math.max(0, latest - CONFIG.registryMonitor.confirmations);
   state.latestBlock = latest;
   state.safeLatestBlock = safeLatest;
@@ -3106,8 +3131,9 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
 
   const fromBlock = state.lastBlock + 1;
   const toBlock = Math.min(safeLatest, state.lastBlock + CONFIG.registryMonitor.maxBlocksPerRun);
-  const logs = await bscRpcCall("eth_getLogs", [{
+  const logs = await rpcCallFn("eth_getLogs", [{
     address: CONFIG.registryMonitor.address,
+    topics: [[...CONFIG.registryMonitor.watchedEventTopics]],
     fromBlock: numberToHex(fromBlock),
     toBlock: numberToHex(toBlock),
   }]);
@@ -3125,7 +3151,7 @@ async function checkFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, ti
     }
   }
 
-  const contractSet = new Set(await filterContractAddresses(candidates.map(c => c.vault)));
+  const contractSet = new Set(await filterContractsFn(candidates.map(c => c.vault)));
   state.knownVaults = state.knownVaults || {};
   const newEvents = [];
   const nextKnownVaults = { ...state.knownVaults };
@@ -3658,6 +3684,8 @@ function createFactoryPoolWsFeed({
   proxy,
   topics,
   topicFilter,
+  subscription = "logs",
+  onRemoved,
   label = "Flap Factory WSS",
   onEvent,
   onSubscribed,
@@ -3764,7 +3792,7 @@ function createFactoryPoolWsFeed({
         jsonrpc: "2.0",
         id: 1,
         method: "eth_subscribe",
-        params: ["logs", filter],
+        params: subscription === "newHeads" ? ["newHeads"] : ["logs", filter],
       }));
     });
     ws.on("message", raw => {
@@ -3802,7 +3830,11 @@ function createFactoryPoolWsFeed({
         return;
       }
       const event = message.params?.result;
-      if (!event || event.removed) return;
+      if (message.method !== "eth_subscription" || message.params?.subscription !== endpoint.subscriptionId || !event) return;
+      if (event.removed) {
+        void Promise.resolve(onRemoved?.(event, endpoint.url)).catch(error => logFn(`[${label}] 重组处理失败：${error.message}`));
+        return;
+      }
       endpoint.lastEventAt = nowIso();
       emitStatus();
       void Promise.resolve(onEvent?.(event, endpoint.url)).catch(error => {
@@ -6792,6 +6824,7 @@ function buildFlapStartupContent(
     "",
     "**06｜Vault Portal 链上注册**",
     `Vault Portal：${addressLink(CONFIG.registryMonitor.address)}`,
+    `独立扫描：${CONFIG.registryMonitor.intervalMs / 1000} 秒｜WSS 唤醒：${CONFIG.registryMonitor.wsEnabled ? "已启用" : "未启用"}`,
     `确认块：${CONFIG.registryMonitor.confirmations}`,
     `启动回溯：${CONFIG.registryMonitor.bootstrapLookbackBlocks} 块`,
     `单轮最大扫描：${CONFIG.registryMonitor.maxBlocksPerRun} 块`,
@@ -6813,6 +6846,7 @@ function buildFlapStartupContent(
     ...(safeProposalState.lastError ? [`最近异常：${safeProposalState.lastError}`] : []),
     "",
     "【底池提前信号】",
+    "事件通道：WSS 快速回执／新区块确认 + HTTP 断点补扫｜外部数据独立调度",
     `启用：${CONFIG.earlySignalMonitor.enabled ? "是" : "否"}｜扫描区块：${earlySignalState.cursor ?? "未建立"}｜最新区块：${earlySignalState.latestBlock ?? "未知"}`,
     `候选资产：${Object.keys(earlySignalState.tokens || {}).length}｜观察地址：${Object.keys(earlySignalState.candidates || {}).length}｜待推送：${earlySignalState.pendingChanges?.length || 0}`,
     ...Object.entries(earlySignalState.health || {}).filter(([,h]) => h.lastError).map(([name,h]) => `异常 ${name}：${h.lastError}`),
@@ -6831,52 +6865,114 @@ async function startMonitor() {
     CONFIG.safeProposalMonitor.safes,
   );
   const earlySignalState = loadEarlySignalState(CONFIG.earlySignalMonitor.stateFile);
-  let earlyPromise = null, earlyTimer = null, earlyExternalPromise = null, earlyExternalTimer = null;
-  const earlyFeeds = [];
-  async function earlyPoll() {
-    if (!CONFIG.earlySignalMonitor.enabled || isShuttingDown) return;
-    if (earlyPromise) return earlyPromise;
-    earlyPromise = (async () => {
+  const receiptHints = new Map(), priorityTokens = new Set(), externalJobs = new Map();
+  let earlyDeliveryPromise = null;
+  function deliverEarly() {
+    if (!canAttemptFeishuDelivery()) return Promise.resolve();
+    if (!earlyDeliveryPromise) earlyDeliveryPromise = deliverFlapEarlySignals(earlySignalState)
+      .catch(error => log(`[Flap 提前信号发送] ${error.message}`)).finally(() => { earlyDeliveryPromise = null; });
+    return earlyDeliveryPromise;
+  }
+  function refreshEarlyFeeds() {
+    if (CONFIG.earlySignalMonitor.enabled && CONFIG.earlySignalMonitor.wsEnabled && !isShuttingDown)
+      earlyFeeds.update(earlyLogFilters(earlySignalState, earlySignalConfig()));
+  }
+  function prioritize(tokens) {
+    for (const token of tokens) if (earlySignalState.tokens[token]) priorityTokens.add(token);
+    if (priorityTokens.size) void externalJobs.get("assets")?.wake();
+  }
+  const earlyChainJob = createWakeableJob({ intervalMs: CONFIG.earlySignalMonitor.intervalMs,
+    onError: error => log(`[Flap 提前信号] ${error.message}`),
+    run: async () => {
+      if (isShuttingDown) return;
       const previous = JSON.stringify(Object.entries(earlySignalState.health).map(([name,h]) => [name,h.lastError]));
-      try {
-        const result = await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain" }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
+      const knownTokens = new Set(Object.keys(earlySignalState.tokens));
+      const result = await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain" }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
+      saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
+      refreshEarlyFeeds();
+      prioritize(Object.keys(earlySignalState.tokens).filter(token => !knownTokens.has(token)));
+      if (result.errors.length && previous !== JSON.stringify(Object.entries(earlySignalState.health).map(([name,h]) => [name,h.lastError]))) log("[Flap 提前信号] " + result.errors.join("；"));
+      void deliverEarly();
+    } });
+  let fastRetryAt = 0, fastFailures = 0;
+  const earlyFastJob = createWakeableJob({ intervalMs: CONFIG.earlySignalMonitor.intervalMs,
+    onError: error => {
+      fastRetryAt = Date.now() + Math.min(30_000, 1000 * 2 ** Math.min(5, fastFailures++));
+      earlySignalState.health.fast = { lastError: error.message };
+      log(`[Flap 快速回执] ${error.message}`);
+    }, run: async () => {
+      if (isShuttingDown || Date.now() < fastRetryAt) return;
+      for (const [hash, hint] of receiptHints) if (Number(hint.blockNumber) <= (earlySignalState.cursor ?? -1)) receiptHints.delete(hash);
+      if (!receiptHints.size && !Object.keys(earlySignalState.fastBlocks || {}).length) return;
+      const result = await processEarlyReceiptHints(earlySignalState, [...receiptHints.values()], earlySignalConfig(), bscRpcBatch);
+      for (const hash of result.processed) receiptHints.delete(hash);
+      fastFailures = 0;
+      earlySignalState.health.fast = { lastError: "", lastSuccessAt: new Date().toISOString() };
+      saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
+      refreshEarlyFeeds();
+      prioritize(result.tokens);
+      void deliverEarly();
+    } });
+  const earlyFeeds = createSubscriptionSet(filter => createFactoryPoolWsFeed({
+    urls: CONFIG.factoryPoolMonitor.wsUrls, proxy: filter.address, topicFilter: filter.topics,
+    label: "Flap 提前信号 WSS",
+    onEvent: event => {
+      if (!shouldPrioritizeEarlyLog(event, earlySignalState)) return;
+      if (/^0x[a-f0-9]{64}$/i.test(event.transactionHash || "") && receiptHints.size < 1000)
+        receiptHints.set(event.transactionHash.toLowerCase(), { transactionHash: event.transactionHash.toLowerCase(), blockNumber: event.blockNumber });
+      void earlyFastJob.wake();
+    },
+    onRemoved: () => { void earlyFastJob.wake(); void earlyChainJob.wake(); },
+    onSubscribed: () => { void earlyChainJob.wake(); },
+    onStatus: health => { earlySignalState.wssHealth = health; },
+  }));
+  for (const source of ["cow", "assets", "positions", "balances", "discovery"]) {
+    const intervalMs = source === "cow" ? CONFIG.earlySignalMonitor.cowIntervalMs : source === "discovery" ? 60_000 : 10_000;
+    externalJobs.set(source, createWakeableJob({ intervalMs,
+      onError: error => log(`[Flap ${source}] ${error.message}`), run: async () => {
+        if (isShuttingDown) return;
+        const knownTokens = new Set(Object.keys(earlySignalState.tokens));
+        const tokens = source === "assets" ? [...priorityTokens].slice(0, 10) : [];
+        await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "external", sources: [source], scheduledSource: true, priorityTokens: tokens }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
+        if (!earlySignalState.health.assets?.lastError) for (const token of tokens) priorityTokens.delete(token);
         saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
-        if (result.errors.length && previous !== JSON.stringify(Object.entries(earlySignalState.health).map(([name,h]) => [name,h.lastError]))) log("[Flap 提前信号] " + result.errors.join("；"));
-        if (canAttemptFeishuDelivery()) await deliverFlapEarlySignals(earlySignalState);
-      } catch (error) { log("[Flap 提前信号] " + error.message); }
-    })().finally(() => { earlyPromise = null; });
-    return earlyPromise;
-  }
-  async function earlyExternalPoll() {
-    if (!CONFIG.earlySignalMonitor.enabled || isShuttingDown || earlyExternalPromise) return;
-    earlyExternalPromise = runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "external" }, rpcBatch: bscRpcBatch, safeState: safeProposalState })
-      .then(() => saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState))
-      .catch(error => log("[Flap 提前信号 API] " + error.message))
-      .finally(() => { earlyExternalPromise = null; });
-    await earlyExternalPromise;
-    if (!isShuttingDown) earlyExternalTimer = setTimeout(earlyExternalPoll, CONFIG.earlySignalMonitor.cowIntervalMs);
-  }
-  function scheduleEarly() {
-    if (!CONFIG.earlySignalMonitor.enabled || isShuttingDown) return;
-    earlyTimer = setTimeout(async () => { await earlyPoll(); scheduleEarly(); }, CONFIG.earlySignalMonitor.intervalMs);
+        refreshEarlyFeeds();
+        if (source !== "assets") prioritize(Object.keys(earlySignalState.tokens).filter(token => !knownTokens.has(token)));
+        void deliverEarly();
+      } }));
   }
   if (CONFIG.earlySignalMonitor.enabled) {
-    // Start independently; slow discovery APIs cannot hold up the existing factory initialization.
-    void earlyPoll().then(scheduleEarly);
-    void earlyExternalPoll();
-    if (CONFIG.earlySignalMonitor.wsEnabled) for (const filter of earlyLogFilters(earlySignalState, earlySignalConfig())) {
-      earlyFeeds.push(createFactoryPoolWsFeed({ urls: CONFIG.factoryPoolMonitor.wsUrls, proxy: filter.address,
-        topics: filter.topics, topicFilter: filter.topics, label: "Flap 提前信号 WSS",
-        onEvent: () => { void earlyPoll(); }, onSubscribed: () => { void earlyPoll(); },
-        onStatus: health => { earlySignalState.wssHealth = health; } }).start());
-    }
+    earlyChainJob.start(); earlyFastJob.start();
+    for (const job of externalJobs.values()) job.start();
+    refreshEarlyFeeds();
   }
+  const registryJob = createWakeableJob({ intervalMs: CONFIG.registryMonitor.intervalMs,
+    onError: error => log(`[Flap Vault Portal] ${error.message}`), run: async () => {
+      if (isShuttingDown) return;
+      const result = await checkFlapRegistryLogs(snapshot);
+      if (result.changed) saveSnapshot(snapshot);
+    } });
+  if (CONFIG.registryMonitor.enabled) registryJob.start();
+  const registryFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.wsEnabled ? createFactoryPoolWsFeed({
+    urls: CONFIG.factoryPoolMonitor.wsUrls, proxy: CONFIG.registryMonitor.address,
+    topics: [...CONFIG.registryMonitor.watchedEventTopics], label: "Flap 金库注册 WSS",
+    onEvent: () => { void registryJob.wake(); }, onSubscribed: () => { void registryJob.wake(); },
+  }).start() : null;
+  let lastHeadKey = "";
+  const headFeed = (CONFIG.earlySignalMonitor.enabled && CONFIG.earlySignalMonitor.wsEnabled) || (CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.wsEnabled)
+    ? createFactoryPoolWsFeed({ urls: CONFIG.factoryPoolMonitor.wsUrls, subscription: "newHeads", label: "Flap 区块 WSS",
+      onEvent: head => {
+        const key = `${head.number}:${head.hash}`;
+        if (lastHeadKey === key) return;
+        lastHeadKey = key;
+        // Heads release confirmed fast hints; periodic HTTP scanning remains independent.
+        if (CONFIG.earlySignalMonitor.enabled && CONFIG.earlySignalMonitor.wsEnabled) void earlyFastJob.wake();
+        if (CONFIG.registryMonitor.enabled) void registryJob.wake();
+      } }).start() : null;
   global.__earlySignalDrain = async () => {
-    clearTimeout(earlyTimer);
-    clearTimeout(earlyExternalTimer);
-    earlyFeeds.forEach(feed => feed.stop());
-    if (earlyPromise) await earlyPromise;
-    if (earlyExternalPromise) await earlyExternalPromise;
+    earlyFeeds.stop(); registryFeed?.stop(); headFeed?.stop();
+    await Promise.all([earlyChainJob.stop(), earlyFastJob.stop(), registryJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
+    if (earlyDeliveryPromise) await earlyDeliveryPromise;
     saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
   };
   let contractIntegrityMutationQueue = Promise.resolve();
@@ -7549,12 +7645,6 @@ async function startMonitor() {
       }
 
       await sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries });
-      try {
-        const registryResult = await checkFlapRegistryLogs(snapshot);
-        if (registryResult.changed) saveSnapshot(snapshot);
-      } catch (err) {
-        log(`[Flap Vault Portal] 检测失败：${err.message}`);
-      }
 
       const notificationsToSend = coalesceFlapNotifications(notifications);
       if (notificationsToSend.length > 0) {
@@ -7702,6 +7792,8 @@ if (!IS_TEST_MODE) {
 }
 
 export const __testables = {
+  checkFlapRegistryLogs,
+  fetchPage,
   extractCaStoreVaultSections,
   CONFIG,
   deliverFlapEarlySignals,

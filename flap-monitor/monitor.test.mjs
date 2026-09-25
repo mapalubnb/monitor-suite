@@ -11,6 +11,63 @@ process.env.FLAP_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
 
+test("conditional page fetch reuses a 304 body and never caches a region error", async () => {
+  const cache = new Map(), url = "https://flap.sh/launch";
+  const fetchFn = async (_url, opts) => {
+    assert.equal(opts.headers["If-None-Match"], undefined);
+    return { ok: true, status: 200, headers: new Headers({ etag: '"build-1"' }), text: async () => "<h1>Create Token</h1>" };
+  };
+  const body = await __testables.fetchPage(url, { cache, fetchFn });
+  const reused = await __testables.fetchPage(url, { cache, fetchFn: async (_url, opts) => {
+    assert.equal(opts.headers["If-None-Match"], '"build-1"');
+    return { status: 304, ok: false };
+  } });
+  assert.equal(reused, body);
+  await __testables.fetchPage(url, { cache, fetchFn: async () => ({ ok: true, status: 200, text: async () => "Service not available in your region" }) });
+  assert.equal(cache.get(url).body, body);
+});
+
+test("independent registry triggers serialize and retain cursor on delivery failure", async () => {
+  const address = "0x1111111111111111111111111111111111111111";
+  const snapshot = { registryMonitor: { lastBlock: 90, knownVaults: {} } };
+  const rpcCallFn = async method => method === "eth_blockNumber" ? "0x64" : [{
+    address: __testables.CONFIG.registryMonitor.address,
+    topics: [[...__testables.CONFIG.registryMonitor.watchedEventTopics][0]],
+    data: "0x" + address.slice(2).padStart(64, "0"), blockNumber: "0x5f", logIndex: "0x0", transactionHash: "0x" + "aa".repeat(32),
+  }];
+  const options = { rpcCallFn, filterContractsFn: async addresses => addresses };
+  await assert.rejects(__testables.checkFlapRegistryLogs(snapshot, { ...options, sendCardFn: async () => null }), /未送达/);
+  assert.equal(snapshot.registryMonitor.lastBlock, 90);
+  let sends = 0;
+  const sendCardFn = async () => { sends++; return "sent"; };
+  await Promise.all([1, 2].map(() => __testables.checkFlapRegistryLogs(snapshot, { ...options, sendCardFn })));
+  assert.equal(sends, 1);
+  assert.equal(snapshot.registryMonitor.lastBlock, 95);
+  assert.ok(snapshot.registryMonitor.knownVaults[address]);
+});
+
+test("newHeads feed validates subscription identity and forwards removed-log notifications", () => {
+  class Socket extends EventEmitter {
+    static OPEN = 1; static instances = [];
+    constructor() { super(); this.readyState = 1; this.sent = []; Socket.instances.push(this); }
+    send(value) { this.sent.push(JSON.parse(value)); }
+    ping() {}
+    close() { this.readyState = 3; }
+  }
+  let heads = 0, removed = 0;
+  const feed = __testables.createFactoryPoolWsFeed({ urls: ["wss://test"], subscription: "newHeads",
+    WebSocketImpl: Socket, logFn: () => {}, onEvent: () => heads++, onRemoved: () => removed++ }).start();
+  try {
+    const socket = Socket.instances[0]; socket.emit("open");
+    assert.deepEqual(socket.sent[0].params, ["newHeads"]);
+    socket.emit("message", JSON.stringify({ id: 1, result: "heads-1" }));
+    const send = (subscription, result) => socket.emit("message", JSON.stringify({ method: "eth_subscription", params: { subscription, result } }));
+    send("other", { number: "0x1" }); send("heads-1", { number: "0x1" });
+    send("heads-1", { removed: true });
+    assert.equal(heads, 1); assert.equal(removed, 1);
+  } finally { feed.stop(); }
+});
+
 test("incomplete frontend downloads never become a reusable baseline and recover on retry", async () => {
   const old = { assetHash: "same", assetAnalysisSchemaVersion: __testables.ASSET_ANALYSIS_SCHEMA_VERSION,
     assetFiles: ["/_next/static/chunks/missing.js"], assetContents: {} };
@@ -802,7 +859,7 @@ test("parallel Factory WSS feeds subscribe together and queue duplicate logs onc
       topics: [FACTORY_POOL_STATE_EVENT_TOPICS],
     }]);
     socket.emit("message", JSON.stringify({ id: 1, result: `subscription-${socket.url}` }));
-    socket.emit("message", JSON.stringify({ params: { result: event } }));
+    socket.emit("message", JSON.stringify({ method: "eth_subscription", params: { subscription: `subscription-${socket.url}`, result: event } }));
   }
   await queue.drain();
   assert.equal(processed, 1);

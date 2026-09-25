@@ -30,7 +30,7 @@ export const stageLabel = stage => STAGES[stage] || stage;
 export function createEarlySignalState() {
   return { schemaVersion: EARLY_SIGNAL_SCHEMA_VERSION, chainId: 56, cursor: null, cursorHash: "", events: {},
     pendingChanges: [], tokens: {}, pools: {}, positions: {}, orders: {}, candidates: {}, safeInfo: {},
-    balances: {}, stages: {}, proposalVersions: {}, health: {}, discoveryCursor: 0, lastDiscoveryAt: 0, lastRunAt: "" };
+    balances: {}, stages: {}, proposalVersions: {}, fastBlocks: {}, health: {}, discoveryCursor: 0, lastDiscoveryAt: 0, lastRunAt: "" };
 }
 export function loadEarlySignalState(path) {
   if (!existsSync(path)) return createEarlySignalState();
@@ -38,7 +38,7 @@ export function loadEarlySignalState(path) {
   const raw = JSON.parse(readFileSync(path, "utf8"));
   if (raw.chainId !== 56) throw new Error("提前监控状态不是 BSC");
   const state = { ...createEarlySignalState(), ...raw, schemaVersion: EARLY_SIGNAL_SCHEMA_VERSION };
-  for (const name of ["events", "tokens", "pools", "positions", "orders", "candidates", "safeInfo", "balances", "stages", "proposalVersions", "health"]) {
+  for (const name of ["events", "tokens", "pools", "positions", "orders", "candidates", "safeInfo", "balances", "stages", "proposalVersions", "fastBlocks", "health"]) {
     if (!state[name] || typeof state[name] !== "object" || Array.isArray(state[name])) throw new Error(`提前监控状态 ${name} 无效`);
   }
   if (!Array.isArray(state.pendingChanges)) throw new Error("提前监控队列无效");
@@ -110,7 +110,21 @@ export function earlyLogFilters(state, config = {}) {
     }] : []),
   ];
 }
+export function shouldPrioritizeEarlyLog(event, state) {
+  // Global factory initialization subscriptions include unrelated public pools.
+  // Wallet-scoped logs and known pools still enter the fast lane immediately.
+  const topic = lower(event.topics?.[0]);
+  if ([TOPICS.PairCreated, TOPICS.PoolCreated, TOPICS.V4Initialize, TOPICS.CLInitialize, TOPICS.BinInitialize].includes(topic)) {
+    const offset = [TOPICS.PairCreated, TOPICS.PoolCreated].includes(topic) ? 1 : 2;
+    return [addressTopic(event.topics?.[offset]), addressTopic(event.topics?.[offset + 1])].some(token => state.tokens[token]);
+  }
+  return true;
+}
 function logId(log) { return `${lower(log.blockHash)}:${lower(log.transactionHash)}:${Number(log.logIndex)}`; }
+function chainOrder(a, b) {
+  return Number(a.blockNumber || 0) - Number(b.blockNumber || 0)
+    || Number(a.logIndex ?? a.id?.split(":")[2] ?? 0) - Number(b.logIndex ?? b.id?.split(":")[2] ?? 0);
+}
 
 // Receipt decoding accepts only recognized factories/managers or verified pool addresses.
 export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.now(), silent = false, transaction = null } = {}) {
@@ -126,6 +140,7 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
   const emitted = [];
   const add = (log, event) => {
     const e = { ...event, id: `${logId(log)}:${event.kind}:${event.token || ""}`, blockNumber: Number(log.blockNumber || receipt.blockNumber),
+      logIndex: Number(log.logIndex || 0),
       blockHash: lower(log.blockHash || receipt.blockHash), transactionHash: lower(receipt.transactionHash),
       source: "chain", chainId: 56, provisional: true };
     if (emit(state, e, options)) emitted.push(e);
@@ -176,7 +191,10 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         if (t === TOPICS.Transfer && wallets.has(from)) candidate(state, to, `资金/仓位接收 ${receipt.transactionHash}`, nowMs);
         add(l, { kind, token: nft ? "" : a, stage: "observation", from, to, amount, tokenId: nft ? amount : undefined,
           detail: `${kind === "positionTransfer" ? "LP NFT 转移" : kind === "approval" ? "授权" : nft ? "NFT 转移" : "代币收支"} ${a}｜${from} → ${to}｜${nft ? "tokenId" : "原始数量"} ${amount}` });
-        if (kind === "positionTransfer") state.positions[`${a}:${amount}`] = { manager: a, tokenId: amount, owner: to, blockNumber: Number(receipt.blockNumber) };
+        if (kind === "positionTransfer") {
+          const key = `${a}:${amount}`, next = { manager: a, tokenId: amount, owner: to, blockNumber: Number(receipt.blockNumber), logIndex: Number(l.logIndex || 0) };
+          if (!state.positions[key] || chainOrder(next, state.positions[key]) >= 0) state.positions[key] = { ...state.positions[key], ...next };
+        }
       } else if ([TOPICS.Deposit, TOPICS.Withdraw].includes(t) && related) {
         const participant = [addressTopic(l.topics[1]), addressTopic(l.topics[2]), addressTopic(l.topics[3])].some(x => wallets.has(x));
         if (!participant || (t === TOPICS.Deposit && w.length !== 2)) continue;
@@ -285,7 +303,7 @@ export async function scanCowOrders(state, config, fetchFn, nowMs) {
     }
     if (!complete) throw new Error("CoW 订单超过分页上限，未完成快照");
     ingestCowOrders(state, owner, all, { nowMs, bootstrap });
-  }, nowMs, config.cowIntervalMs || 10000);
+  }, nowMs, config.scheduledSource ? 0 : config.cowIntervalMs || 10000);
 }
 
 export function syncEarlyProposals(state, safeState, nowMs = Date.now()) {
@@ -338,6 +356,8 @@ export async function scanAddressDiscovery(state, config, fetchFn, nowMs) {
 }
 
 export function rewindEarlySignals(state, fromBlock, nowMs = Date.now()) {
+  state.reorgRevision = (state.reorgRevision || 0) + 1;
+  for (const block of Object.keys(state.fastBlocks || {})) if (Number(block) >= fromBlock) delete state.fastBlocks[block];
   const invalid = new Set(Object.values(state.events).filter(e => Number.isInteger(e.blockNumber) && e.blockNumber >= fromBlock).map(e => e.id));
   for (const id of invalid) delete state.events[id];
   state.pendingChanges = state.pendingChanges.filter(e => !invalid.has(e.id));
@@ -415,6 +435,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   state.latestBlock = latest;
   const confirmations = config.confirmations ?? 1;
   const head = latest - confirmations;
+  await validateFastBlocks(state, head, rpcBatch, nowMs);
   const bootstrap = state.cursor == null;
   let scanCursor = bootstrap ? Math.max(0, head - (config.bootstrapBlocks ?? 2)) : state.cursor;
   if (scanCursor > head) return;
@@ -428,14 +449,18 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   const from = scanCursor + 1;
   const to = Math.min(head, from + (config.maxBlocksPerRun || 10) - 1);
   if (from > to) return;
+  const reorgRevision = state.reorgRevision || 0;
   const boundary = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(to), false]);
   const filters = earlyLogFilters(state, config);
   const logs = [];
   // Some public BSC nodes disable batch eth_getLogs: keep these requests independent.
-  for (const filter of filters) {
-    const page = await strictRpc(rpcBatch, "eth_getLogs", [{ ...filter, fromBlock: blockTag(from), toBlock: blockTag(to) }]);
-    if (!Array.isArray(page)) throw new Error("eth_getLogs 非数组");
-    logs.push(...page);
+  for (let i = 0; i < filters.length; i += 3) {
+    const pages = await Promise.all(filters.slice(i, i + 3).map(filter =>
+      strictRpc(rpcBatch, "eth_getLogs", [{ ...filter, fromBlock: blockTag(from), toBlock: blockTag(to) }])));
+    for (const page of pages) {
+      if (!Array.isArray(page)) throw new Error("eth_getLogs 非数组");
+      logs.push(...page);
+    }
   }
   const transactionMap = new Map();
   if (config.nativeTransactions !== false) {
@@ -454,11 +479,17 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
     if (result.some(r => !r?.blockHash || Number(r.blockNumber) < from || Number(r.blockNumber) > to)) throw new Error("回执尚未就绪/不在扫描窗口");
     receipts.push(...result);
   }
+  const receiptBlocks = uniq(receipts.map(receipt => receipt.blockNumber));
+  const canonicalBlocks = await rpcBatch(receiptBlocks.map(number => ({ method: "eth_getBlockByNumber", params: [number, false] })), { requireAllResults: true });
+  const canonicalHashes = new Map(receiptBlocks.map((number, i) => [number, lower(canonicalBlocks[i]?.hash)]));
+  if (receipts.some(receipt => !canonicalHashes.get(receipt.blockNumber) || lower(receipt.blockHash) !== canonicalHashes.get(receipt.blockNumber)))
+    throw new Error("回执区块已重组，保留游标重试");
   // Fetch pool metadata outside the commit, then merge only this field into the draft.
   const resolved = { pools: structuredClone(state.pools) };
   await resolveReceiptPools(resolved, receipts, rpcBatch, config);
   const check = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(to), false]);
   if (lower(check.hash) !== lower(boundary.hash)) throw new Error("扫描期间发生重组，保留游标重试");
+  if ((state.reorgRevision || 0) !== reorgRevision) throw new Error("并发快速通道检测到重组，保留游标重试");
   // Commit a complete window atomically in memory. Any malformed response leaves the old cursor intact.
   const draft = structuredClone(state);
   Object.assign(draft.pools, resolved.pools);
@@ -473,15 +504,64 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   draft.cursor = to;
   draft.cursorHash = lower(boundary.hash);
   draft.chainBaselineAt ||= iso(nowMs);
+  for (const block of Object.keys(draft.fastBlocks || {})) if (Number(block) <= to) delete draft.fastBlocks[block];
   // Source health entries can be held by a concurrent API pass across an await.
   Object.assign(state, draft, { health: state.health });
+}
+
+async function validateFastBlocks(state, head, rpcBatch, nowMs) {
+  const anchors = Object.entries(state.fastBlocks || {}).filter(([block]) => Number(block) <= head);
+  if (!anchors.length) return;
+  const blocks = await rpcBatch(anchors.map(([block]) => ({ method: "eth_getBlockByNumber", params: [blockTag(Number(block)), false] })), { requireAllResults: true });
+  for (let i = 0; i < anchors.length; i++) {
+    if (!blocks[i]?.hash) throw new Error("快速信号区块校验不可用");
+    if (lower(blocks[i].hash) !== anchors[i][1]) {
+      rewindEarlySignals(state, Math.max(1, Math.min(Number(anchors[i][0]), (state.cursor ?? 0) + 1)), nowMs);
+      return;
+    }
+  }
+}
+
+// Fast lane never advances the HTTP cursor. Both lanes use receipt log IDs for deduplication.
+export async function processEarlyReceiptHints(state, hints, config, rpcBatch, nowMs = Date.now()) {
+  if (!state.chainBaselineAt) return { processed: [], tokens: [] };
+  const chain = await strictRpc(rpcBatch, "eth_chainId", []);
+  if (Number(chain) !== 56) throw new Error("RPC chainId 不是 BSC 56");
+  const latest = Number(await strictRpc(rpcBatch, "eth_blockNumber", []));
+  const head = latest - (config.confirmations ?? 1);
+  await validateFastBlocks(state, head, rpcBatch, nowMs);
+  const eligible = hints.filter(h => Number(h.blockNumber) <= head).slice(0, 20);
+  const processed = [], tokens = new Set();
+  for (const hint of eligible) {
+    const reorgRevision = state.reorgRevision || 0;
+    const receipt = await strictRpc(rpcBatch, "eth_getTransactionReceipt", [hint.transactionHash]);
+    if (lower(receipt.transactionHash) !== lower(hint.transactionHash) || Number(receipt.blockNumber) > head) continue;
+    const block = await strictRpc(rpcBatch, "eth_getBlockByNumber", [receipt.blockNumber, false]);
+    if (lower(block.hash) !== lower(receipt.blockHash)) continue;
+    if (!state.fastBlocks?.[Number(receipt.blockNumber)] && Object.keys(state.fastBlocks || {}).length >= 128) break;
+    const resolved = { pools: structuredClone(state.pools) };
+    await resolveReceiptPools(resolved, [receipt], rpcBatch, config);
+    const check = await strictRpc(rpcBatch, "eth_getBlockByNumber", [receipt.blockNumber, false]);
+    if (lower(check.hash) !== lower(receipt.blockHash)) continue;
+    if ((state.reorgRevision || 0) !== reorgRevision) continue;
+    const draft = structuredClone(state);
+    Object.assign(draft.pools, resolved.pools);
+    const events = decodeEarlyReceipt(receipt, draft, { config, nowMs });
+    draft.fastBlocks ||= {};
+    if (Number(receipt.blockNumber) > (state.cursor ?? 0)) draft.fastBlocks[Number(receipt.blockNumber)] = lower(receipt.blockHash);
+    Object.assign(state, draft, { health: state.health });
+    for (const event of events) if (event.token) tokens.add(event.token);
+    processed.push(hint.transactionHash);
+  }
+  return { processed, tokens: [...tokens] };
 }
 
 export async function refreshEarlyAssets(state, config, rpcBatch, nowMs) {
   const addresses = keys(state.tokens);
   const start = (state.assetCursor || 0) % Math.max(1, addresses.length);
-  const selected = [...addresses.slice(start), ...addresses.slice(0, start)].slice(0, config.assetsPerRun || 10);
-  state.assetCursor = start + selected.length;
+  const priority = (config.priorityTokens || []).filter(token => state.tokens[token]);
+  const selected = uniq([...priority, ...addresses.slice(start), ...addresses.slice(0, start)]).slice(0, config.assetsPerRun || 10);
+  if (!priority.length) state.assetCursor = start + selected.length;
   for (const token of selected) {
     const values = await rpcBatch([
       { method: "eth_call", params: [{ to: token, data: "0x38d52e0f" }, "latest"] },
@@ -516,10 +596,10 @@ export function earlyAssetStage(state, token) {
   const proposals = new Map(signals.filter(e => e.kind === "proposal").map(e => [e.safeTxHash, e]));
   for (const stage of ["executable", "signed", "proposed"]) if ([...proposals.values()].some(e => e.stage === stage)) return stage;
   if (meta.effectiveEnabled === false && meta.everEnabled) return "disabled";
-  const liquidity = signals.filter(e => ["liquidityAdded", "liquidityRemoved"].includes(e.kind)).at(-1);
+  const liquidity = signals.filter(e => ["liquidityAdded", "liquidityRemoved"].includes(e.kind)).sort(chainOrder).at(-1);
   if (liquidity?.kind === "liquidityAdded") return "prepared";
   const order = signals.filter(e => e.kind === "order").at(-1);
-  const wrapping = signals.filter(e => ["wrap", "redeem"].includes(e.kind)).at(-1);
+  const wrapping = signals.filter(e => ["wrap", "redeem"].includes(e.kind)).sort(chainOrder).at(-1);
   if (order?.stage === "stocking" || wrapping?.kind === "wrap" && meta.underlying) return "stocking";
   return "observation";
 }
@@ -566,11 +646,13 @@ export async function runEarlySignalScan({ state, config = {}, rpcBatch, fetchFn
   syncEarlyProposals(state, safeState, nowMs);
   if (config.mode !== "external") await sourcePass(state, "chain", () => scanEarlyChain(state, config, rpcBatch, nowMs), nowMs);
   if (config.mode !== "chain") {
-    await scanCowOrders(state, config, fetchFn, nowMs);
-    await sourcePass(state, "assets", () => refreshEarlyAssets(state, config, rpcBatch, nowMs), nowMs, config.assetIntervalMs || 10000);
-    await sourcePass(state, "positions", () => refreshEarlyPositions(state, rpcBatch), nowMs, 10000);
-    await sourcePass(state, "balances", () => refreshNativeBalances(state, config, rpcBatch, nowMs), nowMs, 10000);
-    await sourcePass(state, "discovery", () => scanAddressDiscovery(state, config, fetchFn, nowMs), nowMs, config.discoveryIntervalMs || DAY);
+    const enabled = source => !config.sources || config.sources.includes(source);
+    const periodicInterval = config.scheduledSource ? 0 : 10000;
+    if (enabled("cow")) await scanCowOrders(state, config, fetchFn, nowMs);
+    if (enabled("assets")) await sourcePass(state, "assets", () => refreshEarlyAssets(state, config, rpcBatch, nowMs), nowMs, config.priorityTokens?.length || config.scheduledSource ? 0 : config.assetIntervalMs || 10000);
+    if (enabled("positions")) await sourcePass(state, "positions", () => refreshEarlyPositions(state, rpcBatch), nowMs, periodicInterval);
+    if (enabled("balances")) await sourcePass(state, "balances", () => refreshNativeBalances(state, config, rpcBatch, nowMs), nowMs, periodicInterval);
+    if (enabled("discovery")) await sourcePass(state, "discovery", () => scanAddressDiscovery(state, config, fetchFn, nowMs), nowMs, config.discoveryIntervalMs || DAY);
   }
   state.lastRunAt = iso(nowMs);
   prune(state, nowMs);

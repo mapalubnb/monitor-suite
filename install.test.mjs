@@ -115,6 +115,7 @@ test("separate Flap deployment copies every runtime module", () => {
     "safe-proposal-monitor.mjs",
     "quote-token-codec.mjs",
     "early-signal-monitor.mjs",
+    "realtime-scheduler.mjs",
     "early-signal-catalog.mjs",
     "early-signal-topics.mjs",
     "operational-call-codec.mjs",

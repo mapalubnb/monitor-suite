@@ -1,15 +1,15 @@
 {
   "name": "monitor-suite",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Four.meme 和 Flap.sh 平台变更自动化监控系统",
   "type": "module",
   "private": true,
   "scripts": {
-    "check": "node --check fourmeme-monitor/monitor.mjs && node --check fourmeme-monitor/feishu-bot.mjs && node --check flap-monitor/factory-pool-monitor.mjs && node --check flap-monitor/compact-factory-pool-state.mjs && node --check flap-monitor/contract-integrity-monitor.mjs && node --check flap-monitor/quote-token-codec.mjs && node --check flap-monitor/safe-proposal-monitor.mjs && node --check flap-monitor/monitor.mjs && node --check flap-monitor/early-signal-monitor.mjs && node --check flap-monitor/operational-call-codec.mjs && node --check flap-monitor/early-signal-catalog.mjs && node --check flap-monitor/early-signal-topics.mjs",
-    "test": "node --test install.test.mjs shared/feishu-client.test.mjs fourmeme-monitor/monitor.test.mjs flap-monitor/monitor.test.mjs flap-monitor/contract-integrity-monitor.test.mjs flap-monitor/safe-proposal-monitor.test.mjs flap-monitor/early-signal-monitor.test.mjs",
+    "check": "node --check fourmeme-monitor/monitor.mjs && node --check fourmeme-monitor/feishu-bot.mjs && node --check flap-monitor/factory-pool-monitor.mjs && node --check flap-monitor/compact-factory-pool-state.mjs && node --check flap-monitor/contract-integrity-monitor.mjs && node --check flap-monitor/quote-token-codec.mjs && node --check flap-monitor/safe-proposal-monitor.mjs && node --check flap-monitor/monitor.mjs && node --check flap-monitor/early-signal-monitor.mjs && node --check flap-monitor/operational-call-codec.mjs && node --check flap-monitor/early-signal-catalog.mjs && node --check flap-monitor/early-signal-topics.mjs && node --check flap-monitor/realtime-scheduler.mjs",
+    "test": "node --test install.test.mjs shared/feishu-client.test.mjs fourmeme-monitor/monitor.test.mjs flap-monitor/monitor.test.mjs flap-monitor/contract-integrity-monitor.test.mjs flap-monitor/safe-proposal-monitor.test.mjs flap-monitor/early-signal-monitor.test.mjs flap-monitor/realtime-scheduler.test.mjs",
     "check:fourmeme": "node --check fourmeme-monitor/monitor.mjs",
     "test:fourmeme": "node --test fourmeme-monitor/monitor.test.mjs",
-    "test:flap": "node --test flap-monitor/monitor.test.mjs flap-monitor/contract-integrity-monitor.test.mjs flap-monitor/safe-proposal-monitor.test.mjs flap-monitor/early-signal-monitor.test.mjs",
+    "test:flap": "node --test flap-monitor/monitor.test.mjs flap-monitor/contract-integrity-monitor.test.mjs flap-monitor/safe-proposal-monitor.test.mjs flap-monitor/early-signal-monitor.test.mjs flap-monitor/realtime-scheduler.test.mjs",
     "repair:flap-factory-state": "node flap-monitor/compact-factory-pool-state.mjs"
   },
   "dependencies": {
