@@ -68,9 +68,40 @@ FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
 | `FEISHU_MENTION_OPEN_ID` | Flap 重点告警需要 @ 的用户，留空不提醒指定用户 |
 | `FLAP_SAFE_API_KEY` | Safe 提案查询认证 |
 | `GITHUB_TOKEN` | 提高 GitHub API 可用额度 |
-| AI 提供商 API Key | 启用 AI 摘要，可配置豆包、DeepSeek、通义千问或 OpenAI |
+| `DOUBAO_API_KEY` / `DEEPSEEK_API_KEY` / `QWEN_API_KEY` / `OPENAI_API_KEY` | 可选，填写任意一个以启用 AI 摘要 |
 
-修改 `.env` 后执行 `mon-restart`。保留 `.env` 和运行状态文件，不要提交凭证或删除用于恢复进度的快照。
+完整配置和每项说明见 [.env.example](.env.example)。保留 `.env` 和运行状态文件，不要提交凭证或删除用于恢复进度的快照。
+
+### 调整监控配置
+
+编辑 `/root/monitor-suite/.env`，可修改监控频率、RPC 节点、监听地址及功能开关：
+
+- **Four.meme**：前端默认 7 秒、最低 5 秒；API 默认 10 秒、最低 8 秒；底池、模板、合约和链上参数默认 2 秒、最低 1 秒。
+- **Flap**：页面默认 1000ms、最低 500ms；Safe 提案默认 10 秒，有待执行提案时切换为 5 秒。
+- **RPC**：通过 `FOURMEME_BSC_RPC_URLS` 等对应模块配置指定节点；多个地址按 `.env.example` 的格式填写。
+- **源站限流**：适当增加检查间隔，或降低前端请求并发。
+
+修改配置后重启并查看状态：
+
+```bash
+cd /root/monitor-suite
+nano .env
+mon-restart
+mon-status
+```
+
+## 更新部署
+
+已有安装直接拉取代码并重新运行安装脚本：
+
+```bash
+cd /root/monitor-suite
+git pull
+sudo bash install.sh
+pm2 status
+```
+
+`install.sh` 会保留现有 `.env`，并自动补齐缺少的配置项。需要凭证的项目仍需自行填写；不要重新复制 `.env.example` 覆盖已有配置，也不要删除监控状态文件。
 
 ## 日常使用
 
@@ -85,15 +116,7 @@ FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
 
 白名单用户可在飞书中使用 `route list` 查看待确认的 Four.meme 路由，使用 `route add <完整URL>` 加入监控，或用 `route ignore <完整URL>` 忽略。
 
-拉取代码并部署：
-
-```bash
-cd /root/monitor-suite
-git pull
-sudo bash install.sh
-```
-
-安装脚本保留已有 `.env` 并补齐缺少的配置项。异常时先查看对应模块的状态和日志，核对飞书权限、RPC 连接或接口限流情况。
+异常时先查看对应模块的状态和日志，核对飞书权限、RPC 连接或接口限流情况。
 
 本地检查：
 
