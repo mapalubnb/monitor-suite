@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
 import {
@@ -680,6 +681,8 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
     lines.push(`**${escapedName}**`, `<font color='${color}'>${icon} ${status}</font>`);
     if (change.quoteToken) lines.push("计价代币：[" + change.quoteToken + "](https://bscscan.com/address/" + change.quoteToken + ")");
     if (change.vaultFactory) lines.push("Vault Factory：[" + change.vaultFactory + "](https://bscscan.com/address/" + change.vaultFactory + ")");
+    const launchUrl = buildVaultFactoryLaunchUrl(change.vaultFactory);
+    if (launchUrl) lines.push(`🏦 金库链接：[打开金库](${launchUrl})`);
     for (const action of change.actions || []) {
       if (action.kind === "vaultFactory") {
         const risks = ["未验证", "低风险", "中低风险", "中风险", "高风险"];

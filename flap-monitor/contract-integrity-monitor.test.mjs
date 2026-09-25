@@ -23,6 +23,17 @@ import {
 
 const { __testables } = await import("./contract-integrity-monitor.mjs");
 
+test('Vault Factory 合约变更附带金库链接，Portal 不误生成链接', () => {
+  const factory = '0x15cbf6b763b102acef6b4db9c62ed96fd3c0ab73';
+  const portal = FLAP_CORE_CONTRACTS.vaultPortal;
+  const content = buildContractIntegrityContent([
+    {address: factory, type: 'event', field: '配置更新'},
+    {address: portal, type: 'event', field: '权限更新'},
+  ], {catalog: {[factory]: {kind: 'vaultFactory'}, [portal]: {kind: 'vaultPortal'}}});
+  assert.ok(content.includes(`https://flap.sh/launch?vaultfactory=${factory}&chain=bnb&lang=zh`));
+  assert.ok(!content.includes(`vaultfactory=${portal}`));
+});
+
 const word = value => String(value || "").replace(/^0x/, "").padStart(64, "0");
 const addressWord = address => `0x${word(address)}`;
 const uintWord = value => `0x${BigInt(value).toString(16).padStart(64, "0")}`;

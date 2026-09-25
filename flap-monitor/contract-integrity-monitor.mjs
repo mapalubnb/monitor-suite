@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
 import { PROXY_ADMINS } from "./early-signal-catalog.mjs";
@@ -562,6 +563,9 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
     const contract = state.catalog?.[change.address];
     const label = contract?.label || change.address || "未知合约";
     lines.push(`- ${label}: [${change.address}](https://bscscan.com/address/${change.address})`);
+    const launchUrl = contract?.kind === "vaultFactory" || contract?.hintedKind === "vaultFactory"
+      ? buildVaultFactoryLaunchUrl(change.address) : "";
+    if (launchUrl) lines.push(`  🏦 金库链接：[打开金库](${launchUrl})`);
     if (change.type === "event") {
       lines.push(`  🟠 ${change.field}`);
       if (change.txHash) lines.push(`  交易: [${change.txHash}](https://bscscan.com/tx/${change.txHash})`);

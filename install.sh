@@ -179,6 +179,7 @@ if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; th
   cp flap-monitor/compact-factory-pool-state.mjs "$FLAP_DIR/"
   cp flap-monitor/contract-integrity-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/safe-proposal-monitor.mjs "$FLAP_DIR/"
+  cp flap-monitor/vault-links.mjs "$FLAP_DIR/"
   cp flap-monitor/quote-token-codec.mjs "$FLAP_DIR/"
   cp flap-monitor/early-signal-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/realtime-scheduler.mjs "$FLAP_DIR/"

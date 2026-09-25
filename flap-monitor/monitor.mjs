@@ -1,3 +1,4 @@
+import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 /**
  * Flap.sh 页面监控脚本 v2 — 高频并行版
  *
@@ -3072,11 +3073,7 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
   return content;
 }
 
-function buildVaultFactoryLaunchUrl(factory, options = {}) {
-  if (!/^0x[a-fA-F0-9]{40}$/.test(String(factory || ""))) return "";
-  const chain = options.chain === "robinhood" ? "robinhood" : "bnb";
-  return `https://flap.sh/launch?vaultfactory=${factory}&chain=${chain}&lang=zh`;
-}
+// 所有金库卡片共用链接构造规则。
 
 function vaultLaunchLink(factory, label = "打开金库") {
   const url = buildVaultFactoryLaunchUrl(factory);
