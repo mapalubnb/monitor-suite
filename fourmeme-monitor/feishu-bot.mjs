@@ -384,8 +384,8 @@ function buildMonitorContext() {
         for (const nft of op.agentNfts) parts.push(`  ${nft}`);
       }
 
-      const actorHistory = snap.chainActorMonitor || {};
-      const actorState = actorHistory.realtime || actorHistory;
+      const actorHistory = snap.chainActorHistory || snap.chainActorMonitor || {};
+      const actorState = snap.chainActorMonitor?.realtime || snap.chainActorMonitor || {};
       const actorCount = actorState.actionActorCount
         ?? Object.values(actorState.actors || {}).filter(actor => actor.actionWatched).length;
       parts.push(`\n创建者动作监听: ${actorCount} 个地址`);

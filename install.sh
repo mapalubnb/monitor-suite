@@ -359,8 +359,8 @@ if [ -f "$SNAP" ]; then
     const fpKeys=Object.keys(fp);
     const op=s.onchainParams||{};
     const nfts=op.agentNfts||[];
-    const actorHistory=s.chainActorMonitor||{};
-    const am=actorHistory.realtime||actorHistory;
+    const actorHistory=s.chainActorHistory||s.chainActorMonitor||{};
+    const am=s.chainActorMonitor?.realtime||s.chainActorMonitor||{};
     const allActors=am.actors||{};
     const actors=Object.keys(allActors).filter(a=>allActors[a]?.actionWatched);
     const cachedCreators=Object.values(am.creators||{}).filter(x=>x&&x.creator).length;

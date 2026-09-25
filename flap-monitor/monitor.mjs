@@ -2742,7 +2742,9 @@ async function queryBscLogs(params, options) {
   const history = options.history ? "eth_getLogs:history" : bscRpcPreferenceKey("eth_getLogs", params);
   const timeoutMs = Math.max(4000, bscRpcTimeoutMs("eth_getLogs", params));
   for (const url of urls) {
-    const key = url + ":" + history;
+    const from = Number(params[0]?.fromBlock || 0), to = Number(params[0]?.toBlock || 0);
+    // Pruned archives and unsupported wide windows must not quarantine current blocks.
+    const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + (to - from > 49 ? "wide" : "narrow");
     if ((logRpcCooldowns.get(key) || 0) > Date.now()) continue;
     try {
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },

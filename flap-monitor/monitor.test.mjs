@@ -3309,3 +3309,22 @@ test("early signal delivery retains failed cards and acknowledges only the deliv
   assert.deepEqual(state.pendingChanges.map(x => x.id), ["during-send"]);
   assert.equal(saved, 1);
 });
+
+test('archive endpoint failure never quarantines recent log queries and only two queries run at once', async () => {
+  const originalFetch = globalThis.fetch;
+  const urls = ['https://first.rpc', 'https://second.rpc'];
+  __testables.resetBscRpcHealth();
+  let active = 0, peak = 0;
+  globalThis.fetch = async (url, opts) => {
+    active++; peak = Math.max(peak, active);
+    const filter = JSON.parse(opts.body).params[0];
+    await new Promise(resolve => setTimeout(resolve, 2));
+    active--;
+    return { ok: true, json: async () => Number(filter.fromBlock) < 8192 ? { error: { message: 'header not found' } } : { result: [] } };
+  };
+  try {
+    await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x1',toBlock:'0x2'}], {rpcUrls:urls,history:true}), /header not found/);
+    await Promise.all(Array.from({length:6}, () => __testables.executeBscGetLogsRequest([{fromBlock:'0x4000',toBlock:'0x4001'}], {rpcUrls:urls})));
+    assert.ok(peak <= 2);
+  } finally { globalThis.fetch = originalFetch; __testables.resetBscRpcHealth(); }
+});

@@ -328,7 +328,7 @@ test("restart card reports process and baseline separately within one card", () 
   assert.equal(card.title, "Four.meme 监控已启动");
   assert.match(card.content, /进程已启动/);
   assert.match(card.content, /前端：每 7 秒｜API：每 10 秒/);
-  assert.match(card.content, /首轮检查：完成 0\/9/);
+  assert.match(card.content, /首轮检查：完成 0\/10/);
   assert.doesNotMatch(card.content, /全部模块首轮检查完成|监控启动中/);
   assert.ok(card.content.length < 460);
 });

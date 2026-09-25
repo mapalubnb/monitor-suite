@@ -611,6 +611,9 @@ function scheduleRuntimeMetricsWrite() {
           ? Math.round(snapshotWriteMetrics.totalDurationMs / snapshotWriteMetrics.writes)
           : 0,
       },
+      actorRealtimeBlock: snapshot?.chainActorMonitor?.realtime?.lastBlock || 0,
+      actorHistoryBlock: snapshot?.chainActorHistory?.lastBlock || 0,
+      actorHistoryError: snapshot?.chainActorHistory?.historyError || "",
       actorScanMode: actorRawScanState.lastMode || "validatedBlockBatch",
       actorFastSkips: actorRawScanState.fastSkips,
       actorFallbacks: actorRawScanState.fallbacks,
@@ -8746,22 +8749,27 @@ function shouldLogActorCatchup(state, lagBefore, lagAfter) {
 
 async function runActorCheck() {
   await runActorLane(true);
+}
+async function runActorHistoryCheck() {
   const root = ensureActorMonitorState();
-  if (Date.now() < (root.historyNextAt || 0)) return;
+  if (root.historyEndBlock == null) return;
+  const history = snapshot.chainActorHistory ||= { ...root, realtime: undefined };
+  if (Date.now() < (history.historyNextAt || 0)) return;
   try {
     await runActorLane(false);
-    root.historyError = "";
-    root.historyNextAt = Date.now() + 10_000;
+    history.historyError = "";
+    history.historyNextAt = Date.now() + 10_000;
   } catch (error) {
-    root.historyError = error.message;
-    root.historyNextAt = Date.now() + 60_000;
+    history.historyError = error.message;
+    history.historyNextAt = Date.now() + 60_000;
     log("[创建者补扫] " + error.message);
   }
 }
 async function runActorLane(realtime) {
   if (!CONFIG.actorMonitor.enabled) return;
   const root = ensureActorMonitorState();
-  const state = realtime ? (root.realtime ||= { creators: root.creators || {}, creatorLookup: root.creatorLookup || {}, seenTxs: [] }) : root;
+  const state = realtime ? (root.realtime ||= { creators: root.creators || {}, creatorLookup: root.creatorLookup || {}, seenTxs: [] }) : snapshot.chainActorHistory;
+  if (realtime) state.creators = { ...state.creators, ...snapshot.chainActorHistory?.creators };
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
     log("[创建者] 尚无合约指纹，等待合约模块建立基线");
@@ -8881,7 +8889,7 @@ async function runActorLane(realtime) {
     }
   }
 
-  if (state.actorLagBlocks <= CONFIG.actorMonitor.maxBlocksPerRun) {
+  if (!realtime) {
     const beforeCreators = JSON.stringify(state.creators || {});
     await fetchContractCreatorActors(contractEntries, state, { refresh: true });
     if (beforeCreators !== JSON.stringify(state.creators || {})) {
@@ -9924,6 +9932,7 @@ const modules = [
   createModuleRunner("onchain",  runOnchainCheck,   CONFIG.intervals.onchain),
   createModuleRunner("actor",    runActorCheck,     CONFIG.actorMonitor.wsEnabled ? CONFIG.actorMonitor.httpFallbackMs : CONFIG.intervals.actor),
 ];
+modules.push(createModuleRunner("actorHistory", runActorHistoryCheck, 10_000));
 const actorRunner = modules.find(m => m.name === "actor");
 const openFourDiscoveryRunner = createModuleRunner("openfourDiscovery", () => CONFIG.openFourRegistryLogMonitor.enabled ? runOpenFourModuleDiscoveryCheck() : undefined, 30_000);
 modules.push(openFourDiscoveryRunner);
