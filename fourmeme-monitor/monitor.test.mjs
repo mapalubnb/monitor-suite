@@ -9,6 +9,52 @@ process.env.FOURMEME_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
 
+test('API 混合名称样本与排序变化不会生成新增删除告警', () => {
+  const { extractStructure, stabilizeApiListTypes, diffApiStructures } = __testables;
+  const extract = rows => ({ token_search_new: extractStructure({data: rows}, '', 'token_search_new') });
+  const baseline = extract([{name: 'normal'}]);
+  const mixed = extract([{name: []}, {name: 'normal'}]);
+  assert.deepEqual(mixed, extract([{name: 'normal'}, {name: []}]));
+  const next = stabilizeApiListTypes(baseline, mixed, new Map());
+  assert.deepEqual(diffApiStructures(baseline, next), []);
+  assert.deepEqual(diffApiStructures(next, baseline), []);
+  const legacy = structuredClone(baseline);
+  legacy.token_search_new['data[0].name[]'] = 'array';
+  assert.deepEqual(diffApiStructures(legacy, baseline), []);
+});
+
+test('API 稳定类型变更需三轮确认，失败和混合样本中断确认', () => {
+  const { extractStructure, stabilizeApiListTypes, diffApiStructures } = __testables;
+  const extract = name => ({ token_search_new: extractStructure({data: [{name}]}, '', 'token_search_new') });
+  let baseline = extract('normal');
+  const pending = new Map();
+  const array = extract([]);
+  assert.deepEqual(diffApiStructures(baseline, stabilizeApiListTypes(baseline, array, pending)), []);
+  stabilizeApiListTypes(baseline, {}, pending);
+  assert.equal(pending.size, 0);
+  const mixed = {token_search_new: {'data[0].name': 'array|string'}};
+  stabilizeApiListTypes(baseline, array, pending);
+  stabilizeApiListTypes(baseline, mixed, pending);
+  assert.equal(pending.size, 0);
+  for (let i = 0; i < 2; i++) {
+    const next = stabilizeApiListTypes(baseline, array, pending);
+    assert.deepEqual(diffApiStructures(baseline, next), []);
+    baseline = next;
+  }
+  const confirmed = stabilizeApiListTypes(baseline, array, pending);
+  assert.deepEqual(diffApiStructures(baseline, confirmed)[0].changed, ['data[0].name: string → array']);
+  assert.deepEqual(diffApiStructures(confirmed, stabilizeApiListTypes(confirmed, array, pending)), []);
+});
+
+test('API 真正新增数组字段与非列表类型变更仍立即报告', () => {
+  const { stabilizeApiListTypes, diffApiStructures } = __testables;
+  const before = {token_search_new: {code: 'number'}, public_config: {flag: 'boolean'}};
+  const after = {token_search_new: {code: 'number', 'data[0].features': 'array', 'data[0].features[]': 'array'}, public_config: {flag: 'string'}};
+  const changes = diffApiStructures(before, stabilizeApiListTypes(before, after, new Map()));
+  assert.deepEqual(changes[0].added, ['data[0].features (array)']);
+  assert.deepEqual(changes[1].changed, ['flag: boolean → string']);
+});
+
 test('first scan completion does not wait for the queued WSS follow-up scan', async () => {
   let releaseFirst, releaseSecond;
   const firstGate = new Promise(resolve => { releaseFirst = resolve; });

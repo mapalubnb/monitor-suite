@@ -5826,7 +5826,9 @@ function extractStructure(obj, prefix = "", endpoint = "") {
   if (Array.isArray(obj)) {
     result[prefix + "[]"] = "array";
     for (const item of obj.slice(0, 10)) {
-      Object.assign(result, extractStructure(item, prefix + "[0].", endpoint));
+      for (const [field, type] of Object.entries(extractStructure(item, prefix + "[0].", endpoint))) {
+        result[field] = [...new Set([...(result[field] || "").split("|"), ...type.split("|")].filter(Boolean))].sort().join("|");
+      }
     }
   } else if (typeof obj === "object") {
     for (const [k, v] of Object.entries(obj)) {
@@ -6052,6 +6054,7 @@ function isNumericLikeString(value) {
 }
 
 function normalizeApiStructureFieldType(endpoint, field, type) {
+  if (type.includes("|")) return [...new Set(type.split("|").map(t => normalizeApiStructureFieldType(endpoint, field, t)))].sort().join("|");
   const name = normalizeStructureFieldName(field);
   if (API_TOKEN_LIST_ENDPOINTS.has(endpoint)) {
     if (API_TOKEN_TEXT_FIELD_RE.test(name) && (type === "string" || type === "number")) return "string";
@@ -6170,6 +6173,8 @@ function diffApiStructures(oldStruct, newStruct) {
     }
     const added = [], removed = [], changed = [];
     for (const [key, type] of Object.entries(newFields)) {
+      // [] 是提取器生成的容器标记，不是接口新增字段；类型由父字段报告。
+      if (key.endsWith("[]") && key.slice(0, -2) in newFields) continue;
       if (isVolatileApiStructureField(endpoint, key)) continue;
       const normalizedNewType = normalizeApiStructureFieldType(endpoint, key, type);
       if (!(key in oldFields)) added.push(`${key} (${type})`);
@@ -6179,6 +6184,7 @@ function diffApiStructures(oldStruct, newStruct) {
       }
     }
     for (const key of Object.keys(oldFields)) {
+      if (key.endsWith("[]") && key.slice(0, -2) in oldFields) continue;
       if (isVolatileApiStructureField(endpoint, key)) continue;
       if (!(key in newFields)) removed.push(key);
     }
@@ -6187,6 +6193,36 @@ function diffApiStructures(oldStruct, newStruct) {
     }
   }
   return changes;
+}
+
+const apiTypeConfirmations = new Map();
+function stabilizeApiListTypes(oldStruct, newStruct, pending = apiTypeConfirmations) {
+  const structures = structuredClone(newStruct);
+  const seen = new Set();
+  for (const [endpoint, fields] of Object.entries(structures)) {
+    if (!API_TOKEN_LIST_ENDPOINTS.has(endpoint)) continue;
+    for (const [field, rawType] of Object.entries(fields)) {
+      const key = `${endpoint}:${field}`;
+      seen.add(key);
+      const previous = oldStruct?.[endpoint]?.[field];
+      if (!previous || field.endsWith("[]")) { pending.delete(key); continue; }
+      const type = normalizeApiStructureFieldType(endpoint, field, rawType);
+      const oldType = normalizeApiStructureFieldType(endpoint, field, previous);
+      // 混合样本无法证明接口类型整体改变；必须连续三轮出现同一单一新类型。
+      if (type === oldType || type.includes("|")) {
+        pending.delete(key);
+        fields[field] = previous;
+        continue;
+      }
+      const last = pending.get(key);
+      const count = last?.type === type ? last.count + 1 : 1;
+      if (count >= 3) pending.delete(key);
+      else { pending.set(key, { type, count }); fields[field] = previous; }
+    }
+  }
+  // 失败/缺失的样本中断连续确认，不能跨失败轮次累计。
+  for (const key of pending.keys()) if (!seen.has(key)) pending.delete(key);
+  return structures;
 }
 
 /**
@@ -9747,8 +9783,9 @@ async function runApiCheck() {
   if (prunedApiKeys.length > 0) {
     log(`[API] 已清理停用端点快照：${prunedApiKeys.join(", ")}`);
   }
-  const { structures: newStruct, suppressed: suppressedEmptyArrayStructs } =
+  const { structures: sampledStruct, suppressed: suppressedEmptyArrayStructs } =
     stabilizeApiStructuresForEmptyArrays(snapshot.apiStructure || {}, rawNewStruct);
+  const newStruct = stabilizeApiListTypes(snapshot.apiStructure || {}, sampledStruct);
   if (suppressedEmptyArrayStructs.length > 0) {
     const loggableEmptyArrayStructs = suppressedEmptyArrayStructs.filter(shouldLogApiEmptyArrayPreserve);
     const summary = loggableEmptyArrayStructs
@@ -9768,7 +9805,7 @@ async function runApiCheck() {
   }
   const notifications = [];
 
-  // 结构变更检测（即时推送，无延迟）
+  // 新增/删除字段即时检测，列表字段类型变化经过连续确认。
   const apiChanges = diffApiStructures(snapshot.apiStructure, newStruct);
   if (apiChanges.length > 0) {
     log(`[API] 检测到结构变化！`);
@@ -10222,6 +10259,8 @@ export const __testables = {
   calculateNextModuleDueAt,
   fetchActorBlockActions,
   diffApiStructures,
+  extractStructure,
+  stabilizeApiListTypes,
   buildMergedFrontendAssetNotification,
   formatFrontendTextChanges,
 };
