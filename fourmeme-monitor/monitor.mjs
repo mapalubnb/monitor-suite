@@ -872,6 +872,7 @@ function mergeRouteDecisionMap(target, source) {
 
 function mergeExternalFrontendRouteStateFromFile(data, filePath) {
   if (!data || !filePath || !existsSync(filePath)) return false;
+  if (filePath === CONFIG.snapshotFile && statSync(filePath).mtimeMs === lastWrittenSnapshotMtime) return false;
   let external;
   try {
     external = JSON.parse(readFileSync(filePath, "utf-8"));
@@ -897,6 +898,17 @@ function mergeExternalFrontendRouteState(data = snapshot) {
 }
 
 let persistedFrontendPages;
+let lastWrittenSnapshotMtime = -1;
+const snapshotJsonCache = new Map();
+function serializeMonitorSnapshot(data) {
+  const cachedFields = new Set(["frontendPages", "_frontendAssetStore", "_frontendStaticIndex", "_globalI18nResourceWatch"]);
+  return "{" + Object.entries(data).filter(([, value]) => value !== undefined).map(([key, value]) => {
+    const cached = snapshotJsonCache.get(key);
+    const json = cachedFields.has(key) && cached?.value === value ? cached.json : JSON.stringify(value);
+    if (cachedFields.has(key)) snapshotJsonCache.set(key, { value, json });
+    return JSON.stringify(key) + ":" + json;
+  }).join(",") + "}";
+}
 function persistMonitorSnapshot(data) {
   if (data.frontendPages !== persistedFrontendPages) frontendSnapshotRevision++;
   const startedAt = Date.now();
@@ -905,8 +917,9 @@ function persistMonitorSnapshot(data) {
   data._atomicNotifications = true;
   data.lastCheck = ts();
   const tmpFile = CONFIG.snapshotFile + ".tmp";
-  writeFileSync(tmpFile, JSON.stringify(compactFrontendSnapshotForDisk(data)), "utf-8");
+  writeFileSync(tmpFile, serializeMonitorSnapshot(compactFrontendSnapshotForDisk(data)), "utf-8");
   renameSync(tmpFile, CONFIG.snapshotFile);
+  lastWrittenSnapshotMtime = statSync(CONFIG.snapshotFile).mtimeMs;
   persistedFrontendPages = data.frontendPages;
   snapshotWriteMetrics.writes++;
   snapshotWriteMetrics.lastDurationMs = Date.now() - startedAt;
@@ -10097,6 +10110,7 @@ export const __testables = {
   createModuleRunner,
   sendNotificationMaybeAi,
   saveSnapshot,
+  serializeMonitorSnapshot,
   loadSnapshot,
   cachedContractBatch,
   validateActorBlocks,

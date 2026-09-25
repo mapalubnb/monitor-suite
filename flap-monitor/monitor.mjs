@@ -6799,7 +6799,7 @@ async function startMonitor() {
       if (isShuttingDown) return;
       const previous = JSON.stringify(Object.entries(earlySignalState.health).map(([name,h]) => [name,h.lastError]));
       const knownTokens = new Set(Object.keys(earlySignalState.tokens));
-      const result = await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain", realtime: true, bootstrapBlocks: 20 }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
+      const result = await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain", realtime: true, bootstrapBlocks: 20, maxBlocksPerRun: 50 }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
       saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
       refreshEarlyFeeds();
       prioritize(Object.keys(earlySignalState.tokens).filter(token => !knownTokens.has(token)));

@@ -501,7 +501,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
       for (const tx of block.transactions) if (wallets.has(lower(tx.from)) || wallets.has(lower(tx.to))) transactionMap.set(lower(tx.hash), tx);
     }
   }
-  const hashes = uniq([...logs.map(l => lower(l.transactionHash)), ...transactionMap.keys()]);
+  const hashes = uniq([...logs.filter(l => shouldPrioritizeEarlyLog(l, state)).map(l => lower(l.transactionHash)), ...transactionMap.keys()]);
   if (hashes.length > 300) throw new Error("单窗口关联交易超过 300，请降低 FLAP_EARLY_MAX_BLOCKS");
   const receipts = [];
   for (let i = 0; i < hashes.length; i += 20) {

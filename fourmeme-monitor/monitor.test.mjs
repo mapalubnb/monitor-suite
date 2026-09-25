@@ -1556,3 +1556,12 @@ test('background i18n confirmation rotates bounded work without dropping pending
   await __testables.confirmGlobalI18nResourceWatchesAsync(state, {}, { maxItems: 4 });
   assert.equal(Object.values(state._globalI18nResourceWatch).filter(x => x.lastCheckedAt).length, 9);
 });
+
+test('snapshot serialization reuses stable frontend sections and includes new transactional revisions', () => {
+  const first = { frontendPages: { page: { text: 'old' } }, chainActorMonitor: { cursor: 1 }, skipped: undefined };
+  assert.deepEqual(JSON.parse(__testables.serializeMonitorSnapshot(first)), JSON.parse(JSON.stringify(first)));
+  const next = { ...first, chainActorMonitor: { cursor: 2 } };
+  assert.equal(JSON.parse(__testables.serializeMonitorSnapshot(next)).chainActorMonitor.cursor, 2);
+  next.frontendPages = { page: { text: 'new' } };
+  assert.equal(JSON.parse(__testables.serializeMonitorSnapshot(next)).frontendPages.page.text, 'new');
+});

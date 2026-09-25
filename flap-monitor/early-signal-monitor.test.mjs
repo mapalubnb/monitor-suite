@@ -365,3 +365,15 @@ test('historical lane stops at the saved realtime boundary without rescanning li
   assert.equal(state.cursor, 99);
   assert.equal(state.realtimeCursor, 999);
 });
+
+test('unrelated public pair discovery does not download transaction receipts', async () => {
+  const state = createEarlySignalState(); state.cursor = 99;
+  const pair = log(DEX.v2Factory, [TOPICS.PairCreated, topic(TOKEN), topic(OWNER)], '0x' + word(POOL) + word(1));
+  const rpc = async calls => calls.map(c => {
+    assert.notEqual(c.method, 'eth_getTransactionReceipt');
+    return { eth_chainId: '0x38', eth_blockNumber: '0x65', eth_getBlockByNumber: {hash: BH, transactions: []}, eth_getLogs: [pair] }[c.method];
+  });
+  await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
+  assert.equal(state.cursor, 100);
+  assert.equal(state.pendingChanges.length, 0);
+});
