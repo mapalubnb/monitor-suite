@@ -6770,7 +6770,7 @@ async function startMonitor() {
       return messageId;
     },
     patch: (id, card) => patchCard(id, card.title, card.content, card.template),
-    onError: error => log(`[Flap 启动通知] 将自动重试：${error.message}`),
+    onError: error => log(`[Flap 启动通知] 发送／更新状态：${error.message}`),
   });
   global.__startupNotifier = startupNotifier;
   void startupNotifier.refresh();

@@ -2,6 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { isAuthorizedSender, sendCard } from './feishu-client.mjs';
 
+test('expired startup card does not send after credential retrieval', async () => {
+  let sends = 0;
+  const opts = {chatId: 'test', expiresAt: Date.now() + 60_000};
+  const transport = {
+    withToken: async () => { opts.expiresAt = Date.now() - 1; return {}; },
+    client: {im: {message: {create: async () => { sends++; }}}},
+  };
+  await assert.rejects(sendCard('startup', 'test', 'green', opts, transport), /已过期/);
+  assert.equal(sends, 0);
+});
+
 test('bot authorization denies an empty whitelist and unknown operators', () => {
   assert.equal(isAuthorizedSender('ou_one', []), false);
   assert.equal(isAuthorizedSender('', ['ou_one']), false);

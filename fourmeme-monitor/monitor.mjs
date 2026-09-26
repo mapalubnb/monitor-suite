@@ -10027,7 +10027,7 @@ async function startAllModules() {
     render: () => buildFourmemeRestartCard(),
     send: (card, opts) => sendCard(card.title, card.content, card.template, opts),
     patch: (id, card) => patchCard(id, card.title, card.content, card.template),
-    onError: error => log(`[启动通知] 将自动重试：${error.message}`),
+    onError: error => log(`[启动通知] 发送／更新状态：${error.message}`),
   });
   void startupNotifier.refresh();
   outboxTimer = setInterval(() => monitorStore.drain().catch(err => log(`[待发送] 落盘失败：${err.message}`)), 1_000);

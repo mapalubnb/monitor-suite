@@ -109,3 +109,46 @@ test('startup card distinguishes failures from pending checks and excludes disab
   assert.match(card.content, /后台检查/);
   assert.doesNotMatch(card.content, /全部.*完成/);
 });
+
+test('timed out send is reused until its late result arrives instead of sending again', async () => {
+  const time = clock();
+  let resolveSend, sends = 0;
+  const notifier = createStartupNotifier({ ...time,
+    render: () => buildStartupCard('Flap', {scan: 'pending'}),
+    send: () => { sends++; return new Promise(resolve => { resolveSend = resolve; }); },
+    patch: async () => {},
+  });
+  const first = notifier.refresh();
+  await new Promise(resolve => setImmediate(resolve));
+  await time.fire(30_000);
+  await first;
+  await time.fire(2_000);
+  assert.equal(sends, 1);
+  resolveSend('late-card');
+  await new Promise(resolve => setImmediate(resolve));
+  await notifier.refresh();
+  assert.equal(sends, 1);
+  notifier.stop();
+});
+
+test('startup window expires permanently and all retries keep actual startup time', async () => {
+  const time = clock();
+  let now = 0;
+  const cards = [], errors = [];
+  const notifier = createStartupNotifier({...time, now: () => now, maxAgeMs: 5000,
+    render: () => buildStartupCard('Flap', {scan: 'pending'}),
+    send: async (card, opts) => { cards.push(card); assert.equal(opts.expiresAt, 5000); throw new Error('offline'); },
+    patch: async () => {}, onError: e => errors.push(e.message),
+  });
+  await notifier.refresh();
+  now = 2000;
+  await time.fire(2000);
+  assert.deepEqual(cards[0], cards[1]);
+  assert.match(cards[0].content, /本次进程启动：.*PID/);
+  now = 5000;
+  await time.fire(3000);
+  await notifier.refresh();
+  assert.equal(cards.length, 2);
+  assert.equal(time.tasks.size, 0);
+  assert.match(errors.at(-1), /停止补发/);
+});

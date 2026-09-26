@@ -571,6 +571,10 @@ async function pauseBetweenChunks(index, total) {
  * @returns {Promise<string>} message_id
  */
 export async function sendCard(title, content, template = "red", opts = {}, transport = {}) {
+  const assertFresh = () => {
+    if (opts.expiresAt && Date.now() >= opts.expiresAt) throw new Error("启动通知已过期，取消发送");
+  };
+  assertFresh();
   const client = transport.client || getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
   const targetChatId = opts.chatId || CHAT_ID;
@@ -581,6 +585,7 @@ export async function sendCard(title, content, template = "red", opts = {}, tran
   const sentParts = opts.sentParts || [];
   let firstMessageId = sentParts[0] || "";
   for (let i = 0; i < chunks.length; i++) {
+    assertFresh();
     if (sentParts[i]) continue;
     const cardJson = buildCardJson(
       partTitle(title, i + 1, chunks.length),

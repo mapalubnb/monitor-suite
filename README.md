@@ -126,3 +126,5 @@ npm install
 npm run check
 npm test
 ```
+
+启动卡片标明实际进程启动时间和 PID，在启动后 5 分钟内重试并更新首轮检查进度，过期后不再补发或更新。
