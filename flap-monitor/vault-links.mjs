@@ -1,5 +1,4 @@
-export function buildVaultFactoryLaunchUrl(factory, options = {}) {
+export function buildVaultFactoryLaunchUrl(factory) {
   if (!/^0x[a-fA-F0-9]{40}$/.test(String(factory || "")) || /^0x0{40}$/i.test(factory)) return "";
-  const chain = options.chain === "robinhood" ? "robinhood" : "bnb";
-  return `https://flap.sh/launch?vaultfactory=${factory}&chain=${chain}&lang=zh`;
+  return `https://flap.sh/launch?vaultfactory=${factory}&chain=bnb&lang=zh`;
 }

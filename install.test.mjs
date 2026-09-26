@@ -142,8 +142,8 @@ test("Flap status includes Vault Portal and contract integrity health", () => {
     lastCodeAuditAt: "2026-08-23T01:00:00.000Z",
     wssHealth: { contracts: { status: "healthy", subscribedCount: 2, configuredCount: 2 } },
   });
-  assert.match(output, /\*\*07｜Vault Portal 链上注册\*\*/);
-  assert.match(output, /\*\*08｜合约与配置完整性\*\*/);
+  assert.match(output, /\*\*06｜Vault Portal 链上注册\*\*/);
+  assert.match(output, /\*\*07｜合约与配置完整性\*\*/);
   assert.match(output, /合约目录：2 个｜已知资产 1 个｜待发送变更 1 项/);
   assert.match(output, /精准地址 WSS：healthy｜已订阅 2\/2/);
 });
@@ -157,7 +157,7 @@ test("Flap status includes Safe proposal nonce baseline and pending targets", ()
     pendingChanges: [{ id: "proposal" }],
     lastSuccessAt: "2026-08-24T04:00:00.000Z",
   });
-  assert.match(output, /\*\*09｜Safe 计价代币管理提案预警\*\*/);
+  assert.match(output, /\*\*08｜Safe 计价代币管理提案预警\*\*/);
   assert.match(output, /健康 Safe：1\/1｜跟踪中目标 1 个｜待发送变更 1 项/);
   assert.match(output, /nonce 12｜基线完成/);
 });
@@ -179,10 +179,8 @@ test("Flap status links current factories and registered vaults to launch pages"
   });
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}&chain=bnb&lang=zh`));
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${registered}&chain=bnb&lang=zh`));
-  assert.match(output, /\*\*05｜Robinhood CAStore\*\*/);
-  assert.match(output, /https:\/\/flap\.sh\/robinhood\/CAstore\?lang=zh/);
-  assert.match(output, /币股（IndexVault）｜状态 监控中/);
-  assert.match(output, /https:\/\/flap\.sh\/launch\?vaultfactory=0xe6ca297D1d963b6F00d5b216986123CAeB883AF6&chain=robinhood&lang=zh/);
+  assert.doesNotMatch(output, /Robinhood|robinhood|e6ca297D1d963b6F00d5b216986123CAeB883AF6/);
+  assert.match(output, /\*\*05｜Factory 底池资产\*\*/);
 });
 
 test("Flap status shows concise Factory pool state", () => {
@@ -219,7 +217,7 @@ test("Flap status shows concise Factory pool state", () => {
       [namedToken]: { quoteToken: namedToken, name: "Tether Gold", symbol: "XAUt", configured: true, creationDisabled: true, effectiveEnabled: false, values: ["1", "33", "33", "7", "0"] },
     },
   });
-  assert.match(output, /\*\*06｜Factory 底池资产\*\*/);
+  assert.match(output, /\*\*05｜Factory 底池资产\*\*/);
   assert.match(output, /监控状态：<font color="green">运行正常<\/font>/);
   assert.match(output, /实时通道：运行正常｜已订阅 2\/2｜最后订阅 .*｜最后事件/);
   assert.match(output, /HTTP 兜底：已扫 100｜最新 105｜延迟 5 块/);

@@ -95,7 +95,6 @@ function readPositiveIntEnv(name, fallback, min = 1) {
 const CONFIG = {
   urls: [
     "https://flap.sh/bnb/CAstore?lang=zh",
-    "https://flap.sh/robinhood/CAstore?lang=zh",
     "https://flap.sh/launch?chain=bnb&lang=zh",
     "https://flap.sh/create?chain=bnb&lang=zh",
   ],
@@ -402,8 +401,6 @@ const UI_STYLE_CATEGORY_META = {
 };
 
 const FACTORY_BACKGROUND_TASK_ORDER = Object.freeze(["catchup", "assets"]);
-
-const ROBINHOOD_INDEX_VAULT_FACTORY = "0xe6ca297D1d963b6F00d5b216986123CAeB883AF6";
 
 function classifyUiStyleString(value) {
   const s = String(value || "").trim();
@@ -844,8 +841,12 @@ function loadSnapshot() {
  */
 function migrateSnapshot(data) {
   data.pages ||= {};
+  // Retire the removed page baseline so status and saved resources stay current.
+  for (const key of Object.keys(data.pages)) {
+    if (key.startsWith(urlToKey("https://flap.sh/robinhood/"))) delete data.pages[key];
+  }
   for (const url of CONFIG.urls) {
-    const previousUrl = url.startsWith("https://flap.sh/robinhood/") ? url : url.split("?")[0];
+    const previousUrl = url.split("?")[0];
     const previous = data.pages[urlToKey(previousUrl)];
     if (!data.pages[urlToKey(url)] && previous) data.pages[urlToKey(url)] = previous;
     if (previousUrl !== url) delete data.pages[urlToKey(previousUrl)];
@@ -4602,9 +4603,6 @@ function mergeRoundVaultFactoryMaps(entries = []) {
 }
 
 function collectRoundVaultFactory(roundEntries, url, features) {
-  // Robinhood currently shares frontend chunks with BNB. Do not merge those
-  // chain-specific values into the BSC factory state.
-  if (/\/robinhood\//i.test(url)) return null;
   const map = extractVaultFactoryMapFromFeatures(features);
   if (map) roundEntries.push({ url, map });
   return map;
@@ -5276,7 +5274,7 @@ function extractVaultFactoryAddress(text) {
 
 function extractCaStoreVaultSections(html, options = {}) {
   const sourceUrl = String(options.url || "");
-  const chain = /\/robinhood\//i.test(sourceUrl) ? "robinhood" : /\/bnb\//i.test(sourceUrl) ? "bnb" : "";
+  const chain = /\/bnb\//i.test(sourceUrl) ? "bnb" : "";
   // Current CAStore exposes card boundaries. Names are not a reliable type filter
   // (e.g. FOMOX and 动态空投), and the FAQ also contains the word 金库.
   const { document } = parseHTML(html);
@@ -5291,8 +5289,7 @@ function extractCaStoreVaultSections(html, options = {}) {
       occurrences.set(nameKey, occurrence);
       return { name, description, nameKey, area: "精选金库模板", areaKey: "featured vaults", occurrence,
         position: index + 1, key: `featured vaults::${nameKey}#${occurrence}`,
-        factory: extractVaultFactoryAddress(card.outerHTML)
-          || (chain === "robinhood" && /^(币股|幣股)$/.test(name) ? ROBINHOOD_INDEX_VAULT_FACTORY : null),
+        factory: extractVaultFactoryAddress(card.outerHTML),
         chain, sourceUrl, signature: md5(`${name}\n${description}`) };
     }).filter(card => card.name);
   }
@@ -5319,8 +5316,7 @@ function extractCaStoreVaultSections(html, options = {}) {
     const rawDescription = htmlFragmentToText(rawSectionHtml);
     const description = cleanVaultDescription(rawDescription);
     if (!description && !/custom vault factory/i.test(h.name)) continue;
-    const factory = extractVaultFactoryAddress(rawSectionHtml)
-      || (chain === "robinhood" && /^(币股|幣股)$/i.test(h.name) ? ROBINHOOD_INDEX_VAULT_FACTORY : null);
+    const factory = extractVaultFactoryAddress(rawSectionHtml);
     const areaKey = normalizeVaultName(currentArea || "Featured Vaults");
     const nameKey = normalizeVaultName(h.name);
     const baseKey = `${areaKey}::${nameKey}`;
@@ -5527,7 +5523,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
   const name = getCaStoreVaultDisplayName(change);
   const copy = getCaStoreVaultCopy(change);
   const factory = resolveCaStoreVaultFactory(change, vaultFactoryMap);
-  const launchUrl = buildVaultFactoryLaunchUrl(factory, { chain: change?.chain });
+  const launchUrl = buildVaultFactoryLaunchUrl(factory);
   const typeLabel = caStoreVaultChangeLabel(change?.type);
   const typeText = change?.type === "removed"
     ? removedText(typeLabel)
@@ -5547,7 +5543,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
   });
 
   return {
-    title: `${titlePrefix}${change?.chain === "robinhood" ? "Robinhood " : ""}CAstore 金库变更：${name}`,
+    title: `${titlePrefix}CAstore 金库变更：${name}`,
     content,
     template: change?.type === "removed" ? "red" : change?.type === "added" ? "green" : "orange",
     url: launchUrl || change?.sourceUrl || "https://flap.sh/bnb/CAstore",
@@ -5651,7 +5647,7 @@ function getFlapPageQuality(url, html, features) {
     reasons.push(`疑似错误页(${matchedError.source})`);
   }
 
-  if (/\/(?:bnb|robinhood)\/CAstore/i.test(url) && !/Vault|金库|金庫|CA STORE|STORE|Connect Wallet/i.test(text)) {
+  if (/\/bnb\/CAstore/i.test(url) && !/Vault|金库|金庫|CA STORE|STORE|Connect Wallet/i.test(text)) {
     warnings.push("CAstore 关键文案缺失");
   } else if (/\/(?:launch|create)(?:$|\?)/i.test(url) && !/Create|Token|Connect Wallet/i.test(text)) {
     warnings.push("创建页关键文案缺失");
@@ -7837,6 +7833,7 @@ export const __testables = {
   fetchPage,
   extractCaStoreVaultSections,
   CONFIG,
+  migrateSnapshot,
   deliverFlapEarlySignals,
   earlySignalConfig,
   ASSET_ANALYSIS_SCHEMA_VERSION,

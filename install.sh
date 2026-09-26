@@ -560,10 +560,7 @@ if [ -f "$SNAP" ]; then
     console.log('实时扫描：'+(es.realtimeCursor??'未建立')+'｜历史补扫 '+(es.cursor??'未建立')+' / '+(es.historyEndBlock??'未知')+'｜最新 '+(es.latestBlock??'未知')+'｜候选资产 '+Object.keys(es.tokens||{}).length+'｜待推送 '+(es.pendingChanges||[]).length);
     for(const [name,h] of Object.entries(es.health||{})) if(h.lastError) console.log(name+'：'+h.lastError+(h.nextAttemptAtMs>0?'｜下次重试 '+new Date(h.nextAttemptAtMs).toISOString():'｜等待下轮检测'));
     const mdLink=(label,url)=>'['+label+']('+url+')';
-    const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+(chain==='robinhood'?'robinhood':'bnb')+'&lang=zh');
-    const robinhoodPage='https://flap.sh/robinhood/CAstore?lang=zh';
-    const robinhoodFactory='0xe6ca297D1d963b6F00d5b216986123CAeB883AF6';
-    const robinhoodLaunch='https://flap.sh/launch?vaultfactory='+robinhoodFactory+'&chain=robinhood&lang=zh';
+    const vaultLink=(address)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+'bnb'+'&lang=zh');
     const pageLabel=(url)=>String(url||'-');
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
     const metricsPath='$SNAP'.replace(/snapshot\.json$/,'runtime-metrics.json');
@@ -666,14 +663,7 @@ if [ -f "$SNAP" ]; then
     }
     console.log('');
 
-    console.log('**05｜Robinhood CAStore**');
-    console.log('页面：'+mdLink(robinhoodPage,robinhoodPage));
-    console.log('模板：币股（IndexVault）｜状态 监控中');
-    console.log('Factory：'+mdLink(robinhoodFactory,robinhoodLaunch));
-    console.log('金库入口：'+mdLink(robinhoodLaunch,robinhoodLaunch));
-    console.log('');
-
-    console.log('**06｜Factory 底池资产**');
+    console.log('**05｜Factory 底池资产**');
     console.log('Factory Proxy：'+mdLink(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0','https://bscscan.com/address/'+(fp.proxy||'0xe2cE6ab80874Fa9Fa2aAE65D277Dd6B8e65C9De0')));
     const factoryLatest=fp.latestBlock??fp.safeLatestBlock??'-';
     const factoryScanned=fp.headLastScannedBlock??'-';
@@ -698,7 +688,7 @@ if [ -f "$SNAP" ]; then
     }
     console.log('');
 
-    console.log('**07｜Vault Portal 链上注册**');
+    console.log('**06｜Vault Portal 链上注册**');
     console.log('Vault Portal：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
     console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
     console.log('历史补扫：'+(registry.historyLastBlock??'无')+' / '+(registry.historyEndBlock??'无')+'｜待补区间 '+JSON.stringify(registry.realtimeGaps||[]));
@@ -708,7 +698,7 @@ if [ -f "$SNAP" ]; then
     for(const [index,addr] of knownVaults.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(addr,'https://bscscan.com/address/'+addr)+'｜金库 '+vaultLink(addr));
     console.log('');
 
-    console.log('**08｜合约与配置完整性**');
+    console.log('**07｜合约与配置完整性**');
     const integrityLag=Math.max(0,(ci.latestBlock||0)-(ci.httpRealtimeLastBlock||ci.latestBlock||0));
     const integrityStatus=ci.lastError||integrityLag>50?'需要关注':ci.lastCoreScanAt?'运行正常':'尚未建立';
     console.log('监控状态：'+(integrityStatus==='运行正常'?ok(integrityStatus):warn(integrityStatus)));
@@ -721,7 +711,7 @@ if [ -f "$SNAP" ]; then
     if(ci.lastError) console.log('最近异常：'+ci.lastError);
     console.log('');
 
-    console.log('**09｜Safe 计价代币管理提案预警**');
+    console.log('**08｜Safe 计价代币管理提案预警**');
     const safeStatus=sp.lastError?'部分异常':safeStates.length&&safeStates.every(v=>v.baselineEstablished)?'运行正常':'尚未建立';
     console.log('监控状态：'+(safeStatus==='运行正常'?ok(safeStatus):warn(safeStatus)));
     console.log('健康 Safe：'+healthySafes+'/'+safeStates.length+'｜跟踪中目标 '+activeSafeProposals.length+' 个｜待发送变更 '+((sp.pendingChanges||[]).length)+' 项');
