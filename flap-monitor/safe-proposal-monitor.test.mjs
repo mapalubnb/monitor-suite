@@ -40,7 +40,7 @@ test('Safe API keys normalize duplicates and preserve legacy fallback', () => {
   assert.deepEqual(normalizeSafeApiKeys('new', 'legacy'), ['new']);
 });
 
-test('Safe API pool rotates credentials, persists per-account quota and does not expose keys', async () => {
+test('Safe API pool keeps the selected credential across requests and reloads without monthly pacing', async () => {
   let now = 1000;
   const state = {safes: {}}, calls = [];
   const fetchFn = async (_, opts) => {
@@ -48,10 +48,10 @@ test('Safe API pool rotates credentials, persists per-account quota and does not
     return {ok: true, status: 200, headers: {get: key => ({'x-ratelimit-limit':'50000', 'x-ratelimit-remaining':'100', 'x-ratelimit-reset':'1000'})[key] ?? null}};
   };
   let pool = createSafeApiPoolFetch(state, fetchFn, {apiKeys:['secret-account-a', 'secret-account-b'], now: () => now});
-  await pool('url'); await pool('url');
-  assert.deepEqual(calls, ['Bearer secret-account-a', 'Bearer secret-account-b']);
-  await assert.rejects(pool('url'), /暂无可用/);
-  assert.equal(state.apiNextAttemptAtMs, 11000);
+  await pool('url');
+  now = 6000;
+  await pool('url');
+  assert.deepEqual(calls, ['Bearer secret-account-a', 'Bearer secret-account-a']);
   assert.doesNotMatch(JSON.stringify(state), /secret-account/);
   now = 11000;
   pool = createSafeApiPoolFetch(JSON.parse(JSON.stringify(state)), fetchFn, {apiKeys:['secret-account-a', 'secret-account-b'], now: () => now});
@@ -115,7 +115,7 @@ test('Safe polling rotates one address per run without updating skipped poll tim
   assert.notEqual(calls[0], calls[1]);
 });
 
-test('Safe monthly exhaustion uses server reset and remaining quota spaces successful requests', async () => {
+test('Safe monthly exhaustion uses server reset without spreading remaining quota', async () => {
   const state = {}, now = () => 1000;
   const response = (remaining, status) => ({status, ok: status === 200,
     headers: {get: key => ({'x-ratelimit-limit': '50000', 'x-ratelimit-remaining': String(remaining), 'x-ratelimit-reset': '472938'})[key] ?? null}});
@@ -127,8 +127,7 @@ test('Safe monthly exhaustion uses server reset and remaining quota spaces succe
   const fresh = {};
   guard = createSafeRateLimitedFetch(fresh, async () => response(1000, 200), {now});
   await guard.waitForTurn(); await guard('url');
-  assert.equal(fresh.apiRequestNextAt, 473938);
-  await assert.rejects(guard.waitForTurn(), /额度预算等待/);
+  assert.equal(fresh.apiRequestNextAt, 6000);
 });
 const VAULT_CALLS = JSON.parse(readFileSync(new URL("./fixtures/safe-vault-factory-calls.json", import.meta.url), "utf8"));
 const jsonResponse = value => ({ ok: true, status: 200, json: async () => value });
@@ -545,4 +544,25 @@ test("future nonce prevents executable claim and one missing nonce does not bloc
   assert.equal(record.executionCheck.status, "blocked");
   assert.match(state.safes[OTHER].lastError, /nonce/);
   assert.equal(state.safes[SAFE].baselineEstablished, true);
+});
+
+ test('Safe pool clears legacy pacing but preserves exhausted accounts and skips last successful exhausted key', async () => {
+  let now = 1000;
+  const state = {}, calls = [];
+  const fetchFn = async (_, opts) => {
+    const key = opts.headers.get('Authorization'); calls.push(key);
+    return {ok:true, status:200, headers:{get:name => ({'x-ratelimit-remaining': key.endsWith('first') ? '0' : '100', 'x-ratelimit-reset':'1000'})[name] ?? null}};
+  };
+  let pool = createSafeApiPoolFetch(state, fetchFn, {apiKeys:['first','second'],now:()=>now});
+  await pool('url');
+  await pool('url');
+  assert.deepEqual(calls,['Bearer first','Bearer second']);
+  const [first,second]=state.apiAccountIds.map(id=>state.apiAccounts[id]);
+  second.apiRequestNextAt=999999;
+  pool=createSafeApiPoolFetch(state,fetchFn,{apiKeys:['first','second'],now:()=>now});
+  assert.equal(first.apiNextAttemptAtMs,1001000);
+  assert.equal(second.apiRequestNextAt,6000);
+  now=6000;
+  await pool('url');
+  assert.equal(calls.at(-1),'Bearer second');
 });

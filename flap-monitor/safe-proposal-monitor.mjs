@@ -400,6 +400,8 @@ async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
 
 export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, now = Date.now,
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  // Discard legacy monthly pacing while preserving server-imposed cooldowns.
+  state.apiRequestNextAt = Math.min(state.apiRequestNextAt || 0, now() + intervalMs);
   const guarded = async (...args) => {
     const response = await fetchFn(...args);
     const headerNumber = key => {
@@ -409,8 +411,6 @@ export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, 
     const remaining = headerNumber('x-ratelimit-remaining'), resetSeconds = headerNumber('x-ratelimit-reset');
     if (remaining !== null && resetSeconds !== null) {
       state.apiQuota = {limit: headerNumber('x-ratelimit-limit'), remaining, resetsAt: now() + resetSeconds * 1000};
-      if (remaining > 0) state.apiRequestNextAt = Math.max(state.apiRequestNextAt || 0,
-        now() + Math.ceil(resetSeconds * 1000 / remaining));
     }
     if (response.status === 429) {
       state.apiRateLimitFailures = (state.apiRateLimitFailures || 0) + 1;
@@ -419,6 +419,9 @@ export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, 
     } else if (response.ok) {
       state.apiRateLimitFailures = 0;
       state.apiNextAttemptAtMs = 0;
+    }
+    if (remaining === 0 && resetSeconds > 0) {
+      state.apiNextAttemptAtMs = Math.max(state.apiNextAttemptAtMs || 0, now() + resetSeconds * 1000);
     }
     return response;
   };
@@ -433,7 +436,7 @@ export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, 
     check();
     const slot = Math.max(now(), state.apiRequestNextAt || 0);
     if (slot - now() > intervalMs) {
-      const error = new Error('Safe API 额度预算等待');
+      const error = new Error('Safe API 请求间隔等待');
       error.retryAfterMs = slot - now();
       throw error;
     }
@@ -488,7 +491,8 @@ export function createSafeApiPoolFetch(state, fetchFn, { apiKeys, apiBaseUrl = D
         .find(item => !tried.has(item.id) && dueAt(item) <= now());
       if (!account) break;
       tried.add(account.id);
-      state.apiAccountCursor = (accounts.indexOf(account) + 1) % accounts.length;
+      // Keep using this account until it is exhausted or temporarily unavailable.
+      state.apiAccountCursor = accounts.indexOf(account);
       try {
         await account.fetch.waitForTurn();
         const headers = new Headers(options.headers);
