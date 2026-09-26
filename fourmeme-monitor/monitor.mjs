@@ -35,7 +35,7 @@ import { fileURLToPath } from "node:url";
 import WebSocket from "ws";
 import { parseHTML } from "linkedom";
 
-import { sendCard, sendCardQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard, waitQueueDrain, isMultiPartCard } from "../shared/feishu-client.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FOURMEME_MONITOR_TEST === "1";
@@ -960,9 +960,10 @@ async function sendFeishu(title, content, template = "red", _retries = 2) {
  */
 async function sendCardViaApi(title, content, template = "red", diffFilePath, retries = 2, cardOpts = {}) {
   if (cardOpts.deliveryId) retries = 0;
+  const opts = { ...cardOpts, diffFilePath };
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await sendCard(title, content, template, { ...cardOpts, diffFilePath });
+      return await sendCard(title, content, template, opts);
     } catch (err) {
       log(`[IM API] 发送失败（第${attempt + 1}次）：${err.message}`);
       if (attempt < retries) await sleep(2_000 * (attempt + 1));
@@ -978,14 +979,7 @@ async function patchCardViaApi(messageId, title, content, template = "red", diff
   await patchCard(messageId, title, content, template, { ...cardOpts, diffFilePath });
 }
 
-const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
-  const n = Number(process.env.FEISHU_CARD_CHUNK_LIMIT || 3500);
-  return Number.isFinite(n) && n >= 500 ? Math.floor(n) : 3500;
-})();
-
-function isTooLongForSingleCard(content) {
-  return String(content ?? "").length > FEISHU_CARD_PATCH_SAFE_LIMIT;
-}
+const isTooLongForSingleCard = isMultiPartCard;
 
 /**
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
@@ -1011,7 +1005,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
       const enrichedContent = urlLine + enriched;
       if (messageId) {
-        if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
+        if (isTooLongForSingleCard(initialContent, title, template, { ...cardOpts, diffFilePath }) || isTooLongForSingleCard(enrichedContent, title, template, { ...cardOpts, diffFilePath })) {
           log(`[AI→更新] ${title} 正文较长，保留完整分片卡片，另发 AI 摘要卡片`);
           await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
           return;

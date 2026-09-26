@@ -3486,12 +3486,11 @@ test('failed early name lookups keep delivered signals and respect metadata retr
 });
 
 test('multipart early signal cards enrich only their matching original part', async () => {
-  const {splitMessageContent,balanceCardFontTags}=await import('../shared/feishu-client.mjs');
   const token='0x'+'3'.repeat(40), second='0x'+'4'.repeat(40);
   const state={pendingChanges:[{id:'long-one',token,kind:'observation',detail:'完整证据'.repeat(1200)},{id:'long-two',token:second,kind:'observation',detail:'第二资产'}],tokens:{[token]:{},[second]:{}},events:{},health:{}};
   let originals=[];const patched=[];
   const result=await __testables.deliverFlapEarlySignals(state,{saveStateFn:()=>{},
-    sendCardFn:async (_title,content,_color,_file,opts)=>{originals=balanceCardFontTags(splitMessageContent(content,3460));originals.forEach((_,i)=>opts.sentParts.push('part-'+i));return 'part-0';},
+    sendCardFn:async (_title,content,_color,_file,opts)=>{originals=opts.cardParts.map(part=>part.content);originals.forEach((_,i)=>opts.sentParts.push('part-'+i));return 'part-0';},
     resolveMetadataFn:async()=>({metadata:{[token]:{name:'First Asset'},[second]:{name:'Second Asset'}}}),
     patchCardFn:async(id,title,content)=>patched.push({id,title,content})});
   await result.metadataPromise;

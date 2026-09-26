@@ -87,6 +87,8 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
         try {
           const id = await deliver(candidate.payload, {
             deliveryId: candidate.id, sentParts: candidate.parts,
+            cardParts: candidate.cardParts,
+            onPlan: async cardParts => update({ cardParts: structuredClone(cardParts) }),
             onPartSent: async parts => update({ parts: [...parts] }),
           });
           if (!id) throw new Error('通知未返回 message_id');

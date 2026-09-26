@@ -2,6 +2,27 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTransactionalOutbox } from './transactional-outbox.mjs';
 
+test('outbox persists a frozen card plan before sending and restores it after restart', async () => {
+  let disk = {};
+  const plan = [{title:'提醒 (1/2)',content:'第一片'},{title:'提醒 (2/2)',content:'第二片'}];
+  const persist = value => { disk = structuredClone(value); };
+  const first = createTransactionalOutbox({persist,deliver:async (_payload,opts)=>{
+    await opts.onPlan(plan);
+    assert.deepEqual(disk._notificationOutbox[0].cardParts,plan);
+    await opts.onPartSent(['sent-1']);
+    throw Error('offline');
+  }});
+  await first.enqueue({title:'提醒'});
+  await first.drain();
+  const restored=createTransactionalOutbox({initial:disk,persist,deliver:async (_payload,opts)=>{
+    assert.deepEqual(opts.cardParts,plan);
+    assert.deepEqual(opts.sentParts,['sent-1']);
+    return 'sent-1';
+  }});
+  await restored.drain(Infinity);
+  assert.equal(disk._notificationOutbox.length,0);
+});
+
 test('completed transaction releases inherited async scope and delayed work sees current state', async () => {
   const store = createTransactionalOutbox({initial: {large: {payload: 'x'.repeat(1_000_000)}, cursor: 1}, persist: () => {}});
   let release;

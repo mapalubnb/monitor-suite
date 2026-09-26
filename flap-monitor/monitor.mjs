@@ -30,7 +30,7 @@ import { createStartupNotifier, buildStartupCard } from "../shared/startup-notif
 import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.mjs";
 import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
-import { sendCard, sendCardQueued, patchCard, waitQueueDrain, splitMessageContent, balanceCardFontTags } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
   FACTORY_POOL_STATE_EVENT_TOPICS,
@@ -1038,14 +1038,7 @@ function sendAlertCard(sendCardFn, title, content, template) {
   return sendCardFn(title, content, template, undefined, alertMentionCardOptions());
 }
 
-const FEISHU_CARD_PATCH_SAFE_LIMIT = (() => {
-  const n = Number(process.env.FEISHU_CARD_CHUNK_LIMIT || 3500);
-  return Number.isFinite(n) && n >= 500 ? Math.floor(n) - 40 : 3460;
-})();
-
-function isTooLongForSingleCard(content) {
-  return String(content ?? "").length > FEISHU_CARD_PATCH_SAFE_LIMIT;
-}
+const isTooLongForSingleCard = isMultiPartCard;
 
 /**
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
@@ -1064,7 +1057,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
         : `**🤖 AI 分析：**\n${summary}\n\n---\n\n${content}`;
       const enrichedContent = buildCardUrlPrefix(url, enriched) + enriched;
       try {
-        if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
+        if (isTooLongForSingleCard(initialContent, title, template, { ...cardOpts, diffFilePath }) || isTooLongForSingleCard(enrichedContent, title, template, { ...cardOpts, diffFilePath })) {
           log(`[AI 摘要] ${title} 正文较长，保留完整变更卡片，另发 AI 摘要卡片`);
           await sendFeishu(`🤖 ${title}`, `**AI 分析：**\n${summary}`, "blue");
         } else {
@@ -3594,7 +3587,7 @@ async function enrichFactoryPoolMetadataAfterSend({
     })),
   };
   const enrichedContent = buildFactoryPoolMonitorContent(enrichedResult);
-  if (isTooLongForSingleCard(initialContent) || isTooLongForSingleCard(enrichedContent)) {
+  if (isTooLongForSingleCard(initialContent, title, template, cardOpts) || isTooLongForSingleCard(enrichedContent, title, template, cardOpts)) {
     log(`[Flap Factory 名称] ${title} 为分段卡片，仅更新名称缓存`);
     return { patched: false, metadataChanged };
   }
@@ -6569,8 +6562,8 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
       void resolveFactoryPoolTokenMetadata(missingNames).then(async ({ metadata }) => {
         if (!Object.keys(metadata).length) return;
         const enriched = buildSafeProposalContent(changes, { ...factoryPoolState?.assets, ...metadata });
-        const limit = Number(process.env.FEISHU_CARD_CHUNK_LIMIT) || 3500;
-        if (content.length < limit - 40 && enriched.length < limit - 40) {
+        const color = invalidated ? 'yellow' : 'red';
+        if (!isTooLongForSingleCard(content, title, color) && !isTooLongForSingleCard(enriched, title, color)) {
           await patchCard(messageId, title, enriched, invalidated ? "yellow" : "red");
         }
       }).catch(error => log(`[Flap Safe 名称] 补充失败：${error.message}`));
@@ -6594,7 +6587,8 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
   if (!changes.length) return { sent: false };
   const content = buildEarlySignalContent(changes, state);
   const sentParts = [];
-  const id = await sendCardFn("Flap 底池提前信号", content, "orange", undefined, { sentParts });
+  const cardParts = planCardParts("Flap 底池提前信号", content, "orange");
+  const id = await sendCardFn("Flap 底池提前信号", content, "orange", undefined, { sentParts, cardParts });
   if (!id) return { sent: false };
   acknowledgeEarlySignals(state, changes.map(e => e.id));
   saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
@@ -6618,9 +6612,7 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
       }
       if (!changed) return;
       saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
-      const configuredLimit = Number(process.env.FEISHU_CARD_CHUNK_LIMIT);
-      const limit = Number.isFinite(configuredLimit) && configuredLimit >= 500 ? Math.floor(configuredLimit) : 3500;
-      const parts = balanceCardFontTags(splitMessageContent(content, limit - 40));
+      const parts = cardParts.map(part => part.content);
       if (!sentParts.length && parts.length === 1) sentParts.push(id);
       // Patch the original parts in place. Only add names, never recalculate
       // signal stages or move evidence between already delivered cards.

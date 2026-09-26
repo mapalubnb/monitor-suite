@@ -123,6 +123,7 @@ CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/ai-client.mjs "$SHARED_DIR/"
   cp shared/feishu-client.mjs "$SHARED_DIR/"
+  cp shared/card-markdown.mjs "$SHARED_DIR/"
   cp shared/display-format.cjs "$SHARED_DIR/"
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
   cp shared/snapshot-store.cjs "$SHARED_DIR/"

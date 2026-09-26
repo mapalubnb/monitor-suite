@@ -44,6 +44,125 @@ test('card retries resume unsent parts with stable request ids', async () => {
 });
 
 import { assertFeishuResponse, balanceCardFontTags, buildCardJson, splitMessageContent } from "./feishu-client.mjs";
+import { planCardParts, cardCapacity, isMultiPartCard, patchCard } from './feishu-client.mjs';
+import { splitCardMarkdown } from './card-markdown.mjs';
+
+test('dense headings are partitioned by final element and request byte budgets', async () => {
+  const source = Array.from({ length: 75 }, (_, i) => `## 项目${i}\n值：正常`).join('\n');
+  const parts = planCardParts('边界', source, 'blue');
+  assert.ok(parts.length > 1);
+  assert.equal(parts.map(part => part.content).join(''), source);
+  for (const part of parts) {
+    const capacity = cardCapacity(buildCardJson(part.title, part.content, 'blue'), {
+      receive_id: 'oc_' + 'x'.repeat(32), msg_type: 'interactive', uuid: 'x'.repeat(40),
+    });
+    assert.ok(capacity.elements <= 200);
+    assert.ok(capacity.bytes < 30_000);
+  }
+  await assert.rejects(patchCard('unused', '边界', source, 'blue'), /超过容量/);
+});
+
+test('Unicode graphemes, combining characters and emoji families survive card and text cuts', () => {
+  for (const symbol of ['😀', '👩‍👩‍👧‍👦', 'e\u0301', '🇨🇳']) {
+    const source = 'a'.repeat(3459) + symbol + 'b'.repeat(100);
+    for (const parts of [planCardParts('文字', source).map(part => part.content), splitMessageContent(source, 3460)]) {
+      assert.equal(parts.join(''), source);
+      assert.ok(parts.every(part => part.isWellFormed()));
+      assert.ok(parts.some(part => part.includes(symbol)));
+    }
+  }
+});
+
+test('links longer than the preferred chunk length remain clickable and fit the actual byte limit', () => {
+  const url = 'https://example.com/' + 'a'.repeat(3500) + '(detail)';
+  const link = `[名称\\]完整](${url})`;
+  const source = '前文\n' + link + '\n后文';
+  const parts = planCardParts('链接', source);
+  assert.equal(parts.map(part => part.content).join(''), source);
+  assert.ok(parts.some(part => part.content.includes(link)));
+  assert.ok(parts.every(part => cardCapacity(buildCardJson(part.title, part.content, 'red')).bytes < 30_000));
+});
+
+test('code fences reopen with their language and close independently in every part', () => {
+  for (const marker of ['```', '~~~~']) {
+    const rows = Array.from({ length: 150 }, (_, i) => `日志${i} <font color="red">字面标签</font> **值**`);
+    const parts = planCardParts('日志', marker + 'text\n' + rows.join('\n') + '\n' + marker);
+    assert.ok(parts.length > 1);
+    const retained = [];
+    for (const { content } of parts) {
+      assert.ok(content.startsWith(marker + 'text\n'));
+      assert.ok(content.endsWith(marker));
+      retained.push(content.slice((marker + 'text\n').length, -marker.length).trimEnd());
+      const card = JSON.parse(buildCardJson('日志', content, 'blue'));
+      assert.equal(card.body.elements.filter(el => el.element_id?.startsWith('code_')).length, 1);
+    }
+    assert.equal(retained.join('\n'), rows.join('\n'));
+  }
+});
+
+test('nested font tags are balanced without interpreting tags inside code', () => {
+  const source = '<font color="green"><font color="red">' + '完整证据'.repeat(1800) + '</font>尾部</font>';
+  const parts = splitCardMarkdown(source, 3460);
+  assert.ok(parts.length > 1);
+  for (const part of parts) {
+    assert.equal((part.match(/<font\b/g) || []).length, (part.match(/<\/font>/g) || []).length);
+    assert.ok(part.startsWith('<font color="green">'));
+  }
+  assert.equal(parts.join('').replace(/<\/?font\b[^>]*>/g, ''), source.replace(/<\/?font\b[^>]*>/g, ''));
+});
+
+test('unrepresentable atomic links fail before sending any partial notification', async () => {
+  let calls = 0;
+  const transport = { withToken: async () => ({}), client: { im: { message: { create: async () => { calls++; } } } } };
+  await assert.rejects(sendCard('超长链接', '正文\n[链接](https://example.com/' + 'a'.repeat(40_000) + ')', 'blue', {chatId:'test'}, transport), /无法无损分片/);
+  assert.equal(calls, 0);
+});
+
+test('3461 through 3500 characters use the same multipart decision as sending', () => {
+  for (const length of [3460, 3461, 3480, 3500]) {
+    const source = 'a'.repeat(length);
+    assert.equal(isMultiPartCard(source), planCardParts('监控通知', source).length > 1);
+    assert.equal(isMultiPartCard(source), length > 3460);
+  }
+});
+
+test('saved card plans preserve unsent content and message IDs across retries', async () => {
+  let plan, saved = [], requests = [], fail = true;
+  const transport = { withToken: async () => ({}), pause: async () => {}, client: { im: { message: {
+    create: async request => {
+      requests.push(request.data);
+      if (requests.length === 2 && fail) throw Error('offline');
+      return {code:0,data:{message_id:'part-'+requests.length}};
+    },
+  } } } };
+  const opts = () => ({chatId:'test',deliveryId:'stable',sentParts:[...saved],cardParts:plan,
+    onPlan:async parts=>{plan=structuredClone(parts);},onPartSent:async parts=>{saved=[...parts];}});
+  await assert.rejects(sendCard('原标题', '证据'.repeat(2200), 'blue', opts(), transport), /offline/);
+  assert.ok(plan.length > 1);
+  fail = false;
+  await sendCard('后续配置', '不能替换已冻结的正文', 'blue', opts(), transport);
+  assert.equal(requests[1].uuid, requests[2].uuid);
+  const original = JSON.parse(requests[1].content), retried = JSON.parse(requests[2].content);
+  assert.equal(original.header.title.content, retried.header.title.content);
+  assert.equal(original.body.elements[0].content, retried.body.elements[0].content);
+  assert.equal(requests.length, 3);
+});
+
+test('time fields and bold markers remain intact at fragment boundaries', () => {
+  const source = 'a'.repeat(3450) + '**首次观测**2026-09-26T06:55:52.123Z';
+  const parts = planCardParts('时间', source);
+  const cards = parts.map(part => buildCardJson(part.title, part.content, 'blue')).join('');
+  assert.match(cards, /2026\/9\/26 14:55:52\.123/);
+  assert.doesNotMatch(cards, /\*\*/);
+  assert.equal(parts.map(part => part.content).join(''), source);
+});
+
+test('more than fifty table columns fall back to complete text without dropped values', () => {
+  const source = '01　项目｜' + Array.from({length:51},(_,i)=>`字段${i} 值${i}`).join('｜');
+  const card=JSON.parse(buildCardJson('表格',source,'blue'));
+  assert.ok(!card.body.elements.some(element=>element.tag==='table'));
+  assert.ok(card.body.elements.some(element=>element.content===source));
+});
 
 test("message chunks preserve every character and prefer semantic boundaries", () => {
   const address = "0x1234567890abcdef1234567890abcdef12345678";

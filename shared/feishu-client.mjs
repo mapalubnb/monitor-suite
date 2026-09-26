@@ -1,4 +1,5 @@
 import { formatBeijingTime, formatDisplayText } from "./display-format.cjs";
+import { splitCardMarkdown, splitUnicodeText } from './card-markdown.mjs';
 /**
  * 共享飞书 SDK 客户端 — 统一消息通道
  *
@@ -260,6 +261,7 @@ function buildTable(lines, elementId) {
   const rows = lines.map(parseNumberedTableRow);
   if (rows.some(row => !row)) return null;
   const labels = [...new Set(rows.flatMap(row => Object.keys(row)))];
+  if (labels.length > 50) return null;
   const columns = labels.map((label, index) => ({
     name: `col_${index + 1}`,
     display_name: label,
@@ -388,7 +390,7 @@ export function buildCardBodyElements(content, opts = {}) {
         if (table) {
           elements.push(table);
           tableCount++;
-        }
+        } else plain.push(...tableLines);
       } else if (tableLines.length > 0) {
         plain.push(...tableLines);
       } else {
@@ -496,7 +498,40 @@ function normalizeChunkLimit(value, fallback) {
   return Number.isFinite(n) && n >= 500 ? Math.floor(n) : fallback;
 }
 
+// Official limits: 200 tagged elements and a 30 KB serialized request body.
+// Reserve room for transport identifiers and timestamps before sending anything.
+export function cardCapacity(cardJson, envelope = {}) {
+  const card = JSON.parse(cardJson);
+  const count = value => !value || typeof value !== 'object' ? 0
+    : (typeof value.tag === 'string' ? 1 : 0) + Object.values(value).reduce((sum, child) => sum + count(child), 0);
+  return { elements: count(card), bytes: Buffer.byteLength(JSON.stringify({ ...envelope, content: cardJson }), 'utf8') };
+}
+
+function assertCardCapacity(cardJson, envelope = {}) {
+  const capacity = cardCapacity(cardJson, envelope);
+  if (capacity.elements > 200 || capacity.bytes > 30_000) {
+    throw new Error(`飞书卡片超过容量：${capacity.elements} 个元素，${capacity.bytes} 字节`);
+  }
+}
+
+export function planCardParts(title, content, template = 'red', opts = {}) {
+  const chunks = splitCardMarkdown(content, FEISHU_CARD_CHUNK_LIMIT - 40, fragment => {
+    const capacity = cardCapacity(buildCardJson(`${title} (999999/999999)`, fragment, template, opts));
+    return capacity.elements <= 190 && capacity.bytes <= 28_000;
+  });
+  return chunks.map((fragment, index) => ({ title: partTitle(title, index + 1, chunks.length), content: fragment }));
+}
+
+export function isMultiPartCard(content, title = '监控通知', template = 'red', opts = {}) {
+  try { return planCardParts(title, content, template, opts).length > 1; }
+  catch { return true; }
+}
+
 export function splitMessageContent(value, limit) {
+  return splitUnicodeText(value, limit);
+}
+
+function splitLegacyMessageContent(value, limit) {
   const text = String(value ?? "");
   if (text.length <= limit) return [text];
 
@@ -634,19 +669,27 @@ export async function sendCard(title, content, template = "red", opts = {}, tran
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
-  const chunks = balanceCardFontTags(splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT - 40));
+  const sentParts = opts.sentParts || (opts.sentParts = []);
+  // Persist the exact plan before the first send, so restarts/retries never move
+  // content between message IDs. Older partially sent outboxes retain old cuts.
+  if (!opts.cardParts?.length) {
+    opts.cardParts = sentParts.length
+      ? balanceCardFontTags(splitLegacyMessageContent(content, FEISHU_CARD_CHUNK_LIMIT - 40))
+        .map((fragment, index, all) => ({ title: partTitle(title, index + 1, all.length), content: fragment }))
+      : planCardParts(title, content, template, opts);
+  }
+  const parts = opts.cardParts;
+  if (sentParts.length > parts.length) throw new Error('飞书卡片分片记录不一致，停止发送以避免漏发');
+  const cards = parts.map((part, index) => buildCardJson(part.title, part.content, template,
+    index === 0 ? opts : { ...opts, mentionOpenId: '' }));
+  cards.forEach(card => assertCardCapacity(card, { receive_id: targetChatId, msg_type: 'interactive', uuid: '0'.repeat(40) }));
+  if (opts.onPlan) await opts.onPlan(parts);
   const tokenOpt = await (transport.withToken || withToken)();
-  const sentParts = opts.sentParts || [];
   let firstMessageId = sentParts[0] || "";
-  for (let i = 0; i < chunks.length; i++) {
+  for (let i = 0; i < parts.length; i++) {
     assertFresh();
     if (sentParts[i]) continue;
-    const cardJson = buildCardJson(
-      partTitle(title, i + 1, chunks.length),
-      chunks[i],
-      template,
-      i === 0 ? opts : { ...opts, mentionOpenId: "" },
-    );
+    const cardJson = cards[i];
     const res = await client.im.message.create({
       params: { receive_id_type: "chat_id" },
       data: {
@@ -662,8 +705,8 @@ export async function sendCard(title, content, template = "red", opts = {}, tran
     sentParts[i] = messageId;
     if (opts.onPartSent) await opts.onPartSent(sentParts);
     if (!firstMessageId) firstMessageId = messageId;
-    log(`[飞书 SDK] 卡片已发送${chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : ""} → ${messageId}`);
-    await (transport.pause || pauseBetweenChunks)(i + 1, chunks.length);
+    log(`[飞书 SDK] 卡片已发送${parts.length > 1 ? ` (${i + 1}/${parts.length})` : ""} → ${messageId}`);
+    await (transport.pause || pauseBetweenChunks)(i + 1, parts.length);
   }
   return firstMessageId;
 }
@@ -677,7 +720,7 @@ export async function sendText(text, opts = {}) {
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
-  const chunks = splitMessageContent(formatDisplayText(text), FEISHU_TEXT_CHUNK_LIMIT);
+  const chunks = splitUnicodeText(formatDisplayText(text), FEISHU_TEXT_CHUNK_LIMIT);
   const tokenOpt = await withToken();
   let firstMessageId = "";
   for (let i = 0; i < chunks.length; i++) {
@@ -702,7 +745,7 @@ export async function sendText(text, opts = {}) {
 export async function replyText(messageId, text) {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
-  const chunks = splitMessageContent(formatDisplayText(text), FEISHU_TEXT_CHUNK_LIMIT);
+  const chunks = splitUnicodeText(formatDisplayText(text), FEISHU_TEXT_CHUNK_LIMIT);
   const tokenOpt = await withToken();
   let firstRes = null;
   for (let i = 0; i < chunks.length; i++) {
@@ -726,11 +769,13 @@ export async function replyText(messageId, text) {
 export async function replyCard(messageId, title, content, color = "blue") {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
-  const chunks = balanceCardFontTags(splitMessageContent(content, FEISHU_CARD_CHUNK_LIMIT - 40));
+  const parts = planCardParts(title, content, color);
+  const cards = parts.map(part => buildCardJson(part.title, part.content, color));
+  cards.forEach(card => assertCardCapacity(card, { msg_type: 'interactive' }));
   const tokenOpt = await withToken();
   let firstRes = null;
-  for (let i = 0; i < chunks.length; i++) {
-    const card = buildCardJson(partTitle(title, i + 1, chunks.length), chunks[i], color);
+  for (let i = 0; i < parts.length; i++) {
+    const card = cards[i];
     const res = await client.im.message.reply({
       path: { message_id: messageId },
       data: {
@@ -740,7 +785,7 @@ export async function replyCard(messageId, title, content, color = "blue") {
     }, tokenOpt);
     if (!firstRes) firstRes = res;
     assertFeishuResponse(res, "回复卡片");
-    await pauseBetweenChunks(i + 1, chunks.length);
+    await pauseBetweenChunks(i + 1, parts.length);
   }
   return firstRes;
 }
@@ -749,13 +794,15 @@ export async function replyCard(messageId, title, content, color = "blue") {
  * 编辑已发送的卡片消息（用于补充 AI 摘要）
  */
 export async function patchCard(messageId, title, content, template = "red", opts = {}) {
+  const cardJson = buildCardJson(title, content, template, opts);
+  assertCardCapacity(cardJson);
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
   const tokenOpt = await withToken();
   const res = await client.im.message.patch({
     path: { message_id: messageId },
     data: {
-      content: buildCardJson(title, content, template, opts),
+      content: cardJson,
     },
   }, tokenOpt);
   if (res.code !== 0) throw new Error(`code=${res.code}: ${res.msg}`);
