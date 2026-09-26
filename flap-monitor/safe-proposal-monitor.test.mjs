@@ -59,6 +59,22 @@ test('Safe polling rotates one address per run without updating skipped poll tim
   assert.equal(calls.length, 2);
   assert.notEqual(calls[0], calls[1]);
 });
+
+test('Safe monthly exhaustion uses server reset and remaining quota spaces successful requests', async () => {
+  const state = {}, now = () => 1000;
+  const response = (remaining, status) => ({status, ok: status === 200,
+    headers: {get: key => ({'x-ratelimit-limit': '50000', 'x-ratelimit-remaining': String(remaining), 'x-ratelimit-reset': '472938'})[key] ?? null}});
+  let guard = createSafeRateLimitedFetch(state, async () => response(0, 429), {now});
+  await guard.waitForTurn(); await guard('url');
+  assert.equal(state.apiNextAttemptAtMs, 472939000);
+  assert.equal(state.apiQuota.remaining, 0);
+  await assert.rejects(guard.waitForTurn(), /共享冷却/);
+  const fresh = {};
+  guard = createSafeRateLimitedFetch(fresh, async () => response(1000, 200), {now});
+  await guard.waitForTurn(); await guard('url');
+  assert.equal(fresh.apiRequestNextAt, 473938);
+  await assert.rejects(guard.waitForTurn(), /额度预算等待/);
+});
 const VAULT_CALLS = JSON.parse(readFileSync(new URL("./fixtures/safe-vault-factory-calls.json", import.meta.url), "utf8"));
 const jsonResponse = value => ({ ok: true, status: 200, json: async () => value });
 

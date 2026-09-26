@@ -705,6 +705,8 @@ if [ -f "$SNAP" ]; then
     console.log('健康 Safe：'+healthySafes+'/'+safeStates.length+'｜跟踪中目标 '+activeSafeProposals.length+' 个｜待发送变更 '+((sp.pendingChanges||[]).length)+' 项');
     for(const [index,v] of safeStates.entries()) console.log(String(index+1).padStart(2,'0')+'　Safe '+mdLink(v.address,'https://app.safe.global/transactions/queue?safe=bnb:'+v.address)+'｜nonce '+(v.currentNonce??'未知')+'｜'+(v.lastError?'异常':v.baselineEstablished?'基线完成':'等待基线'));
     if(sp.lastSuccessAt) console.log('最后成功：'+fmtTime(sp.lastSuccessAt));
+    if(sp.apiQuota) console.log('Safe 月度额度：'+sp.apiQuota.remaining+'/'+sp.apiQuota.limit+'｜重置 '+fmtTime(sp.apiQuota.resetsAt));
+    if(sp.apiNextAttemptAtMs>Date.now()) console.log('Safe API 下次尝试：'+fmtTime(sp.apiNextAttemptAtMs));
     if(sp.lastError) console.log('最近异常：'+sp.lastError);
     console.log('');
 

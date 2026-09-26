@@ -387,7 +387,8 @@ async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
     if (!response?.ok) {
       const status = response?.status || "unknown";
       const suffix = status === 422 ? "（Safe 地址必须使用 EIP-55 校验和格式）" : "";
-      const error = new Error(`Safe API HTTP ${status}${suffix}`);
+      const quotaExhausted = response?.headers?.get?.('x-ratelimit-remaining') === '0';
+      const error = new Error(`Safe API HTTP ${status}${suffix}${quotaExhausted ? '（账户月度额度已耗尽）' : ''}`);
       error.retryAfterMs = retryAfterMilliseconds(response);
       throw error;
     }
@@ -401,10 +402,20 @@ export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, 
   sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   const guarded = async (...args) => {
     const response = await fetchFn(...args);
+    const headerNumber = key => {
+      const raw = response.headers?.get?.(key);
+      return raw !== null && raw !== undefined && Number.isFinite(Number(raw)) ? Number(raw) : null;
+    };
+    const remaining = headerNumber('x-ratelimit-remaining'), resetSeconds = headerNumber('x-ratelimit-reset');
+    if (remaining !== null && resetSeconds !== null) {
+      state.apiQuota = {limit: headerNumber('x-ratelimit-limit'), remaining, resetsAt: now() + resetSeconds * 1000};
+      if (remaining > 0) state.apiRequestNextAt = Math.max(state.apiRequestNextAt || 0,
+        now() + Math.ceil(resetSeconds * 1000 / remaining));
+    }
     if (response.status === 429) {
       state.apiRateLimitFailures = (state.apiRateLimitFailures || 0) + 1;
       const delay = Math.max(retryAfterMilliseconds(response), Math.min(300_000, 60_000 * 2 ** Math.min(3, state.apiRateLimitFailures - 1)));
-      state.apiNextAttemptAtMs = now() + delay;
+      state.apiNextAttemptAtMs = Math.max(now() + delay, remaining === 0 && resetSeconds > 0 ? now() + resetSeconds * 1000 : 0);
     } else if (response.ok) {
       state.apiRateLimitFailures = 0;
       state.apiNextAttemptAtMs = 0;
@@ -421,6 +432,11 @@ export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, 
     };
     check();
     const slot = Math.max(now(), state.apiRequestNextAt || 0);
+    if (slot - now() > intervalMs) {
+      const error = new Error('Safe API 额度预算等待');
+      error.retryAfterMs = slot - now();
+      throw error;
+    }
     state.apiRequestNextAt = slot + intervalMs;
     if (slot > now()) await sleep(slot - now());
     check();
@@ -500,6 +516,15 @@ export async function runSafeProposalScan({
 
   const migrated = migrateSafeProposalState(state, normalizedSafes);
   Object.assign(state, migrated);
+  const credentialId = hashText(`${apiBaseUrl}|${apiKey}`);
+  if (state.apiCredentialId && state.apiCredentialId !== credentialId) {
+    state.apiNextAttemptAtMs = 0;
+    state.apiRequestNextAt = 0;
+    state.apiRateLimitFailures = 0;
+    delete state.apiQuota;
+    for (const health of Object.values(state.safes)) { health.nextAttemptAtMs = 0; health.consecutiveFailures = 0; }
+  }
+  state.apiCredentialId = credentialId;
   if (requestIntervalMs > 0) fetchFn = createSafeRateLimitedFetch(state, fetchFn, {intervalMs: requestIntervalMs});
   const runAt = nowIso(nowMs);
   const nonceResults = await rpcBatch(safeNonceCalls(normalizedSafes));
@@ -512,7 +537,7 @@ export async function runSafeProposalScan({
   const start = (state.pollCursor || 0) % normalizedSafes.length;
   const eligible = [...normalizedSafes.slice(start), ...normalizedSafes.slice(0, start)]
     .filter(safe => !(state.safes[safe]?.nextAttemptAtMs > nowMs));
-  const selected = new Set(eligible.slice(0, maxSafesPerRun));
+  const selected = new Set(state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs ? [] : eligible.slice(0, maxSafesPerRun));
   const lastSelected = [...selected].at(-1);
   if (lastSelected) state.pollCursor = (normalizedSafes.indexOf(lastSelected) + 1) % normalizedSafes.length;
 
@@ -523,7 +548,7 @@ export async function runSafeProposalScan({
     if (currentNonce === null) throw new Error("Safe nonce 读取失败，保留该 Safe 的上次快照");
     safeState.currentNonce = currentNonce;
     safeState.lastNonceAt = runAt;
-    if (!selected.has(safe) || state.apiNextAttemptAtMs > nowMs) return { safe, skipped: true, currentNonce };
+    if (!selected.has(safe) || state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs) return { safe, skipped: true, currentNonce };
     if (Number(safeState.nextAttemptAtMs) > nowMs) return { safe, skipped: true, currentNonce };
     // 错开同一轮多个 Safe 请求，降低出口 IP 触发 Safe API 限流的概率。
     if (index > 0) await new Promise(resolve => setTimeout(resolve, index * SAFE_API_STAGGER_MS));
