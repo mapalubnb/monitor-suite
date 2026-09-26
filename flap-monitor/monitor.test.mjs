@@ -3400,3 +3400,35 @@ test('realtime empty logs reject a lagging provider and report provider names',a
  try{await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://lagging.rpc']}),/lagging.rpc: 节点尚未同步/);}
  finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
 });
+
+
+test('strict batch validation retries another node instead of accepting a partial response', async () => {
+  const original = globalThis.fetch, urls = __testables.CONFIG.bscRpcUrls;
+  __testables.CONFIG.bscRpcUrls = ['https://partial.test', 'https://complete.test'];
+  __testables.resetBscRpcHealth();
+  let count = 0;
+  globalThis.fetch = async (url, options) => {
+    count++;
+    const payload = JSON.parse(options.body);
+    return { ok: true, json: async () => payload.map(item => ({ id: item.id, result: url.includes('partial') && item.id === 2 ? null : '0x1' })) };
+  };
+  try {
+    const result = await __testables.bscRpcBatch([{ method: 'eth_call', params: [1] }, { method: 'eth_call', params: [2] }], { requireAllResults: true });
+    assert.deepEqual(result, ['0x1', '0x1']);
+    assert.equal(count, 2);
+  } finally { globalThis.fetch = original; __testables.CONFIG.bscRpcUrls = urls; __testables.resetBscRpcHealth(); }
+});
+
+test('simultaneous Flap head reads share a request and provider quota blocks the ordinary lane too', async () => {
+  const original = globalThis.fetch, urls = __testables.CONFIG.bscRpcUrls;
+  __testables.CONFIG.bscRpcUrls = ['https://quota.test']; __testables.resetBscRpcHealth();
+  let count = 0;
+  globalThis.fetch = async () => { count++; await new Promise(r => setTimeout(r, 5)); return { ok: true, json: async () => ({result:'0x64'}) }; };
+  try {
+    assert.deepEqual(await Promise.all([1,2,3].map(() => __testables.bscRpcCall('eth_blockNumber'))), ['0x64','0x64','0x64']);
+    assert.equal(count, 1);
+    __testables.rpcControl.failure('https://quota.test', new Error('HTTP 429'));
+    await assert.rejects(__testables.bscRpcCall('eth_getCode', ['0x1', 'latest']), /冷却/);
+    assert.equal(count, 1);
+  } finally { globalThis.fetch = original; __testables.CONFIG.bscRpcUrls = urls; __testables.resetBscRpcHealth(); }
+});

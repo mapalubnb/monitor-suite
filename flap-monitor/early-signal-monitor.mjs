@@ -550,7 +550,7 @@ async function validateFastBlocks(state, head, rpcBatch, nowMs) {
   for (let i = 0; i < anchors.length; i++) {
     if (!blocks[i]?.hash) throw new Error("快速信号区块校验不可用");
     if (lower(blocks[i].hash) !== anchors[i][1]) {
-      rewindEarlySignals(state, Math.max(1, Math.min(Number(anchors[i][0]), (state.cursor ?? 0) + 1)), nowMs);
+      rewindEarlySignals(state, Math.max(1, Number(anchors[i][0]) - REORG_WINDOW), nowMs);
       return;
     }
   }
@@ -582,7 +582,7 @@ export async function processEarlyReceiptHints(state, hints, config, rpcBatch, n
     Object.assign(draft.pools, resolved.pools);
     const events = decodeEarlyReceipt(receipt, draft, { config, nowMs });
     draft.fastBlocks ||= {};
-    if (Number(receipt.blockNumber) > (state.cursor ?? 0)) draft.fastBlocks[Number(receipt.blockNumber)] = lower(receipt.blockHash);
+    if (Number(receipt.blockNumber) > (state.realtimeCursor ?? state.cursor ?? 0)) draft.fastBlocks[Number(receipt.blockNumber)] = lower(receipt.blockHash);
     Object.assign(state, draft, { health: state.health });
     for (const event of events) if (event.token) tokens.add(event.token);
     processed.push(hint.transactionHash);

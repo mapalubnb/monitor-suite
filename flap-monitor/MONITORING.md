@@ -1,4 +1,4 @@
-# Flap 底池提前监控（1.4.0）
+# Flap 底池提前监控（1.8.0）
 
 ## 免费加速升级
 
@@ -108,3 +108,10 @@ WSS 快速通道与 HTTP 游标补扫互补，同一回执用日志标识去重�
 安装脚本会复制全部新模块，保留旧状态文件。部署须更新整个项目，确认 `.env` 的间隔和 RPC 配额后，运行原有安装/更新流程并重启 `flap-monitor`；本地测试通过不代表服务器进程已经使用新版。
 
 协议依据：[Safe Modules](https://docs.safe.global/advanced/smart-account-modules)、[CoW Order API](https://api.cow.fi/docs/)、[Pancake Infinity 部署](https://developer.pancakeswap.finance/contracts/infinity/resources/addresses)、[Uniswap V4 部署](https://developers.uniswap.org/docs/protocols/v4/deployments)、[Flap 官方部署](https://docs.flap.sh/flap/developers/deployed-contract-addresses)。
+
+
+## 1.8.0 运行修复
+
+快速回执重组以异常区块回退 128 块，不再用落后的历史游标撤回无关旧事件。实时提前信号每轮区块数遵守 `FLAP_EARLY_MAX_BLOCKS`；合约历史窗口遵守 `FLAP_CONTRACT_EVENT_MAX_BLOCKS`。监控周期不变，历史缺口保留。状态命令会将明显实时延迟标为需要关注。
+
+页面快照采用内容文件加原子清单，备份必须包含 `snapshot.json.parts/`。RPC 并发去重、节点共享退避、受控备用竞速与分段查询的行为及回滚要求见主 README 的 1.10.0 说明。

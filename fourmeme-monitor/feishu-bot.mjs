@@ -1,3 +1,4 @@
+import { readSnapshot } from "../shared/snapshot-store.cjs";
 /**
  * 飞书交互机器人 — 远程 Shell（长连接模式）
  * 通过飞书 WebSocket 长连接接收消息，无需公网 IP 和事件订阅配置。
@@ -337,7 +338,7 @@ function buildMonitorContext() {
   if (existsSync(fmSnapPath)) {
     try {
       const stat = statSync(fmSnapPath);
-      const snap = mergeActorCheckpoint(JSON.parse(readFileSync(fmSnapPath, "utf-8")), dirname(fmSnapPath));
+      const snap = mergeActorCheckpoint(readSnapshot(fmSnapPath), dirname(fmSnapPath));
       parts.push("=== Four.meme 监控快照 ===");
       parts.push(`更新时间: ${stat.mtime.toLocaleString("zh-CN", { hour12: false })}`);
 
@@ -411,7 +412,7 @@ function buildMonitorContext() {
   ]);
   if (flSnapPath) {
     try {
-      const snap = JSON.parse(readFileSync(flSnapPath, "utf-8"));
+      const snap = readSnapshot(flSnapPath);
       parts.push("\n=== Flap.sh 监控快照 ===");
       parts.push(`最后检测: ${snap.lastCheck || "未知"}`);
       const flapSummary = summarizeFlapSnapshot(snap);
@@ -991,7 +992,7 @@ function readFourmemeSnapshot() {
   const snapPath = join(CONFIG.monitorDir, "snapshot.json");
   if (!existsSync(snapPath)) return {};
   try {
-    return mergeActorCheckpoint(JSON.parse(readFileSync(snapPath, "utf-8")), dirname(snapPath));
+    return mergeActorCheckpoint(readSnapshot(snapPath), dirname(snapPath));
   } catch (err) {
     throw new Error(`读取 snapshot.json 失败：${err.message}`);
   }

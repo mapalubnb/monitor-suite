@@ -1,3 +1,5 @@
+import { createRpcControl } from "../shared/rpc-control.mjs";
+import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
@@ -606,6 +608,7 @@ function scheduleRuntimeMetricsWrite() {
       uptimeSeconds: Math.round(process.uptime()),
       memory: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal },
       modules: modulesSummary,
+      rpc: rpcControl.summary(),
       snapshotWrites: {
         ...snapshotWriteMetrics,
         averageDurationMs: snapshotWriteMetrics.writes
@@ -680,13 +683,6 @@ function formatInterval(ms) {
   return `每 ${(value / 1000).toFixed(1).replace(/\.0$/, "")} 秒`;
 }
 
-function formatDuration(ms) {
-  const value = Number(ms || 0);
-  if (!Number.isFinite(value) || value <= 0) return "未知";
-  if (value % 60000 === 0) return `${value / 60000} 分钟`;
-  if (value % 1000 === 0) return `${value / 1000} 秒`;
-  return `${(value / 1000).toFixed(1).replace(/\.0$/, "")} 秒`;
-}
 const log = (msg) => console.log(`[${ts()}] ${msg}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
@@ -737,7 +733,7 @@ const snapshotMutex = {
 function loadSnapshot() {
   try {
     if (existsSync(CONFIG.snapshotFile)) {
-      const data = JSON.parse(readFileSync(CONFIG.snapshotFile, "utf-8"));
+      const data = readSnapshot(CONFIG.snapshotFile);
       const migrated = migrateSnapshot(data);
       try {
         if (!data._atomicNotifications && existsSync(CONFIG.actorStateFile)) {
@@ -876,7 +872,7 @@ function mergeExternalFrontendRouteStateFromFile(data, filePath) {
   if (filePath === CONFIG.snapshotFile && statSync(filePath).mtimeMs === lastWrittenSnapshotMtime) return false;
   let external;
   try {
-    external = JSON.parse(readFileSync(filePath, "utf-8"));
+    external = filePath === CONFIG.snapshotFile ? readSnapshot(filePath) : JSON.parse(readFileSync(filePath, "utf-8"));
   } catch {
     return false;
   }
@@ -901,14 +897,21 @@ function mergeExternalFrontendRouteState(data = snapshot) {
 let persistedFrontendPages;
 let lastWrittenSnapshotMtime = -1;
 const snapshotJsonCache = new Map();
-function serializeMonitorSnapshot(data) {
+function encodeSnapshotField(key, value) {
   const cachedFields = new Set(["frontendPages", "_frontendAssetStore", "_frontendStaticIndex", "_globalI18nResourceWatch"]);
-  return "{" + Object.entries(data).filter(([, value]) => value !== undefined).map(([key, value]) => {
-    const cached = snapshotJsonCache.get(key);
-    const json = cachedFields.has(key) && cached?.value === value ? cached.json : JSON.stringify(value);
-    if (cachedFields.has(key)) snapshotJsonCache.set(key, { value, json });
-    return JSON.stringify(key) + ":" + json;
-  }).join(",") + "}";
+  const cached = snapshotJsonCache.get(key);
+  const json = cachedFields.has(key) && cached?.value === value ? cached.json : JSON.stringify(value);
+  if (cachedFields.has(key)) snapshotJsonCache.set(key, { value, json });
+  return json;
+}
+function serializeMonitorSnapshot(data) {
+  return "{" + Object.entries(data).filter(([, value]) => value !== undefined)
+    .map(([key, value]) => JSON.stringify(key) + ":" + encodeSnapshotField(key, value)).join(",") + "}";
+}
+let snapshotStore, snapshotStorePath;
+function getSnapshotStore() {
+  if (snapshotStorePath !== CONFIG.snapshotFile) { snapshotStorePath = CONFIG.snapshotFile; snapshotStore = createSnapshotStore(snapshotStorePath); }
+  return snapshotStore;
 }
 function persistMonitorSnapshot(data) {
   if (data.frontendPages !== persistedFrontendPages) frontendSnapshotRevision++;
@@ -917,9 +920,7 @@ function persistMonitorSnapshot(data) {
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
   data._atomicNotifications = true;
   data.lastCheck = ts();
-  const tmpFile = CONFIG.snapshotFile + ".tmp";
-  writeFileSync(tmpFile, serializeMonitorSnapshot(compactFrontendSnapshotForDisk(data)), "utf-8");
-  renameSync(tmpFile, CONFIG.snapshotFile);
+  getSnapshotStore().write(compactFrontendSnapshotForDisk(data), encodeSnapshotField);
   lastWrittenSnapshotMtime = statSync(CONFIG.snapshotFile).mtimeMs;
   persistedFrontendPages = data.frontendPages;
   snapshotWriteMetrics.writes++;
@@ -1461,7 +1462,8 @@ function createAllRpcBackoffError() {
   return error;
 }
 
-const bscRpcEndpointPool = createRpcEndpointPool(CONFIG.bscRpcUrls);
+const rpcControl = createRpcControl({ directory: IS_TEST_MODE ? "" : join(__dirname, "..", ".rpc-cooldowns") });
+const bscRpcEndpointPool = createRpcEndpointPool(CONFIG.bscRpcUrls, { isBackedOff: url => Boolean(currentBackoffState(getDomain(url))) || Boolean(rpcControl.cooldown(url)) });
 const bscRpcInflight = new Map();
 
 async function requestBscRpcPayload(payload, timeoutMs, {
@@ -1487,15 +1489,21 @@ async function requestBscRpcPayload(payload, timeoutMs, {
       const rpcUrl = lease.endpoint.url;
       attempted.add(rpcUrl);
       try {
+        const parsed = await rpcControl.withEndpoint(rpcUrl, async () => {
         const response = await fetchFn(rpcUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         }, timeoutMs);
+        if (!response.ok) rpcControl.failure(rpcUrl, new Error(`HTTP ${response.status}`), response);
         const parsed = await parseResponse(response, rpcUrl);
+        for (const item of Array.isArray(parsed) ? parsed : [parsed]) if (item?.error) rpcControl.failure(rpcUrl, new Error(item.error.message || "RPC error"));
+        return parsed;
+        });
         pool.succeed(lease);
         return parsed;
       } catch (err) {
+        rpcControl.failure(rpcUrl, err);
         pool.fail(lease);
         lastErr = err;
       }
@@ -3713,9 +3721,6 @@ function finishSearchSteps(iterator) {
   let step;
   do { step = iterator.next(); } while (!step.done);
   return step.value;
-}
-function detectGlobalI18nResourceEvidence(item, pages = {}, cache = new Map()) {
-  return finishSearchSteps(globalI18nResourceSteps(item, pages, cache));
 }
 function* globalI18nResourceSteps(item, pages = {}, cache = new Map()) {
   const evidence = [];
@@ -8146,6 +8151,33 @@ function creatorMissingKey(missing) {
   return [...missing].sort().join(",");
 }
 
+// Stream bounded groups of full blocks, then fetch only actual deployment
+// receipts. Downloading every receipt for 120 busy blocks caused huge responses.
+async function findCreatorsInRange(fromBlock, toBlock, missing, rpcBatchFn) {
+  const targets = new Set(missing), discovered = {};
+  for (let start = fromBlock; start <= toBlock; start += 8) {
+    const count = Math.min(8, toBlock - start + 1);
+    const blocks = await rpcBatchFn(Array.from({ length: count }, (_, i) => ({ method: "eth_getBlockByNumber", params: [blockTag(start + i), true] })));
+    if (blocks.length !== count || blocks.some(block => !Array.isArray(block?.transactions))) throw new Error("创建者反查区块不完整，保留历史游标");
+    const creations = blocks.flatMap(block => block.transactions.filter(tx => !tx.to).map(tx => ({ ...tx, blockNumber: tx.blockNumber || block.number })));
+    for (let offset = 0; offset < creations.length; offset += 8) {
+      const batch = creations.slice(offset, offset + 8);
+      const receipts = await rpcBatchFn(batch.map(tx => ({ method: "eth_getTransactionReceipt", params: [tx.hash] })));
+      if (receipts.length !== batch.length || receipts.some(receipt => !receipt)) throw new Error("创建者反查回执不完整，保留历史游标");
+      for (const [i, receipt] of receipts.entries()) {
+        const contract = normalizeAddress(receipt.contractAddress);
+        if (!contract || !targets.has(contract)) continue;
+        const tx = batch[i];
+        if (!normalizeAddress(tx.from)) continue;
+        discovered[contract] = { creator: normalizeAddress(tx.from), txHash: tx.hash.toLowerCase(),
+          blockNumber: hexToNumber(tx.blockNumber), source: "rpc_recent_creation", updatedAt: ts() };
+      }
+    }
+    if (Object.keys(discovered).length === targets.size) break;
+  }
+  return discovered;
+}
+
 async function fetchCreatorsViaRecentChain(missing, state, lookupState, now) {
   if (!CONFIG.actorMonitor.creatorChainLookupEnabled || missing.length === 0) return;
   if (lookupState.chainNextRetryAt && now < lookupState.chainNextRetryAt) return;
@@ -8169,65 +8201,9 @@ async function fetchCreatorsViaRecentChain(missing, state, lookupState, now) {
     const fromBlock = Math.max(lowerBound, toBlock - CONFIG.actorMonitor.creatorChainMaxBlocksPerRun + 1);
     if (toBlock < fromBlock) return;
 
-    const targetSet = new Set(missing);
-    const receiptBlockCalls = [];
-    for (let n = fromBlock; n <= toBlock; n++) {
-      receiptBlockCalls.push({ method: "eth_getBlockReceipts", params: [blockTag(n)] });
-    }
-    const blockReceipts = await bscRpcBatch(receiptBlockCalls);
-    let found = 0;
-    let receiptBlockSupported = false;
-    for (const receipts of blockReceipts) {
-      if (!Array.isArray(receipts)) continue;
-      receiptBlockSupported = true;
-      for (const receipt of receipts) {
-        const contract = normalizeAddress(receipt?.contractAddress);
-        if (!contract || !targetSet.has(contract)) continue;
-        const creator = normalizeAddress(receipt.from);
-        const txHash = String(receipt.transactionHash || "").toLowerCase();
-        if (!creator || !txHash) continue;
-        state.creators[contract] = {
-          creator,
-          txHash,
-          blockNumber: hexToNumber(receipt.blockNumber),
-          source: "rpc_block_receipts",
-          updatedAt: ts(),
-        };
-        found++;
-      }
-    }
-
-    if (!receiptBlockSupported) {
-      const blockCalls = [];
-      for (let n = fromBlock; n <= toBlock; n++) {
-        blockCalls.push({ method: "eth_getBlockByNumber", params: [blockTag(n), true] });
-      }
-      const blocks = await bscRpcBatch(blockCalls);
-      const creationTxs = [];
-      for (const block of blocks) {
-        for (const tx of block?.transactions || []) {
-          if (tx?.to) continue;
-          const hash = String(tx.hash || "").toLowerCase();
-          const from = normalizeAddress(tx.from);
-          if (hash && from) creationTxs.push({ hash, from, blockNumber: hexToNumber(tx.blockNumber || block.number) });
-        }
-      }
-      const receipts = await bscRpcBatch(creationTxs.map(tx => ({ method: "eth_getTransactionReceipt", params: [tx.hash] })));
-      for (let i = 0; i < creationTxs.length; i++) {
-        const tx = creationTxs[i];
-        const receipt = receipts[i];
-        const contract = normalizeAddress(receipt?.contractAddress);
-        if (!contract || !targetSet.has(contract)) continue;
-        state.creators[contract] = {
-          creator: tx.from,
-          txHash: tx.hash,
-          blockNumber: tx.blockNumber,
-          source: "rpc_recent_creation",
-          updatedAt: ts(),
-        };
-        found++;
-      }
-    }
+    const discovered = await findCreatorsInRange(fromBlock, toBlock, missing, bscRpcBatch);
+    Object.assign(state.creators, discovered);
+    const found = Object.keys(discovered).length;
 
     if (found > 0) {
       lookupState.chainLastSuccessAt = ts();
@@ -10155,6 +10131,7 @@ export const __testables = {
   sendNotificationMaybeAi,
   saveSnapshot,
   serializeMonitorSnapshot,
+  findCreatorsInRange,
   loadSnapshot,
   cachedContractBatch,
   validateActorBlocks,

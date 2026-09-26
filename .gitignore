@@ -41,3 +41,7 @@ Thumbs.db
 
 early-signal-state.json
 early-signal-state.json.tmp
+
+# 内容寻址快照与跨进程 RPC 冷却（不提交运行数据）
+snapshot.json.parts/
+.rpc-cooldowns/

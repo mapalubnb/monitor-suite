@@ -124,6 +124,8 @@ if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/ai-client.mjs "$SHARED_DIR/"
   cp shared/feishu-client.mjs "$SHARED_DIR/"
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
+  cp shared/snapshot-store.cjs "$SHARED_DIR/"
+  cp shared/rpc-control.mjs "$SHARED_DIR/"
   cp shared/startup-notifier.mjs "$SHARED_DIR/"
   cp shared/scan-recovery.mjs "$SHARED_DIR/"
   cp shared/safe-api-setup.mjs "$SHARED_DIR/"
@@ -163,11 +165,11 @@ cd "$FOURMEME_DIR" && npm install --omit=dev && cd - >/dev/null
 pm2 delete fourmeme-monitor 2>/dev/null || true
 # 创建 .env 文件（如不存在）供快捷命令写入配置
 touch "$FOURMEME_DIR/.env"
-pm2 start "$FOURMEME_DIR/monitor.mjs" --name fourmeme-monitor --time
+pm2 start "$FOURMEME_DIR/monitor.mjs" --name fourmeme-monitor --time --kill-timeout 60000
 
 # feishu-bot（如果之前启动过也重建）
 pm2 delete feishu-bot 2>/dev/null || true
-pm2 start "$FOURMEME_DIR/feishu-bot.mjs" --name feishu-bot --time
+pm2 start "$FOURMEME_DIR/feishu-bot.mjs" --name feishu-bot --time --kill-timeout 60000
 
 echo "  fourmeme-monitor ✓"
 
@@ -197,7 +199,7 @@ fi
 cd "$FLAP_DIR" && npm install --omit=dev && cd - >/dev/null
 
 pm2 delete flap-monitor 2>/dev/null || true
-pm2 start "$FLAP_DIR/monitor.mjs" --name flap-monitor --time
+pm2 start "$FLAP_DIR/monitor.mjs" --name flap-monitor --time --kill-timeout 60000
 
 echo "  flap-monitor ✓"
 
@@ -302,7 +304,8 @@ if [ -f "$SNAP" ]; then
   echo ""
   node -e "
     const fs=require('fs');
-    const s=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
+    const raw=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
+    const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$SNAP'):raw;
     const actorPath='$SNAP'.replace(/snapshot\.json$/,'actor-state.json');
     const metricsPath='$SNAP'.replace(/snapshot\.json$/,'runtime-metrics.json');
     try{if(!s._atomicNotifications&&fs.existsSync(actorPath)){const a=JSON.parse(fs.readFileSync(actorPath,'utf-8'));if(a.chainActorMonitor)s.chainActorMonitor=a.chainActorMonitor}}catch{}
@@ -342,7 +345,7 @@ if [ -f "$SNAP" ]; then
       return url&&!removedFrontendUrls.has(url);
     });
     const assetFiles=pageEntries.reduce((sum,[,p])=>sum+(p.assetFiles||[]).length,0);
-    const downloaded=pageEntries.reduce((sum,[,p])=>sum+Object.keys(p.assetContents||{}).length,0);
+    const downloaded=pageEntries.reduce((sum,[,p])=>sum+Object.keys(p.assetContents||p.assetContentRefs||{}).length,0);
     const i18nTotal=pageEntries.reduce((sum,[,p])=>sum+Object.keys(p.i18nStrings||{}).length,0);
     const api=s.apiStructure||{};
     const apiKeys=Object.keys(api);
@@ -404,6 +407,7 @@ if [ -f "$SNAP" ]; then
     console.log('');
 
     console.log('**04｜性能指标**');
+    if(runtime.rpc) console.log('RPC：实际请求 '+runtime.rpc.requested+'｜复用 '+runtime.rpc.reused+'｜冷却跳过 '+runtime.rpc.cooled+'｜排队 '+runtime.rpc.queued);
     const mem=runtime.memory||{};
     console.log('进程内存：RSS '+(mem.rss?Math.round(mem.rss/1024/1024)+' MB':'未知')+'｜堆使用 '+(mem.heapUsed?Math.round(mem.heapUsed/1024/1024)+' MB':'未知'));
     console.log('创建者待补区间：'+JSON.stringify(am.realtimeGaps||[]));
@@ -422,7 +426,7 @@ if [ -f "$SNAP" ]; then
 
     console.log('**06｜前端页面**');
     if(pageEntries.length===0) console.log('暂无页面快照');
-    for(const [index,[k,p]] of pageEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(pageLabel(p.originalUrl||k),p.originalUrl||k)+'｜资源 '+((p.assetFiles||[]).length)+' 个｜已下载 '+Object.keys(p.assetContents||{}).length+' 个｜i18n '+Object.keys(p.i18nStrings||{}).length+' 键');
+    for(const [index,[k,p]] of pageEntries.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(pageLabel(p.originalUrl||k),p.originalUrl||k)+'｜资源 '+((p.assetFiles||[]).length)+' 个｜已下载 '+Object.keys(p.assetContents||p.assetContentRefs||{}).length+' 个｜i18n '+Object.keys(p.i18nStrings||{}).length+' 键');
     console.log('');
 
     console.log('**07｜公开 API**');
@@ -544,7 +548,8 @@ if [ -f "$SNAP" ]; then
   echo ""
   node -e "
     const fs=require('fs');
-    const s=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
+    const raw=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
+    const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$SNAP'):raw;
     const fp=fs.existsSync('$FACTORY_STATE')?JSON.parse(fs.readFileSync('$FACTORY_STATE','utf-8')):{};
     const ci=fs.existsSync('$INTEGRITY_STATE')?JSON.parse(fs.readFileSync('$INTEGRITY_STATE','utf-8')):{};
     const sp=fs.existsSync('$SAFE_STATE')?JSON.parse(fs.readFileSync('$SAFE_STATE','utf-8')):{};
@@ -560,6 +565,8 @@ if [ -f "$SNAP" ]; then
     const robinhoodLaunch='https://flap.sh/launch?vaultfactory='+robinhoodFactory+'&chain=robinhood&lang=zh';
     const pageLabel=(url)=>String(url||'-');
     const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
+    const metricsPath='$SNAP'.replace(/snapshot\.json$/,'runtime-metrics.json');
+    let runtime={};try{if(fs.existsSync(metricsPath))runtime=JSON.parse(fs.readFileSync(metricsPath,'utf-8'))}catch{}
     const pages=s.pages||{};
     const keys=Object.keys(pages);
     const factories=s.vaultFactories||{};
@@ -616,6 +623,8 @@ if [ -f "$SNAP" ]; then
     if(registry.lastError) health.push(warn('金库注册实时查询异常'));
     if(registry.historyError) health.push(warn('金库注册历史补扫受限'));
     if(ci.lastError) health.push(warn('合约完整性检测异常'));
+    if(ci.latestBlock&&ci.httpRealtimeLastBlock&&ci.latestBlock-ci.httpRealtimeLastBlock>50) health.push(warn('合约事件实时扫描延迟 '+(ci.latestBlock-ci.httpRealtimeLastBlock)+' 块'));
+    if(es.latestBlock&&es.realtimeCursor&&es.latestBlock-es.realtimeCursor>50) health.push(warn('提前信号实时扫描延迟 '+(es.latestBlock-es.realtimeCursor)+' 块'));
     if(fp.catchupError) health.push(warn('Factory 历史补扫受限'));
     if(ci.eventHistoryError) health.push(warn('历史合约日志补扫受限'));
     if(sp.lastError) health.push(warn('Safe 提案检测异常'));
@@ -637,6 +646,7 @@ if [ -f "$SNAP" ]; then
     console.log('金库工厂：总数 '+factoryItems.length+' 个｜CAStore 可见 '+visibleFactories+' 个｜已启用 '+enabledVisibleFactories+' 个｜链上金库 '+knownVaults.length+' 个');
     console.log('Factory 底池：资产 '+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
     console.log('Safe 提案：健康 '+healthySafes+'/'+safeStates.length+'｜跟踪中目标 '+activeSafeProposals.length+' 个');
+    if(runtime.rpc) console.log('RPC：实际请求 '+runtime.rpc.requested+'｜复用 '+runtime.rpc.reused+'｜冷却跳过 '+runtime.rpc.cooled+'｜排队 '+runtime.rpc.queued);
     console.log('');
 
     console.log('**03｜页面监控**');
@@ -698,7 +708,8 @@ if [ -f "$SNAP" ]; then
     console.log('');
 
     console.log('**08｜合约与配置完整性**');
-    const integrityStatus=ci.lastError?'需要关注':ci.lastCoreScanAt?'运行正常':'尚未建立';
+    const integrityLag=Math.max(0,(ci.latestBlock||0)-(ci.httpRealtimeLastBlock||ci.latestBlock||0));
+    const integrityStatus=ci.lastError||integrityLag>50?'需要关注':ci.lastCoreScanAt?'运行正常':'尚未建立';
     console.log('监控状态：'+(integrityStatus==='运行正常'?ok(integrityStatus):warn(integrityStatus)));
     console.log('合约目录：'+integrityCatalog+' 个｜已知资产 '+integrityAssets+' 个｜待发送变更 '+((ci.pendingChanges||[]).length)+' 项');
     console.log('精准地址 WSS：'+(integrityWss.status||'尚未建立')+'｜已订阅 '+(Number(integrityWss.subscribedCount)||0)+'/'+(Number(integrityWss.configuredCount)||0));
@@ -885,7 +896,8 @@ FL_SNAP="/root/monitor-suite/flap-monitor/snapshot.json"
 [ -f "$FL_SNAP" ] || FL_SNAP="/root/flap-monitor/snapshot.json"
 if [ -f "$FM_SNAP" ]; then
   node -e "
-    const s=JSON.parse(require('fs').readFileSync('$FM_SNAP','utf-8'));
+    const raw=JSON.parse(require('fs').readFileSync('$FM_SNAP','utf-8'));
+    const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$FM_SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$FM_SNAP'):raw;
     const pools=(s.poolConfig||[]).length;
     const nets={};for(const p of s.poolConfig||[]){const n=p.networkCode||'?';nets[n]=(nets[n]||0)+1}
     const netStr=Object.entries(nets).map(([k,v])=>k+':'+v).join(' ');
@@ -917,7 +929,8 @@ else
 fi
 if [ -f "$FL_SNAP" ]; then
   node -e "
-    const s=JSON.parse(require('fs').readFileSync('$FL_SNAP','utf-8'));
+    const raw=JSON.parse(require('fs').readFileSync('$FL_SNAP','utf-8'));
+    const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$FL_SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$FL_SNAP'):raw;
     const pages=Object.keys(s.pages||{}).length;
     const factories=Object.values(s.vaultFactories||{}).filter(v=>v&&v.showInCAStore).length;
     const registry=Object.keys((s.registryMonitor||{}).knownVaults||{}).length;

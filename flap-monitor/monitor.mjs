@@ -1,3 +1,5 @@
+import { createRpcControl, rpcCacheTtl, createRpcErrorLogger } from "../shared/rpc-control.mjs";
+import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 /**
@@ -797,7 +799,7 @@ function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 /* ── 工具函数 ── */
 const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
-const log = (msg) => console.log(`[${ts()}] ${msg}`);
+const log = createRpcErrorLogger(msg => console.log(`[${ts()}] ${msg}`));
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 
 function emptyFlapChangeMeta() {
@@ -828,10 +830,10 @@ const METADATA_OUTPUT_FIELDS = new Set(["name", "symbol", "description", "image"
 function loadSnapshot() {
   try {
     if (existsSync(CONFIG.snapshotFile)) {
-      const data = JSON.parse(readFileSync(CONFIG.snapshotFile, "utf-8"));
+      const data = readSnapshot(CONFIG.snapshotFile);
       return migrateSnapshot(data);
     }
-  } catch { /* ignore */ }
+  } catch (error) { throw new Error(`快照读取失败，停止启动以保护基线：${error.message}`); }
   return null;
 }
 
@@ -874,16 +876,19 @@ function migrateSnapshot(data) {
   return data;
 }
 
+let snapshotStore, snapshotStorePath;
+function getSnapshotStore() {
+  if (snapshotStorePath !== CONFIG.snapshotFile) { snapshotStorePath = CONFIG.snapshotFile; snapshotStore = createSnapshotStore(snapshotStorePath); }
+  return snapshotStore;
+}
 function saveSnapshot(data) {
   data.lastCheck = ts();
   data._schemaVersion = CURRENT_SCHEMA_VERSION;
-  try {
-    const tmpFile = CONFIG.snapshotFile + ".tmp";
-    writeFileSync(tmpFile, JSON.stringify(data, null, 2), "utf-8");
-    renameSync(tmpFile, CONFIG.snapshotFile);
-  } catch (err) {
-    log(`[快照] 写入失败：${err.message}`);
-  }
+  getSnapshotStore().write(data);
+}
+function saveRegistrySnapshot(snapshot) {
+  if (!existsSync(CONFIG.snapshotFile)) return saveSnapshot(snapshot);
+  getSnapshotStore().update({ registryMonitor: snapshot.registryMonitor, lastCheck: ts() });
 }
 
 /* ── 飞书消息（SDK 统一通道） ── */
@@ -1113,10 +1118,6 @@ function formatFlapResourceStats(assetStats) {
   return `- 不变 ${assetStats.unchanged || 0} / 重命名 ${assetStats.renamed || 0} / 修改 ${assetStats.modified || 0} / 新增 ${assetStats.added || 0} / 移除 ${assetStats.removed || 0}`;
 }
 
-function shortHash(value, head = 8, tail = 4) {
-  const text = String(value || "");
-  return text || "-";
-}
 
 function addressLink(address, type = "address") {
   const value = String(address || "");
@@ -2641,6 +2642,7 @@ function numberToHex(value) {
   return `0x${Math.max(0, Number(value) || 0).toString(16)}`;
 }
 
+const rpcControl = createRpcControl({ directory: IS_TEST_MODE ? "" : join(__dirname, "..", ".rpc-cooldowns") });
 const preferredBscRpcIndexByKey = new Map();
 const bscRpcHealthByKey = new Map();
 
@@ -2676,7 +2678,7 @@ function bscRpcTimeoutMs(method, params = []) {
 function orderedBscRpcIndexes(preferenceKey) {
   const health = bscRpcHealthByKey.get(preferenceKey) || new Map();
   const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey);
-  return CONFIG.bscRpcUrls.map((_, index) => index).sort((left, right) => {
+  return CONFIG.bscRpcUrls.map((_, index) => index).filter(index => !rpcControl.cooldown(CONFIG.bscRpcUrls[index])).sort((left, right) => {
     const leftHealth = health.get(left);
     const rightHealth = health.get(right);
     const leftLatency = leftHealth?.failedAt && Date.now() - leftHealth.failedAt > 60_000 ? null : leftHealth?.latencyMs;
@@ -2711,6 +2713,7 @@ function resetBscRpcHealth() {
   logRpcCooldowns.clear();
   logRpcProviderCooldowns.clear();
   logRpcHeads.clear();
+  rpcControl.reset();
 }
 
 function dedupeBscLogs(logs = []) {
@@ -2731,25 +2734,49 @@ const logRpcProviderCooldowns = new Map();
 const logRpcHeads = new Map();
 let activeLogRequests = 0, activeHistoryLogRequests = 0;
 const logRequestWaiters = [];
+let liveLogTurns = 0;
 function pumpLogRequests() {
   while (activeLogRequests < 2) {
-    let index = logRequestWaiters.findIndex(item => !item.history);
+    let index = activeHistoryLogRequests === 0 && liveLogTurns >= 8 ? logRequestWaiters.findIndex(item => item.history) : -1;
+    if (index < 0) index = logRequestWaiters.findIndex(item => !item.history);
     if (index < 0 && activeHistoryLogRequests === 0) index = logRequestWaiters.findIndex(item => item.history);
     if (index < 0) break;
     const item = logRequestWaiters.splice(index, 1)[0];
     activeLogRequests++;
-    if (item.history) activeHistoryLogRequests++;
+    if (item.history) { activeHistoryLogRequests++; liveLogTurns = 0; } else liveLogTurns++;
     item.resolve();
   }
 }
-async function executeBscGetLogsRequest(params, options = {}) {
+function executeBscGetLogsRequest(params, options = {}) {
+  return rpcControl.coalesce("logs:" + JSON.stringify([CONFIG.bscRpcUrls, params, options]), () => executeBscGetLogsUnshared(params, options));
+}
+async function executeBscGetLogsUnshared(params, options = {}) {
   const history = options.history ?? bscRpcPreferenceKey("eth_getLogs", params).endsWith(":history");
   await new Promise(resolve => { logRequestWaiters.push({ history, resolve }); pumpLogRequests(); });
   try { return await queryBscLogs(params, options); }
   finally { activeLogRequests--; if (history) activeHistoryLogRequests--; pumpLogRequests(); }
 }
+async function fetchRpcJson(url, payload, timeoutMs, signal) {
+  const effectiveSignal = signal || AbortSignal.timeout(timeoutMs);
+  return rpcControl.withEndpoint(url, async () => {
+    try {
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload), signal: effectiveSignal });
+      if (!response.ok) {
+        const error = new Error("HTTP " + response.status);
+        rpcControl.failure(url, error, response);
+        await response.body?.cancel?.();
+        throw error;
+      }
+      const json = await response.json();
+      for (const item of Array.isArray(json) ? json : [json]) if (item?.error) rpcControl.failure(url, new Error(item.error.message || "RPC error"));
+      return json;
+    } catch (error) { rpcControl.failure(url, error); throw error; }
+  }, effectiveSignal);
+}
 async function queryBscLogs(params, options) {
   const urls = options.rpcUrls || (IS_TEST_MODE ? CONFIG.bscRpcUrls : [...new Set([
+    ...(options.history && process.env.FLAP_FACTORY_ARCHIVE_RPC_URL ? [process.env.FLAP_FACTORY_ARCHIVE_RPC_URL] : []),
     ...(process.env.FLAP_LOG_RPC_URLS || "https://fast.bsc-rpc.com,https://bsc.publicnode.com").split(",").map(s => s.trim()).filter(Boolean),
     ...CONFIG.bscRpcUrls,
   ])]);
@@ -2759,9 +2786,11 @@ async function queryBscLogs(params, options) {
   for (const url of urls) {
     const from = Number(params[0]?.fromBlock || 0), to = Number(params[0]?.toBlock || 0);
     const host = new URL(url).hostname;
+    const sharedCooling = rpcControl.cooldown(url);
+    if (sharedCooling) { errors.push(host + ": " + sharedCooling.reason); continue; }
     // Pruned archives and unsupported wide windows must not quarantine current blocks.
     const filterClass = JSON.stringify({ address: params[0]?.address || null, topics: params[0]?.topics || [] });
-    const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + (to - from > 49 ? "wide" : "narrow") + ":" + filterClass;
+    const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + Math.ceil(Math.log2(Math.max(1, to - from + 1))) + ":" + filterClass;
     const providerKey = url + ":" + history;
     const archiveKey = providerKey + ":archive:" + Math.floor(from / 8192);
     const providerCooling = [logRpcProviderCooldowns.get(providerKey), logRpcProviderCooldowns.get(archiveKey)]
@@ -2770,10 +2799,7 @@ async function queryBscLogs(params, options) {
     const cooling = logRpcCooldowns.get(key);
     if (cooling?.until > Date.now()) { errors.push(cooling.message); continue; }
     try {
-      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getLogs", params }), signal: AbortSignal.timeout(timeoutMs) });
-      if (!response.ok) throw new Error("HTTP " + response.status);
-      const json = await response.json();
+      const json = await fetchRpcJson(url, { jsonrpc: "2.0", id: 1, method: "eth_getLogs", params }, timeoutMs);
       if (json?.error) throw new Error(json.error.message || "RPC error");
       if (!Array.isArray(json?.result)) throw new Error("eth_getLogs 返回非数组");
       const logs = dedupeBscLogs(json.result);
@@ -2782,10 +2808,8 @@ async function queryBscLogs(params, options) {
       if (history === "eth_getLogs:realtime" && Number.isSafeInteger(to) && to > 0) {
         let cached = logRpcHeads.get(url);
         if (!cached || cached.head < to || Date.now() - cached.at > 10_000) {
-          const headResponse = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_blockNumber", params: [] }), signal: AbortSignal.timeout(timeoutMs) });
-          if (!headResponse.ok) throw new Error("节点高度校验 HTTP " + headResponse.status);
-          const headJson = await headResponse.json();
+          const headJson = await rpcControl.coalesce("head:" + url,
+            () => fetchRpcJson(url, { jsonrpc: "2.0", id: 2, method: "eth_blockNumber", params: [] }, timeoutMs), 100);
           if (headJson.error || !/^0x[0-9a-f]+$/i.test(headJson.result || "")) throw new Error("节点高度校验失败");
           cached = { head: Number(headJson.result), at: Date.now() };
           logRpcHeads.set(url, cached);
@@ -2800,61 +2824,67 @@ async function queryBscLogs(params, options) {
       errors.push(message);
       const cooldown = /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 30_000;
       logRpcCooldowns.set(key, { until: Date.now() + cooldown, message });
-      if (/HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical/i.test(error.message)) {
-        const scope = /only serves recent|archive|historical/i.test(error.message) ? archiveKey : providerKey;
+      if (/HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical|header not found/i.test(error.message)) {
+        const scope = /only serves recent|archive|historical|header not found/i.test(error.message) ? archiveKey : providerKey;
         logRpcProviderCooldowns.set(scope, { until: Date.now() + cooldown, message });
       }
       if (logRpcCooldowns.size > 256) for (const [cached, entry] of logRpcCooldowns) if (entry.until <= Date.now()) logRpcCooldowns.delete(cached);
     }
   }
+  const from = Number(params[0]?.fromBlock), to = Number(params[0]?.toBlock);
+  if (Number.isSafeInteger(from) && to > from && errors.some(message => /maximum block range|exceed.*range|range.*limit|response too large|too many results/i.test(message))) {
+    const middle = from + Math.floor((to - from) / 2);
+    const left = await queryBscLogs([{ ...params[0], toBlock: numberToHex(middle) }], options);
+    const right = await queryBscLogs([{ ...params[0], fromBlock: numberToHex(middle + 1) }], options);
+    return dedupeBscLogs([...left, ...right]);
+  }
   throw new Error((emptyProviders.size ? "eth_getLogs 仅一个节点返回空结果，未达到双节点一致；" : "eth_getLogs 无可用节点；") + [...new Set(errors)].join("；"));
 }
 
-async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null) {
+async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null, validationKey = "default") {
+  // Validation belongs to each consumer; the shared operation validates the wire response.
+  const json = await rpcControl.coalesce(JSON.stringify([CONFIG.bscRpcUrls, payload, timeoutMs, validationKey]),
+    () => raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse), rpcCacheTtl(payload));
+  if (validateResponse) validateResponse(json);
+  return json;
+}
+async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse) {
   const indexes = orderedBscRpcIndexes(preferenceKey);
-  const controllers = [];
-  let settled = false;
-  const attempts = indexes.map((index, position) => (async () => {
-    if (position > 0) await sleep(CONFIG.factoryPoolMonitor.rpcHedgeDelayMs * position);
-    if (settled) throw new Error("RPC 请求已由更快节点完成");
-    const controller = new AbortController();
-    controllers.push(controller);
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-    const startedAt = Date.now();
-    try {
-      const response = await fetch(CONFIG.bscRpcUrls[index], {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const json = await response.json();
-      if (!Array.isArray(json) && json?.error) throw new Error(json.error.message || JSON.stringify(json.error));
-      if (validateResponse) validateResponse(json);
-      if (settled) throw new Error("RPC 请求已由更快节点完成");
-      settled = true;
-      const latencyMs = Math.max(1, Date.now() - startedAt);
-      preferredBscRpcIndexByKey.set(preferenceKey, index);
-      updateBscRpcHealth(preferenceKey, index, latencyMs);
-      for (const other of controllers) if (other !== controller) other.abort();
-      return json;
-    } catch (error) {
-      if (!settled) updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt, true);
-      throw error;
-    } finally {
-      clearTimeout(timer);
+  if (!indexes.length) throw new Error("所有 RPC 节点处于共享冷却，等待恢复");
+  const controllers = [], errors = [];
+  let settled = false, position = 0;
+  const latency = bscRpcHealthByKey.get(preferenceKey)?.get(indexes[0])?.latencyMs;
+  const hedgeDelay = Math.min(timeoutMs / 2, Math.max(CONFIG.factoryPoolMonitor.rpcHedgeDelayMs, latency && latency < 5000 ? latency * 2 : 0));
+  let hedgeTimer, releaseHedge;
+  const hedgeReady = new Promise(resolve => { releaseHedge = resolve; hedgeTimer = setTimeout(resolve, hedgeDelay); });
+  async function worker(secondary) {
+    if (secondary) await hedgeReady;
+    while (!settled && position < indexes.length) {
+      const index = indexes[position++], url = CONFIG.bscRpcUrls[index];
+      const controller = new AbortController(); controllers.push(controller);
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const startedAt = Date.now();
+      try {
+        const json = await fetchRpcJson(url, payload, timeoutMs, controller.signal);
+        if (!Array.isArray(json) && json?.error) throw new Error(json.error.message || "RPC error");
+        if (Array.isArray(payload) ? !Array.isArray(json) : !json || !("result" in json)) throw new Error("RPC 返回无效结果");
+        if (Array.isArray(json) && json.every(item => item?.error || item?.result == null)) throw new Error("Batch RPC 全部读取失败");
+        if (validateResponse) validateResponse(json);
+        if (settled) throw new Error("RPC 请求已由其他节点完成");
+        settled = true;
+        preferredBscRpcIndexByKey.set(preferenceKey, index);
+        updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt);
+        for (const other of controllers) if (other !== controller) other.abort();
+        return json;
+      } catch (error) {
+        if (!settled) { errors.push(new URL(url).hostname + ": " + error.message); updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt, true); }
+      } finally { clearTimeout(timer); }
     }
-  })());
-  try {
-    return await Promise.any(attempts);
-  } catch (error) {
-    const messages = (error?.errors || []).map(item => item?.message).filter(message => message && !message.includes("更快节点完成"));
-    throw new Error(messages.at(-1) || error?.message || "所有 BSC RPC 节点均不可用");
-  } finally {
-    settled = true;
-    for (const controller of controllers) controller.abort();
+    throw new Error(errors.at(-1) || "没有可用 RPC 结果");
   }
+  try { return await Promise.any([worker(false), worker(true)]); }
+  catch { throw new Error([...new Set(errors)].join("；") || "所有 BSC RPC 节点均不可用"); }
+  finally { settled = true; clearTimeout(hedgeTimer); releaseHedge(); for (const controller of controllers) controller.abort(); }
 }
 
 async function bscRpcCall(method, params = [], options = {}) {
@@ -2871,7 +2901,7 @@ async function bscRpcCall(method, params = [], options = {}) {
     json => {
       if (json?.error) throw new Error(json.error.message || JSON.stringify(json.error));
       if (options.requireResult && json?.result == null) throw new Error(`${method} 返回空结果`);
-    },
+    }, options.requireResult ? "required-result" : "optional-result",
   );
   return json.result;
 }
@@ -2889,7 +2919,7 @@ async function bscRpcBatch(calls = [], options = {}) {
     if (payload.some(item => !byId.get(item.id) || byId.get(item.id).error || byId.get(item.id).result == null)) {
       throw new Error("Batch RPC 存在空结果");
     }
-  });
+  }, options.requireAllResults ? "all-results" : "partial-results");
   if (!Array.isArray(json)) throw new Error("Batch RPC 返回非数组");
   const byId = new Map(json.map(item => [item.id, item]));
   const results = payload.map(item => {
@@ -6428,7 +6458,7 @@ async function runFlapContractIntegrityPass(state, {
   if (Date.now() >= (state.eventHistoryNextAt || 0)) {
     try {
       await scanContractIntegrityEvents({ state, rpcCall: (method, params) => bscRpcCall(method, params, { history: true }), latestBlock: state.latestBlock,
-        maxBlocks: 50, suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled });
+        maxBlocks: CONFIG.contractIntegrityMonitor.eventMaxBlocksPerRun, suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled });
       state.eventHistoryError = "";
       state.eventHistoryNextAt = Date.now() + 10_000;
     } catch (error) {
@@ -6463,7 +6493,7 @@ async function deliverFlapContractIntegrityChanges(state, {
     "red",
   );
   if (!messageId) return { sent: false, changes };
-  acknowledgeFn(state, changes.map(change => change.id));
+  await acknowledgeFn(state, changes.map(change => change.id));
   saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
   return { sent: true, changes, messageId };
 }
@@ -6492,7 +6522,7 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
       ? await sendCardFn(title, content, "yellow")
       : await sendAlertCard(sendCardFn, title, content, "red");
     if (!messageId) continue;
-    acknowledgeFn(state, changes.map(change => change.id));
+    await acknowledgeFn(state, changes.map(change => change.id));
     saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
     delivered.push(...changes);
     messageIds.push(messageId);
@@ -6735,30 +6765,6 @@ async function runCheck() {
    持续监控模式（主循环）
    ══════════════════════════════════════════ */
 
-function factoryPoolWssDisplay(state = {}) {
-  const health = state.wssHealth;
-  if (!health || health.enabled !== true) {
-    return { status: "未启用", statusCode: "disabled", subscribed: "0/0", backfill: "未启用", backfillStatus: "disabled", lastSubscribed: "暂无", lastEvent: "暂无", wssError: "", backfillError: "" };
-  }
-  const statusMap = { healthy: "运行正常", degraded: "部分可用", connecting: "连接中", reconnecting: "重连中", stopped: "已停止", disabled: "未启用" };
-  const backfillStatus = health.backfill?.status || "idle";
-  const backfillMap = { idle: "等待", running: "进行中", completed: "已完成", failed: "失败" };
-  const backfillLabel = backfillMap[backfillStatus] || backfillStatus;
-  const backfill = backfillStatus === "completed" && Number.isFinite(Number(health.backfill?.fromBlock))
-    ? `${backfillLabel}｜范围 ${health.backfill.fromBlock} → ${health.backfill.toBlock}｜事件 ${Number(health.backfill.eventCount) || 0} 条`
-    : backfillLabel;
-  return {
-    status: statusMap[health.status] || health.status || "未知",
-    statusCode: health.status || "unknown",
-    subscribed: `${Number(health.subscribedCount) || 0}/${Number(health.configuredCount) || 0}`,
-    backfill,
-    backfillStatus,
-    lastSubscribed: health.lastSubscribedAt ? new Date(health.lastSubscribedAt).toLocaleString("zh-CN", { hour12: false }) : "暂无",
-    lastEvent: health.lastEventAt ? new Date(health.lastEventAt).toLocaleString("zh-CN", { hour12: false }) : "暂无",
-    wssError: health.lastError || "",
-    backfillError: health.backfill?.lastError || "",
-  };
-}
 
 function safeProposalDisplay(state = {}) {
   const safeStates = Object.values(state.safes || {});
@@ -6798,6 +6804,25 @@ function buildFlapRestartCard(snapshot, checks, factoryState) {
 
 async function startMonitor() {
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
+  const scheduledRuns = new Set();
+  const scheduledTimers = new Set();
+  function scheduleTask(run, delay) {
+    if (isShuttingDown) return;
+    const timer = setTimeout(() => {
+      scheduledTimers.delete(timer);
+      if (isShuttingDown) return;
+      const flight = Promise.resolve().then(run).catch(error => log(`[调度] ${error.message}`));
+      scheduledRuns.add(flight);
+      void flight.finally(() => scheduledRuns.delete(flight));
+    }, delay);
+    scheduledTimers.add(timer);
+  }
+  global.__scheduledDrain = async () => {
+    for (const timer of scheduledTimers) clearTimeout(timer);
+    scheduledTimers.clear();
+    await Promise.allSettled([...scheduledRuns]);
+    saveSnapshot(snapshot);
+  };
   const factoryPoolState = loadFactoryPoolState(CONFIG.factoryPoolMonitor.stateFile, CONFIG.factoryPoolMonitor.proxy);
   const contractIntegrityState = loadContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile);
   const safeProposalState = loadSafeProposalState(
@@ -6823,6 +6848,13 @@ async function startMonitor() {
   });
   global.__startupNotifier = startupNotifier;
   void startupNotifier.refresh();
+  let lastMetricsAt = 0;
+  function saveRpcMetrics() {
+    if (Date.now() - lastMetricsAt < 10_000) return;
+    const file = join(__dirname, "runtime-metrics.json");
+    writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage() }));
+    renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
+  }
   const receiptHints = new Map(), priorityTokens = new Set(), externalJobs = new Map();
   let earlyDeliveryPromise = null;
   function deliverEarly() {
@@ -6843,9 +6875,10 @@ async function startMonitor() {
     onError: error => log(`[Flap 提前信号] ${error.message}`),
     run: async () => {
       if (isShuttingDown) return;
+      saveRpcMetrics();
       const previous = JSON.stringify(Object.entries(earlySignalState.health).map(([name,h]) => [name,h.lastError]));
       const knownTokens = new Set(Object.keys(earlySignalState.tokens));
-      const result = await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain", realtime: true, bootstrapBlocks: 20, maxBlocksPerRun: 50 }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
+      const result = await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain", realtime: true, bootstrapBlocks: 20 }, rpcBatch: bscRpcBatch, safeState: safeProposalState });
       saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
       refreshEarlyFeeds();
       prioritize(Object.keys(earlySignalState.tokens).filter(token => !knownTokens.has(token)));
@@ -6856,7 +6889,7 @@ async function startMonitor() {
     onError: error => log("[Flap 提前信号补扫] " + error.message),
     run: async () => {
       if (isShuttingDown) return;
-      await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain", maxBlocksPerRun: 50 }, rpcBatch: (calls, opts) => bscRpcBatch(calls, { ...opts, history: true }), safeState: safeProposalState });
+      await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain" }, rpcBatch: (calls, opts) => bscRpcBatch(calls, { ...opts, history: true }), safeState: safeProposalState });
       saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
       void deliverEarly();
     } });
@@ -6868,7 +6901,7 @@ async function startMonitor() {
       log(`[Flap 快速回执] ${error.message}`);
     }, run: async () => {
       if (isShuttingDown || Date.now() < fastRetryAt) return;
-      for (const [hash, hint] of receiptHints) if (Number(hint.blockNumber) <= (earlySignalState.cursor ?? -1)) receiptHints.delete(hash);
+      for (const [hash, hint] of receiptHints) if (Number(hint.blockNumber) <= (earlySignalState.realtimeCursor ?? earlySignalState.cursor ?? -1)) receiptHints.delete(hash);
       if (!receiptHints.size && !Object.keys(earlySignalState.fastBlocks || {}).length) return;
       const result = await processEarlyReceiptHints(earlySignalState, [...receiptHints.values()], earlySignalConfig(), bscRpcBatch);
       for (const hash of result.processed) receiptHints.delete(hash);
@@ -6921,7 +6954,7 @@ async function startMonitor() {
       } catch (error) {
         snapshot.registryMonitor.lastError = error.message;
         throw error;
-      } finally { saveSnapshot(snapshot); }
+      } finally { saveRegistrySnapshot(snapshot); }
     } });
   const registryHistoryJob = createWakeableJob({ intervalMs: CONFIG.registryMonitor.intervalMs,
     onError: error => log(`[Flap Vault Portal 历史] ${error.message}`), run: async () => {
@@ -6936,7 +6969,7 @@ async function startMonitor() {
         state.historyError = error.message;
         state.historyNextAt = Date.now() + 60_000;
         throw error;
-      } finally { saveSnapshot(snapshot); }
+      } finally { saveRegistrySnapshot(snapshot); }
     } });
   if (CONFIG.registryMonitor.enabled) { registryJob.start(); registryHistoryJob.start(); }
   const registryFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.wsEnabled ? createFactoryPoolWsFeed({
@@ -6979,19 +7012,14 @@ async function startMonitor() {
       if (pendingCount === 0) return { sent: false };
       if (!canAttemptFeishuDelivery()) return { sent: false, deliveryDeferred: true };
       try {
-        const changes = await enqueueContractIntegrityMutation(() => [...contractIntegrityState.pendingChanges]);
-        const messageId = await sendAlertCard(
-          sendCardViaApi,
-          `${titlePrefix}Flap 合约与配置完整性变更`,
-          buildContractIntegrityContent(changes, contractIntegrityState),
-          "red",
-        );
-        if (!messageId) return { sent: false };
-        await enqueueContractIntegrityMutation(() => {
-          acknowledgeContractIntegrityChanges(contractIntegrityState, changes.map(change => change.id));
-          saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
+        return await deliverFlapContractIntegrityChanges(contractIntegrityState, {
+          titlePrefix,
+          acknowledgeFn: (_state, ids) => enqueueContractIntegrityMutation(() => {
+            acknowledgeContractIntegrityChanges(contractIntegrityState, ids);
+            saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
+          }),
+          saveStateFn: () => {},
         });
-        return { sent: true };
       } catch (error) {
         log(`[Flap 合约完整性] 待发送变更已保留：${error.message}`);
         return { sent: false, error };
@@ -7041,7 +7069,7 @@ async function startMonitor() {
   }
 
   async function contractIntegrityPoll({ suppressNotifications = false, forceExtended = false, forceCodeAudit = false } = {}) {
-    if (!CONFIG.contractIntegrityMonitor.enabled) return;
+    if (isShuttingDown || !CONFIG.contractIntegrityMonitor.enabled) return;
     const now = Date.now();
     const extendedDue = forceExtended || now - (Date.parse(contractIntegrityState.lastExtendedScanAt || "") || 0) >= CONFIG.contractIntegrityMonitor.extendedIntervalMs;
     const codeAuditDue = forceCodeAudit || now - (Date.parse(contractIntegrityState.lastCodeAuditAt || "") || 0) >= CONFIG.contractIntegrityMonitor.codeAuditIntervalMs;
@@ -7085,7 +7113,7 @@ async function startMonitor() {
   }
 
   async function safeProposalPoll({ suppressNotifications = false, titlePrefix = "" } = {}) {
-    if (!CONFIG.safeProposalMonitor.enabled) return { changed: false, skipped: true };
+    if (isShuttingDown || !CONFIG.safeProposalMonitor.enabled) return { changed: false, skipped: true };
     if (safeProposalPollPromise) return await safeProposalPollPromise;
     safeProposalPollPromise = (async () => {
       const previousError = safeProposalState.lastError || "";
@@ -7308,7 +7336,7 @@ async function startMonitor() {
     return isFactoryRealtimeScanning || getFactoryRealtimeLag() > CONFIG.factoryPoolMonitor.realtimeMaxBlocksPerRun;
   }
   async function factoryPoolRealtimePoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryRealtimeScanning) return;
+    if (isShuttingDown || !CONFIG.factoryPoolMonitor.enabled || isFactoryRealtimeScanning) return;
     isFactoryRealtimeScanning = true;
     try {
       await checkFlapFactoryPools(factoryPoolState, {
@@ -7324,7 +7352,7 @@ async function startMonitor() {
   }
 
   async function factoryPoolAssetPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryAssetScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
+    if (isShuttingDown || !CONFIG.factoryPoolMonitor.enabled || isFactoryAssetScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
     isFactoryAssetScanning = true;
     isFactoryBackgroundScanning = true;
     try {
@@ -7342,7 +7370,7 @@ async function startMonitor() {
   }
 
   async function factoryPoolCatchupPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryCatchupScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
+    if (isShuttingDown || !CONFIG.factoryPoolMonitor.enabled || isFactoryCatchupScanning || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
     isFactoryCatchupScanning = true;
     isFactoryBackgroundScanning = true;
     try {
@@ -7360,7 +7388,7 @@ async function startMonitor() {
   }
 
   function scheduleFactoryRealtimeNext(delayMs = CONFIG.factoryPoolMonitor.intervalMs) {
-    setTimeout(async () => {
+    scheduleTask(async () => {
       const startedAt = Date.now();
       await factoryPoolRealtimePoll();
       const elapsed = Date.now() - startedAt;
@@ -7378,14 +7406,14 @@ async function startMonitor() {
     CONFIG.factoryPoolMonitor.catchupIntervalMs,
   ) / 2));
   async function factoryPoolBackgroundPoll() {
-    if (!CONFIG.factoryPoolMonitor.enabled || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
+    if (isShuttingDown || !CONFIG.factoryPoolMonitor.enabled || isFactoryBackgroundScanning || shouldDeferFactoryBackgroundScan()) return;
     const taskName = FACTORY_BACKGROUND_TASK_ORDER[factoryBackgroundTaskIndex];
     const task = factoryBackgroundTasks[taskName];
     factoryBackgroundTaskIndex = (factoryBackgroundTaskIndex + 1) % FACTORY_BACKGROUND_TASK_ORDER.length;
     await task();
   }
   function scheduleFactoryBackgroundNext() {
-    setTimeout(async () => {
+    scheduleTask(async () => {
       await factoryPoolBackgroundPoll();
       scheduleFactoryBackgroundNext();
     }, factoryBackgroundTickMs);
@@ -7394,8 +7422,8 @@ async function startMonitor() {
   scheduleFactoryBackgroundNext();
 
   function scheduleContractIntegrityNext(delayMs = CONFIG.contractIntegrityMonitor.coreIntervalMs) {
-    if (!CONFIG.contractIntegrityMonitor.enabled) return;
-    setTimeout(async () => {
+    if (isShuttingDown || !CONFIG.contractIntegrityMonitor.enabled) return;
+    scheduleTask(async () => {
       const startedAt = Date.now();
       await contractIntegrityPoll();
       scheduleContractIntegrityNext(Math.max(250, CONFIG.contractIntegrityMonitor.coreIntervalMs - (Date.now() - startedAt)));
@@ -7405,7 +7433,7 @@ async function startMonitor() {
 
   function scheduleSafeProposalNext(delayMs = CONFIG.safeProposalMonitor.intervalMs) {
     if (!CONFIG.safeProposalMonitor.enabled) return;
-    setTimeout(async () => {
+    scheduleTask(async () => {
       const startedAt = Date.now();
       try {
         await safeProposalPoll();
@@ -7425,6 +7453,7 @@ async function startMonitor() {
   // 轮询函数：并行检测所有页面
   let pendingPoll = false;
   async function poll() {
+    if (isShuttingDown) return;
     if (isPolling) {
       pendingPoll = true;  // 记录有待执行的轮询
       return;
@@ -7703,7 +7732,7 @@ async function startMonitor() {
   // 带抖动的定时轮询
   function scheduleNext() {
     const interval = CONFIG.pollIntervalMs + (Math.random() - 0.5) * 2 * CONFIG.jitterMs;
-    setTimeout(async () => {
+    scheduleTask(async () => {
       try { await poll(); }
       catch (err) { log(`[轮询异常] ${err.message}`); }
       finally { scheduleNext(); }
@@ -7725,6 +7754,7 @@ async function gracefulShutdown(signal) {
   if (isShuttingDown) return;
   isShuttingDown = true;
   global.__startupNotifier?.stop();
+  const scheduledDrain = global.__scheduledDrain?.().catch(error => log(`[退出保存] ${error.message}`));
   log(`收到 ${signal}，正在优雅退出……`);
   if (global.__factoryPoolWsFeed) {
     global.__factoryPoolWsFeed.stop();
@@ -7754,9 +7784,9 @@ async function gracefulShutdown(signal) {
   if (global.__earlySignalDrain) {
     try { await global.__earlySignalDrain(); } catch (error) { log("提前信号停机保存失败：" + error.message); }
   }
+  if (scheduledDrain) await scheduledDrain;
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
-  try { saveSnapshot(loadSnapshot() || {}); } catch {}
   process.exit(0);
 }
 if (!IS_TEST_MODE) {
@@ -7829,6 +7859,7 @@ export const __testables = {
   processFactoryPoolFeedEvent,
   backfillFactoryPoolFeedEvents,
   resetBscRpcHealth,
+  rpcControl,
   buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,
   extractVaultFactories,

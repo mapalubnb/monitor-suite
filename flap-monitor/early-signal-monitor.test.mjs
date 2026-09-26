@@ -68,7 +68,7 @@ test("fast receipt anchors detect reorg before HTTP cursor reaches that block", 
   assert.equal(Object.keys(state.fastBlocks).length, 0);
   assert.ok(state.pendingChanges.some(e => e.kind === "reorg"));
   assert.equal(state.pendingChanges.some(e => e.kind === "liquidityAdded"), false);
-  assert.equal(state.cursor, block - 1);
+  assert.equal(state.cursor, block - 129);
 });
 
 test("unrelated global pool logs stay off the fast lane until a token becomes relevant", () => {
@@ -386,4 +386,19 @@ test('unrelated public pair discovery does not download transaction receipts', a
   await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
   assert.equal(state.cursor, 100);
   assert.equal(state.pendingChanges.length, 0);
+});
+
+
+test('fast-lane reorg preserves old history and does not drag realtime back to historical cursor', async () => {
+  const state = createEarlySignalState();
+  state.cursor = 100; state.historyEndBlock = 900; state.realtimeCursor = 999;
+  state.chainBaselineAt = new Date(nowMs).toISOString(); state.fastBlocks[1000] = BH;
+  state.events.older = { id: 'older', blockNumber: 500, kind: 'observation' };
+  state.events.recent = { id: 'recent', blockNumber: 999, kind: 'observation' };
+  const rpc = async calls => calls.map(c => ({ eth_chainId: '0x38', eth_blockNumber: '0x3ea', eth_getBlockByNumber: { hash: '0x' + 'ee'.repeat(32) } })[c.method]);
+  await processEarlyReceiptHints(state, [], { confirmations: 1 }, rpc, nowMs);
+  assert.equal(state.cursor, 100);
+  assert.equal(state.realtimeCursor, 871);
+  assert.ok(state.events.older);
+  assert.equal(state.events.recent, undefined);
 });

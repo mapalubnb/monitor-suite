@@ -1611,3 +1611,21 @@ test('snapshot serialization reuses stable frontend sections and includes new tr
   next.frontendPages = { page: { text: 'new' } };
   assert.equal(JSON.parse(__testables.serializeMonitorSnapshot(next)).frontendPages.page.text, 'new');
 });
+
+
+test('creator discovery streams bounded blocks and reads only deployment receipts', async () => {
+  const address = '0x' + 'ab'.repeat(20), creator = '0x' + 'cd'.repeat(20), txHash = '0x' + 'ef'.repeat(32);
+  const requests = [];
+  const rpc = async calls => {
+    requests.push(calls);
+    return calls.map(call => call.method === 'eth_getBlockByNumber'
+      ? { number: call.params[0], transactions: Number(call.params[0]) === 12 ? [{ to: null, from: creator, hash: txHash }] : [{ to: address, from: creator, hash: txHash }] }
+      : { contractAddress: address });
+  };
+  const found = await __testables.findCreatorsInRange(1, 30, [address], rpc);
+  assert.equal(found[address].creator, creator);
+  assert.ok(requests.every(batch => batch.length <= 8));
+  assert.equal(requests.flat().filter(call => call.method === 'eth_getTransactionReceipt').length, 1);
+  assert.equal(requests.flat().some(call => call.method === 'eth_getBlockReceipts'), false);
+  await assert.rejects(__testables.findCreatorsInRange(1, 2, [address], async () => [null, null]), /保留历史游标/);
+});

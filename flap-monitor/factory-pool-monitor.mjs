@@ -560,6 +560,7 @@ async function fetchRangeLogs(rpcCall, proxy, fromBlock, toBlock, topics) {
       return { logs: logs || [], toBlock: end };
     } catch (error) {
       lastError = error;
+      if (!/maximum block range|exceed.*range|range.*limit|response too large|too many results/i.test(error.message)) throw error;
       if (end === fromBlock) break;
       end = fromBlock + Math.floor((end - fromBlock) / 2);
     }
