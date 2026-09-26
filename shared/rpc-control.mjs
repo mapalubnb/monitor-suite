@@ -5,19 +5,26 @@ import { createRpcBudget } from './rpc-budget.mjs';
 
 export const RPC_BATCH_SIZE = 8;
 
+export function rpcRequestScope({ payload, history = false } = {}) {
+  if (!payload) return '';
+  const methods = [...new Set((Array.isArray(payload) ? payload : [payload]).map(item => item.method))].sort();
+  return methods.join(',') + (methods.includes('eth_getLogs') ? (history ? ':history' : ':realtime') : '');
+}
+
 // Only provider-wide failures are shared. Archive/range errors stay with the
 // caller's range-specific policy and cannot quarantine recent reads.
 export function createRpcControl({ directory = '', now = Date.now, concurrency = 2, limits = JSON.parse(process.env.RPC_PROVIDER_LIMITS || '{}') } = {}) {
   const budget = createRpcBudget({ directory, limits, now });
-  const cooldowns = new Map(), checked = new Map(), active = new Map(), waiters = new Map(), inflight = new Map(), cache = new Map();
-  const metrics = { requested: 0, reused: 0, cooled: 0, failures: 0 };
-  function key(url) {
+  const cooldowns = new Map(), checked = new Map(), active = new Map(), activeHistory = new Map(), waiters = new Map(), inflight = new Map(), cache = new Map();
+  const metrics = { requested: 0, reused: 0, cooled: 0, failures: 0, upstream429: 0, denied: 0, timeouts: 0, hedgeSkipped: 0 };
+  const methods = new Map();
+  function key(url, scope = '') {
     const parsed = new URL(url);
     if (parsed.hostname.endsWith('.publicnode.com')) parsed.hostname = 'publicnode.com';
-    return createHash('sha256').update(parsed.href).digest('hex');
+    return createHash('sha256').update('v2:' + parsed.href + ':' + scope).digest('hex');
   }
-  function cooldown(url) {
-    const id = key(url);
+  function scopedCooldown(url, scope = '') {
+    const id = key(url, scope);
     if (directory && now() - (checked.get(id) || 0) >= 1000) {
       checked.set(id, now());
       try {
@@ -28,7 +35,10 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
     const entry = cooldowns.get(id);
     return entry?.until > now() ? entry : null;
   }
-  function failure(url, error, response) {
+  function cooldown(url, request = {}) {
+    return scopedCooldown(url) || (rpcRequestScope(request) ? scopedCooldown(url, rpcRequestScope(request)) : null);
+  }
+  function failure(url, error, response, request = {}) {
     const status = Number(response?.status || error?.status);
     const message = String(error?.message || '');
     const quota = status === 429 || /HTTP 429|compute units|rate.?limit|usage limit|too many requests/i.test(message);
@@ -36,8 +46,10 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
     if (!quota && !denied) return;
     const retry = response?.headers?.get?.('retry-after');
     const retryMs = retry ? (/^\d+(\.\d+)?$/.test(retry) ? Number(retry) * 1000 : Date.parse(retry) - now()) : 0;
-    const id = key(url);
-    const entry = { until: Math.max(cooldown(url)?.until || 0, now() + Math.max(retryMs || 0, denied ? 300_000 : 30_000)), reason: quota ? 'RPC 限流' : 'RPC 访问被拒绝' };
+    const global = status === 401 || /HTTP 401|compute units|account.*(?:limit|disabled)|invalid.*api.?key/i.test(message);
+    const scope = global ? '' : rpcRequestScope(request);
+    const id = key(url, scope);
+    const entry = { until: Math.max(scopedCooldown(url, scope)?.until || 0, now() + Math.max(retryMs || 0, denied ? 300_000 : 30_000)), reason: quota ? 'RPC 限流' : 'RPC 访问被拒绝', scope };
     cooldowns.set(id, entry);
     metrics.failures++;
     if (directory) {
@@ -49,8 +61,8 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
       } catch { /* In-memory cooldown still protects this process. */ }
     }
   }
-  function assertAvailable(url) {
-    const entry = cooldown(url);
+  function assertAvailable(url, request) {
+    const entry = cooldown(url, request);
     if (!entry) return;
     metrics.cooled++;
     const error = new Error(`${new URL(url).hostname}: ${entry.reason}，等待恢复`);
@@ -59,29 +71,50 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
     throw error;
   }
   async function withEndpoint(url, operation, signal, request = {}) {
-    assertAvailable(url);
+    assertAvailable(url, request);
     const id = key(url);
-    if ((active.get(id) || 0) >= concurrency) await new Promise((resolve, reject) => {
+    const available = () => (active.get(id) || 0) < concurrency && (!request.history || !(activeHistory.get(id) || 0));
+    const occupy = () => { active.set(id, (active.get(id) || 0) + 1); if (request.history) activeHistory.set(id, (activeHistory.get(id) || 0) + 1); };
+    if (request.speculative && (!available() || waiters.get(id)?.length)) {
+      metrics.hedgeSkipped++;
+      throw Object.assign(new Error('RPC 备用竞速等待空闲容量'), { rpcBudget: true });
+    }
+    if (!available()) await new Promise((resolve, reject) => {
       const queue = waiters.get(id) || [];
-      const item = { resolve: () => { signal?.removeEventListener('abort', abort); resolve(); } };
+      const item = { history: request.history, critical: request.critical, resolve: () => { occupy(); signal?.removeEventListener('abort', abort); resolve(); } };
       const abort = () => { const index = queue.indexOf(item); if (index >= 0) queue.splice(index, 1); reject(signal.reason || new Error('RPC 已取消')); };
       queue.push(item); waiters.set(id, queue);
       if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
     });
-    else active.set(id, (active.get(id) || 0) + 1);
+    else occupy();
     let release;
     try {
-      signal?.throwIfAborted(); assertAvailable(url);
+      signal?.throwIfAborted(); assertAvailable(url, request);
       release = directory ? await budget.acquire(url, { ...request, signal }) : null;
-      signal?.throwIfAborted(); assertAvailable(url); metrics.requested++;
-      return await operation();
+      signal?.throwIfAborted(); assertAvailable(url, request); metrics.requested++;
+      const started = now(), methodKey = new URL(url).hostname + ':' + rpcRequestScope(request);
+      const stats = methods.get(methodKey) || { ok: 0, failed: 0, totalMs: 0, maxMs: 0 };
+      methods.set(methodKey, stats);
+      try { const value = await operation(); stats.ok++; return value; }
+      catch (error) {
+        if (!signal?.aborted) { stats.failed++; if (/429|rate.?limit/i.test(error.message)) metrics.upstream429++; else if (/403|401/.test(error.message)) metrics.denied++; else if (/timeout|timed out/i.test(error.message)) metrics.timeouts++; }
+        throw error;
+      } finally { stats.lastMs = now() - started; stats.totalMs += stats.lastMs; stats.maxMs = Math.max(stats.maxMs, stats.lastMs); }
     }
     finally {
       try { if (release) await release(); }
       finally {
-        const next = waiters.get(id)?.shift();
-        if (next) next.resolve(); // Transfer the occupied slot to the waiter.
-        else active.set(id, Math.max(0, (active.get(id) || 1) - 1));
+        active.set(id, Math.max(0, (active.get(id) || 1) - 1));
+        if (request.history) activeHistory.set(id, Math.max(0, (activeHistory.get(id) || 1) - 1));
+        const queue = waiters.get(id) || [];
+        while ((active.get(id) || 0) < concurrency) {
+          const eligible = item => !item.history || !(activeHistory.get(id) || 0);
+          let index = queue.findIndex(item => eligible(item) && item.critical);
+          if (index < 0) index = queue.findIndex(item => eligible(item) && !item.history);
+          if (index < 0) index = queue.findIndex(eligible);
+          if (index < 0) break;
+          queue.splice(index, 1)[0].resolve();
+        }
       }
     }
   }
@@ -102,7 +135,7 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
   }
   return { cooldown, failure, withEndpoint, coalesce, metrics,
     reset() { cooldowns.clear(); checked.clear(); cache.clear(); },
-    summary: () => ({ ...metrics, ...budget.metrics, inFlight: inflight.size, queued: [...waiters.values()].reduce((n, q) => n + q.length, 0) }),
+    summary: () => ({ ...metrics, ...budget.metrics, methods: Object.fromEntries(methods), inFlight: inflight.size, queued: [...waiters.values()].reduce((n, q) => n + q.length, 0) }),
   };
 }
 

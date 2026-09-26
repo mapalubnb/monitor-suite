@@ -3498,3 +3498,38 @@ test('multipart early signal cards enrich only their matching original part', as
   assert.equal(patched.length,2);
   for(const part of patched){const index=Number(part.id.split('-')[1]);assert.equal(part.content.replace(/资产名称：(First|Second) Asset\n/g,''),originals[index]);}
 });
+
+test('history full blocks use the dedicated history block pool', async()=>{
+ const original=globalThis.fetch,pools=__testables.CONFIG.rpcPools; const seen=[];
+ __testables.CONFIG.rpcPools={read:[],block:['https://live.test'],historyblock:['https://history.test']};__testables.resetBscRpcHealth();
+ globalThis.fetch=async url=>{seen.push(url);return {ok:true,json:async()=>({result:{hash:'block'}})};};
+ try{await __testables.bscRpcCall('eth_getBlockByNumber',['0x1',true],{history:true});assert.deepEqual(seen,['https://history.test']);}
+ finally{globalThis.fetch=original;__testables.CONFIG.rpcPools=pools;__testables.resetBscRpcHealth();}
+});
+
+test('history denial leaves same-provider live logs working',async()=>{
+ const original=globalThis.fetch;__testables.resetBscRpcHealth();let denied=true;
+ globalThis.fetch=async(_url,options)=>{const req=JSON.parse(options.body);if(denied)return {ok:false,status:403,body:{cancel:async()=>{}}};return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x100':[]})};};
+ try{
+  await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x1',toBlock:'0x2'}],{history:true,rpcUrls:['https://scoped.test']}),/403/);
+  denied=false;
+  assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0xfe',toBlock:'0xff'}],{history:false,rpcUrls:['https://scoped.test']}),[]);
+ }finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
+});
+
+test('a one-block lag recovers after short cooldown without poisoning the range',async()=>{
+ const original=globalThis.fetch;__testables.resetBscRpcHealth();let head='0x64';
+ globalThis.fetch=async(_url,options)=>({ok:true,json:async()=>({result:JSON.parse(options.body).method==='eth_blockNumber'?head:[]})});
+ try{
+  const args=[[{fromBlock:'0x64',toBlock:'0x65'}],{history:false,rpcUrls:['https://lag.test']}];
+  await assert.rejects(__testables.executeBscGetLogsRequest(...args),/尚未同步/);
+  head='0x65';await new Promise(r=>setTimeout(r,550));
+  assert.deepEqual(await __testables.executeBscGetLogsRequest(...args),[]);
+ }finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
+});
+
+test('core integrity pass never awaits historical scans',async()=>{
+ const state=createContractIntegrityState();const kinds=[];
+ await __testables.runFlapContractIntegrityPass(state,{stateScanFn:async()=>({changed:false,changes:[]}),eventScanFn:async opts=>{kinds.push(opts.realtime);return {changed:false,changes:[],latest:100};},saveStateFn:()=>{}});
+ assert.deepEqual(kinds,[true]);
+});

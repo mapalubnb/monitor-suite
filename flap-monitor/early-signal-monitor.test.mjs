@@ -442,3 +442,11 @@ test('early asset names retain the contract link and escape API-provided formatt
   assert.ok(content.includes('资产：['+TOKEN+'](https://bscscan.com/address/'+TOKEN+')'));
   assert.match(content,/原始证据/);
 });
+
+test('full-block reuse revalidates canonical headers and refetches on reorg',async()=>{
+ const {readEarlyFullBlocks}=await import('./early-signal-monitor.mjs');const state={};let hash='0x'+'a'.repeat(64),full=0,headers=0;
+ const rpc=async calls=>calls.map(call=>{if(call.params[1])full++;else headers++;return {number:call.params[0],hash,transactions:call.params[1]?[{hash:'tx'}]:['tx']};});
+ const one=await readEarlyFullBlocks(state,[10,11],rpc);one[0].transactions.length=0;
+ const two=await readEarlyFullBlocks(state,[10,11],rpc);assert.equal(two[0].transactions.length,1);assert.equal(full,2);assert.equal(headers,2);
+ hash='0x'+'b'.repeat(64);const three=await readEarlyFullBlocks(state,[10,11],rpc);assert.equal(full,4);assert.equal(three[0].hash,hash);
+});

@@ -1,7 +1,7 @@
 import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
-import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
+import { recoverLiveCursor, activateHistoryGap, selectReadyHistoryRange, deferHistoryRange } from "../shared/scan-recovery.mjs";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 /**
  * Flap.sh 页面监控脚本 v2 — 高频并行版
@@ -118,7 +118,7 @@ const CONFIG = {
     minAssetFiles: 2,
   },
   assetStringLimit: 300,
-  rpcPools: Object.fromEntries(['read', 'block', 'realtime', 'history'].map(lane => [lane,
+  rpcPools: Object.fromEntries(['read', 'block', 'historyblock', 'historyread', 'realtime', 'history'].map(lane => [lane,
     (process.env[`FLAP_RPC_${lane.toUpperCase()}_URLS`] || '').split(/[\s,]+/).filter(Boolean)])),
   bscRpcUrls: [...new Set((process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://fast.bsc-rpc.com,https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com")
     .split(",").map(s => s.trim()).filter(Boolean)
@@ -2654,7 +2654,8 @@ function bscRpcPreferenceKey(method, params = []) {
     const to = hexToNumber(filter.toBlock);
     return from > 0 && to > 0 && to - from > 100 ? "eth_getLogs:history" : "eth_getLogs:realtime";
   }
-  if (method === "eth_getBlockByNumber" || method === "eth_getTransactionByHash" || method === "eth_getTransactionReceipt") return "block_data";
+  if (method === "eth_getBlockByNumber") return method + (params[1] ? ':full' : ':header');
+  if (method === "eth_getTransactionByHash" || method === "eth_getTransactionReceipt") return method;
   if (method === "eth_getCode" || method === "eth_getStorageAt") return "contract_state";
   return method || "default";
 }
@@ -2705,6 +2706,7 @@ function updateBscRpcHealth(preferenceKey, index, latencyMs, failed = false) {
         latencyMs: previous.latencyMs == null ? latencyMs : Math.round(previous.latencyMs * 0.7 + latencyMs * 0.3),
       });
   bscRpcHealthByKey.set(preferenceKey, health);
+  if (bscRpcHealthByKey.size > 256) bscRpcHealthByKey.delete(bscRpcHealthByKey.keys().next().value);
 }
 
 function resetBscRpcHealth() {
@@ -2756,8 +2758,9 @@ async function executeBscGetLogsUnshared(params, options = {}) {
   try { return await queryBscLogs(params, options); }
   finally { activeLogRequests--; if (history) activeHistoryLogRequests--; pumpLogRequests(); }
 }
-async function fetchRpcJson(url, payload, timeoutMs, signal, history = false) {
-  const queueTimeout = AbortSignal.timeout(1000);
+async function fetchRpcJson(url, payload, timeoutMs, signal, history = false, scheduling = {}) {
+  const request = { payload, history, ...scheduling };
+  const queueTimeout = AbortSignal.timeout(scheduling.critical ? 3000 : 1000);
   const queueSignal = signal ? AbortSignal.any([signal, queueTimeout]) : queueTimeout;
   let started = false;
   try { return await rpcControl.withEndpoint(url, async () => {
@@ -2769,15 +2772,17 @@ async function fetchRpcJson(url, payload, timeoutMs, signal, history = false) {
         body: JSON.stringify(payload), signal: effectiveSignal });
       if (!response.ok) {
         const error = new Error("HTTP " + response.status);
-        rpcControl.failure(url, error, response);
+        rpcControl.failure(url, error, response, request);
         await response.body?.cancel?.();
         throw error;
       }
       const json = await response.json();
-      for (const item of Array.isArray(json) ? json : [json]) if (item?.error) rpcControl.failure(url, new Error(item.error.message || "RPC error"));
+      for (const item of Array.isArray(json) ? json : [json]) if (item?.error && !/execution reverted/i.test(item.error.message || '')) {
+        throw new Error(item.error.message || 'RPC error');
+      }
       return json;
-    } catch (error) { rpcControl.failure(url, error); throw error; }
-  }, queueSignal, { cost: Array.isArray(payload) ? payload.length : 1, history }); }
+    } catch (error) { rpcControl.failure(url, error, undefined, request); throw error; }
+  }, queueSignal, { cost: Array.isArray(payload) ? payload.length : 1, ...request }); }
   catch (error) {
     if (!started && queueTimeout.aborted && !signal?.aborted) throw Object.assign(new Error('RPC 本地队列已满，切换备用节点'), { rpcBudget: true });
     throw error;
@@ -2793,10 +2798,12 @@ async function queryBscLogs(params, options) {
   ])]);
   const errors = [], emptyProviders = new Set();
   const timeoutMs = Math.max(4000, bscRpcTimeoutMs("eth_getLogs", params));
-  for (const url of urls) {
+  const healthKey = history + ':' + JSON.stringify(urls) + (history.endsWith(':history') ? ':' + Math.floor(Number(params[0]?.fromBlock || 0) / 8192) : '');
+  for (const index of orderedBscRpcIndexes(healthKey, urls)) {
+    const url = urls[index];
     const from = Number(params[0]?.fromBlock || 0), to = Number(params[0]?.toBlock || 0);
     const host = new URL(url).hostname;
-    const sharedCooling = rpcControl.cooldown(url);
+    const sharedCooling = rpcControl.cooldown(url, { payload: { method: 'eth_getLogs' }, history: history.endsWith(':history') });
     if (sharedCooling) { errors.push(host + ": " + sharedCooling.reason); continue; }
     // Pruned archives and unsupported wide windows must not quarantine current blocks.
     const filterClass = JSON.stringify({ address: params[0]?.address || null, topics: params[0]?.topics || [] });
@@ -2809,10 +2816,12 @@ async function queryBscLogs(params, options) {
     const cooling = logRpcCooldowns.get(key);
     if (cooling?.until > Date.now()) { errors.push(cooling.message); continue; }
     try {
+      const startedAt = Date.now();
       const json = await fetchRpcJson(url, { jsonrpc: "2.0", id: 1, method: "eth_getLogs", params }, timeoutMs, undefined, history.endsWith(':history'));
       if (json?.error) throw new Error(json.error.message || "RPC error");
       if (!Array.isArray(json?.result)) throw new Error("eth_getLogs 返回非数组");
       const logs = dedupeBscLogs(json.result);
+      updateBscRpcHealth(healthKey, index, Date.now() - startedAt);
       logRpcCooldowns.delete(key);
       if (logs.length) return logs;
       if (history === "eth_getLogs:realtime" && Number.isSafeInteger(to) && to > 0) {
@@ -2833,9 +2842,12 @@ async function queryBscLogs(params, options) {
       const message = `${host}: ${error.message}`;
       errors.push(message);
       if (error.rpcBudget) continue;
-      const cooldown = /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 30_000;
+      const lagging = /尚未同步|invalid block range/i.test(error.message) || (history.endsWith(':realtime') && /header not found/i.test(error.message));
+      const cooldown = lagging ? 500 : /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 10_000;
+      if (!lagging) updateBscRpcHealth(healthKey, index, 0, true);
       logRpcCooldowns.set(key, { until: Date.now() + cooldown, message });
-      if (/HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical|header not found/i.test(error.message)) {
+      if (/timeout|timed out/i.test(error.message)) logRpcProviderCooldowns.set(providerKey, { until: Date.now() + cooldown, message });
+      if (!lagging && /HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical|header not found/i.test(error.message)) {
         const scope = /only serves recent|archive|historical|header not found/i.test(error.message) ? archiveKey : providerKey;
         logRpcProviderCooldowns.set(scope, { until: Date.now() + cooldown, message });
       }
@@ -2853,8 +2865,9 @@ async function queryBscLogs(params, options) {
 }
 
 async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null, validationKey = "default", options = {}) {
-  const lane = rpcReadLane(payload) === 'block' ? 'block' : options.history ? 'history' : 'read';
-  const configured = CONFIG.rpcPools[lane]?.length ? CONFIG.rpcPools[lane] : CONFIG.rpcPools.read;
+  const baseLane = rpcReadLane(payload);
+  const lane = options.history ? 'history' + baseLane : baseLane;
+  const configured = CONFIG.rpcPools[lane]?.length ? CONFIG.rpcPools[lane] : CONFIG.rpcPools[baseLane]?.length ? CONFIG.rpcPools[baseLane] : CONFIG.rpcPools.read;
   const urls = configured.length ? configured : CONFIG.bscRpcUrls;
   preferenceKey += ':' + JSON.stringify(urls);
   // Validation belongs to each consumer; the shared operation validates the wire response.
@@ -2874,12 +2887,13 @@ async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResp
   const hedgeReady = new Promise(resolve => { releaseHedge = resolve; hedgeTimer = setTimeout(resolve, hedgeDelay); });
   async function worker(secondary) {
     if (secondary) await hedgeReady;
+    if (secondary && options.history) throw new Error('历史请求不启动备用竞速');
     while (!settled && position < indexes.length) {
       const index = indexes[position++], url = urls[index];
       const controller = new AbortController(); controllers.push(controller);
       const startedAt = Date.now();
       try {
-        const json = await fetchRpcJson(url, payload, timeoutMs, controller.signal, Boolean(options.history));
+        const json = await fetchRpcJson(url, payload, timeoutMs, controller.signal, Boolean(options.history), { critical: options.critical, speculative: secondary });
         if (!Array.isArray(json) && json?.error) throw new Error(json.error.message || "RPC error");
         if (Array.isArray(payload) ? !Array.isArray(json) : !json || !("result" in json)) throw new Error("RPC 返回无效结果");
         if (Array.isArray(json) && json.every(item => item?.error || item?.result == null)
@@ -2895,6 +2909,11 @@ async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResp
         return json;
       } catch (error) {
         if (!settled) { errors.push(new URL(url).hostname + ": " + error.message); if (!error.rpcBudget) updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt, true); }
+        if (secondary) {
+          // Admission failure did not contact this endpoint. Keep it for primary fallback.
+          if (error.rpcBudget && !settled) indexes.push(index);
+          break;
+        }
       }
     }
     throw new Error(errors.at(-1) || "没有可用 RPC 结果");
@@ -2942,12 +2961,17 @@ async function bscRpcBatch(calls = [], options = {}) {
   const timeoutMs = Math.max(...calls.map(call => bscRpcTimeoutMs(call.method, call.params || [])));
   const json = await executeBscRpcRequest(payload, preferenceKey, timeoutMs, response => {
     if (!Array.isArray(response)) throw new Error("Batch RPC 返回非数组");
+    // Optional EVM reverts are valid missing getters; transport/range errors are not.
+    if (options.rejectRpcErrors && (response.some(item => item.error && !/execution reverted/i.test(item.error.message || ''))
+      || payload.some(call => !response.some(item => item.id === call.id && (item.result != null || /execution reverted/i.test(item.error?.message || '')))))) {
+      throw new Error('Batch RPC 部分请求失败：' + response.filter(item => item.error).map(item => item.error.message).join('；').slice(0, 240));
+    }
     if (!options.requireAllResults) return;
     const byId = new Map(response.map(item => [item.id, item]));
     if (payload.some(item => !byId.get(item.id) || byId.get(item.id).error || byId.get(item.id).result == null)) {
       throw new Error("Batch RPC 存在空结果");
     }
-  }, options.requireAllResults ? "all-results" : "partial-results", options);
+  }, options.requireAllResults ? "all-results" : options.rejectRpcErrors ? "optional-reverts" : "partial-results", options);
   if (!Array.isArray(json)) throw new Error("Batch RPC 返回非数组");
   const byId = new Map(json.map(item => [item.id, item]));
   const results = payload.map(item => {
@@ -6461,12 +6485,13 @@ async function runFlapContractIntegrityPass(state, {
 } = {}) {
   if (!CONFIG.contractIntegrityMonitor.enabled) return { changed: false, changes: [], state };
   const existingPendingIds = new Set(state.pendingChanges.map(change => change.id));
+  state.coreIntervalMs = CONFIG.contractIntegrityMonitor.coreIntervalMs;
   syncFlapContractIntegrityCatalog(state, snapshot, factoryPoolState);
   let stateResult = { changed: false, changes: [] }, stateError;
   try { stateResult = await stateScanFn({
     state,
-    rpcCall: bscRpcCall,
-    rpcBatch: calls => bscRpcBatch(calls),
+    rpcCall: (method, params) => bscRpcCall(method, params, { critical: true }),
+    rpcBatch: calls => bscRpcBatch(calls, { critical: true, rejectRpcErrors: true }),
     extended,
     forceCodeAudit,
     trackedAssetLimit: CONFIG.contractIntegrityMonitor.trackedAssetLimit,
@@ -6482,18 +6507,6 @@ async function runFlapContractIntegrityPass(state, {
     realtime: true,
     suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
   });
-  // History has its own retry schedule and cannot roll back a successful live scan.
-  if (Date.now() >= (state.eventHistoryNextAt || 0)) {
-    try {
-      await eventScanFn({ state, rpcCall: (method, params) => bscRpcCall(method, params, { history: true }), latestBlock: eventResult.latest || state.latestBlock,
-        maxBlocks: CONFIG.contractIntegrityMonitor.eventMaxBlocksPerRun, suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled });
-      state.eventHistoryError = "";
-      state.eventHistoryNextAt = Date.now() + 10_000;
-    } catch (error) {
-      state.eventHistoryError = error.message;
-      state.eventHistoryNextAt = Date.now() + 60_000;
-    }
-  }
   if (suppressNotifications && state.pendingChanges.length > 0) {
     acknowledgeContractIntegrityChanges(state, state.pendingChanges.filter(change => !existingPendingIds.has(change.id)).map(change => change.id));
   }
@@ -6968,7 +6981,15 @@ async function startMonitor() {
     onError: error => log("[Flap 提前信号补扫] " + error.message),
     run: async () => {
       if (isShuttingDown) return;
+      const previousCursor = earlySignalState.cursor;
+      if (!selectReadyHistoryRange(earlySignalState, 'cursor', 'historyEndBlock')) return;
+      if (previousCursor !== earlySignalState.cursor) {
+        earlySignalState.cursorHash = '';
+        if (earlySignalState.health.chain) earlySignalState.health.chain.nextAttemptAtMs = 0;
+      }
+      const previousFailures = earlySignalState.health.chain?.failures || 0;
       await runEarlySignalScan({ state: earlySignalState, config: { ...earlySignalConfig(), mode: "chain" }, rpcBatch: (calls, opts) => bscRpcBatch(calls, { ...opts, history: true }), safeState: safeProposalState });
+      if ((earlySignalState.health.chain?.failures || 0) > previousFailures) deferHistoryRange(earlySignalState, 'cursor', /header not found|archive|403|访问被拒绝/i.test(earlySignalState.health.chain.lastError) ? 300_000 : 30_000);
       saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
       void deliverEarly();
     } });
@@ -7173,7 +7194,29 @@ async function startMonitor() {
     }
   }
 
-  global.__contractIntegrityMutationDrain = () => contractIntegrityMutationQueue;
+  const integrityHistoryJob = createWakeableJob({ intervalMs: 10_000,
+    onError: error => log('[Flap 合约历史] ' + error.message),
+    run: async () => {
+      if (isShuttingDown || !CONFIG.contractIntegrityMonitor.enabled || !contractIntegrityState.lastCoreScanAt) return;
+      if (!selectReadyHistoryRange(contractIntegrityState, 'httpEventLastBlock', 'eventHistoryEndBlock')) return;
+      try {
+        await scanContractIntegrityEvents({ state: contractIntegrityState,
+          rpcCall: (method, params) => bscRpcCall(method, params, { history: true }),
+          maxBlocks: CONFIG.contractIntegrityMonitor.eventMaxBlocksPerRun,
+          suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
+          commit: operation => enqueueContractIntegrityMutation(operation) });
+        contractIntegrityState.eventHistoryError = '';
+        contractIntegrityState.eventHistoryNextAt = Date.now() + 10_000;
+      } catch (error) {
+        contractIntegrityState.eventHistoryError = error.message;
+        const delay = /header not found|archive|403|访问被拒绝/i.test(error.message) ? 300_000 : 30_000;
+        deferHistoryRange(contractIntegrityState, 'httpEventLastBlock', delay);
+        contractIntegrityState.eventHistoryNextAt = Date.now() + delay;
+      }
+      saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
+      void scheduleContractIntegrityDelivery();
+    } });
+  global.__contractIntegrityMutationDrain = async () => { await integrityHistoryJob.stop(); await contractIntegrityMutationQueue; };
   global.__contractIntegrityDeliveryDrain = async () => {
     if (contractIntegrityDeliveryPromise) await contractIntegrityDeliveryPromise;
   };
@@ -7510,6 +7553,7 @@ async function startMonitor() {
     }, delayMs);
   }
   scheduleContractIntegrityNext();
+  if (CONFIG.contractIntegrityMonitor.enabled) integrityHistoryJob.start();
 
   function scheduleSafeProposalNext(delayMs = CONFIG.safeProposalMonitor.intervalMs) {
     if (!CONFIG.safeProposalMonitor.enabled) return;

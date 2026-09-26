@@ -505,7 +505,7 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
   return { processed: true, change };
 }
 
-export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock = 0, maxBlocks = 2_000, realtime = false, suppressFactoryUpgrade = false } = {}) {
+export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock = 0, maxBlocks = 2_000, realtime = false, suppressFactoryUpgrade = false, commit = operation => operation() } = {}) {
   const cursorKey = realtime ? "httpRealtimeLastBlock" : "httpEventLastBlock";
   if (realtime) recoverLiveCursor(state, {head: latestBlock || hexToNumber(await rpcCall('eth_blockNumber', [])), cursorKey});
   else activateHistoryGap(state, state, 'httpEventLastBlock', 'eventHistoryEndBlock');
@@ -528,13 +528,15 @@ export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock 
   if (otherAddresses.length > 0) filters.push({ address: otherAddresses, fromBlock: numberToHex(fromBlock), toBlock: numberToHex(toBlock) });
   const results = await Promise.all(filters.map(filter => rpcCall("eth_getLogs", [filter])));
   const logs = results.flat().sort((left, right) => hexToNumber(left.blockNumber) - hexToNumber(right.blockNumber) || hexToNumber(left.logIndex) - hexToNumber(right.logIndex));
-  const changes = [];
-  for (const entry of logs) {
-    const result = ingestContractIntegrityEvent(state, entry, "http-backfill", { suppressFactoryUpgrade });
-    if (result.change) changes.push(result.change);
-  }
-  state[cursorKey] = toBlock;
-  return { changed: changes.length > 0, changes, latest, fromBlock, toBlock };
+  return commit(() => {
+    const changes = [];
+    for (const entry of logs) {
+      const result = ingestContractIntegrityEvent(state, entry, "http-backfill", { suppressFactoryUpgrade });
+      if (result.change) changes.push(result.change);
+    }
+    state[cursorKey] = toBlock;
+    return { changed: changes.length > 0, changes, latest, fromBlock, toBlock };
+  });
 }
 
 export function contractIntegritySubscriptionAddresses(state, { includeFactory = false } = {}) {

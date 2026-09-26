@@ -1,0 +1,1857 @@
+{
+  "capability": {
+    "start": "2026-09-26T08:41:56.909Z",
+    "end": "2026-09-26T08:44:26.479Z",
+    "rows": [
+      {
+        "type": "config",
+        "start": "2026-09-26T08:41:56.909Z",
+        "groups": {
+          "BSC_WS_URLS": [
+            "bsc-rpc.publicnode.com"
+          ],
+          "FLAP_FACTORY_ARCHIVE_RPC_URL": [],
+          "FOURMEME_BSC_RPC_URLS": [
+            "bsc.rpc.blxrbdn.com",
+            "rpc.48.club",
+            "bnb-mainnet.g.alchemy.com",
+            "bsc-rpc.publicnode.com"
+          ],
+          "FLAP_FACTORY_WS_URLS": [
+            "bsc-rpc.publicnode.com",
+            "bsc.publicnode.com"
+          ],
+          "FLAP_CONTRACT_WS_URLS": [],
+          "FLAP_LOG_RPC_URLS": [
+            "fast.bsc-rpc.com",
+            "bsc.publicnode.com"
+          ],
+          "FLAP_RPC_READ_URLS": [
+            "bsc-dataseed1.ninicoin.io",
+            "bsc-dataseed1.defibit.io",
+            "bsc-dataseed.bnbchain.org",
+            "bnb-mainnet.g.alchemy.com",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FOURMEME_RPC_READ_URLS": [
+            "bnb-mainnet.g.alchemy.com",
+            "bsc-dataseed1.defibit.io",
+            "bsc-dataseed1.ninicoin.io",
+            "bsc-dataseed.bnbchain.org",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FLAP_RPC_REALTIME_URLS": [
+            "rpc.48.club",
+            "fast.bsc-rpc.com",
+            "bsc.publicnode.com",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FLAP_RPC_HISTORY_URLS": [
+            "rpc.48.club",
+            "bsc.rpc.blxrbdn.com",
+            "bsc.publicnode.com",
+            "fast.bsc-rpc.com"
+          ],
+          "FOURMEME_RPC_LOGS_URLS": [
+            "rpc.48.club",
+            "bsc-rpc.publicnode.com",
+            "fast.bsc-rpc.com",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FLAP_RPC_BLOCK_URLS": [
+            "bsc-dataseed-public.bnbchain.org",
+            "bsc.rpc.blxrbdn.com",
+            "bnb-mainnet.g.alchemy.com"
+          ],
+          "FOURMEME_RPC_BLOCK_URLS": [
+            "bsc-dataseed-public.bnbchain.org",
+            "bsc.rpc.blxrbdn.com",
+            "bnb-mainnet.g.alchemy.com"
+          ]
+        }
+      },
+      {
+        "type": "blocks",
+        "head": 124110678,
+        "recent": 124110628,
+        "near": 123904638,
+        "old": 117817600
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 36,
+        "height": 124110678
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 425,
+        "height": 124110678
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 21,
+        "height": 124110679
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 112,
+        "height": 124110679
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 169,
+        "height": 124110680
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 14
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 20
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 272,
+        "height": 124110681
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 83
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 329
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 18
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 31,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 228
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 22,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 79,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 193
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": true,
+        "ms": 33,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 179
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": true,
+        "ms": 27,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": true,
+        "ms": 31,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 189,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "near_logs",
+        "n": 0,
+        "ok": true,
+        "ms": 120,
+        "count": 617,
+        "logIdentitySha256": "9daa61630468746c095fbd0791c590b0313e66e8a1131f54593aacf40bc135bc"
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 180,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "near_logs",
+        "n": 1,
+        "ok": true,
+        "ms": 39,
+        "count": 617,
+        "logIdentitySha256": "9daa61630468746c095fbd0791c590b0313e66e8a1131f54593aacf40bc135bc"
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "header not found",
+        "ms": 19
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 171,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "header not found",
+        "ms": 78
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "old_header",
+        "n": 0,
+        "ok": false,
+        "error": "null",
+        "ms": 14
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "receipt",
+        "ok": true,
+        "ms": 14,
+        "present": true
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 13,
+        "height": 124110688
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 8,
+        "height": 124110689
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 9,
+        "height": 124110689
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 9
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 11
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 11
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 12
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 14,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 13,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 14,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": false,
+        "error": "HTTP 429",
+        "ms": 8
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": false,
+        "error": "HTTP 429",
+        "ms": 7
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": false,
+        "error": "HTTP 429",
+        "ms": 8
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "HTTP 429",
+        "ms": 7
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "HTTP 429",
+        "ms": 6
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "HTTP 429",
+        "ms": 7
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "HTTP 429",
+        "ms": 7
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "old_header",
+        "n": 0,
+        "ok": true,
+        "ms": 18,
+        "hash": "0x6f3c338fc7404868a4e55c6bc7ca9296671b36fa20d011c6d53f7b4d851b5f0c"
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "receipt",
+        "ok": true,
+        "ms": 9,
+        "present": true
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8002
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "head",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8000,
+        "height": null
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 101,
+        "height": 124110715
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 99,
+        "height": 124110716
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 122
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8002
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "state_call",
+        "n": 1,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8002
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "state_call",
+        "n": 2,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8002
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 284
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 2084,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8002
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 4906,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 621,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": true,
+        "ms": 723,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": true,
+        "ms": 4886,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": true,
+        "ms": 614,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "HTTP 403",
+        "ms": 988
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "old_logs",
+        "n": 1,
+        "ok": true,
+        "ms": 2723,
+        "count": 817,
+        "logIdentitySha256": "5bf460803c5d2ffd357ed59acdf60e0c143ef95f62764848a62e2bb231b8a539"
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "HTTP 403",
+        "ms": 5949
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "old_header",
+        "n": 0,
+        "ok": true,
+        "ms": 276,
+        "hash": "0x6f3c338fc7404868a4e55c6bc7ca9296671b36fa20d011c6d53f7b4d851b5f0c"
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "HTTP 403",
+        "ms": 6250
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "HTTP 403",
+        "ms": 511
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "receipt",
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001,
+        "present": false
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 46,
+        "height": 124110822
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 12,
+        "height": 124110823
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 12,
+        "height": 124110823
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 13
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 14
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 11
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 11
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 52,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 25,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 41,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": true,
+        "ms": 54,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": true,
+        "ms": 197,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": true,
+        "ms": 75,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "near_logs",
+        "n": 0,
+        "ok": true,
+        "ms": 155,
+        "count": 617,
+        "logIdentitySha256": "9daa61630468746c095fbd0791c590b0313e66e8a1131f54593aacf40bc135bc"
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "near_logs",
+        "n": 1,
+        "ok": true,
+        "ms": 87,
+        "count": 617,
+        "logIdentitySha256": "9daa61630468746c095fbd0791c590b0313e66e8a1131f54593aacf40bc135bc"
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "header not found",
+        "ms": 22
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "header not found",
+        "ms": 13
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "old_header",
+        "n": 0,
+        "ok": false,
+        "error": "null",
+        "ms": 27
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "receipt",
+        "ok": true,
+        "ms": 13,
+        "present": true
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "old_header",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 5278,
+        "height": 124110832
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 142,
+        "height": 124110845
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 205,
+        "height": 124110845
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 167
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 104
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 98
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 104
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "receipt",
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001,
+        "present": false
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 354,
+        "height": 124110857
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 91,
+        "height": 124110857
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 93,
+        "height": 124110858
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 94
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 94
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 94
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 95
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 107,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 107,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 99,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 91
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 92
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "full_block",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 92
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "old_header",
+        "n": 0,
+        "ok": true,
+        "ms": 96,
+        "hash": "0x6f3c338fc7404868a4e55c6bc7ca9296671b36fa20d011c6d53f7b4d851b5f0c"
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "receipt",
+        "ok": true,
+        "ms": 97,
+        "present": true
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 327,
+        "height": 124110869
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 84,
+        "height": 124110870
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 86,
+        "height": 124110870
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 87
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 88
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 84
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 86
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 99,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 101,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 110,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 84
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 86
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 85
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 98
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 85
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 88
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 85
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "old_header",
+        "n": 0,
+        "ok": true,
+        "ms": 89,
+        "hash": "0x6f3c338fc7404868a4e55c6bc7ca9296671b36fa20d011c6d53f7b4d851b5f0c"
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "receipt",
+        "ok": true,
+        "ms": 90,
+        "present": true
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 318,
+        "height": 124110882
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 82,
+        "height": 124110882
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 83,
+        "height": 124110883
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 84
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 85
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "full_block",
+        "n": 1,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 82
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 82
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 175,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 98,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 89,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 83
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 87
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 83
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 84
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 84
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 82
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 83
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "old_header",
+        "n": 0,
+        "ok": true,
+        "ms": 89,
+        "hash": "0x6f3c338fc7404868a4e55c6bc7ca9296671b36fa20d011c6d53f7b4d851b5f0c"
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "receipt",
+        "ok": true,
+        "ms": 87,
+        "present": true
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "head",
+        "n": 0,
+        "ok": true,
+        "ms": 376,
+        "height": 124110892
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "head",
+        "n": 1,
+        "ok": true,
+        "ms": 93,
+        "height": 124110894
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "head",
+        "n": 2,
+        "ok": true,
+        "ms": 93,
+        "height": 124110894
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "state_call",
+        "n": 0,
+        "ok": true,
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "state_call",
+        "n": 1,
+        "ok": true,
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "state_call",
+        "n": 2,
+        "ok": true,
+        "ms": 95
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "code",
+        "n": 0,
+        "ok": true,
+        "ms": 218
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "full_block",
+        "n": 0,
+        "ok": true,
+        "ms": 109,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "full_block",
+        "n": 1,
+        "ok": true,
+        "ms": 116,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "full_block",
+        "n": 2,
+        "ok": true,
+        "ms": 107,
+        "block": "0x765c724",
+        "hash": "0x18d3f056f6fcc68a9b09f220604b971ca385b452aef2991984926b54424ee708",
+        "transactions": 99
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 94
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "full_block",
+        "n": 2,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 94
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 93
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "limit exceeded",
+        "ms": 94
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "old_header",
+        "n": 0,
+        "ok": true,
+        "ms": 104,
+        "hash": "0x6f3c338fc7404868a4e55c6bc7ca9296671b36fa20d011c6d53f7b4d851b5f0c"
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "receipt",
+        "ok": true,
+        "ms": 468,
+        "present": true
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "recent_logs",
+        "n": 0,
+        "ok": true,
+        "ms": 3698,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "recent_logs",
+        "n": 1,
+        "ok": true,
+        "ms": 3765,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "recent_logs",
+        "n": 2,
+        "ok": true,
+        "ms": 1472,
+        "count": 155,
+        "logIdentitySha256": "f8e80808d2282f26afb3d5693589cf53781fe3c80e83656d3c2735ff090c0844"
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "near_logs",
+        "n": 0,
+        "ok": false,
+        "error": "HTTP 403",
+        "ms": 1107
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "near_logs",
+        "n": 1,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8000
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "old_logs",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "old_logs",
+        "n": 1,
+        "ok": false,
+        "error": "HTTP 403",
+        "ms": 107
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "old_header",
+        "n": 0,
+        "ok": false,
+        "error": "timeout",
+        "ms": 8001
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "wss_newHeads",
+        "ok": true,
+        "ack": true,
+        "count": 11,
+        "firstMs": 1567,
+        "ms": 6007
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "wss_newHeads",
+        "ok": true,
+        "ack": true,
+        "count": 11,
+        "firstMs": 1489,
+        "ms": 6002
+      }
+    ]
+  },
+  "batch": {
+    "start": "2026-09-26T08:44:30.011Z",
+    "end": "2026-09-26T08:44:41.910Z",
+    "rows": [
+      {
+        "type": "config",
+        "start": "2026-09-26T08:44:30.011Z",
+        "groups": {
+          "BSC_WS_URLS": [
+            "bsc-rpc.publicnode.com"
+          ],
+          "FLAP_FACTORY_ARCHIVE_RPC_URL": [],
+          "FOURMEME_BSC_RPC_URLS": [
+            "bsc.rpc.blxrbdn.com",
+            "rpc.48.club",
+            "bnb-mainnet.g.alchemy.com",
+            "bsc-rpc.publicnode.com"
+          ],
+          "FLAP_FACTORY_WS_URLS": [
+            "bsc-rpc.publicnode.com",
+            "bsc.publicnode.com"
+          ],
+          "FLAP_CONTRACT_WS_URLS": [],
+          "FLAP_LOG_RPC_URLS": [
+            "fast.bsc-rpc.com",
+            "bsc.publicnode.com"
+          ],
+          "FLAP_RPC_READ_URLS": [
+            "bsc-dataseed1.ninicoin.io",
+            "bsc-dataseed1.defibit.io",
+            "bsc-dataseed.bnbchain.org",
+            "bnb-mainnet.g.alchemy.com",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FOURMEME_RPC_READ_URLS": [
+            "bnb-mainnet.g.alchemy.com",
+            "bsc-dataseed1.defibit.io",
+            "bsc-dataseed1.ninicoin.io",
+            "bsc-dataseed.bnbchain.org",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FLAP_RPC_REALTIME_URLS": [
+            "rpc.48.club",
+            "fast.bsc-rpc.com",
+            "bsc.publicnode.com",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FLAP_RPC_HISTORY_URLS": [
+            "rpc.48.club",
+            "bsc.rpc.blxrbdn.com",
+            "bsc.publicnode.com",
+            "fast.bsc-rpc.com"
+          ],
+          "FOURMEME_RPC_LOGS_URLS": [
+            "rpc.48.club",
+            "bsc-rpc.publicnode.com",
+            "fast.bsc-rpc.com",
+            "bsc.rpc.blxrbdn.com"
+          ],
+          "FLAP_RPC_BLOCK_URLS": [
+            "bsc-dataseed-public.bnbchain.org",
+            "bsc.rpc.blxrbdn.com",
+            "bnb-mainnet.g.alchemy.com"
+          ],
+          "FOURMEME_RPC_BLOCK_URLS": [
+            "bsc-dataseed-public.bnbchain.org",
+            "bsc.rpc.blxrbdn.com",
+            "bnb-mainnet.g.alchemy.com"
+          ]
+        }
+      },
+      {
+        "type": "blocks",
+        "head": 124111018,
+        "recent": 124110968,
+        "near": 123904638,
+        "old": 117817600
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "storage",
+        "ok": true,
+        "ms": 34
+      },
+      {
+        "host": "rpc.48.club",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 93,
+        "error": ""
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "storage",
+        "ok": true,
+        "ms": 11
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "storage",
+        "ok": true,
+        "ms": 181
+      },
+      {
+        "host": "bnb-mainnet.g.alchemy.com",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 57,
+        "error": ""
+      },
+      {
+        "host": "bsc.rpc.blxrbdn.com",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 816,
+        "error": ""
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "storage",
+        "ok": true,
+        "ms": 39
+      },
+      {
+        "host": "fast.bsc-rpc.com",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 263,
+        "error": ""
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "storage",
+        "ok": true,
+        "ms": 148
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "storage",
+        "ok": true,
+        "ms": 2738
+      },
+      {
+        "host": "bsc.publicnode.com",
+        "test": "batch8_full_blocks",
+        "ok": false,
+        "error": "TimeoutError",
+        "ms": 8002
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "storage",
+        "ok": true,
+        "ms": 305
+      },
+      {
+        "host": "bsc-dataseed1.ninicoin.io",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 240,
+        "error": ""
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "storage",
+        "ok": true,
+        "ms": 369
+      },
+      {
+        "host": "bsc-dataseed1.defibit.io",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 311,
+        "error": ""
+      },
+      {
+        "host": "bsc-rpc.publicnode.com",
+        "test": "batch8_full_blocks",
+        "ok": false,
+        "error": "TimeoutError",
+        "ms": 8001
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "storage",
+        "ok": true,
+        "ms": 344
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "storage",
+        "ok": true,
+        "ms": 506
+      },
+      {
+        "host": "bsc-dataseed.bnbchain.org",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 474,
+        "error": ""
+      },
+      {
+        "host": "bsc-dataseed-public.bnbchain.org",
+        "test": "batch8_full_blocks",
+        "ok": true,
+        "good": 8,
+        "ms": 365,
+        "error": ""
+      }
+    ]
+  }
+}

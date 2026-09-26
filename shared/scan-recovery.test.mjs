@@ -26,3 +26,16 @@ test('normal live progress and uninitialized cursors are not moved', () => {
     assert.equal(state.live, live);
   }
 });
+
+test('blocked history rotates without losing a block and survives serialization',async()=>{
+ const {selectReadyHistoryRange,deferHistoryRange}=await import('./scan-recovery.mjs');
+ let state={cursor:10,end:100,realtimeGaps:[{from:201,to:220}]};
+ deferHistoryRange(state,'cursor',300000,1000);
+ assert.equal(selectReadyHistoryRange(state,'cursor','end',1001),true);
+ assert.equal(state.cursor,200);assert.equal(state.end,220);
+ assert.deepEqual(state.realtimeGaps,[{from:11,to:100}]);
+ state=JSON.parse(JSON.stringify(state));state.cursor=220;
+ assert.equal(selectReadyHistoryRange(state,'cursor','end',2000),false);
+ assert.equal(selectReadyHistoryRange(state,'cursor','end',302000),true);
+ assert.equal(state.cursor,10);assert.equal(state.end,100);assert.deepEqual(state.realtimeGaps,[]);
+});

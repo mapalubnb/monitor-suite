@@ -1476,7 +1476,7 @@ function rpcPoolFor(payload) {
 async function requestBscRpcPayload(payload, timeoutMs, {
   pool = rpcPoolFor(payload),
   inflight = bscRpcInflight,
-  fetchFn = fetchSafe,
+  fetchFn = fetchWithTimeout,
   parseResponse = response => response.json(),
   dedupeKeySuffix = "json",
 } = {}) {
@@ -1502,19 +1502,19 @@ async function requestBscRpcPayload(payload, timeoutMs, {
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         }, timeoutMs);
-        if (!response.ok) rpcControl.failure(rpcUrl, new Error(`HTTP ${response.status}`), response);
+        if (!response.ok) rpcControl.failure(rpcUrl, new Error(`HTTP ${response.status}`), response, { payload });
         const parsed = await parseResponse(response, rpcUrl);
         for (const item of Array.isArray(parsed) ? parsed : [parsed]) if (item?.error) {
           const error = new Error(item.error.message || "RPC error");
-          rpcControl.failure(rpcUrl, error);
+          rpcControl.failure(rpcUrl, error, undefined, { payload });
           if (/rate.?limit|compute units|too many requests|usage limit|resource.*not available|method.*not (found|supported)/i.test(error.message)) throw error;
         }
         return parsed;
-        }, AbortSignal.timeout(timeoutMs + 1000), { cost: Array.isArray(payload) ? payload.length : 1 });
+        }, AbortSignal.timeout(timeoutMs + 1000), { cost: Array.isArray(payload) ? payload.length : 1, payload });
         pool.succeed(lease);
         return parsed;
       } catch (err) {
-        rpcControl.failure(rpcUrl, err);
+        rpcControl.failure(rpcUrl, err, undefined, { payload });
         pool.fail(lease);
         lastErr = err;
       }

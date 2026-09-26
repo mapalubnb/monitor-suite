@@ -360,3 +360,8 @@ test("Four.meme native pools retain their name without a contract address", () =
   assert.match(output, /01　BNB｜状态/);
   assert.match(output, /募集总量 18/);
 });
+
+test('integrity status flags stale core checks even when event cursor is caught up',()=>{
+ const output=renderFlapStatus({}, {},{lastCoreScanAt:'2026-01-01T00:00:00Z',latestBlock:100,httpRealtimeLastBlock:100});
+ assert.match(output,/核心校验已 .*秒未成功/);
+});

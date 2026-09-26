@@ -58,3 +58,15 @@ test('corrupt budget data fails closed instead of silently creating another quot
     await assert.rejects(budget.acquire('https://node.test'), SyntaxError);
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('background budget preserves tokens for live and critical work across instances', async()=>{
+ const directory=mkdtempSync(join(tmpdir(),'rpc-reserve-'));
+ const options={directory,maxWaitMs:0,limits:{'node.test':{rps:0.001,burst:20,concurrency:4}}};
+ try{
+  const a=createRpcBudget(options),b=createRpcBudget(options);
+  const h=await a.acquire('https://node.test',{cost:12,history:true});await h();
+  await assert.rejects(b.acquire('https://node.test',{cost:1,history:true}),e=>e.rpcBudget);
+  const live=await b.acquire('https://node.test',{cost:6});await live();
+  const critical=await a.acquire('https://node.test',{cost:2,critical:true});await critical();
+ }finally{rmSync(directory,{recursive:true,force:true});}
+});

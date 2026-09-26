@@ -403,3 +403,9 @@ test('contract live cursor progresses even when archived logs are unavailable', 
   assert.equal(state.httpRealtimeLastBlock, 1000);
   assert.equal(state.httpEventLastBlock, 100);
 });
+
+test('history cursor commits only after all filters finish and commit gate opens',async()=>{
+ const state=createContractIntegrityState();state.httpEventLastBlock=10;state.eventHistoryEndBlock=20;
+ let commit;const pending=scanContractIntegrityEvents({state,latestBlock:20,rpcCall:async()=>[],commit:fn=>new Promise(resolve=>{commit=()=>resolve(fn());})});
+ await new Promise(r=>setImmediate(r));assert.equal(state.httpEventLastBlock,10);assert.equal(typeof commit,'function');commit();await pending;assert.equal(state.httpEventLastBlock,20);
+});

@@ -416,7 +416,7 @@ if [ -f "$SNAP" ]; then
     console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
     console.log('覆盖：底池 '+allPools.length+' · 页面 '+pageEntries.length+' · API '+apiKeys.length+' · 合约 '+fpKeys.length);
     console.log('前端：资源 '+downloaded+'/'+assetFiles+' · i18n '+i18nTotal+' · 路由待确认 '+pendingRoutes+' / 已纳管 '+approvedRoutes+' / 已忽略 '+ignoredRoutes);
-    if(runtime.rpc) console.log('RPC：请求 '+runtime.rpc.requested+' · 复用 '+runtime.rpc.reused+' · 冷却 '+runtime.rpc.cooled+' · 排队 '+runtime.rpc.queued+' · 预算切换 '+(runtime.rpc.budgetRejected||0));
+    if(runtime.rpc) console.log('RPC：请求 '+runtime.rpc.requested+' · 复用 '+runtime.rpc.reused+' · 冷却 '+runtime.rpc.cooled+' · 排队 '+runtime.rpc.queued+' · 本地预算等待 '+(runtime.rpc.budgetRejected||0)+' · 上游429 '+(runtime.rpc.upstream429||0)+' · 拒绝 '+(runtime.rpc.denied||0)+' · 超时 '+(runtime.rpc.timeouts||0));
     if(s._notificationOutbox?.length) console.log('⚠️ 待发送：'+warn(s._notificationOutbox.length+' 条，自动重试'));
 
     section('03｜🪙 底池配置');
@@ -637,7 +637,7 @@ if [ -f "$SNAP" ]; then
     console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
     console.log('覆盖：页面 '+keys.length+' · 资源 '+totalAssets+' · 金库工厂 '+factoryItems.length+' · 链上金库 '+knownVaults.length);
     console.log('页面：'+(pageStats.map(p=>mdLink(p.label,p.url)).join(' · ')||'暂无快照'));
-    if(runtime.rpc)console.log('RPC：请求 '+runtime.rpc.requested+' · 复用 '+runtime.rpc.reused+' · 冷却 '+runtime.rpc.cooled+' · 排队 '+runtime.rpc.queued+' · 预算切换 '+(runtime.rpc.budgetRejected||0));
+    if(runtime.rpc)console.log('RPC：请求 '+runtime.rpc.requested+' · 复用 '+runtime.rpc.reused+' · 冷却 '+runtime.rpc.cooled+' · 排队 '+runtime.rpc.queued+' · 本地预算等待 '+(runtime.rpc.budgetRejected||0)+' · 上游429 '+(runtime.rpc.upstream429||0)+' · 拒绝 '+(runtime.rpc.denied||0)+' · 超时 '+(runtime.rpc.timeouts||0));
 
     section('03｜🪙 Factory 底池');
     const factoryStatus=(fp.realtimeError??fp.lastError)||wssNeedsAttention?'需要关注':wssStarting?'连接中':wss.status==='degraded'?'部分可用':typeof headLag==='number'&&headLag>20?'存在延迟':'运行正常';
@@ -671,13 +671,16 @@ if [ -f "$SNAP" ]; then
 
     section('05｜🛡️ 合约完整性');
     const integrityLag=Math.max(0,(ci.latestBlock||0)-(ci.httpRealtimeLastBlock||ci.latestBlock||0));
-    const integrityStatus=ci.lastError||integrityLag>50?'需要关注':ci.lastCoreScanAt?'运行正常':'尚未建立';
+    const coreAge=Date.now()-(Date.parse(ci.lastCoreScanAt||'')||0);
+    const coreLimit=Math.max(30000,Number(ci.coreIntervalMs||10000)*3);
+    const integrityStatus=ci.lastError||integrityLag>50||ci.lastCoreScanAt&&coreAge>coreLimit?'需要关注':ci.lastCoreScanAt?'运行正常':'尚未建立';
     console.log('监控状态：'+(integrityStatus==='运行正常'?ok(integrityStatus):warn(integrityStatus)));
     console.log('合约目录：'+integrityCatalog+' 个｜已知资产 '+integrityAssets+' 个｜待发送变更 '+((ci.pendingChanges||[]).length)+' 项');
     console.log('精准地址 WSS：'+(wssStatusMap[integrityWss.status]||integrityWss.status||'尚未建立')+'｜已订阅 '+(Number(integrityWss.subscribedCount)||0)+'/'+(Number(integrityWss.configuredCount)||0));
     console.log('事件实时扫描：'+(ci.httpRealtimeLastBlock??'未建立')+' · 延迟 '+integrityLag+' 块 · 历史 '+(ci.httpEventLastBlock??'未建立')+' / '+(ci.eventHistoryEndBlock??'未知'));
     console.log('待补区间：'+gaps(ci.realtimeGaps));
     console.log('核心校验：'+fmtTime(ci.lastCoreScanAt)+' · 扩展 '+fmtTime(ci.lastExtendedScanAt)+' · 代码 '+fmtTime(ci.lastCodeAuditAt));
+    if(ci.lastCoreScanAt&&coreAge>coreLimit)console.log(warn('⚠️ 核心校验已 '+Math.floor(coreAge/1000)+' 秒未成功'));
     error('历史查询',ci.eventHistoryError);error('最近异常',ci.lastError);
 
     section('06｜✍️ Safe 提案');

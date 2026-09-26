@@ -26,3 +26,27 @@ export function activateHistoryGap(history, live, cursorKey, endKey) {
   history[endKey] = range.to;
   return true;
 }
+
+// Rotate an unavailable active range back into durable gaps. No block is acknowledged.
+export function selectReadyHistoryRange(state, cursorKey, endKey, now = Date.now()) {
+  const retries = state.historyRangeRetries || {};
+  const from = state[cursorKey] + 1, to = state[endKey];
+  if (!Number.isSafeInteger(from) || !Number.isSafeInteger(to)) return true;
+  if (from <= to && !(retries[from] > now)) return true;
+  const gaps = state.realtimeGaps || [];
+  let index = -1;
+  for (let i = 0; i < gaps.length; i++) if (!(retries[gaps[i].from] > now) && (index < 0 || gaps[i].from > gaps[index].from)) index = i;
+  if (index < 0) return from > to && gaps.length === 0;
+  const [next] = gaps.splice(index, 1);
+  if (from <= to) gaps.push({ from, to });
+  state.realtimeGaps = gaps.sort((a, b) => a.from - b.from);
+  state[cursorKey] = next.from - 1; state[endKey] = next.to;
+  return true;
+}
+
+export function deferHistoryRange(state, cursorKey, delayMs = 300_000, now = Date.now()) {
+  const from = state[cursorKey] + 1;
+  if (!Number.isSafeInteger(from)) return;
+  state.historyRangeRetries = Object.fromEntries(Object.entries(state.historyRangeRetries || {}).filter(([, until]) => until > now));
+  state.historyRangeRetries[from] = now + delayMs;
+}

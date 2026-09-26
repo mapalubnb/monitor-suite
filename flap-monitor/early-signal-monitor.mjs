@@ -462,6 +462,32 @@ export async function refreshNativeBalances(state, config, rpcBatch, nowMs) {
     state.balances[address] = current;
   }
 }
+const fullBlockCaches = new WeakMap();
+export async function readEarlyFullBlocks(state, numbers, rpcBatch) {
+  let cache = fullBlockCaches.get(state);
+  if (!cache) { cache = new Map(); fullBlockCaches.set(state, cache); }
+  const cachedNumbers = numbers.filter(number => cache.has(number));
+  // Re-read canonical headers every time; never cache block-number-to-hash mappings.
+  const headers = cachedNumbers.length ? await rpcBatch(cachedNumbers.map(number => ({ method: 'eth_getBlockByNumber', params: [blockTag(number), false] })), { requireAllResults: true }) : [];
+  const verified = new Map();
+  for (let i = 0; i < cachedNumbers.length; i++) {
+    const number = cachedNumbers[i], entry = cache.get(number);
+    if (entry && lower(headers[i]?.hash) === entry.hash) verified.set(number, entry.block);
+    else cache.delete(number);
+  }
+  const missing = numbers.filter(number => !verified.has(number));
+  const fetched = missing.length ? await rpcBatch(missing.map(number => ({ method: 'eth_getBlockByNumber', params: [blockTag(number), true] })), { requireAllResults: true }) : [];
+  for (let i = 0; i < missing.length; i++) {
+    const block = fetched[i];
+    if (!Array.isArray(block?.transactions)) throw new Error('完整区块交易不可用');
+    if (block.number != null && Number(block.number) !== missing[i]) throw new Error('完整区块高度不一致');
+    verified.set(missing[i], block);
+    if (/^0x[0-9a-f]{64}$/i.test(block.hash || '')) cache.set(missing[i], { hash: lower(block.hash), block: structuredClone(block) });
+  }
+  while (cache.size > 64) cache.delete(cache.keys().next().value);
+  return numbers.map(number => structuredClone(verified.get(number)));
+}
+
 export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   const cursorKey = config.realtime ? "realtimeCursor" : "cursor";
   const hashKey = config.realtime ? "realtimeCursorHash" : "cursorHash";
@@ -503,7 +529,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   const transactionMap = new Map();
   if (config.nativeTransactions !== false) {
     const wallets = new Set(watchedWallets(config));
-    const blocks = await rpcBatch(Array.from({ length: to - from + 1 }, (_, i) => ({ method: "eth_getBlockByNumber", params: [blockTag(from + i), true] })), { requireAllResults: true });
+    const blocks = await readEarlyFullBlocks(state, Array.from({ length: to - from + 1 }, (_, i) => from + i), rpcBatch);
     for (const block of blocks) {
       if (!Array.isArray(block.transactions)) throw new Error("完整区块交易不可用");
       for (const tx of block.transactions) if (wallets.has(lower(tx.from)) || wallets.has(lower(tx.to))) transactionMap.set(lower(tx.hash), tx);

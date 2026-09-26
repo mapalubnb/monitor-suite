@@ -39,3 +39,34 @@ test('per-provider concurrency stays bounded and a cancelled waiter releases its
   release('first'); assert.equal(await first, 'first'); assert.equal(await next, 'next');
   assert.equal(rpc.summary().queued, 0);
 });
+
+test('method-scoped 403 and 429 do not cool working reads or recent logs', () => {
+  const rpc = createRpcControl(); const url = 'https://node.test';
+  const history = { payload: { method: 'eth_getLogs' }, history: true };
+  rpc.failure(url, new Error('HTTP 403'), { status: 403 }, history);
+  assert.ok(rpc.cooldown(url, history));
+  assert.equal(rpc.cooldown(url, { payload: { method: 'eth_getLogs' }, history: false }), null);
+  assert.equal(rpc.cooldown(url, { payload: { method: 'eth_blockNumber' } }), null);
+  rpc.failure(url, new Error('HTTP 429'), { status: 429 }, { payload: { method: 'eth_getLogs' } });
+  assert.equal(rpc.cooldown(url, { payload: { method: 'eth_call' } }), null);
+  rpc.failure(url, new Error('invalid api key'), { status: 401 }, history);
+  assert.ok(rpc.cooldown(url, { payload: { method: 'eth_call' } }));
+});
+
+test('critical work overtakes queued history and speculative work never queues', async () => {
+  const rpc=createRpcControl({concurrency:1}); const order=[]; let release;
+  const first=rpc.withEndpoint('https://node.test',()=>new Promise(r=>{release=r;}));
+  const history=rpc.withEndpoint('https://node.test',()=>order.push('history'),undefined,{history:true});
+  const critical=rpc.withEndpoint('https://node.test',()=>order.push('critical'),undefined,{critical:true});
+  await assert.rejects(rpc.withEndpoint('https://node.test',()=>assert.fail(),undefined,{speculative:true}), e=>e.rpcBudget);
+  release(); await Promise.all([first,history,critical]);
+  assert.deepEqual(order,['critical','history']); assert.equal(rpc.summary().queued,0);
+});
+
+test('one waiting history request cannot occupy both local slots',async()=>{
+  const rpc=createRpcControl({concurrency:2});let release;
+  const first=rpc.withEndpoint('https://node.test',()=>new Promise(r=>{release=r;}),undefined,{history:true});
+  const second=rpc.withEndpoint('https://node.test',()=>2,undefined,{history:true});
+  assert.equal(await rpc.withEndpoint('https://node.test',()=>3),3);
+  release();await first;assert.equal(await second,2);
+});

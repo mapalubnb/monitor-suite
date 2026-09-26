@@ -52,11 +52,11 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
           return result;
         } finally { unlinkSync(lock); }
       }
-      if (now() >= deadline) throw new Error('RPC 配额锁等待超时');
+      if (now() >= deadline) throw Object.assign(new Error('RPC 配额锁等待超时'), { rpcBudget: true });
       await delay(10, undefined, { signal });
     }
   }
-  async function acquire(url, { cost = 1, history = false, signal } = {}) {
+  async function acquire(url, { cost = 1, history = false, speculative = false, critical = false, signal } = {}) {
     if (!directory) return async () => {};
     const host = rpcProvider(url), policy = limits[host] || {};
     const rate = Number(policy.rps ?? 20), burst = Number(policy.burst ?? 40), concurrency = Number(policy.concurrency ?? 4);
@@ -66,7 +66,7 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
     const identity = policy.group || (new URL(url).pathname === '/' ? host : host + new URL(url).pathname + new URL(url).search);
     const file = join(directory, createHash('sha256').update(identity).digest('hex') + '.budget.json');
     mkdirSync(directory, { recursive: true });
-    const id = randomUUID(), started = now(), deadline = started + maxWaitMs;
+    const id = randomUUID(), started = now(), deadline = started + (speculative ? 0 : maxWaitMs);
     cost = Math.max(1, Number(cost) || 1);
     if (cost > burst) { metrics.budgetRejected++; throw Object.assign(new Error('RPC 批次超过节点请求预算'), { rpcBudget: true }); }
     for (;;) {
@@ -74,8 +74,11 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
         const time = now();
         state.leases = (state.leases || []).filter(lease => lease.until > time && alive(lease.pid));
         const tokens = Math.min(burst, (state.tokens ?? burst) + Math.max(0, time - (state.at ?? time)) * rate / 1000);
-        const busy = state.leases.length >= concurrency || (history && state.leases.some(lease => lease.history));
-        if (busy || tokens < cost) return { changed: false, wait: busy ? 25 : Math.ceil((cost - tokens) * 1000 / rate) };
+        const reserve = Math.min(Math.max(0, burst - cost), history || speculative ? Number(policy.liveReserve ?? 8) : critical ? 0 : Number(policy.criticalReserve ?? 2));
+        const busy = state.leases.length >= concurrency
+          || ((history || speculative) && state.leases.length >= Math.max(1, concurrency - 1))
+          || (history && state.leases.some(lease => lease.history));
+        if (busy || tokens < cost + reserve) return { changed: false, wait: busy ? 25 : Math.ceil((cost + reserve - tokens) * 1000 / rate) };
         state.tokens = tokens - cost; state.at = time;
         state.leases.push({ id, pid: process.pid, history, until: time + 120_000 });
         return { changed: true, granted: true };
