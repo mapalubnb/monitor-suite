@@ -377,6 +377,11 @@ export function buildCardBodyElements(content, opts = {}) {
   };
 
   for (const line of lines) {
+    if (line.trim() === "---") {
+      flushMarkdown();
+      elements.push({ tag: "hr", element_id: nextId("divider"), margin: "6px 0" });
+      continue;
+    }
     const heading = line.match(/^\*\*([^*\n]+)\*\*$/);
     if (heading) {
       flushMarkdown();

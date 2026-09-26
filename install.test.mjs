@@ -94,8 +94,8 @@ test("PM2 status parser accepts ANSI-prefixed JSON", () => {
   assert.doesNotMatch(result.stdout, /解析失败|●|○/);
 });
 
-test("startup status commands contain no emoji, markdown bullets or omitted-item copy", () => {
-  for (const name of ["fm-status", "fl-status", "bot-status", "mon-status"]) {
+test("other status commands retain their existing plain layout", () => {
+  for (const name of ["bot-status", "mon-status"]) {
     const source = extractHeredoc(name);
     assert.doesNotMatch(source, /[\p{Extended_Pictographic}]/u, `${name} 仍包含 emoji`);
     assert.doesNotMatch(source, /console\.log\(['"]-\s|echo\s+["']-\s/, `${name} 仍包含列表蓝点`);
@@ -142,10 +142,10 @@ test("Flap status includes Vault Portal and contract integrity health", () => {
     lastCodeAuditAt: "2026-08-23T01:00:00.000Z",
     wssHealth: { contracts: { status: "healthy", subscribedCount: 2, configuredCount: 2 } },
   });
-  assert.match(output, /\*\*06｜Vault Portal 链上注册\*\*/);
-  assert.match(output, /\*\*07｜合约与配置完整性\*\*/);
+  assert.match(output, /\*\*04｜🏦 金库目录与注册\*\*/);
+  assert.match(output, /\*\*05｜🛡️ 合约完整性\*\*/);
   assert.match(output, /合约目录：2 个｜已知资产 1 个｜待发送变更 1 项/);
-  assert.match(output, /精准地址 WSS：healthy｜已订阅 2\/2/);
+  assert.match(output, /精准地址 WSS：运行正常｜已订阅 2\/2/);
 });
 
 test("Flap status includes Safe proposal nonce baseline and pending targets", () => {
@@ -157,9 +157,9 @@ test("Flap status includes Safe proposal nonce baseline and pending targets", ()
     pendingChanges: [{ id: "proposal" }],
     lastSuccessAt: "2026-08-24T04:00:00.000Z",
   });
-  assert.match(output, /\*\*08｜Safe 计价代币管理提案预警\*\*/);
+  assert.match(output, /\*\*06｜✍️ Safe 提案\*\*/);
   assert.match(output, /健康 Safe：1\/1｜跟踪中目标 1 个｜待发送变更 1 项/);
-  assert.match(output, /nonce 12｜基线完成/);
+  assert.match(output, /nonce 12｜状态 基线完成/);
 });
 
 test("Flap status links current factories and registered vaults to launch pages", () => {
@@ -180,7 +180,7 @@ test("Flap status links current factories and registered vaults to launch pages"
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}&chain=bnb&lang=zh`));
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${registered}&chain=bnb&lang=zh`));
   assert.doesNotMatch(output, /Robinhood|robinhood|e6ca297D1d963b6F00d5b216986123CAeB883AF6/);
-  assert.match(output, /\*\*05｜Factory 底池资产\*\*/);
+  assert.match(output, /\*\*03｜🪙 Factory 底池\*\*/);
 });
 
 test("Flap status shows concise Factory pool state", () => {
@@ -217,14 +217,15 @@ test("Flap status shows concise Factory pool state", () => {
       [namedToken]: { quoteToken: namedToken, name: "Tether Gold", symbol: "XAUt", configured: true, creationDisabled: true, effectiveEnabled: false, values: ["1", "33", "33", "7", "0"] },
     },
   });
-  assert.match(output, /\*\*05｜Factory 底池资产\*\*/);
+  assert.match(output, /\*\*03｜🪙 Factory 底池\*\*/);
   assert.match(output, /监控状态：<font color="green">运行正常<\/font>/);
-  assert.match(output, /实时通道：运行正常｜已订阅 2\/2｜最后订阅 .*｜最后事件/);
+  assert.match(output, /实时通道：运行正常｜已订阅 2\/2｜最后事件/);
   assert.match(output, /HTTP 兜底：已扫 100｜最新 105｜延迟 5 块/);
   assert.match(output, /短窗口回扫：已完成/);
   assert.match(output, /资产数量：2 个｜支持创建 1 个｜暂停创建 1 个｜已停用 0 个/);
-  assert.match(output, /BNB｜状态 支持创建｜地址 \[0x0000000000000000000000000000000000000000\]/);
-  assert.match(output, /Tether Gold \(XAUt\)｜状态 暂停创建｜地址 \[0x21caef8a43163eea865baee23b9c2e327696a3bf\]/);
+  assert.match(output, /\[BNB\]\(https:\/\/bscscan.com\/address\/0x0000000000000000000000000000000000000000\)/);
+  assert.match(output, /\[Tether Gold\]\(https:\/\/bscscan.com\/address\/0x21caef8a43163eea865baee23b9c2e327696a3bf\)/);
+  assert.doesNotMatch(output, /\[0x[a-f0-9]{40}\]|｜地址 /i);
   assert.doesNotMatch(output, /字段 [1-5]：/);
   assert.doesNotMatch(output, new RegExp(txHash));
   assert.doesNotMatch(output, /部署区块|实时头部|配置事件连续补扫|历史反向|配置事件快速回溯|Implementation|选择器/);
@@ -247,15 +248,15 @@ test("Flap status reports WSS outage and backfill failure", () => {
   assert.match(output, /监控状态：<font color="orange">需要关注<\/font>/);
   assert.match(output, /实时通道：重连中｜已订阅 0\/2/);
   assert.match(output, /短窗口回扫：失败/);
-  assert.match(output, /实时通道异常：两个节点均已断开/);
-  assert.match(output, /短窗口回扫异常：回扫请求失败/);
+  assert.match(output, /实时通道异常：<font color="orange">两个节点均已断开/);
+  assert.match(output, /短窗口回扫异常：<font color="orange">回扫请求失败/);
 });
 
-test("Four.meme pool status keeps only the requested four fields", () => {
+test("Four.meme pools keep linked symbols, state and fundraising totals", () => {
   const source = extractHeredoc("fm-status");
   const poolLine = source.split("\n").find(line => line.includes("allPools.entries()) console.log"));
   assert.ok(poolLine, "未找到底池状态输出");
-  for (const field of ["符号", "状态", "地址", "募集总量"]) assert.match(poolLine, new RegExp(field));
+  for (const field of ["symbol", "symbolAddress", "状态", "募集总量"]) assert.match(poolLine, new RegExp(field));
   assert.doesNotMatch(poolLine, /买入费|卖出费|初始金额|buyFee|sellFee|b0Amount/);
 });
 
@@ -293,12 +294,12 @@ test("full Four.meme status keeps useful OpenFour content and removes repetitive
   });
 
   assert.match(output, /OpenFour：模板 2 个｜PUBLISHED 1 个｜模块 2 个｜presetIds 4 个/);
-  assert.match(output, /\*\*04｜性能指标\*\*/);
-  assert.match(output, /创建者扫描：等待指标｜快速跳过 0｜回退 0/);
-  assert.match(output, /\*\*09｜OpenFour 模板\*\*/);
-  assert.match(output, /01　ID 101｜名称 Launch Agent｜状态 PUBLISHED｜标签 Agent/);
-  assert.match(output, /02　ID 102｜名称 Trading Assistant｜状态 INIT｜标签 Trading/);
-  assert.match(output, /模块：2 个｜presetIds 4 个/);
+  assert.match(output, /\*\*07｜⏱️ 模块性能\*\*/);
+  assert.match(output, /等待运行指标/);
+  assert.match(output, /\*\*05｜🧩 OpenFour\*\*/);
+  assert.match(output, /01　Launch Agent｜ID 101｜状态 <font color="green">PUBLISHED<\/font>｜标签 Agent/);
+  assert.match(output, /02　Trading Assistant｜ID 102｜状态 <font color="red">INIT<\/font>｜标签 Trading/);
+  assert.match(output, /模块 2 个｜presetIds 4 个/);
   assert.match(output, /角色分布：launchpad 1｜tokenImpl 2/);
   assert.doesNotMatch(output, new RegExp(addresses[1]));
   assert.doesNotMatch(output, new RegExp(addresses[4]));
@@ -338,4 +339,24 @@ test("Flap status separates healthy WSS from failed backfill and ignores cached 
  assert.match(output,/Factory 启动补扫受限/);
  assert.match(output,/延迟 10 块/);
  assert.match(output,/实时通道：运行正常/);
+});
+
+
+test("status cards preserve native dividers, linked token names and inactive markers", () => {
+  const address = '0x' + 'a'.repeat(40);
+  const output = renderFlapStatus({pages:{}}, {assets:{[address]:{quoteToken:address,name:'Disabled Token',configured:false}}}, {}, {}, {realtimeGaps:[{from:100,to:200}],health:{chain:{lastError:'RPC unavailable'}}});
+  assert.match(output, /~~\[Disabled Token\]\(https:\/\/bscscan.com\/address\/0xa{40}\)~~/);
+  assert.match(output, /100–200/);
+  assert.match(output, /RPC unavailable/);
+  const card = JSON.parse(buildCardJson('Flap 状态', output, 'green'));
+  assert.ok(card.body.elements.filter(e=>e.tag==='hr').length >= 7);
+  assert.match(JSON.stringify(card), /Disabled Token/);
+  assert.doesNotMatch(JSON.stringify(card), /"content":"---"/);
+});
+
+
+test("Four.meme native pools retain their name without a contract address", () => {
+  const output = renderFourmemeStatus({poolConfig:[{nativeSymbol:'BNB',status:'PUBLISH',totalBAmount:'18'}]});
+  assert.match(output, /01　BNB｜状态/);
+  assert.match(output, /募集总量 18/);
 });
