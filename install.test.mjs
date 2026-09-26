@@ -349,7 +349,7 @@ test("status cards preserve native dividers, linked token names and inactive mar
   assert.match(output, /100–200/);
   assert.match(output, /RPC unavailable/);
   const card = JSON.parse(buildCardJson('Flap 状态', output, 'green'));
-  assert.ok(card.body.elements.filter(e=>e.tag==='hr').length >= 7);
+  assert.ok(card.body.elements.filter(e=>e.tag==='hr').length >= 6);
   assert.match(JSON.stringify(card), /Disabled Token/);
   assert.doesNotMatch(JSON.stringify(card), /"content":"---"/);
 });

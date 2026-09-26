@@ -183,15 +183,15 @@ function buildDiffButton(opts = {}) {
   };
 }
 
-function sectionHeading(content, elementId) {
+function sectionHeading(content, elementId, { minor = false } = {}) {
   return {
     tag: "div",
     element_id: elementId,
-    margin: "8px 0 2px 0",
+    margin: minor ? "4px 0 2px 0" : "8px 0 4px 0",
     text: {
       tag: "lark_md",
       content: `**${content}**`,
-      text_size: "heading",
+      text_size: minor ? "normal" : "heading",
       text_align: "left",
     },
   };
@@ -215,13 +215,17 @@ function normalizeMentionId(value) {
 
 function parseNumberedTableRow(line) {
   if (!/^\d{2}[　\s]/.test(line) || !line.includes("｜")) return null;
+  // Delimiters inside links/code are content, not table columns.
+  if (/\[[^\]]*｜[^\]]*\]\([^)]+\)|`[^`]*｜[^`]*`/.test(line)) return null;
   const parts = line.split("｜").map(part => part.trim()).filter(Boolean);
   if (parts.length < 2) return null;
-  const values = { 项目: parts.shift() };
+  const values = Object.create(null);
+  values.项目 = parts.shift();
   for (let index = 0; index < parts.length; index++) {
     const part = parts[index];
     const match = part.match(/^([^：:\s]{1,16})[：:\s]+([\s\S]+)$/);
     const label = match?.[1] || `信息${index + 1}`;
+    if (Object.hasOwn(values, label)) return null;
     values[label] = match?.[2] || part;
   }
   return values;
@@ -293,6 +297,8 @@ function parseSimpleMetric(line) {
 function buildMetricRows(lines, idPrefix) {
   const metrics = lines.map(parseSimpleMetric);
   if (metrics.some(metric => !metric) || metrics.length < 2 || metrics.length > 8) return null;
+  // Long errors, links and descriptions need the full card width.
+  if (metrics.some(metric => tableTextLength(metric.value) > 72)) return null;
   const elements = [];
   for (let index = 0; index < metrics.length; index += 2) {
     const pair = metrics.slice(index, index + 2);
@@ -321,6 +327,14 @@ function buildMetricRows(lines, idPrefix) {
   return elements;
 }
 
+function emphasizeFieldLabel(line) {
+  // Add emphasis only; keep the original punctuation, value and link verbatim.
+  if (/^(?: {4}|\t)/.test(line)) return line;
+  const match = line.match(/^(\s*(?:[-*]\s+)?)([^*`<>\[\]：:\n]{1,24})([：:])([ \t]*\S[\s\S]*)$/);
+  if (!match || /^\s*\/\//.test(match[4]) || /^\d[\d .-]*$/.test(match[2])) return line;
+  return `${match[1]}**${match[2]}${match[3]}**${match[4]}`;
+}
+
 export function buildCardBodyElements(content, opts = {}) {
   const lines = String(content || "").trim().split("\n");
   const contentHasTimestamp = lines.some(line => /^更新时间：/.test(line.trim()));
@@ -329,9 +343,16 @@ export function buildCardBodyElements(content, opts = {}) {
   let elementIndex = 0;
   let tableCount = 0;
   let currentHeading = "";
+  let codeFence = null;
+  let codeLines = [];
   const nextId = (prefix) => `${prefix}_${++elementIndex}`;
   const mentionId = normalizeMentionId(opts.mentionOpenId);
   if (mentionId) elements.push(markdownBlock(`<at id=${mentionId}></at>`, nextId("mention"), "0 0 4px 0"));
+  const divider = () => {
+    if (elements.length && elements.at(-1).tag !== "hr") {
+      elements.push({ tag: "hr", element_id: nextId("divider"), margin: "6px 0" });
+    }
+  };
   const flushMarkdown = () => {
     while (markdownLines.length > 0 && !markdownLines[0].trim()) markdownLines.shift();
     while (markdownLines.length > 0 && !markdownLines.at(-1).trim()) markdownLines.pop();
@@ -349,7 +370,9 @@ export function buildCardBodyElements(content, opts = {}) {
 
     let plain = [];
     const flushPlain = () => {
-      if (plain.length > 0) elements.push(markdownBlock(plain.join("\n"), nextId("text")));
+      if (plain.some(line => line.trim())) {
+        elements.push(markdownBlock(plain.map(emphasizeFieldLabel).join("\n"), nextId("text"), "2px 0 4px 0"));
+      }
       plain = [];
     };
     for (let index = 0; index < markdownLines.length;) {
@@ -368,6 +391,8 @@ export function buildCardBodyElements(content, opts = {}) {
       } else if (tableLines.length > 0) {
         plain.push(...tableLines);
       } else {
+        // Keep paragraphs in the same Markdown block: a font/span may cross
+        // an empty line, and splitting it would change the original styling.
         plain.push(markdownLines[index]);
         index++;
       }
@@ -377,20 +402,43 @@ export function buildCardBodyElements(content, opts = {}) {
   };
 
   for (const line of lines) {
-    if (line.trim() === "---") {
-      flushMarkdown();
-      elements.push({ tag: "hr", element_id: nextId("divider"), margin: "6px 0" });
+    const fence = line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+    if (codeFence) {
+      codeLines.push(line);
+      if (fence && fence[1][0] === codeFence.char && fence[1].length >= codeFence.length && !fence[2].trim()) {
+        elements.push(markdownBlock(codeLines.join("\n"), nextId("code"), "4px 0"));
+        codeFence = null;
+        codeLines = [];
+      }
       continue;
     }
-    const heading = line.match(/^\*\*([^*\n]+)\*\*$/);
+    if (fence) {
+      flushMarkdown();
+      codeFence = { char: fence[1][0], length: fence[1].length };
+      codeLines = [line];
+      continue;
+    }
+    if (line.trim() === "---") {
+      flushMarkdown();
+      divider();
+      continue;
+    }
+    const heading = line.match(/^\*\*([^*\n]+)\*\*$/) || line.match(/^#{1,3}\s+(.+?)\s*$/);
     if (heading) {
       flushMarkdown();
       currentHeading = heading[1].trim();
-      elements.push(sectionHeading(currentHeading, nextId("section")));
+      const minor = /[：:]$/.test(currentHeading) || /^###\s/.test(line);
+      if (!minor && elements.some(element => element.element_id?.startsWith("section_"))) divider();
+      elements.push(sectionHeading(currentHeading, nextId("section"), { minor }));
+    } else if (/^(?:更新时间|最后检测|快照更新|本次进程启动)：/.test(line)) {
+      flushMarkdown();
+      elements.push({ tag: "div", element_id: nextId("timestamp"), margin: "2px 0",
+        text: { tag: "plain_text", content: line, text_size: "notation", text_color: "grey" } });
     } else {
       markdownLines.push(line);
     }
   }
+  if (codeLines.length) elements.push(markdownBlock(codeLines.join("\n"), nextId("code"), "4px 0"));
   flushMarkdown();
 
   const diffButton = buildDiffButton(opts);
