@@ -28,7 +28,7 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
       const rate = Number(policy.rps ?? 20), burst = Number(policy.burst ?? 40), limit = Number(policy.concurrency ?? 4);
       const leases = (state.leases || []).filter(lease => lease.until > now() && alive(lease.pid));
       const tokens = Math.min(burst, (state.tokens ?? burst) + Math.max(0, now() - (state.at ?? now())) * rate / 1000);
-      const reserve = Math.min(Math.max(0, burst - cost), history ? Number(policy.liveReserve ?? 8) : critical ? 0 : Number(policy.criticalReserve ?? 2));
+      const reserve = Math.min(Math.max(0, burst - cost), history ? Number(policy.liveReserve ?? 8) : critical ? 0 : Number(policy.criticalReserve ?? 8));
       return leases.length / limit + Math.max(0, cost + reserve - tokens) / rate + (history && leases.some(lease => lease.history) ? 2 : 0);
     } catch (error) { return error.code === 'ENOENT' ? 0 : 4; }
   }
@@ -81,7 +81,7 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
     // Public aliases share a budget; private credentials remain isolated unless
     // an explicit group combines endpoints belonging to the same account.
     mkdirSync(directory, { recursive: true });
-    const id = randomUUID(), started = now(), deadline = started + (speculative ? 0 : maxWaitMs);
+    const id = randomUUID(), started = now(), deadline = started + (speculative ? 0 : critical ? Math.max(maxWaitMs, 1500) : maxWaitMs);
     cost = Math.max(1, Number(cost) || 1);
     if (cost > burst) { metrics.budgetRejected++; throw Object.assign(new Error('RPC 批次超过节点请求预算'), { rpcBudget: true }); }
     for (;;) {
@@ -89,7 +89,7 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
         const time = now();
         state.leases = (state.leases || []).filter(lease => lease.until > time && alive(lease.pid));
         const tokens = Math.min(burst, (state.tokens ?? burst) + Math.max(0, time - (state.at ?? time)) * rate / 1000);
-        const reserve = Math.min(Math.max(0, burst - cost), history || speculative ? Number(policy.liveReserve ?? 8) : critical ? 0 : Number(policy.criticalReserve ?? 2));
+        const reserve = Math.min(Math.max(0, burst - cost), history || speculative ? Number(policy.liveReserve ?? 8) : critical ? 0 : Number(policy.criticalReserve ?? 8));
         const busy = state.leases.length >= concurrency
           || ((history || speculative) && state.leases.length >= Math.max(1, concurrency - 1))
           || (history && state.leases.some(lease => lease.history));

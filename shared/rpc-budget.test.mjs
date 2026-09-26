@@ -61,7 +61,7 @@ test('corrupt budget data fails closed instead of silently creating another quot
 
 test('background budget preserves tokens for live and critical work across instances', async()=>{
  const directory=mkdtempSync(join(tmpdir(),'rpc-reserve-'));
- const options={directory,maxWaitMs:0,limits:{'node.test':{rps:0.001,burst:20,concurrency:4}}};
+ const options={directory,maxWaitMs:0,limits:{'node.test':{rps:0.001,burst:20,concurrency:4,criticalReserve:2}}};
  try{
   const a=createRpcBudget(options),b=createRpcBudget(options);
   const h=await a.acquire('https://node.test',{cost:12,history:true});await h();
@@ -77,5 +77,14 @@ test('pressure reads shared occupancy without spending quota',async()=>{
  const release=await budget.acquire('https://node.test',{history:true});
  assert.ok(budget.pressure('https://node.test',{history:true})>budget.pressure('https://node.test',{critical:true}));
  await release();assert.equal(budget.pressure('https://node.test'),0);
+ }finally{rmSync(directory,{recursive:true,force:true});}
+});
+
+test('default reserve admits a complete critical batch after ordinary traffic',async()=>{
+ const directory=mkdtempSync(join(tmpdir(),'rpc-critical-'));try{
+ const budget=createRpcBudget({directory,maxWaitMs:0,limits:{'node.test':{rps:0.001,burst:40}}});
+ const ordinary=await budget.acquire('https://node.test',{cost:32});await ordinary();
+ await assert.rejects(budget.acquire('https://node.test'),e=>e.rpcBudget);
+ const critical=await budget.acquire('https://node.test',{cost:8,critical:true});await critical();
  }finally{rmSync(directory,{recursive:true,force:true});}
 });
