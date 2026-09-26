@@ -70,3 +70,9 @@ test('one waiting history request cannot occupy both local slots',async()=>{
   assert.equal(await rpc.withEndpoint('https://node.test',()=>3),3);
   release();await first;assert.equal(await second,2);
 });
+
+test('expired queue deadline does not hide a later upstream timeout',async()=>{
+ const rpc=createRpcControl(),queue=new AbortController();
+ await assert.rejects(rpc.withEndpoint('https://node.test',async()=>{queue.abort();throw new DOMException('timeout','TimeoutError');},queue.signal,{payload:{method:'eth_getLogs'}}));
+ assert.equal(rpc.summary().timeouts,1);
+});

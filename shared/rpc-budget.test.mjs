@@ -70,3 +70,12 @@ test('background budget preserves tokens for live and critical work across insta
   const critical=await a.acquire('https://node.test',{cost:2,critical:true});await critical();
  }finally{rmSync(directory,{recursive:true,force:true});}
 });
+
+test('pressure reads shared occupancy without spending quota',async()=>{
+ const directory=mkdtempSync(join(tmpdir(),'rpc-pressure-'));try{
+ const budget=createRpcBudget({directory});assert.equal(budget.pressure('https://node.test'),0);
+ const release=await budget.acquire('https://node.test',{history:true});
+ assert.ok(budget.pressure('https://node.test',{history:true})>budget.pressure('https://node.test',{critical:true}));
+ await release();assert.equal(budget.pressure('https://node.test'),0);
+ }finally{rmSync(directory,{recursive:true,force:true});}
+});

@@ -97,7 +97,7 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
       methods.set(methodKey, stats);
       try { const value = await operation(); stats.ok++; return value; }
       catch (error) {
-        if (!signal?.aborted) { stats.failed++; if (/429|rate.?limit/i.test(error.message)) metrics.upstream429++; else if (/403|401/.test(error.message)) metrics.denied++; else if (/timeout|timed out/i.test(error.message)) metrics.timeouts++; }
+        if (!request.cancelSignal?.aborted) { stats.failed++; if (/429|rate.?limit/i.test(error.message)) metrics.upstream429++; else if (/403|401/.test(error.message)) metrics.denied++; else if (/timeout|timed out/i.test(error.message) || ['TimeoutError', 'AbortError'].includes(error.name)) metrics.timeouts++; }
         throw error;
       } finally { stats.lastMs = now() - started; stats.totalMs += stats.lastMs; stats.maxMs = Math.max(stats.maxMs, stats.lastMs); }
     }
@@ -134,6 +134,7 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
     } finally { inflight.delete(id); }
   }
   return { cooldown, failure, withEndpoint, coalesce, metrics,
+    pressure: (url, request = {}) => budget.pressure(url, request) + (active.get(key(url)) || 0) / concurrency + (waiters.get(key(url))?.length || 0),
     reset() { cooldowns.clear(); checked.clear(); cache.clear(); },
     summary: () => ({ ...metrics, ...budget.metrics, methods: Object.fromEntries(methods), inFlight: inflight.size, queued: [...waiters.values()].reduce((n, q) => n + q.length, 0) }),
   };

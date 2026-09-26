@@ -3533,3 +3533,11 @@ test('core integrity pass never awaits historical scans',async()=>{
  await __testables.runFlapContractIntegrityPass(state,{stateScanFn:async()=>({changed:false,changes:[]}),eventScanFn:async opts=>{kinds.push(opts.realtime);return {changed:false,changes:[],latest:100};},saveStateFn:()=>{}});
  assert.deepEqual(kinds,[true]);
 });
+
+test('optional single getter revert does not trigger a whole chunk replay',async()=>{
+ const original=globalThis.fetch,urls=__testables.CONFIG.bscRpcUrls;let count=0;
+ __testables.CONFIG.bscRpcUrls=['https://revert.test'];__testables.resetBscRpcHealth();
+ globalThis.fetch=async()=>{count++;return {ok:true,json:async()=>({error:{message:'execution reverted'}})};};
+ try{assert.deepEqual(await __testables.bscRpcBatch([{method:'eth_call',params:[{}]}]),[null]);assert.equal(count,1);await assert.rejects(__testables.bscRpcBatch([{method:'eth_call',params:[{}]}],{requireAllResults:true}),/execution reverted/);}
+ finally{globalThis.fetch=original;__testables.CONFIG.bscRpcUrls=urls;__testables.resetBscRpcHealth();}
+});

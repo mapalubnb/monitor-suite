@@ -2676,7 +2676,7 @@ function bscRpcTimeoutMs(method, params = []) {
   return CONFIG.factoryPoolMonitor.rpcTimeoutMs;
 }
 
-function orderedBscRpcIndexes(preferenceKey, urls = CONFIG.bscRpcUrls) {
+function orderedBscRpcIndexes(preferenceKey, urls = CONFIG.bscRpcUrls, request = {}) {
   const health = bscRpcHealthByKey.get(preferenceKey) || new Map();
   const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey);
   return urls.map((_, index) => index).filter(index => !rpcControl.cooldown(urls[index])).sort((left, right) => {
@@ -2684,8 +2684,8 @@ function orderedBscRpcIndexes(preferenceKey, urls = CONFIG.bscRpcUrls) {
     const rightHealth = health.get(right);
     const leftLatency = leftHealth?.failedAt && Date.now() - leftHealth.failedAt > 60_000 ? null : leftHealth?.latencyMs;
     const rightLatency = rightHealth?.failedAt && Date.now() - rightHealth.failedAt > 60_000 ? null : rightHealth?.latencyMs;
-    const leftScore = leftLatency ?? (left === preferredIndex ? 250 : 1_000 + left * 10);
-    const rightScore = rightLatency ?? (right === preferredIndex ? 250 : 1_000 + right * 10);
+    const leftScore = (leftLatency ?? (left === preferredIndex ? 250 : 1_000 + left * 10)) + rpcControl.pressure(urls[left], request) * 1000;
+    const rightScore = (rightLatency ?? (right === preferredIndex ? 250 : 1_000 + right * 10)) + rpcControl.pressure(urls[right], request) * 1000;
     return leftScore - rightScore;
   });
 }
@@ -2759,7 +2759,7 @@ async function executeBscGetLogsUnshared(params, options = {}) {
   finally { activeLogRequests--; if (history) activeHistoryLogRequests--; pumpLogRequests(); }
 }
 async function fetchRpcJson(url, payload, timeoutMs, signal, history = false, scheduling = {}) {
-  const request = { payload, history, ...scheduling };
+  const request = { payload, history, cancelSignal: signal, ...scheduling };
   const queueTimeout = AbortSignal.timeout(scheduling.critical ? 3000 : 1000);
   const queueSignal = signal ? AbortSignal.any([signal, queueTimeout]) : queueTimeout;
   let started = false;
@@ -2877,7 +2877,7 @@ async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateR
   return json;
 }
 async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse, urls, options) {
-  const indexes = orderedBscRpcIndexes(preferenceKey, urls);
+  const indexes = orderedBscRpcIndexes(preferenceKey, urls, { cost: Array.isArray(payload) ? payload.length : 1, history: options.history, critical: options.critical });
   if (!indexes.length) throw new Error("所有 RPC 节点处于共享冷却，等待恢复");
   const controllers = [], errors = [];
   let settled = false, position = 0;
@@ -2955,7 +2955,10 @@ async function bscRpcBatch(calls = [], options = {}) {
       catch (error) { if (options.requireAllResults) throw error; return null; }
     }));
   }
-  if (calls.length === 1) return [await bscRpcCall(calls[0].method, calls[0].params, { ...options, requireResult: options.requireAllResults })];
+  if (calls.length === 1) {
+    try { return [await bscRpcCall(calls[0].method, calls[0].params, { ...options, requireResult: options.requireAllResults })]; }
+    catch (error) { if (!options.requireAllResults && /execution reverted/i.test(error.message)) return [null]; throw error; }
+  }
   const payload = calls.map((call, i) => ({ jsonrpc: "2.0", id: i + 1, method: call.method, params: call.params || [] }));
   const preferenceKey = bscRpcBatchPreferenceKey(calls);
   const timeoutMs = Math.max(...calls.map(call => bscRpcTimeoutMs(call.method, call.params || [])));

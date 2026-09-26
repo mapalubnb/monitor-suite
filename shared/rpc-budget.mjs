@@ -15,6 +15,23 @@ export function rpcProvider(url) {
 export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWaitMs = 300 } = {}) {
   const metrics = { budgetWaits: 0, budgetRejected: 0, budgetWaitMs: 0 };
   const alive = pid => { if (!Number.isInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
+  function settings(url) {
+    const host = rpcProvider(url), policy = limits[host] || {};
+    const identity = policy.group || (new URL(url).pathname === '/' ? host : host + new URL(url).pathname + new URL(url).search);
+    return { host, policy, file: join(directory, createHash('sha256').update(identity).digest('hex') + '.budget.json') };
+  }
+  function pressure(url, { cost = 1, history = false, critical = false } = {}) {
+    if (!directory) return 0;
+    const { policy, file } = settings(url);
+    try {
+      const state = JSON.parse(readFileSync(file, 'utf8'));
+      const rate = Number(policy.rps ?? 20), burst = Number(policy.burst ?? 40), limit = Number(policy.concurrency ?? 4);
+      const leases = (state.leases || []).filter(lease => lease.until > now() && alive(lease.pid));
+      const tokens = Math.min(burst, (state.tokens ?? burst) + Math.max(0, now() - (state.at ?? now())) * rate / 1000);
+      const reserve = Math.min(Math.max(0, burst - cost), history ? Number(policy.liveReserve ?? 8) : critical ? 0 : Number(policy.criticalReserve ?? 2));
+      return leases.length / limit + Math.max(0, cost + reserve - tokens) / rate + (history && leases.some(lease => lease.history) ? 2 : 0);
+    } catch (error) { return error.code === 'ENOENT' ? 0 : 4; }
+  }
   async function mutate(file, operation, deadline, signal) {
     const lock = file + '.lock';
     for (;;) {
@@ -58,13 +75,11 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
   }
   async function acquire(url, { cost = 1, history = false, speculative = false, critical = false, signal } = {}) {
     if (!directory) return async () => {};
-    const host = rpcProvider(url), policy = limits[host] || {};
+    const { host, policy, file } = settings(url);
     const rate = Number(policy.rps ?? 20), burst = Number(policy.burst ?? 40), concurrency = Number(policy.concurrency ?? 4);
     if (!(rate > 0 && burst >= 1 && concurrency >= 1)) throw new Error('RPC 配额配置无效：' + host);
     // Public aliases share a budget; private credentials remain isolated unless
     // an explicit group combines endpoints belonging to the same account.
-    const identity = policy.group || (new URL(url).pathname === '/' ? host : host + new URL(url).pathname + new URL(url).search);
-    const file = join(directory, createHash('sha256').update(identity).digest('hex') + '.budget.json');
     mkdirSync(directory, { recursive: true });
     const id = randomUUID(), started = now(), deadline = started + (speculative ? 0 : maxWaitMs);
     cost = Math.max(1, Number(cost) || 1);
@@ -98,5 +113,5 @@ export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWai
       await mutate(file, state => { state.leases = (state.leases || []).filter(lease => lease.id !== id); return { changed: true }; }, now() + 2000);
     };
   }
-  return { acquire, metrics };
+  return { acquire, pressure, metrics };
 }
