@@ -88,3 +88,14 @@ test('default reserve admits a complete critical batch after ordinary traffic',a
  const critical=await budget.acquire('https://node.test',{cost:8,critical:true});await critical();
  }finally{rmSync(directory,{recursive:true,force:true});}
 });
+
+test('ordinary batch can wait for an eight-token refill without consuming critical reserve',async()=>{
+ const directory=mkdtempSync(join(tmpdir(),'rpc-refill-'));
+ try{
+  const budget=createRpcBudget({directory});
+  const initial=await budget.acquire('https://node.test',{cost:32});await initial();
+  const next=await budget.acquire('https://node.test',{cost:8});await next();
+  const state=JSON.parse(readFileSync(join(directory,readdirSync(directory).find(n=>n.endsWith('.json')))));
+  assert.ok(state.tokens>=8);assert.equal(budget.metrics.budgetRejected,0);
+ }finally{rmSync(directory,{recursive:true,force:true});}
+});

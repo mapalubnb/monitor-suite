@@ -2760,7 +2760,7 @@ async function executeBscGetLogsUnshared(params, options = {}) {
 }
 async function fetchRpcJson(url, payload, timeoutMs, signal, history = false, scheduling = {}) {
   const request = { payload, history, cancelSignal: signal, operationTimeoutMs: timeoutMs, ...scheduling };
-  const queueTimeout = AbortSignal.timeout(scheduling.critical ? 3000 : 1000);
+  const queueTimeout = AbortSignal.timeout(3000);
   const queueSignal = signal ? AbortSignal.any([signal, queueTimeout]) : queueTimeout;
   let started = false;
   try { return await rpcControl.withEndpoint(url, async effectiveSignal => {

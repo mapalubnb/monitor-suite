@@ -12,7 +12,7 @@ export function rpcProvider(url) {
 
 // Shared by local monitor processes. A lease is charged before the HTTP request;
 // queued work never consumes an HTTP timeout or silently bypasses the budget.
-export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWaitMs = 300 } = {}) {
+export function createRpcBudget({ directory, limits = {}, now = Date.now, maxWaitMs = 1000 } = {}) {
   const metrics = { budgetWaits: 0, budgetRejected: 0, budgetWaitMs: 0 };
   const alive = pid => { if (!Number.isInteger(pid) || pid < 1) return false; try { process.kill(pid, 0); return true; } catch (e) { return e.code !== 'ESRCH'; } };
   function settings(url) {
