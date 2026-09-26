@@ -830,7 +830,10 @@ function loadSnapshot() {
   try {
     if (existsSync(CONFIG.snapshotFile)) {
       const data = readSnapshot(CONFIG.snapshotFile);
-      return migrateSnapshot(data);
+      const pageCount = Object.keys(data.pages || {}).length;
+      const migrated = migrateSnapshot(data);
+      if (Object.keys(migrated.pages).length !== pageCount) saveSnapshot(migrated);
+      return migrated;
     }
   } catch (error) { throw new Error(`快照读取失败，停止启动以保护基线：${error.message}`); }
   return null;
