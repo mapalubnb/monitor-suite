@@ -690,12 +690,19 @@ export async function runEarlySignalScan({ state, config = {}, rpcBatch, fetchFn
     if (enabled("assets")) await sourcePass(state, "assets", () => refreshEarlyAssets(state, config, rpcBatch, nowMs), nowMs, config.priorityTokens?.length || config.scheduledSource ? 0 : config.assetIntervalMs || 10000);
     if (enabled("positions")) await sourcePass(state, "positions", () => refreshEarlyPositions(state, rpcBatch), nowMs, periodicInterval);
     if (enabled("balances")) await sourcePass(state, "balances", () => refreshNativeBalances(state, config, rpcBatch, nowMs), nowMs, periodicInterval);
-    if (enabled("discovery")) await sourcePass(state, "discovery", () => {
+    if (enabled("discovery")) {
       const keys = normalizeSafeApiKeys(config.safeApiKeys, config.safeApiKey || '');
-      const safeFetch = keys.length ? createSafeApiPoolFetch(safeState || (state.safeApiState ||= {}), fetchFn,
-        { apiKeys: keys, apiBaseUrl: config.safeApiBaseUrl, intervalMs: 5000 }) : fetchFn;
-      return scanAddressDiscovery(state, config, safeFetch, nowMs);
-    }, nowMs, config.discoveryIntervalMs || DAY);
+      const credentialId = hash(JSON.stringify([config.safeApiBaseUrl, [...keys].sort()]));
+      if (state.discoveryCredentialId !== credentialId) {
+        state.discoveryCredentialId = credentialId;
+        if (state.health.discovery) Object.assign(state.health.discovery, { nextAttemptAtMs: 0, failures: 0 });
+      }
+      await sourcePass(state, "discovery", () => {
+        const safeFetch = keys.length ? createSafeApiPoolFetch(safeState || (state.safeApiState ||= {}), fetchFn,
+          { apiKeys: keys, apiBaseUrl: config.safeApiBaseUrl, intervalMs: 5000 }) : fetchFn;
+        return scanAddressDiscovery(state, config, safeFetch, nowMs);
+      }, nowMs, config.discoveryIntervalMs || DAY);
+    }
   }
   state.lastRunAt = iso(nowMs);
   prune(state, nowMs);

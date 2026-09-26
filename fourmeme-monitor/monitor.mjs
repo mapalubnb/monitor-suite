@@ -1,4 +1,4 @@
-import { createRpcControl } from "../shared/rpc-control.mjs";
+import { createRpcControl, rpcReadLane } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 /**
@@ -206,7 +206,7 @@ const CONFIG = {
   hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 60),
 
   // ── BSC RPC ──
-  rpcPools: Object.fromEntries(['read', 'logs'].map(lane => [lane,
+  rpcPools: Object.fromEntries(['read', 'block', 'logs'].map(lane => [lane,
     (process.env[`FOURMEME_RPC_${lane.toUpperCase()}_URLS`] || '').split(/[\s,]+/).filter(Boolean)])),
   bscRpcUrls: [...new Set((process.env.FOURMEME_BSC_RPC_URLS || [
     "https://bsc.rpc.blxrbdn.com",
@@ -1469,8 +1469,8 @@ const bscRpcEndpointPool = createRpcEndpointPool(CONFIG.bscRpcUrls, { isBackedOf
 const bscRpcInflight = new Map();
 const routedRpcPools = new Map();
 function rpcPoolFor(payload) {
-  const lane = (Array.isArray(payload) ? payload : [payload]).some(item => item.method === 'eth_getLogs') ? 'logs' : 'read';
-  const urls = CONFIG.rpcPools[lane];
+  const lane = (Array.isArray(payload) ? payload : [payload]).some(item => item.method === 'eth_getLogs') ? 'logs' : rpcReadLane(payload);
+  const urls = CONFIG.rpcPools[lane]?.length ? CONFIG.rpcPools[lane] : lane === 'block' ? CONFIG.rpcPools.read : CONFIG.rpcPools[lane];
   if (!urls.length) return bscRpcEndpointPool;
   const key = JSON.stringify(urls);
   if (!routedRpcPools.has(key)) routedRpcPools.set(key, createRpcEndpointPool(urls,
@@ -1512,7 +1512,7 @@ async function requestBscRpcPayload(payload, timeoutMs, {
         for (const item of Array.isArray(parsed) ? parsed : [parsed]) if (item?.error) {
           const error = new Error(item.error.message || "RPC error");
           rpcControl.failure(rpcUrl, error);
-          if (/rate.?limit|compute units|too many requests|usage limit/i.test(error.message)) throw error;
+          if (/rate.?limit|compute units|too many requests|usage limit|resource.*not available|method.*not (found|supported)/i.test(error.message)) throw error;
         }
         return parsed;
         }, AbortSignal.timeout(timeoutMs + 1000), { cost: Array.isArray(payload) ? payload.length : 1 });
@@ -8471,6 +8471,12 @@ async function fetchValidatedActorBlocks(
   rpcBatchFn = bscRpcBatch,
 ) {
   if (actorAddresses.length === 0) return [];
+  if (blockCalls.length > 20) {
+    const blocks = [];
+    for (let i = 0; i < blockCalls.length; i += 20) blocks.push(...await fetchValidatedActorBlocks(blockCalls.slice(i, i + 20), actorAddresses, rpcRequestFn, rpcBatchFn));
+    validateActorBlocks(blockCalls, blocks);
+    return blocks;
+  }
   const payload = blockCalls.map((call, index) => ({
     jsonrpc: "2.0",
     id: index + 1,

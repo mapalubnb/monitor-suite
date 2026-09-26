@@ -1,4 +1,4 @@
-import { createRpcControl, rpcCacheTtl, createRpcErrorLogger } from "../shared/rpc-control.mjs";
+import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
@@ -118,7 +118,7 @@ const CONFIG = {
     minAssetFiles: 2,
   },
   assetStringLimit: 300,
-  rpcPools: Object.fromEntries(['read', 'realtime', 'history'].map(lane => [lane,
+  rpcPools: Object.fromEntries(['read', 'block', 'realtime', 'history'].map(lane => [lane,
     (process.env[`FLAP_RPC_${lane.toUpperCase()}_URLS`] || '').split(/[\s,]+/).filter(Boolean)])),
   bscRpcUrls: [...new Set((process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://fast.bsc-rpc.com,https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com")
     .split(",").map(s => s.trim()).filter(Boolean)
@@ -2855,8 +2855,9 @@ async function queryBscLogs(params, options) {
 }
 
 async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null, validationKey = "default", options = {}) {
-  const lane = options.history ? 'history' : 'read';
-  const urls = CONFIG.rpcPools[lane].length ? CONFIG.rpcPools[lane] : CONFIG.bscRpcUrls;
+  const lane = rpcReadLane(payload) === 'block' ? 'block' : options.history ? 'history' : 'read';
+  const configured = CONFIG.rpcPools[lane]?.length ? CONFIG.rpcPools[lane] : CONFIG.rpcPools.read;
+  const urls = configured.length ? configured : CONFIG.bscRpcUrls;
   preferenceKey += ':' + JSON.stringify(urls);
   // Validation belongs to each consumer; the shared operation validates the wire response.
   const json = await rpcControl.coalesce(JSON.stringify([urls, payload, timeoutMs, validationKey, lane]),

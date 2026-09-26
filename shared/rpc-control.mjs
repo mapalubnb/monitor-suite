@@ -111,6 +111,11 @@ export function rpcCacheTtl(payload) {
   return payload.method === 'eth_chainId' ? 60_000 : payload.method === 'eth_blockNumber' ? 100 : 0;
 }
 
+export function rpcReadLane(payload) {
+  const blockMethods = new Set(['eth_chainId', 'eth_blockNumber', 'eth_getBlockByNumber', 'eth_getTransactionByHash', 'eth_getTransactionReceipt']);
+  return (Array.isArray(payload) ? payload : [payload]).every(item => blockMethods.has(item.method)) ? 'block' : 'read';
+}
+
 export function createRpcErrorLogger(write, { now = Date.now, intervalMs = 30_000 } = {}) {
   const recent = new Map();
   return message => {

@@ -162,6 +162,20 @@ test("missing actor blocks and mixed forks cannot advance a scan", async () => {
   ), /不完整/);
 });
 
+test('large actor reads split before transport and validate across batch boundaries', async () => {
+  const calls = Array.from({ length: 45 }, (_, i) => ({ method: 'eth_getBlockByNumber', params: ['0x' + (i + 1).toString(16), true] }));
+  const sizes = [], hash = n => '0x' + n.toString(16).padStart(64, '0');
+  let fork = false;
+  const request = async (payload, _, options) => {
+    sizes.push(payload.length);
+    const data = payload.map(item => { const n = Number(item.params[0]); return { id: item.id, result: { number: item.params[0], hash: hash(n), parentHash: hash(fork && n === 21 ? 0 : n - 1), transactions: [] } }; });
+    return options.parseResponse({ text: async () => JSON.stringify(data) });
+  };
+  assert.equal((await __testables.fetchValidatedActorBlocks(calls, ['actor'], request)).length, 45);
+  assert.deepEqual(sizes, [20, 20, 5]); fork = true;
+  await assert.rejects(__testables.fetchValidatedActorBlocks(calls, ['actor'], request), /分叉/);
+});
+
 test("OpenFour failed count and truncated preset pages never become removals", async () => {
   await assert.rejects(__testables.fetchOpenFourPresetIds(async () => [null]), /数量读取失败/);
   let calls = 0;

@@ -134,6 +134,8 @@ Safe API Key 逐个录入：在服务器 SSH 终端执行 `sudo fl-safe-api`，�
 
 ## 1.11.0 RPC 分池与容量保护
 
+1.11.1 补充：`FLAP_RPC_BLOCK_URLS` 与 `FOURMEME_RPC_BLOCK_URLS` 可单独分配区块、头块及回执读取，留空沿用普通读取池。`bsc-dataseed-public.bnbchain.org` 实测不支持代码、存储槽与合约调用，不能作为通用读取节点；节点准入须逐方法验证。创建者原始区块读取同样拆分为最多 20 项，分段后仍校验整段父子块连续性。Safe 凭证池变更会解除旧请求来源的重试等待，但保留实际错误直到成功。
+
 - Flap 可分别配置 `FLAP_RPC_READ_URLS`、`FLAP_RPC_REALTIME_URLS`、`FLAP_RPC_HISTORY_URLS`，Four.meme 可配置 `FOURMEME_RPC_READ_URLS`、`FOURMEME_RPC_LOGS_URLS`。空值兼容原节点列表；配置后每个池只在自己的列表内故障切换。历史池需包含足够独立且支持查询范围的服务，空历史日志仍需双源确认。
 - 两个进程在 `.rpc-cooldowns/` 使用同一套令牌及在途租约。默认每个节点每秒 20 个子请求、突发 40、并发 4；历史最多占一个槽。批量拆为最多 20 项，按子请求数扣减。预算不足短暂等待后切备用，全部池容量不足会明确报错，绝不伪装成空结果或推进游标。
 - `RPC_PROVIDER_LIMITS` 是按主机名索引的 JSON，例如 `{"rpc.example.com":{"rps":20,"burst":40,"concurrency":4,"group":"account-a"}}`。同账号不同域名必须使用相同 group 和额度配置；PublicNode 的 BSC 别名及 BNB 官方 dataseed 别名自动归并。配置额度不是服务商承诺，需结合实际吞吐与拒绝率调整。单次请求需在两分钟租约内完成；现有 RPC 超时均远短于该期限。
