@@ -3328,3 +3328,54 @@ test('archive endpoint failure never quarantines recent log queries and only two
     assert.ok(peak <= 2);
   } finally { globalThis.fetch = originalFetch; __testables.resetBscRpcHealth(); }
 });
+
+
+test("registry preserves old gap and continues live scans while history RPC is blocked", async () => {
+  const snapshot = {registryMonitor:{lastBlock:100,knownVaults:{},lagBlocks:999}};
+  let head=10000;
+  const rpcCallFn=async method=>method==='eth_blockNumber'?'0x'+head.toString(16):[];
+  await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn});
+  const state=snapshot.registryMonitor;
+  assert.equal(state.lastBlock,9995);
+  assert.equal(state.lagBlocks,0);
+  assert.deepEqual(state.realtimeGaps,[{from:101,to:9975}]);
+  let release, started;
+  const entered=new Promise(resolve=>{started=resolve;});
+  const waiting=new Promise(resolve=>{release=resolve;});
+  const history=__testables.checkFlapRegistryLogs(snapshot,{history:true,rpcCallFn:async (_method,_params,opts)=>{
+    assert.equal(opts.history,true);started();await waiting;throw new Error('archive unavailable');
+  }});
+  const rejected=assert.rejects(history,/archive unavailable/);
+  await entered;
+  head=10010;
+  await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn});
+  assert.equal(state.lastBlock,10005);
+  assert.equal(state.historyLastBlock,100);
+  assert.equal(state.historyEndBlock,9975);
+  release();await rejected;
+  const reloaded=JSON.parse(JSON.stringify(snapshot));
+  const ranges=[];
+  await __testables.checkFlapRegistryLogs(reloaded,{history:true,rpcCallFn:async (_method,params)=>{ranges.push(params[0]);return [];}});
+  assert.equal(Number(ranges[0].fromBlock),101);
+  assert.equal(reloaded.registryMonitor.lastBlock,10005);
+  assert.equal(reloaded.registryMonitor.historyLastBlock,3100);
+});
+
+test("registry recalculates lag even on RPC failure without losing the recovered gap", async()=>{
+ const snapshot={registryMonitor:{lastBlock:100,knownVaults:{},lagBlocks:1}};
+ await assert.rejects(__testables.checkFlapRegistryLogs(snapshot,{rpcCallFn:async method=>{
+  if(method==='eth_blockNumber')return '0x2710';throw new Error('RPC down');
+ }}),/RPC down/);
+ assert.equal(snapshot.registryMonitor.lagBlocks,20);
+ assert.deepEqual(snapshot.registryMonitor.realtimeGaps,[{from:101,to:9975}]);
+});
+
+test("Factory startup backfill ignores a stale head and caps the recent window",async()=>{
+ const ranges=[];
+ const result=await __testables.backfillFactoryPoolFeedEvents({enqueue:async()=>{}},10000,async(method,params)=>{
+  if(method==='eth_blockNumber')return '0x64';ranges.push(params[0]);return [];
+ },undefined,2000,20000);
+ assert.equal(result.latest,20000);
+ assert.equal(result.fromBlock,15001);
+ assert.equal(Number(ranges.at(-1).toBlock),20000);
+});

@@ -591,14 +591,14 @@ if [ -f "$SNAP" ]; then
     const backfillCode=wss.backfill?.status||'idle';
     const backfillLabel=wssEnabled?(backfillStatusMap[backfillCode]||backfillCode):'未启用';
     const backfillStatus=wssEnabled&&backfillCode==='completed'&&Number.isFinite(Number(wss.backfill?.fromBlock))?backfillLabel+'｜范围 '+wss.backfill.fromBlock+' → '+wss.backfill.toBlock+'｜事件 '+(Number(wss.backfill.eventCount)||0)+' 条':backfillLabel;
-    const wssNeedsAttention=wssEnabled&&(['reconnecting','stopped'].includes(wss.status)||wss.backfill?.status==='failed');
+    const wssNeedsAttention=wssEnabled&&(['reconnecting','stopped'].includes(wss.status)||wssSubscribed===0&&wss.status!=='connecting');
     const wssStarting=wssEnabled&&wss.status==='connecting';
     const registryAddress=registry.address||'0x90497450f2a706f1951b5bdda52b4e5d16f34c06';
     const knownVaults=Object.keys(registry.knownVaults||{});
     const safeLatest=registry.safeLatestBlock??'-';
     const lastBlock=registry.lastBlock??'-';
     const latest=registry.latestBlock??'-';
-    const lag=registry.lagBlocks??(
+    const lag=(
       Number.isFinite(Number(safeLatest))&&Number.isFinite(Number(lastBlock))
         ? Math.max(0,Number(safeLatest)-Number(lastBlock))
         : '-'
@@ -609,10 +609,14 @@ if [ -f "$SNAP" ]; then
     const ok=(text)=>color(text,'green');
     const warn=(text)=>color(text,'orange');
     const health=[];
-    if(typeof lag==='number'&&lag>300) health.push(warn('链上延迟 '+lag+' 块'));
+    if(typeof lag==='number'&&lag>300) health.push(warn('金库注册实时延迟 '+lag+' 块'));
     if(enabledVisibleFactories<visibleFactories) health.push(warn('有可见金库未启用'));
     if(wssNeedsAttention) health.push(warn('Factory 实时通道异常'));
+    if(wssEnabled&&backfillCode==='failed') health.push(warn('Factory 启动补扫受限'));
+    if(registry.lastError) health.push(warn('金库注册实时查询异常'));
+    if(registry.historyError) health.push(warn('金库注册历史补扫受限'));
     if(ci.lastError) health.push(warn('合约完整性检测异常'));
+    if(fp.catchupError) health.push(warn('Factory 历史补扫受限'));
     if(ci.eventHistoryError) health.push(warn('历史合约日志补扫受限'));
     if(sp.lastError) health.push(warn('Safe 提案检测异常'));
 
@@ -663,11 +667,13 @@ if [ -f "$SNAP" ]; then
     const factoryLatest=fp.latestBlock??fp.safeLatestBlock??'-';
     const factoryScanned=fp.headLastScannedBlock??'-';
     const headLag=Number.isFinite(Number(factoryLatest))&&Number.isFinite(Number(factoryScanned))?Math.max(0,Number(factoryLatest)-Number(factoryScanned)):'-';
-    const factoryStatus=fp.lastError||wssNeedsAttention?'需要关注':wssStarting?'连接中':wss.status==='degraded'?'部分可用':typeof headLag==='number'&&headLag>20?'存在延迟':'运行正常';
+    const factoryStatus=(fp.realtimeError??fp.lastError)||wssNeedsAttention?'需要关注':wssStarting?'连接中':wss.status==='degraded'?'部分可用':typeof headLag==='number'&&headLag>20?'存在延迟':'运行正常';
     console.log('监控状态：'+(factoryStatus==='运行正常'?ok(factoryStatus):warn(factoryStatus)));
     console.log('实时通道：'+wssStatus+'｜已订阅 '+wssSubscribed+'/'+wssConfigured+'｜最后订阅 '+(wss.lastSubscribedAt?fmtTime(wss.lastSubscribedAt):'暂无')+'｜最后事件 '+(wss.lastEventAt?fmtTime(wss.lastEventAt):'暂无'));
     console.log('HTTP 兜底：已扫 '+factoryScanned+'｜最新 '+factoryLatest+'｜延迟 '+headLag+' 块');
     console.log('短窗口回扫：'+backfillStatus);
+    console.log('历史补扫进度：'+(fp.lastScannedBlock??'未知')+' / '+factoryScanned);
+    if(fp.catchupError) console.log('历史补扫异常：'+fp.catchupError);
     if(wss.lastError) console.log('实时通道异常：'+wss.lastError);
     if(wss.backfill?.lastError) console.log('短窗口回扫异常：'+wss.backfill.lastError);
     console.log('资产数量：'+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
@@ -684,6 +690,9 @@ if [ -f "$SNAP" ]; then
     console.log('**07｜Vault Portal 链上注册**');
     console.log('Vault Portal：'+mdLink(registryAddress,'https://bscscan.com/address/'+registryAddress));
     console.log('扫描进度：已扫 '+lastBlock+'｜确认 '+safeLatest+'｜最新 '+latest+'｜延迟 '+lag+' 块');
+    console.log('历史补扫：'+(registry.historyLastBlock??'无')+' / '+(registry.historyEndBlock??'无')+'｜待补区间 '+JSON.stringify(registry.realtimeGaps||[]));
+    if(registry.lastError) console.log('实时查询异常：'+registry.lastError);
+    if(registry.historyError) console.log('历史查询异常：'+registry.historyError);
     console.log('已知链上金库：'+knownVaults.length+' 个');
     for(const [index,addr] of knownVaults.entries()) console.log(String(index+1).padStart(2,'0')+'　'+mdLink(addr,'https://bscscan.com/address/'+addr)+'｜金库 '+vaultLink(addr));
     console.log('');

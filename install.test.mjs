@@ -330,3 +330,14 @@ test("Flap status resolves its own early state and exposes lag and source errors
   assert.match(text, /已扫|扫描区块：123/);
   assert.match(text, /RPC 限流/);
 });
+
+
+test("Flap status separates healthy WSS from failed backfill and ignores cached registry lag",()=>{
+ const output=renderFlapStatus({pages:{},vaultFactories:{},registryMonitor:{safeLatestBlock:1000,lastBlock:990,lagBlocks:113360}}, {
+ headLastScannedBlock:1000,latestBlock:1000,assets:{},wssHealth:{enabled:true,configuredCount:2,subscribedCount:2,status:'healthy',backfill:{status:'failed',lastError:'archive restricted'}}
+ });
+ assert.doesNotMatch(output,/Factory 实时通道异常|113360/);
+ assert.match(output,/Factory 启动补扫受限/);
+ assert.match(output,/延迟 10 块/);
+ assert.match(output,/实时通道：运行正常/);
+});

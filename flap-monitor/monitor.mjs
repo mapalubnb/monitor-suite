@@ -1,3 +1,4 @@
+import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 /**
  * Flap.sh 页面监控脚本 v2 — 高频并行版
@@ -2708,6 +2709,7 @@ function resetBscRpcHealth() {
   preferredBscRpcIndexByKey.clear();
   bscRpcHealthByKey.clear();
   logRpcCooldowns.clear();
+  logRpcProviderCooldowns.clear();
 }
 
 function dedupeBscLogs(logs = []) {
@@ -2724,6 +2726,7 @@ function dedupeBscLogs(logs = []) {
 }
 
 const logRpcCooldowns = new Map();
+const logRpcProviderCooldowns = new Map();
 let activeLogRequests = 0, activeHistoryLogRequests = 0;
 const logRequestWaiters = [];
 function pumpLogRequests() {
@@ -2756,6 +2759,9 @@ async function queryBscLogs(params, options) {
     // Pruned archives and unsupported wide windows must not quarantine current blocks.
     const filterClass = JSON.stringify({ address: params[0]?.address || null, topics: params[0]?.topics || [] });
     const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + (to - from > 49 ? "wide" : "narrow") + ":" + filterClass;
+    const providerKey = url + ":" + history;
+    const providerCooling = logRpcProviderCooldowns.get(providerKey);
+    if (providerCooling?.until > Date.now()) { errors.push(providerCooling.message); continue; }
     const cooling = logRpcCooldowns.get(key);
     if (cooling?.until > Date.now()) { errors.push(cooling.message); continue; }
     try {
@@ -2775,6 +2781,9 @@ async function queryBscLogs(params, options) {
       errors.push(error.message);
       const cooldown = /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 30_000;
       logRpcCooldowns.set(key, { until: Date.now() + cooldown, message: error.message });
+      if (/HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical/i.test(error.message)) {
+        logRpcProviderCooldowns.set(providerKey, { until: Date.now() + cooldown, message: error.message });
+      }
       if (logRpcCooldowns.size > 256) for (const [cached, entry] of logRpcCooldowns) if (entry.until <= Date.now()) logRpcCooldowns.delete(cached);
     }
   }
@@ -3091,35 +3100,41 @@ function formatVaultContractLinks(value) {
 }
 
 let registryScanQueue = Promise.resolve();
+let registryHistoryQueue = Promise.resolve();
+let registryCommitQueue = Promise.resolve();
 function checkFlapRegistryLogs(snapshot, options = {}) {
-  const run = registryScanQueue.then(() => scanFlapRegistryLogs(snapshot, options));
-  registryScanQueue = run.catch(() => {});
+  const run = (options.history ? registryHistoryQueue : registryScanQueue).then(() => scanFlapRegistryLogs(snapshot, options));
+  if (options.history) registryHistoryQueue = run.catch(() => {});
+  else registryScanQueue = run.catch(() => {});
   return run;
 }
-async function scanFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, titlePrefix = "", rpcCallFn = bscRpcCall, filterContractsFn = filterContractAddresses } = {}) {
+async function scanFlapRegistryLogs(snapshot, { history = false, sendCardFn = sendCardViaApi, titlePrefix = "", rpcCallFn = bscRpcCall, filterContractsFn = filterContractAddresses } = {}) {
   if (!CONFIG.registryMonitor.enabled) return { changed: false, sent: false };
   const state = snapshot.registryMonitor || (snapshot.registryMonitor = {});
-  const latest = hexToNumber(await rpcCallFn("eth_blockNumber", []));
-  const safeLatest = Math.max(0, latest - CONFIG.registryMonitor.confirmations);
-  state.latestBlock = latest;
-  state.safeLatestBlock = safeLatest;
-
-  if (!state.lastBlock) {
-    state.lastBlock = Math.max(0, safeLatest - CONFIG.registryMonitor.bootstrapLookbackBlocks);
-    state.knownVaults = state.knownVaults || {};
-    log(`[Flap Vault Portal] 初始化区块游标：${state.lastBlock}（确认块=${safeLatest}）`);
-    return { changed: true, sent: false, initialized: true };
+  const cursorKey = history ? "historyLastBlock" : "lastBlock";
+  if (history) {
+    if (!Number.isFinite(state.historyLastBlock)) state.historyLastBlock = state.historyEndBlock = 0;
+    activateHistoryGap(state, state, "historyLastBlock", "historyEndBlock");
+    if (state.historyLastBlock >= state.historyEndBlock) return { changed: false, sent: false };
+  } else {
+    const latest = Math.max(state.latestBlock || 0, hexToNumber(await rpcCallFn("eth_blockNumber", [])));
+    const safeLatest = Math.max(0, latest - CONFIG.registryMonitor.confirmations);
+    state.latestBlock = latest;
+    state.safeLatestBlock = safeLatest;
+    if (!state.lastBlock) state.lastBlock = Math.max(0, safeLatest - CONFIG.registryMonitor.bootstrapLookbackBlocks);
+    recoverLiveCursor(state, { head: safeLatest, cursorKey: "lastBlock" });
+    state.lagBlocks = Math.max(0, safeLatest - state.lastBlock);
+    if (state.lastBlock >= safeLatest) return { changed: true, sent: false };
   }
-  if (state.lastBlock >= safeLatest) return { changed: false, sent: false };
-
-  const fromBlock = state.lastBlock + 1;
-  const toBlock = Math.min(safeLatest, state.lastBlock + CONFIG.registryMonitor.maxBlocksPerRun);
+  const fromBlock = state[cursorKey] + 1;
+  const toBlock = Math.min(history ? state.historyEndBlock : state.safeLatestBlock,
+    state[cursorKey] + (history ? CONFIG.registryMonitor.maxBlocksPerRun : Math.min(100, CONFIG.registryMonitor.maxBlocksPerRun)));
   const logs = await rpcCallFn("eth_getLogs", [{
     address: CONFIG.registryMonitor.address,
     topics: [[...CONFIG.registryMonitor.watchedEventTopics]],
     fromBlock: numberToHex(fromBlock),
     toBlock: numberToHex(toBlock),
-  }]);
+  }], { history });
 
   const candidates = [];
   for (const item of logs || []) {
@@ -3135,33 +3150,37 @@ async function scanFlapRegistryLogs(snapshot, { sendCardFn = sendCardViaApi, tit
   }
 
   const contractSet = new Set(await filterContractsFn(candidates.map(c => c.vault)));
-  state.knownVaults = state.knownVaults || {};
-  const newEvents = [];
-  const nextKnownVaults = { ...state.knownVaults };
-  for (const event of candidates) {
-    if (!contractSet.has(event.vault)) continue;
-    if (nextKnownVaults[event.vault]) continue;
-    nextKnownVaults[event.vault] = {
-      firstSeenAt: ts(),
-      txHash: event.txHash,
-      blockNumber: event.blockNumber,
-      topic0: event.topic0,
-    };
-    newEvents.push(event);
-  }
+  const commit = registryCommitQueue.then(async () => {
+    state.knownVaults = state.knownVaults || {};
+    const newEvents = [];
+    const nextKnownVaults = { ...state.knownVaults };
+    for (const event of candidates) {
+      if (!contractSet.has(event.vault)) continue;
+      if (nextKnownVaults[event.vault]) continue;
+      nextKnownVaults[event.vault] = {
+        firstSeenAt: ts(),
+        txHash: event.txHash,
+        blockNumber: event.blockNumber,
+        topic0: event.topic0,
+      };
+      newEvents.push(event);
+    }
 
-  let messageId = null;
-  if (newEvents.length) {
-    const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
-    const title = `${titlePrefix}Flap 链上金库注册变更`;
-    messageId = await sendAlertCard(sendCardFn, title, content, "green");
-    if (!messageId) throw new Error("金库注册消息未送达，保留区块游标等待重试");
-  }
-  state.knownVaults = nextKnownVaults;
-  state.lastBlock = toBlock;
-  state.lastBlockAt = ts();
-  state.lagBlocks = Math.max(0, safeLatest - state.lastBlock);
-  return { changed: true, sent: Boolean(messageId), events: newEvents };
+    let messageId = null;
+    if (newEvents.length) {
+      const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
+      const title = `${titlePrefix}Flap 链上金库注册变更`;
+      messageId = await sendAlertCard(sendCardFn, title, content, "green");
+      if (!messageId) throw new Error("金库注册消息未送达，保留区块游标等待重试");
+    }
+    state.knownVaults = nextKnownVaults;
+    state[cursorKey] = toBlock;
+    state[history ? "historyLastSuccessAt" : "lastBlockAt"] = ts();
+    if (!history) state.lagBlocks = Math.max(0, state.safeLatestBlock - state.lastBlock);
+    return { changed: true, sent: Boolean(messageId), events: newEvents };
+  });
+  registryCommitQueue = commit.catch(() => {});
+  return await commit;
 }
 
 function formatFactoryPoolAssetName(asset = {}) {
@@ -3528,6 +3547,8 @@ async function checkFlapFactoryPools(factoryPoolState, {
 } = {}) {
   if (!CONFIG.factoryPoolMonitor.enabled) return { changed: false, sent: false, state: factoryPoolState };
   const workingState = cloneFactoryPoolState(factoryPoolState);
+  const healthFields = [["scanRealtime", "realtimeError"], ["scanCatchup", "catchupError"], ["scanAssets", "assetError"]]
+    .filter(([flag]) => scanConfig[flag] !== false).map(([, field]) => field);
   const previousAssets = snapshotFactoryPoolAssets(workingState);
   const previousImplementation = workingState.currentImplementation || "";
   let result;
@@ -3546,6 +3567,7 @@ async function checkFlapFactoryPools(factoryPoolState, {
     await withFactoryPoolStateWrite(() => {
       mergeFactoryPoolScanState(factoryPoolState, workingState);
       factoryPoolState.lastError = error.message;
+      for (const field of healthFields) factoryPoolState[field] = error.message;
       if (!suppressNotifications) {
         factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, partialChanges);
         if (previousImplementation && workingState.currentImplementation !== previousImplementation) {
@@ -3561,6 +3583,9 @@ async function checkFlapFactoryPools(factoryPoolState, {
     });
     throw error;
   }
+  await withFactoryPoolStateWrite(() => {
+    for (const field of healthFields) factoryPoolState[field] = "";
+  });
   result = { ...result, state: factoryPoolState };
   if (suppressNotifications) {
     await commitFactoryPoolScanState(factoryPoolState, workingState, saveStateFn);
@@ -3978,9 +4003,10 @@ async function backfillFactoryPoolFeedEvents(
   rpcCall = bscRpcCall,
   proxy = CONFIG.factoryPoolMonitor.proxy,
   chunkBlocks = CONFIG.factoryPoolMonitor.wsBackfillChunkBlocks,
+  minimumHead = 0,
 ) {
-  const latest = hexToNumber(await rpcCall("eth_blockNumber", []));
-  const fromBlock = Math.max(0, latest - Math.max(1, blocks) + 1);
+  const latest = Math.max(minimumHead, hexToNumber(await rpcCall("eth_blockNumber", [])));
+  const fromBlock = Math.max(0, latest - Math.max(1, Math.min(5000, blocks)) + 1);
   const initialChunkSize = Math.max(100, Math.min(5_000, Number(chunkBlocks) || 2_000));
   const allEvents = [];
   let completedChunks = 0;
@@ -3999,7 +4025,7 @@ async function backfillFactoryPoolFeedEvents(
     } catch (error) {
       const rangeSize = rangeTo - rangeFrom + 1;
       const details = [error.message, ...(error.rpcErrors || [])].join("｜");
-      if (rangeSize <= 100 || !rangeLimitPattern.test(details)) throw error;
+      if (rangeSize <= 100 || /HTTP (?:401|403|429)|archive|historical|only serves recent|usage limit/i.test(details) || !rangeLimitPattern.test(details)) throw error;
       const middle = Math.floor((rangeFrom + rangeTo) / 2);
       log(`[Flap Factory WSS] 回扫范围受限，自动拆分：${rangeFrom} → ${rangeTo}`);
       const left = await readRange(rangeFrom, middle);
@@ -6869,10 +6895,30 @@ async function startMonitor() {
   const registryJob = createWakeableJob({ intervalMs: CONFIG.registryMonitor.intervalMs,
     onError: error => log(`[Flap Vault Portal] ${error.message}`), run: async () => {
       if (isShuttingDown) return;
-      const result = await checkFlapRegistryLogs(snapshot);
-      if (result.changed) saveSnapshot(snapshot);
+      try {
+        await checkFlapRegistryLogs(snapshot);
+        snapshot.registryMonitor.lastError = "";
+      } catch (error) {
+        snapshot.registryMonitor.lastError = error.message;
+        throw error;
+      } finally { saveSnapshot(snapshot); }
     } });
-  if (CONFIG.registryMonitor.enabled) registryJob.start();
+  const registryHistoryJob = createWakeableJob({ intervalMs: CONFIG.registryMonitor.intervalMs,
+    onError: error => log(`[Flap Vault Portal 历史] ${error.message}`), run: async () => {
+      const state = snapshot.registryMonitor;
+      if (isShuttingDown || !state || Date.now() < (state.historyNextAt || 0)) return;
+      if (!state.realtimeGaps?.length && !(state.historyLastBlock < state.historyEndBlock)) return;
+      try {
+        await checkFlapRegistryLogs(snapshot, { history: true });
+        state.historyError = "";
+        state.historyNextAt = Date.now() + CONFIG.registryMonitor.intervalMs;
+      } catch (error) {
+        state.historyError = error.message;
+        state.historyNextAt = Date.now() + 60_000;
+        throw error;
+      } finally { saveSnapshot(snapshot); }
+    } });
+  if (CONFIG.registryMonitor.enabled) { registryJob.start(); registryHistoryJob.start(); }
   const registryFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.wsEnabled ? createFactoryPoolWsFeed({
     urls: CONFIG.factoryPoolMonitor.wsUrls, proxy: CONFIG.registryMonitor.address,
     topics: [...CONFIG.registryMonitor.watchedEventTopics], label: "Flap 金库注册 WSS",
@@ -6891,7 +6937,7 @@ async function startMonitor() {
       } }).start() : null;
   global.__earlySignalDrain = async () => {
     earlyFeeds.stop(); registryFeed?.stop(); headFeed?.stop();
-    await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), registryJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
+    await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), registryJob.stop(), registryHistoryJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
     if (earlyDeliveryPromise) await earlyDeliveryPromise;
     saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
   };
@@ -7197,7 +7243,7 @@ async function startMonitor() {
           lastError: "",
         });
         try {
-          const backfill = await backfillFactoryPoolFeedEvents(factoryPoolEventQueue);
+          const backfill = await backfillFactoryPoolFeedEvents(factoryPoolEventQueue, undefined, undefined, undefined, undefined, factoryPoolState.latestBlock || 0);
           await recordFactoryPoolWsBackfill(factoryPoolState, {
             status: "completed",
             fromBlock: backfill.fromBlock,
