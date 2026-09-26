@@ -3541,3 +3541,14 @@ test('optional single getter revert does not trigger a whole chunk replay',async
  try{assert.deepEqual(await __testables.bscRpcBatch([{method:'eth_call',params:[{}]}]),[null]);assert.equal(count,1);await assert.rejects(__testables.bscRpcBatch([{method:'eth_call',params:[{}]}],{requireAllResults:true}),/execution reverted/);}
  finally{globalThis.fetch=original;__testables.CONFIG.bscRpcUrls=urls;__testables.resetBscRpcHealth();}
 });
+
+test('extended integrity batches yield to due core and live-event checks',async()=>{
+ const state=createContractIntegrityState();let core=0,extended=0,events=0;const old=__testables.CONFIG.contractIntegrityMonitor.coreIntervalMs;
+ __testables.CONFIG.contractIntegrityMonitor.coreIntervalMs=1;
+ try{
+ await __testables.runFlapContractIntegrityPass(state,{extended:true,saveStateFn:()=>{},
+ stateScanFn:async options=>{if(options.excludeCore){extended++;await new Promise(r=>setTimeout(r,5));await options.beforeBatch();}else{core++;state.latestBlock=100+core;}return {changed:false,changes:[]};},
+ eventScanFn:async options=>{assert.equal(options.realtime,true);events++;return {changed:false,changes:[]};}});
+ assert.equal(core,2);assert.equal(extended,1);assert.equal(events,2);
+ }finally{__testables.CONFIG.contractIntegrityMonitor.coreIntervalMs=old;}
+});

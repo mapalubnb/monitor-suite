@@ -6491,15 +6491,38 @@ async function runFlapContractIntegrityPass(state, {
   state.coreIntervalMs = CONFIG.contractIntegrityMonitor.coreIntervalMs;
   syncFlapContractIntegrityCatalog(state, snapshot, factoryPoolState);
   let stateResult = { changed: false, changes: [] }, stateError;
-  try { stateResult = await stateScanFn({
+  const stateOptions = {
     state,
     rpcCall: (method, params) => bscRpcCall(method, params, { critical: true }),
     rpcBatch: calls => bscRpcBatch(calls, { critical: true, rejectRpcErrors: true }),
-    extended,
-    forceCodeAudit,
     trackedAssetLimit: CONFIG.contractIntegrityMonitor.trackedAssetLimit,
     suppressFactoryImplementationChange: CONFIG.factoryPoolMonitor.enabled,
-  }); } catch (error) { stateError = error; }
+  };
+  const scanCore = async () => {
+    const result = await stateScanFn({ ...stateOptions, extended: false, forceCodeAudit: false });
+    stateResult.changed ||= result.changed;
+    stateResult.changes.push(...result.changes);
+  };
+  try {
+    await scanCore();
+    if (extended || forceCodeAudit) {
+      let nextCoreAt = Date.now() + CONFIG.contractIntegrityMonitor.coreIntervalMs;
+      const result = await stateScanFn({ ...stateOptions, extended, forceCodeAudit, excludeCore: true,
+        beforeBatch: async () => {
+          if (Date.now() < nextCoreAt) return;
+          await scanCore();
+          // Keep live events moving while an extended audit yields between batches.
+          const events = await eventScanFn({ state, rpcCall: (method, params) => bscRpcCall(method, params, { history: false }),
+            latestBlock: state.latestBlock, maxBlocks: 50, realtime: true, suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled });
+          stateResult.changed ||= events.changed;
+          stateResult.changes.push(...events.changes);
+          saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
+          nextCoreAt = Date.now() + CONFIG.contractIntegrityMonitor.coreIntervalMs;
+        } });
+      stateResult.changed ||= result.changed;
+      stateResult.changes.push(...result.changes);
+    }
+  } catch (error) { stateError = error; }
   // A state endpoint failure must not prevent the independent live log scan.
   const eventResult = await eventScanFn({
     state,

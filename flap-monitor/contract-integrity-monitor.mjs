@@ -303,9 +303,10 @@ function catalogGetterList(entry) {
   return GETTERS[entry.kind] || [];
 }
 
-async function runBatch(rpcBatch, calls, size = 80) {
+async function runBatch(rpcBatch, calls, size = 80, beforeBatch = null) {
   const results = [];
   for (let index = 0; index < calls.length; index += size) {
+    if (beforeBatch) await beforeBatch();
     const chunk = calls.slice(index, index + size);
     try {
       results.push(...await rpcBatch(chunk));
@@ -334,16 +335,21 @@ export async function runContractIntegrityStateScan({
   forceCodeAudit = false,
   trackedAssetLimit = 20,
   suppressFactoryImplementationChange = false,
+  excludeCore = false,
+  beforeBatch = null,
 } = {}) {
   const changes = [];
   if (state.pendingChanges.length >= 2000) throw new Error("合约通知积压达到上限，等待投递后恢复扫描");
   const [chainIdHex, latestHex] = await Promise.all([rpcCall("eth_chainId", []), rpcCall("eth_blockNumber", [])]);
   const chainId = hexToNumber(chainIdHex);
   if (chainId !== BSC_CHAIN_ID) throw new Error(`Flap 合约完整性 RPC chainId 错误：${chainId}`);
-  state.latestBlock = hexToNumber(latestHex);
-  const blockTag = numberToHex(state.latestBlock);
+  const scanBlock = hexToNumber(latestHex);
+  state.latestBlock = Math.max(state.latestBlock || 0, scanBlock);
+  const blockTag = numberToHex(scanBlock);
+  const scanBatch = calls => runBatch(rpcBatch, calls, beforeBatch ? 8 : 80, beforeBatch);
   const entries = Object.values(state.catalog).filter(entry => (
-    extended || (isVerifiedCatalogEntry(entry) && ["factory", "swapRegistry", "vaultPortal"].includes(entry.kind))
+    excludeCore ? !["factory", "swapRegistry", "vaultPortal"].includes(entry.kind)
+      : extended || (isVerifiedCatalogEntry(entry) && ["factory", "swapRegistry", "vaultPortal"].includes(entry.kind))
   ));
 
   const stateCalls = [];
@@ -357,13 +363,14 @@ export async function runContractIntegrityStateScan({
       stateCalls.push({ address: entry.address, field, type: "getter", valueType, derivedKind, call: { method: "eth_call", params: [{ to: entry.address, data: selector }, blockTag] } });
     }
   }
-  const stateResults = await runBatch(rpcBatch, stateCalls.map(item => item.call));
+  const stateResults = await scanBatch(stateCalls.map(item => item.call));
   const newDerived = [];
   for (let index = 0; index < stateCalls.length; index++) {
     const item = stateCalls[index];
     const raw = stateResults[index];
     if (raw == null) continue;
     const contract = state.contracts[item.address] || (state.contracts[item.address] = { address: item.address, getters: {}, slots: {} });
+    if ((contract.lastStateBlock || 0) > scanBlock) continue;
     if (item.type === "slot") {
       const current = addressFromWord(raw);
       const handledByFactoryMonitor = suppressFactoryImplementationChange
@@ -385,7 +392,7 @@ export async function runContractIntegrityStateScan({
         newDerived.push({ address: decoded, kind: item.derivedKind, label: `${state.catalog[item.address]?.label || item.address} ${item.field}` });
       }
     }
-    contract.lastStateBlock = state.latestBlock;
+    contract.lastStateBlock = scanBlock;
   }
   for (const derived of newDerived) addCatalogEntry(state, derived.address, { ...derived, source: "onchain-getter", verified: true });
 
@@ -398,12 +405,13 @@ export async function runContractIntegrityStateScan({
     if (address && !state.contracts[address]?.codeHash) codeTargets.add(address);
   }
   const codeAddresses = [...codeTargets].filter(Boolean);
-  const codes = await runBatch(rpcBatch, codeAddresses.map(address => ({ method: "eth_getCode", params: [address, blockTag] })));
+  const codes = await scanBatch(codeAddresses.map(address => ({ method: "eth_getCode", params: [address, blockTag] })));
   for (let index = 0; index < codeAddresses.length; index++) {
     const address = codeAddresses[index];
     if (codes[index] == null) continue;
     const code = String(codes[index]);
     const contract = state.contracts[address] || (state.contracts[address] = { address, getters: {}, slots: {} });
+    if ((contract.lastCodeBlock || 0) > scanBlock) continue;
     const codeHash = hashText(code.toLowerCase());
     const selectors = code === "0x" ? [] : extractBytecodeSelectors(code);
     compareField(state, changes, address, "codeHash", contract.codeHash, codeHash, "code-hash");
@@ -423,7 +431,7 @@ export async function runContractIntegrityStateScan({
     contract.codeHash = codeHash;
     contract.codeBytes = Math.max(0, (code.length - 2) / 2);
     contract.selectors = selectors;
-    contract.lastCodeBlock = state.latestBlock;
+    contract.lastCodeBlock = scanBlock;
   }
 
   if (extended) {
@@ -440,20 +448,21 @@ export async function runContractIntegrityStateScan({
         { address, field: "allowedQuoteToken", call: { method: "eth_call", params: [{ to: FLAP_CORE_CONTRACTS.swapRegistry, data: encodeAddressCall("0x235fec98", address) }, blockTag] }, type: "bool" },
       );
     }
-    const checkResults = await runBatch(rpcBatch, checks.map(item => item.call));
+    const checkResults = await scanBatch(checks.map(item => item.call));
     for (let index = 0; index < checks.length; index++) {
       if (checkResults[index] == null) continue;
       const item = checks[index];
       const asset = state.trackedAssets[item.address];
+      if ((asset.lastCheckedBlock || 0) > scanBlock) continue;
       const current = decodeContractValue(checkResults[index], item.type);
       compareField(state, changes, item.address, item.field, asset[item.field], current, "tracked-state");
       asset[item.field] = current;
       asset.lastCheckedAt = nowIso();
-      asset.lastCheckedBlock = state.latestBlock;
+      asset.lastCheckedBlock = scanBlock;
     }
     state.lastExtendedScanAt = nowIso();
   }
-  state.lastCoreScanAt = nowIso();
+  if (!excludeCore) state.lastCoreScanAt = nowIso();
   if (forceCodeAudit) state.lastCodeAuditAt = nowIso();
   state.lastError = "";
   return { changed: changes.length > 0, changes, state };

@@ -409,3 +409,17 @@ test('history cursor commits only after all filters finish and commit gate opens
  let commit;const pending=scanContractIntegrityEvents({state,latestBlock:20,rpcCall:async()=>[],commit:fn=>new Promise(resolve=>{commit=()=>resolve(fn());})});
  await new Promise(r=>setImmediate(r));assert.equal(state.httpEventLastBlock,10);assert.equal(typeof commit,'function');commit();await pending;assert.equal(state.httpEventLastBlock,20);
 });
+
+test('batch boundaries yield before issuing the next network chunk',async()=>{
+ const steps=[];const result=await __testables.runBatch(async calls=>{steps.push('rpc'+calls.length);return calls;},[1,2,3],2,async()=>steps.push('yield'));
+ assert.deepEqual(result,[1,2,3]);assert.deepEqual(steps,['yield','rpc2','yield','rpc1']);
+});
+
+test('older extended audit cannot overwrite a newer core code observation',async()=>{
+ const state=createContractIntegrityState(),fixture=createRpcFixture();await runContractIntegrityStateScan({state,...fixture});
+ const timestamp=state.lastCoreScanAt,address=FLAP_CORE_CONTRACTS.factory;
+ await runContractIntegrityStateScan({state,...fixture,extended:true,forceCodeAudit:true,excludeCore:true,beforeBatch:async()=>{
+  state.latestBlock=200;state.contracts[address].lastCodeBlock=200;state.contracts[address].codeHash='newer-code';
+ }});
+ assert.equal(state.lastCoreScanAt,timestamp);assert.equal(state.latestBlock,200);assert.equal(state.contracts[address].codeHash,'newer-code');assert.equal(state.contracts[address].lastCodeBlock,200);
+});
