@@ -2748,7 +2748,7 @@ async function executeBscGetLogsRequest(params, options = {}) {
 }
 async function queryBscLogs(params, options) {
   const urls = options.rpcUrls || (IS_TEST_MODE ? CONFIG.bscRpcUrls : [...new Set([
-    ...(process.env.FLAP_LOG_RPC_URLS || "https://bsc.publicnode.com,https://public.1rpc.io/bnb,https://bsc-rpc.blockreq.com/v1/rpc/public").split(",").map(s => s.trim()).filter(Boolean),
+    ...(process.env.FLAP_LOG_RPC_URLS || "https://fast.bsc-rpc.com,https://bsc.publicnode.com").split(",").map(s => s.trim()).filter(Boolean),
     ...CONFIG.bscRpcUrls,
   ])]);
   const errors = [], emptyProviders = new Set();
