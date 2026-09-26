@@ -2760,7 +2760,9 @@ async function queryBscLogs(params, options) {
     const filterClass = JSON.stringify({ address: params[0]?.address || null, topics: params[0]?.topics || [] });
     const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + (to - from > 49 ? "wide" : "narrow") + ":" + filterClass;
     const providerKey = url + ":" + history;
-    const providerCooling = logRpcProviderCooldowns.get(providerKey);
+    const archiveKey = providerKey + ":archive:" + Math.floor(from / 8192);
+    const providerCooling = [logRpcProviderCooldowns.get(providerKey), logRpcProviderCooldowns.get(archiveKey)]
+      .find(entry => entry?.until > Date.now());
     if (providerCooling?.until > Date.now()) { errors.push(providerCooling.message); continue; }
     const cooling = logRpcCooldowns.get(key);
     if (cooling?.until > Date.now()) { errors.push(cooling.message); continue; }
@@ -2782,7 +2784,8 @@ async function queryBscLogs(params, options) {
       const cooldown = /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 30_000;
       logRpcCooldowns.set(key, { until: Date.now() + cooldown, message: error.message });
       if (/HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical/i.test(error.message)) {
-        logRpcProviderCooldowns.set(providerKey, { until: Date.now() + cooldown, message: error.message });
+        const scope = /only serves recent|archive|historical/i.test(error.message) ? archiveKey : providerKey;
+        logRpcProviderCooldowns.set(scope, { until: Date.now() + cooldown, message: error.message });
       }
       if (logRpcCooldowns.size > 256) for (const [cached, entry] of logRpcCooldowns) if (entry.until <= Date.now()) logRpcCooldowns.delete(cached);
     }
@@ -7238,6 +7241,9 @@ async function startMonitor() {
         backfillStarted = true;
         await recordFactoryPoolWsBackfill(factoryPoolState, {
           status: "running",
+          fromBlock: null,
+          toBlock: null,
+          eventCount: 0,
           startedAt: new Date().toISOString(),
           completedAt: "",
           lastError: "",

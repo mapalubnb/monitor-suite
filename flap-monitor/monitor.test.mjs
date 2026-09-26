@@ -3320,10 +3320,11 @@ test('archive endpoint failure never quarantines recent log queries and only two
     const filter = JSON.parse(opts.body).params[0];
     await new Promise(resolve => setTimeout(resolve, 2));
     active--;
-    return { ok: true, json: async () => Number(filter.fromBlock) < 8192 ? { error: { message: 'header not found' } } : { result: [] } };
+    return { ok: true, json: async () => Number(filter.fromBlock) < 8192 ? { error: { message: 'public endpoint only serves recent blocks (last 8192)' } } : { result: [] } };
   };
   try {
-    await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x1',toBlock:'0x2'}], {rpcUrls:urls,history:true}), /header not found/);
+    await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x1',toBlock:'0x2'}], {rpcUrls:urls,history:true}), /only serves recent/);
+    await __testables.executeBscGetLogsRequest([{fromBlock:'0x4000',toBlock:'0x4800'}], {rpcUrls:urls,history:true});
     await Promise.all(Array.from({length:6}, () => __testables.executeBscGetLogsRequest([{fromBlock:'0x4000',toBlock:'0x4001'}], {rpcUrls:urls})));
     assert.ok(peak <= 2);
   } finally { globalThis.fetch = originalFetch; __testables.resetBscRpcHealth(); }
