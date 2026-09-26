@@ -126,6 +126,7 @@ if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
   cp shared/startup-notifier.mjs "$SHARED_DIR/"
   cp shared/scan-recovery.mjs "$SHARED_DIR/"
+  cp shared/safe-api-setup.mjs "$SHARED_DIR/"
   cp .env.example "$SUITE_DIR/.env.example"
   if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
     cp ai-models.json "$SUITE_DIR/"
@@ -971,6 +972,11 @@ pm2 stop all
 echo "[$(date '+%H:%M:%S')] 全部进程已停止"
 EOF
 
+cat > "$BIN_DIR/fl-safe-api" << 'EOF'
+#!/bin/sh
+exec node /root/monitor-suite/shared/safe-api-setup.mjs "$@"
+EOF
+
 cat > "$BIN_DIR/mon-ai" << 'AIEOF'
 #!/usr/bin/env node
 // mon-ai — AI 模型管理命令（仅显示已配置 Key 的提供商）
@@ -1127,6 +1133,7 @@ cat << 'INNER'
 
 ── flap (fl-*) ──────────────────────────────────────
   fl-status           进程 + 页面/资源/i18n 摘要
+  fl-safe-api         逐个隐藏录入 Safe API Key，空回车保存并生效
   fl-log [N]          日志（默认 80 行, 倒序）
   fl-restart          重启
   fl-stop             停止
