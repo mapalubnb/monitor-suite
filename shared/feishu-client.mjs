@@ -1,3 +1,4 @@
+import { formatBeijingTime, formatDisplayText } from "./display-format.cjs";
 /**
  * 共享飞书 SDK 客户端 — 统一消息通道
  *
@@ -23,8 +24,8 @@ export function isAuthorizedSender(senderId, allowedSenders) {
     && allowedSenders.map(id => String(id).trim()).filter(Boolean).includes(senderId);
 }
 
-const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
-const log = (msg) => console.log(`[${ts()}] ${msg}`);
+const ts = () => formatBeijingTime();
+const log = (msg) => console.log(`[${ts()}] ${formatDisplayText(msg)}`);
 
 /* ── .env 加载（多路径搜索，确保各种部署方式下都能正确加载）── */
 const ENV_PATHS = [
@@ -190,7 +191,7 @@ function sectionHeading(content, elementId, { minor = false } = {}) {
     margin: minor ? "4px 0 2px 0" : "8px 0 4px 0",
     text: {
       tag: "lark_md",
-      content: `**${content}**`,
+      content,
       text_size: minor ? "normal" : "heading",
       text_align: "left",
     },
@@ -318,7 +319,7 @@ function buildMetricRows(lines, idPrefix) {
         vertical_spacing: "2px",
         elements: [{
           tag: "markdown",
-          content: `**${metric.label}**\n${metric.value}`,
+          content: `${metric.label}\n${metric.value}`,
           text_size: "normal",
         }],
       })),
@@ -327,12 +328,12 @@ function buildMetricRows(lines, idPrefix) {
   return elements;
 }
 
-function emphasizeFieldLabel(line) {
-  // Add emphasis only; keep the original punctuation, value and link verbatim.
-  if (/^(?: {4}|\t)/.test(line)) return line;
-  const match = line.match(/^(\s*(?:[-*]\s+)?)([^*`<>\[\]：:\n]{1,24})([：:])([ \t]*\S[\s\S]*)$/);
-  if (!match || /^\s*\/\//.test(match[4]) || /^\d[\d .-]*$/.test(match[2])) return line;
-  return `${match[1]}**${match[2]}${match[3]}**${match[4]}`;
+function formatCardDisplay(value) {
+  if (Array.isArray(value)) return value.map(formatCardDisplay);
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(Object.entries(value).map(([key, child]) => [key,
+    typeof child === "string" && (key === "content" || key === "display_name" || /^col_\d+$/.test(key))
+      ? formatDisplayText(child) : formatCardDisplay(child)]));
 }
 
 export function buildCardBodyElements(content, opts = {}) {
@@ -371,7 +372,7 @@ export function buildCardBodyElements(content, opts = {}) {
     let plain = [];
     const flushPlain = () => {
       if (plain.some(line => line.trim())) {
-        elements.push(markdownBlock(plain.map(emphasizeFieldLabel).join("\n"), nextId("text"), "2px 0 4px 0"));
+        elements.push(markdownBlock(plain.join("\n"), nextId("text"), "2px 0 4px 0"));
       }
       plain = [];
     };
@@ -423,7 +424,7 @@ export function buildCardBodyElements(content, opts = {}) {
       divider();
       continue;
     }
-    const heading = line.match(/^\*\*([^*\n]+)\*\*$/) || line.match(/^#{1,3}\s+(.+?)\s*$/);
+    const heading = line.match(/^\*\*([^*\n]+)\*\*$/) || line.match(/^#{1,3}\s+(.+?)\s*$/) || line.match(/^(\d{2}｜.+)$/);
     if (heading) {
       flushMarkdown();
       currentHeading = heading[1].trim();
@@ -460,7 +461,7 @@ export function buildCardBodyElements(content, opts = {}) {
       },
     });
   }
-  return elements;
+  return formatCardDisplay(elements);
 }
 
 export function buildCardJson(title, content, template, diffFilePathOrOpts) {
@@ -471,10 +472,10 @@ export function buildCardJson(title, content, template, diffFilePathOrOpts) {
       update_multi: true,
       width_mode: "default",
       enable_forward: true,
-      summary: { content: String(title || "监控通知") },
+      summary: { content: formatDisplayText(title || "监控通知") },
     },
     header: {
-      title: { tag: "plain_text", content: title },
+      title: { tag: "plain_text", content: formatDisplayText(title) },
       template,
       padding: "12px 16px 12px 16px",
     },
@@ -676,7 +677,7 @@ export async function sendText(text, opts = {}) {
   const targetChatId = opts.chatId || CHAT_ID;
   if (!targetChatId) throw new Error("FEISHU_CHAT_ID 未配置");
 
-  const chunks = splitMessageContent(text, FEISHU_TEXT_CHUNK_LIMIT);
+  const chunks = splitMessageContent(formatDisplayText(text), FEISHU_TEXT_CHUNK_LIMIT);
   const tokenOpt = await withToken();
   let firstMessageId = "";
   for (let i = 0; i < chunks.length; i++) {
@@ -701,7 +702,7 @@ export async function sendText(text, opts = {}) {
 export async function replyText(messageId, text) {
   const client = getClient();
   if (!client) throw new Error("飞书 SDK 未初始化");
-  const chunks = splitMessageContent(text, FEISHU_TEXT_CHUNK_LIMIT);
+  const chunks = splitMessageContent(formatDisplayText(text), FEISHU_TEXT_CHUNK_LIMIT);
   const tokenOpt = await withToken();
   let firstRes = null;
   for (let i = 0; i < chunks.length; i++) {

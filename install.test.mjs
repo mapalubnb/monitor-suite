@@ -26,7 +26,7 @@ function extractHeredoc(commandName, marker = "EOF") {
 }
 
 function extractNodeEvalScripts(source) {
-  return [...source.matchAll(/node -e "([\s\S]*?)"(?:\s+2>\/dev\/null)?/g)].map(match => match[1]);
+  return [...source.matchAll(/node -e "([\s\S]*?)"(?:\s+2>\/dev\/null)?/g)].map(match => match[1].replaceAll("'/root/monitor-suite/shared/display-format.cjs'", JSON.stringify(join(process.cwd(), 'shared/display-format.cjs'))));
 }
 
 function renderFourmemeStatus(snapshot) {
@@ -142,8 +142,8 @@ test("Flap status includes Vault Portal and contract integrity health", () => {
     lastCodeAuditAt: "2026-08-23T01:00:00.000Z",
     wssHealth: { contracts: { status: "healthy", subscribedCount: 2, configuredCount: 2 } },
   });
-  assert.match(output, /\*\*04｜🏦 金库目录与注册\*\*/);
-  assert.match(output, /\*\*05｜🛡️ 合约完整性\*\*/);
+  assert.match(output, /04｜🏦 金库目录与注册/);
+  assert.match(output, /05｜🛡️ 合约完整性/);
   assert.match(output, /合约目录：2 个｜已知资产 1 个｜待发送变更 1 项/);
   assert.match(output, /精准地址 WSS：运行正常｜已订阅 2\/2/);
 });
@@ -157,7 +157,7 @@ test("Flap status includes Safe proposal nonce baseline and pending targets", ()
     pendingChanges: [{ id: "proposal" }],
     lastSuccessAt: "2026-08-24T04:00:00.000Z",
   });
-  assert.match(output, /\*\*06｜✍️ Safe 提案\*\*/);
+  assert.match(output, /06｜✍️ Safe 提案/);
   assert.match(output, /健康 Safe：1\/1｜跟踪中目标 1 个｜待发送变更 1 项/);
   assert.match(output, /nonce 12｜状态 基线完成/);
 });
@@ -180,7 +180,7 @@ test("Flap status links current factories and registered vaults to launch pages"
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}&chain=bnb&lang=zh`));
   assert.match(output, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${registered}&chain=bnb&lang=zh`));
   assert.doesNotMatch(output, /Robinhood|robinhood|e6ca297D1d963b6F00d5b216986123CAeB883AF6/);
-  assert.match(output, /\*\*03｜🪙 Factory 底池\*\*/);
+  assert.match(output, /03｜🪙 Factory 底池/);
 });
 
 test("Flap status shows concise Factory pool state", () => {
@@ -217,7 +217,7 @@ test("Flap status shows concise Factory pool state", () => {
       [namedToken]: { quoteToken: namedToken, name: "Tether Gold", symbol: "XAUt", configured: true, creationDisabled: true, effectiveEnabled: false, values: ["1", "33", "33", "7", "0"] },
     },
   });
-  assert.match(output, /\*\*03｜🪙 Factory 底池\*\*/);
+  assert.match(output, /03｜🪙 Factory 底池/);
   assert.match(output, /监控状态：<font color="green">运行正常<\/font>/);
   assert.match(output, /实时通道：运行正常｜已订阅 2\/2｜最后事件/);
   assert.match(output, /HTTP 兜底：已扫 100｜最新 105｜延迟 5 块/);
@@ -294,9 +294,9 @@ test("full Four.meme status keeps useful OpenFour content and removes repetitive
   });
 
   assert.match(output, /OpenFour：模板 2 个｜PUBLISHED 1 个｜模块 2 个｜presetIds 4 个/);
-  assert.match(output, /\*\*07｜⏱️ 模块性能\*\*/);
+  assert.match(output, /07｜⏱️ 模块性能/);
   assert.match(output, /等待运行指标/);
-  assert.match(output, /\*\*05｜🧩 OpenFour\*\*/);
+  assert.match(output, /05｜🧩 OpenFour/);
   assert.match(output, /01　Launch Agent｜ID 101｜状态 <font color="green">PUBLISHED<\/font>｜标签 Agent/);
   assert.match(output, /02　Trading Assistant｜ID 102｜状态 <font color="red">INIT<\/font>｜标签 Trading/);
   assert.match(output, /模块 2 个｜presetIds 4 个/);

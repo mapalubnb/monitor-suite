@@ -1,3 +1,4 @@
+import { formatBeijingTime, formatDisplayText } from "./display-format.cjs";
 /**
  * 共享 AI 客户端 — 统一的多模型调用层
  *
@@ -24,8 +25,8 @@ const MODELS_FILE = join(__dirname, "..", "ai-models.json");
 const ENV_FILE = join(__dirname, "..", ".env");
 
 /* ── 日志 ── */
-const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
-const log = (msg) => console.log(`[${ts()}] ${msg}`);
+const ts = () => formatBeijingTime();
+const log = (msg) => console.log(`[${ts()}] ${formatDisplayText(msg)}`);
 
 /* ── .env 加载（简易实现，不依赖 dotenv） ── */
 function loadEnvFile() {

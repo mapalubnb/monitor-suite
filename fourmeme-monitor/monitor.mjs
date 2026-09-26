@@ -1,3 +1,4 @@
+import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
@@ -82,8 +83,8 @@ function readBoolEnv(name, fallback) {
 }
 
 function earlyLog(msg) {
-  const stamp = new Date().toLocaleString("zh-CN", { hour12: false });
-  console.log(`[${stamp}] ${msg}`);
+  const stamp = formatBeijingTime();
+  console.log(`[${stamp}] ${formatDisplayText(msg)}`);
 }
 
 async function setupHttpKeepAlive() {
@@ -675,7 +676,7 @@ function recordCurrentModuleRequest() {
 /* ══════════════════════════════════════════
    工具函数
    ══════════════════════════════════════════ */
-const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
+const ts = () => formatBeijingTime();
 
 function formatInterval(ms) {
   const value = Number(ms || 0);
@@ -685,7 +686,7 @@ function formatInterval(ms) {
   return `每 ${(value / 1000).toFixed(1).replace(/\.0$/, "")} 秒`;
 }
 
-const log = (msg) => console.log(`[${ts()}] ${msg}`);
+const log = (msg) => console.log(`[${ts()}] ${formatDisplayText(msg)}`);
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
 
@@ -3807,7 +3808,7 @@ function buildGlobalI18nResourceConfirmNotification(item) {
   const lines = [
     `**类型：全局 i18n 资源上线确认**`,
     `命名空间：\`${namespace}\``,
-    `资源首次发现：${item.firstSeenAt ? new Date(item.firstSeenAt).toLocaleString("zh-CN", { hour12: false }) : "未知"}`,
+    `资源首次发现：${item.firstSeenAt ? formatBeijingTime(item.firstSeenAt) : "未知"}`,
     `确认耗时：${elapsedMin} 分钟`,
     "",
     `**确认依据：** ${evidence.length} 条（强证据 ${strongCount} 条）`,

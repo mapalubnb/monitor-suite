@@ -1,3 +1,4 @@
+import { formatBeijingTime } from "../shared/display-format.cjs";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from 'node:timers/promises';
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
@@ -821,7 +822,7 @@ export async function runSafeProposalScan({
 function formatDate(value) {
   const timestamp = Date.parse(value || "");
   if (!Number.isFinite(timestamp)) return "未知";
-  return new Date(timestamp).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" });
+  return formatBeijingTime(value);
 }
 
 export function buildSafeProposalContent(changes = [], factoryAssets = {}) {

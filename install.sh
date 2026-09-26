@@ -50,7 +50,7 @@ sync_env_template_keys() {
   if [ -s "$missing_file" ]; then
     {
       echo ""
-      echo "# ---- Added by install.sh $(date '+%Y-%m-%d %H:%M:%S') from .env.example ----"
+      echo "# ---- Added by install.sh $(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N') from .env.example ----"
       cat "$missing_file"
     } >> "$env_file"
     echo "  .env 已补齐缺失配置项: $env_file"
@@ -123,6 +123,7 @@ CURRENT_DIR="$(cd "$(dirname "$0")" && pwd)"
 if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/ai-client.mjs "$SHARED_DIR/"
   cp shared/feishu-client.mjs "$SHARED_DIR/"
+  cp shared/display-format.cjs "$SHARED_DIR/"
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
   cp shared/snapshot-store.cjs "$SHARED_DIR/"
   cp shared/rpc-control.mjs "$SHARED_DIR/"
@@ -166,11 +167,11 @@ cd "$FOURMEME_DIR" && npm install --omit=dev && cd - >/dev/null
 pm2 delete fourmeme-monitor 2>/dev/null || true
 # 创建 .env 文件（如不存在）供快捷命令写入配置
 touch "$FOURMEME_DIR/.env"
-pm2 start "$FOURMEME_DIR/monitor.mjs" --name fourmeme-monitor --time --kill-timeout 60000
+pm2 start "$FOURMEME_DIR/monitor.mjs" --name fourmeme-monitor --log-date-format "YYYY/M/D HH:mm:ss.SSS" --kill-timeout 60000
 
 # feishu-bot（如果之前启动过也重建）
 pm2 delete feishu-bot 2>/dev/null || true
-pm2 start "$FOURMEME_DIR/feishu-bot.mjs" --name feishu-bot --time --kill-timeout 60000
+pm2 start "$FOURMEME_DIR/feishu-bot.mjs" --name feishu-bot --log-date-format "YYYY/M/D HH:mm:ss.SSS" --kill-timeout 60000
 
 echo "  fourmeme-monitor ✓"
 
@@ -200,7 +201,7 @@ fi
 cd "$FLAP_DIR" && npm install --omit=dev && cd - >/dev/null
 
 pm2 delete flap-monitor 2>/dev/null || true
-pm2 start "$FLAP_DIR/monitor.mjs" --name flap-monitor --time --kill-timeout 60000
+pm2 start "$FLAP_DIR/monitor.mjs" --name flap-monitor --log-date-format "YYYY/M/D HH:mm:ss.SSS" --kill-timeout 60000
 
 echo "  flap-monitor ✓"
 
@@ -272,6 +273,16 @@ process.stdin.on("end", () => {
 HELPER_EOF
 chmod +x "$BIN_DIR/_pm2-proc-info"
 
+# Unified display formatting for historical log lines and last-poll files.
+cat > "$BIN_DIR/_monitor-format" << 'FORMAT_EOF'
+#!/usr/bin/env node
+const {formatDisplayText}=require('/root/monitor-suite/shared/display-format.cjs');
+let text='';process.stdin.setEncoding('utf8');
+process.stdin.on('data',chunk=>text+=chunk);
+process.stdin.on('end',()=>process.stdout.write(formatDisplayText(text)));
+FORMAT_EOF
+chmod +x "$BIN_DIR/_monitor-format"
+
 # fourmeme-monitor
 cat > "$BIN_DIR/fm-status" << 'EOF'
 #!/bin/sh
@@ -279,10 +290,12 @@ SNAP="/root/monitor-suite/fourmeme-monitor/snapshot.json"
 [ -f "$SNAP" ] || SNAP="/root/fourmeme-monitor/snapshot.json"
 PM2_JSON="$(pm2 jlist 2>/dev/null)"
 
-echo "**Four.meme 监控中心**"
+echo "Four.meme 监控中心"
 echo ""
 
 echo "$PM2_JSON" | node -e "
+  const displayText=require('/root/monitor-suite/shared/display-format.cjs').formatDisplayText;
+  const print=console.log;console.log=(...values)=>print(...values.map(displayText));
   let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
     const statusText=(status)=>({online:'在线',stopped:'已停止',errored:'异常',launching:'启动中',stopping:'停止中',waiting:'等待中'}[status]||'未知');
     const fmtUp=(ms)=>{if(!ms)return '未知';const sec=Math.max(0,Math.floor((Date.now()-ms)/1000));const day=Math.floor(sec/86400),h=Math.floor((sec%86400)/3600),m=Math.floor((sec%3600)/60);return day>0?day+' 天 '+h+' 小时':h+' 小时 '+m+' 分钟'};
@@ -291,7 +304,7 @@ echo "$PM2_JSON" | node -e "
       const start=clean.indexOf('['),end=clean.lastIndexOf(']');
       const list=JSON.parse(start>=0&&end>=start?clean.slice(start,end+1):'[]');
       const p=list.find(x=>x.name==='fourmeme-monitor');
-      console.log('**01｜⚙️ 进程**');
+      console.log('01｜⚙️ 进程');
       if(!p){
         console.log('进程：未运行');
         return;
@@ -302,7 +315,7 @@ echo "$PM2_JSON" | node -e "
       console.log('进程：'+statusText(env.status)+'｜PID '+(p.pid||'-')+'｜重启 '+(env.restart_time??0)+' 次');
       console.log('资源：内存 '+mem+'｜CPU '+cpu+'｜运行 '+fmtUp(env.pm_uptime));
     }catch(e){
-      console.log('**01｜⚙️ 进程**');
+      console.log('01｜⚙️ 进程');
       console.log('进程：状态解析失败');
     }
   })
@@ -311,6 +324,8 @@ echo "$PM2_JSON" | node -e "
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
+  const displayText=require('/root/monitor-suite/shared/display-format.cjs').formatDisplayText;
+  const print=console.log;console.log=(...values)=>print(...values.map(displayText));
     const fs=require('fs');
     const raw=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
     const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$SNAP'):raw;
@@ -322,7 +337,7 @@ if [ -f "$SNAP" ]; then
     const mdLink=(label,url)=>'['+cleanLabel(label)+']('+url+')';
     const bscAddress=(addr,label)=>addr?mdLink(label||addr,'https://bscscan.com/address/'+addr):cleanLabel(label||'-');
     const pageLabel=(url)=>{try{return decodeURI(new URL(url).pathname)||'/'}catch{return String(url||'-')}};
-    const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
+    const fmtTime=require('/root/monitor-suite/shared/display-format.cjs').formatBeijingTime;
     const value=(v)=>v===undefined||v===null||v===''?'-':String(v);
     const quote=String.fromCharCode(34);
     const colorStatus=(status)=>{const text=value(status);if(text==='PUBLISH'||text==='PUBLISHED')return '<font color='+quote+'green'+quote+'>'+text+'</font>';if(text==='INIT')return '<font color='+quote+'red'+quote+'>INIT</font>';return text};
@@ -394,7 +409,7 @@ if [ -f "$SNAP" ]; then
     if(feed.enabled!==undefined&&!feed.connected) health.push(warn('新区块 WS 未连接'));
     if(typeof lag==='number'&&lag>120) health.push(warn('扫链延迟 '+lag+' 块'));
 
-    const section=title=>{console.log('---');console.log('**'+title+'**')};
+    const section=title=>{console.log('---');console.log(title)};
     const gaps=items=>(items||[]).map(v=>v.from+'–'+v.to).join('、')||'无';
     section('02｜📊 监控概览');
     console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
@@ -442,16 +457,16 @@ if [ -f "$SNAP" ]; then
   LASTPOLL="/root/monitor-suite/fourmeme-monitor/lastpoll.txt"
   [ -f "$LASTPOLL" ] || LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
   if [ -f "$LASTPOLL" ]; then
-    echo "最后检测：$(cat "$LASTPOLL")"
+    echo "最后检测：$(cat "$LASTPOLL" | _monitor-format)"
   else
     echo "最后检测：未知"
   fi
-  echo "快照更新：$(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
+  echo "快照更新：$(TZ=Asia/Shanghai date -r "$SNAP" '+%Y/%-m/%-d %H:%M:%S.%3N' 2>/dev/null)"
 else
-  echo "**数据状态**"
+  echo "数据状态"
   echo "快照：未找到"
   echo ""
-  echo "更新时间：$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "更新时间：$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 fi
 EOF
 
@@ -459,21 +474,21 @@ cat > "$BIN_DIR/fm-log" << 'EOF'
 #!/bin/sh
 LINES=${1:-80}
 echo "====== fourmeme-monitor 日志 (最近 ${LINES} 行, 倒序) ======"
-echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "时间: $(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 PM2_HOME="${PM2_HOME:-/root/.pm2}"
 echo "日志文件: $(ls -la $PM2_HOME/logs/fourmeme-monitor-out*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
 echo "错误日志: $(ls -la $PM2_HOME/logs/fourmeme-monitor-err*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
 echo "========================================="
-pm2 logs fourmeme-monitor --lines "$LINES" --nostream 2>&1 | tac
+pm2 logs fourmeme-monitor --lines "$LINES" --nostream 2>&1 | tac | _monitor-format
 EOF
 
 cat > "$BIN_DIR/fm-restart" << 'EOF'
 #!/bin/sh
 echo "====== 重启 fourmeme-monitor ======"
-echo "[$(date '+%H:%M:%S')] 正在重启..."
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 正在重启..."
 pm2 restart fourmeme-monitor --update-env
 echo ""
-echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 重启完成，当前状态："
 pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor --brief
   echo "========================================="
 EOF
@@ -481,7 +496,7 @@ EOF
 cat > "$BIN_DIR/fm-stop" << 'EOF'
 #!/bin/sh
 pm2 stop fourmeme-monitor
-echo "[$(date '+%H:%M:%S')] fourmeme-monitor 已停止"
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] fourmeme-monitor 已停止"
 EOF
 
 cat > "$BIN_DIR/fm-check" << 'EOF'
@@ -490,7 +505,7 @@ echo "====== 触发 fourmeme 全量检测 ======"
 PID=$(pm2 pid fourmeme-monitor 2>/dev/null)
 if [ -n "$PID" ] && [ "$PID" != "0" ]; then
   kill -USR1 "$PID"
-  echo "[$(date '+%H:%M:%S')] 已向 PID $PID 发送 SIGUSR1"
+  echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 已向 PID $PID 发送 SIGUSR1"
   echo "提示: 使用 fm-log 查看检测结果"
 else
   echo "fourmeme-monitor 未运行，使用 fm-restart 启动"
@@ -502,9 +517,9 @@ EOF
 # flap-monitor
 cat > "$BIN_DIR/fl-status" << 'EOF'
 #!/bin/sh
-echo "**Flap.sh 监控中心**"
+echo "Flap.sh 监控中心"
 echo ""
-echo "**01｜⚙️ 进程**"
+echo "01｜⚙️ 进程"
 pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor --card
 # 快照摘要（兼容两种部署路径）
 SNAP="/root/monitor-suite/flap-monitor/snapshot.json"
@@ -520,6 +535,8 @@ EARLY_STATE="/root/monitor-suite/flap-monitor/early-signal-state.json"
 if [ -f "$SNAP" ]; then
   echo ""
   node -e "
+  const displayText=require('/root/monitor-suite/shared/display-format.cjs').formatDisplayText;
+  const print=console.log;console.log=(...values)=>print(...values.map(displayText));
     const fs=require('fs');
     const raw=JSON.parse(fs.readFileSync('$SNAP','utf-8'));
     const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$SNAP'):raw;
@@ -531,7 +548,7 @@ if [ -f "$SNAP" ]; then
     const mdLink=(label,url)=>'['+cleanLabel(label)+']('+url+')';
     const vaultLink=(address)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+'bnb'+'&lang=zh');
     const pageLabel=(url)=>{try{return decodeURI(new URL(url).pathname)||'/'}catch{return String(url||'-')}};
-    const fmtTime=(value)=>{if(!value)return '未知';const d=new Date(value);if(Number.isNaN(d.getTime()))return String(value);const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds())};
+    const fmtTime=require('/root/monitor-suite/shared/display-format.cjs').formatBeijingTime;
     const metricsPath='$SNAP'.replace(/snapshot\.json$/,'runtime-metrics.json');
     let runtime={};try{if(fs.existsSync(metricsPath))runtime=JSON.parse(fs.readFileSync(metricsPath,'utf-8'))}catch{}
     const pages=s.pages||{};
@@ -605,7 +622,7 @@ if [ -f "$SNAP" ]; then
     });
     const totalAssets=pageStats.reduce((sum,p)=>sum+p.assets,0);
 
-    const section=title=>{console.log('---');console.log('**'+title+'**')};
+    const section=title=>{console.log('---');console.log(title)};
     const gaps=items=>(items||[]).map(v=>v.from+'–'+v.to).join('、')||'无';
     const error=(label,value)=>{if(value)console.log('⚠️ '+label+'：'+warn(cleanLabel(value)))};
     const short=address=>String(address||'未知').slice(0,6)+'…'+String(address||'').slice(-4);
@@ -687,14 +704,14 @@ if [ -f "$SNAP" ]; then
   echo ""
   LASTPOLL="/root/monitor-suite/flap-monitor/lastpoll.txt"
   [ -f "$LASTPOLL" ] || LASTPOLL="/root/flap-monitor/lastpoll.txt"
-  [ -f "$LASTPOLL" ] && echo "最后检测：$(cat "$LASTPOLL")"
-  echo "快照更新：$(stat -c '%y' "$SNAP" 2>/dev/null | cut -d. -f1)"
+  [ -f "$LASTPOLL" ] && echo "最后检测：$(cat "$LASTPOLL" | _monitor-format)"
+  echo "快照更新：$(TZ=Asia/Shanghai date -r "$SNAP" '+%Y/%-m/%-d %H:%M:%S.%3N' 2>/dev/null)"
 else
   echo ""
-  echo "**02｜数据状态**"
+  echo "02｜数据状态"
   echo "快照：未找到"
   echo ""
-  echo "更新时间：$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "更新时间：$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 fi
 EOF
 
@@ -702,21 +719,21 @@ cat > "$BIN_DIR/fl-log" << 'EOF'
 #!/bin/sh
 LINES=${1:-80}
 echo "====== flap-monitor 日志 (最近 ${LINES} 行, 倒序) ======"
-echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "时间: $(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 PM2_HOME="${PM2_HOME:-/root/.pm2}"
 echo "日志文件: $(ls -la $PM2_HOME/logs/flap-monitor-out*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
 echo "错误日志: $(ls -la $PM2_HOME/logs/flap-monitor-err*.log 2>/dev/null | awk '{print $NF, $5}' | head -1)"
 echo "========================================="
-pm2 logs flap-monitor --lines "$LINES" --nostream 2>&1 | tac
+pm2 logs flap-monitor --lines "$LINES" --nostream 2>&1 | tac | _monitor-format
 EOF
 
 cat > "$BIN_DIR/fl-restart" << 'EOF'
 #!/bin/sh
 echo "====== 重启 flap-monitor ======"
-echo "[$(date '+%H:%M:%S')] 正在重启..."
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 正在重启..."
 pm2 restart flap-monitor
 echo ""
-echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 重启完成，当前状态："
 pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor --brief
 echo "========================================="
 EOF
@@ -724,7 +741,7 @@ EOF
 cat > "$BIN_DIR/fl-stop" << 'EOF'
 #!/bin/sh
 pm2 stop flap-monitor
-echo "[$(date '+%H:%M:%S')] flap-monitor 已停止"
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] flap-monitor 已停止"
 EOF
 
 cat > "$BIN_DIR/fl-check" << 'EOF'
@@ -733,7 +750,7 @@ echo "====== 触发 flap 全量检测 ======"
 PID=$(pm2 pid flap-monitor 2>/dev/null)
 if [ -n "$PID" ] && [ "$PID" != "0" ]; then
   kill -USR1 "$PID"
-  echo "[$(date '+%H:%M:%S')] 已向 PID $PID 发送 SIGUSR1"
+  echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 已向 PID $PID 发送 SIGUSR1"
   echo "提示: 使用 fl-log 查看检测结果"
 else
   echo "flap-monitor 未运行，使用 fl-restart 启动"
@@ -743,42 +760,42 @@ EOF
 
 cat > "$BIN_DIR/fl-check-manual" << 'EOF'
 #!/bin/sh
-echo "[$(date '+%H:%M:%S')] flap 手动检测（独立进程）..."
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] flap 手动检测（独立进程）..."
 node /root/flap-monitor/monitor.mjs check
-echo "[$(date '+%H:%M:%S')] 检测完成"
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 检测完成"
 EOF
 
 # feishu-bot
 cat > "$BIN_DIR/bot-status" << 'EOF'
 #!/bin/sh
-echo "**飞书机器人状态**"
+echo "飞书机器人状态"
 echo ""
-echo "**01｜运行状态**"
+echo "01｜运行状态"
 pm2 jlist 2>/dev/null | _pm2-proc-info feishu-bot
 echo ""
-echo "**02｜服务能力**"
+echo "02｜服务能力"
 echo "模式：WebSocket 长连接｜无需公网 IP"
 echo "能力：命令执行｜状态查询｜日志附件｜卡片交互｜AI 助手"
 echo ""
-echo "更新时间：$(date '+%Y-%m-%d %H:%M:%S')"
+echo "更新时间：$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 EOF
 
 cat > "$BIN_DIR/bot-log" << 'EOF'
 #!/bin/sh
 LINES=${1:-80}
 echo "====== feishu-bot 日志 (最近 ${LINES} 行, 倒序) ======"
-echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "时间: $(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 echo "========================================="
-pm2 logs feishu-bot --lines "$LINES" --nostream 2>&1 | tac
+pm2 logs feishu-bot --lines "$LINES" --nostream 2>&1 | tac | _monitor-format
 EOF
 
 cat > "$BIN_DIR/bot-restart" << 'EOF'
 #!/bin/sh
 echo "====== 重启 feishu-bot ======"
-echo "[$(date '+%H:%M:%S')] 正在重启..."
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 正在重启..."
 pm2 restart feishu-bot
 echo ""
-echo "[$(date '+%H:%M:%S')] 重启完成，当前状态："
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 重启完成，当前状态："
 pm2 jlist 2>/dev/null | _pm2-proc-info feishu-bot --brief
 echo "========================================="
 EOF
@@ -786,20 +803,22 @@ EOF
 cat > "$BIN_DIR/bot-stop" << 'EOF'
 #!/bin/sh
 pm2 stop feishu-bot
-echo "[$(date '+%H:%M:%S')] feishu-bot 已停止"
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] feishu-bot 已停止"
 EOF
 
 # 全局
 cat > "$BIN_DIR/mon-status" << 'EOF'
 #!/bin/sh
-echo "**Monitor Suite 状态总览**"
+echo "Monitor Suite 状态总览"
 echo ""
-echo "**01｜主机状态**"
+echo "01｜主机状态"
 echo "主机：$(hostname)｜内核 $(uname -r)"
 echo "负载：$(cat /proc/loadavg 2>/dev/null | awk '{print $1, $2, $3}' || echo '未知')"
 echo ""
-echo "**02｜进程状态**"
+echo "02｜进程状态"
 pm2 jlist 2>/dev/null | node -e "
+  const displayText=require('/root/monitor-suite/shared/display-format.cjs').formatDisplayText;
+  const print=console.log;console.log=(...values)=>print(...values.map(displayText));
   let d='';process.stdin.on('data',c=>d+=c);process.stdin.on('end',()=>{
     try{
       const clean=d.replace(/\u001b\[[0-?]*[ -\/]*[@-~]/g,'').trim();
@@ -835,13 +854,15 @@ pm2 jlist 2>/dev/null | node -e "
 " 2>/dev/null
 echo ""
 # 快照摘要
-echo "**03｜数据摘要**"
+echo "03｜数据摘要"
 FM_SNAP="/root/monitor-suite/fourmeme-monitor/snapshot.json"
 [ -f "$FM_SNAP" ] || FM_SNAP="/root/fourmeme-monitor/snapshot.json"
 FL_SNAP="/root/monitor-suite/flap-monitor/snapshot.json"
 [ -f "$FL_SNAP" ] || FL_SNAP="/root/flap-monitor/snapshot.json"
 if [ -f "$FM_SNAP" ]; then
   node -e "
+  const displayText=require('/root/monitor-suite/shared/display-format.cjs').formatDisplayText;
+  const print=console.log;console.log=(...values)=>print(...values.map(displayText));
     const raw=JSON.parse(require('fs').readFileSync('$FM_SNAP','utf-8'));
     const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$FM_SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$FM_SNAP'):raw;
     const pools=(s.poolConfig||[]).length;
@@ -858,7 +879,7 @@ if [ -f "$FM_SNAP" ]; then
     const contracts=Object.keys(s.contractFingerprints||{}).length;
     const actors=(s.chainActorMonitor||{}).actionActorCount??Object.values((s.chainActorMonitor||{}).actors||{}).filter(a=>a&&a.actionWatched).length;
     const nfts=(s.onchainParams||{}).agentNftCount??'-';
-    console.log('**Four.meme**');
+    console.log('Four.meme');
     console.log('底池：'+pools+' 个（'+netStr+'）｜前端 '+pages+' 页面｜API '+apis+' 端点');
     console.log('OpenFour：模板 '+templates+' 个（PUBLISHED '+published+'）｜Preset '+ofPresets+'｜模块 '+ofMods);
     console.log('GitHub：'+sha+'｜仓库 '+repos+'｜合约 '+contracts+'｜创建者 '+actors+'｜AgentNFT '+nfts);
@@ -866,38 +887,40 @@ if [ -f "$FM_SNAP" ]; then
   FM_LASTPOLL="/root/monitor-suite/fourmeme-monitor/lastpoll.txt"
   [ -f "$FM_LASTPOLL" ] || FM_LASTPOLL="/root/fourmeme-monitor/lastpoll.txt"
   if [ -f "$FM_LASTPOLL" ]; then
-    echo "最后检测：$(cat "$FM_LASTPOLL")"
+    echo "最后检测：$(cat "$FM_LASTPOLL" | _monitor-format)"
   fi
-  echo "快照：$(stat -c '%y' "$FM_SNAP" 2>/dev/null | cut -d. -f1)"
+  echo "快照：$(TZ=Asia/Shanghai date -r "$FM_SNAP" '+%Y/%-m/%-d %H:%M:%S.%3N' 2>/dev/null)"
 else
-  echo "**Four.meme**"
+  echo "Four.meme"
   echo "快照：无（首次启动中）"
 fi
 if [ -f "$FL_SNAP" ]; then
   node -e "
+  const displayText=require('/root/monitor-suite/shared/display-format.cjs').formatDisplayText;
+  const print=console.log;console.log=(...values)=>print(...values.map(displayText));
     const raw=JSON.parse(require('fs').readFileSync('$FL_SNAP','utf-8'));
     const s=raw._snapshotFields?require(require('path').resolve(require('path').dirname('$FL_SNAP'),'../shared/snapshot-store.cjs')).readSnapshot('$FL_SNAP'):raw;
     const pages=Object.keys(s.pages||{}).length;
     const factories=Object.values(s.vaultFactories||{}).filter(v=>v&&v.showInCAStore).length;
     const registry=Object.keys((s.registryMonitor||{}).knownVaults||{}).length;
     console.log('');
-    console.log('**Flap.sh**');
+    console.log('Flap.sh');
     console.log('页面：'+pages+' 个｜CAStore 金库工厂 '+factories+' 个｜链上金库 '+registry+' 个');
   " 2>/dev/null
   FL_LASTPOLL="/root/monitor-suite/flap-monitor/lastpoll.txt"
   [ -f "$FL_LASTPOLL" ] || FL_LASTPOLL="/root/flap-monitor/lastpoll.txt"
   if [ -f "$FL_LASTPOLL" ]; then
-    echo "最后检测：$(cat "$FL_LASTPOLL")"
+    echo "最后检测：$(cat "$FL_LASTPOLL" | _monitor-format)"
   fi
-  echo "快照：$(stat -c '%y' "$FL_SNAP" 2>/dev/null | cut -d. -f1)"
+  echo "快照：$(TZ=Asia/Shanghai date -r "$FL_SNAP" '+%Y/%-m/%-d %H:%M:%S.%3N' 2>/dev/null)"
 else
   echo ""
-  echo "**Flap.sh**"
+  echo "Flap.sh"
   echo "快照：无（首次启动中）"
 fi
 echo ""
 # 磁盘和日志
-echo "**04｜磁盘占用**"
+echo "04｜磁盘占用"
 FM_DIR="/root/monitor-suite/fourmeme-monitor"
 [ -d "$FM_DIR" ] || FM_DIR="/root/fourmeme-monitor"
 FL_DIR="/root/monitor-suite/flap-monitor"
@@ -908,25 +931,25 @@ PM2_HOME="${PM2_HOME:-/root/.pm2}"
 LOG_SIZE=$(du -sh $PM2_HOME/logs 2>/dev/null | awk '{print $1}' || echo '?')
 echo "Four.meme：$FM_SIZE｜Flap：$FL_SIZE｜PM2 日志：$LOG_SIZE"
 echo ""
-echo "更新时间：$(date '+%Y-%m-%d %H:%M:%S')"
+echo "更新时间：$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 EOF
 
 cat > "$BIN_DIR/mon-log" << 'EOF'
 #!/bin/sh
 LINES=${1:-80}
 echo "====== 全部日志 (最近 ${LINES} 行, 倒序) ======"
-echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "时间: $(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')"
 echo "========================================="
-pm2 logs --lines "$LINES" --nostream 2>&1 | tac
+pm2 logs --lines "$LINES" --nostream 2>&1 | tac | _monitor-format
 EOF
 
 cat > "$BIN_DIR/mon-restart" << 'EOF'
 #!/bin/sh
 echo "====== 重启全部进程 ======"
-echo "[$(date '+%H:%M:%S')] 正在重启所有监控进程..."
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 正在重启所有监控进程..."
 pm2 restart all
 echo ""
-echo "[$(date '+%H:%M:%S')] 重启完成"
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 重启完成"
 echo ""
 pm2 jlist 2>/dev/null | _pm2-proc-info fourmeme-monitor --brief
 pm2 jlist 2>/dev/null | _pm2-proc-info flap-monitor --brief
@@ -937,7 +960,7 @@ EOF
 cat > "$BIN_DIR/mon-stop" << 'EOF'
 #!/bin/sh
 pm2 stop all
-echo "[$(date '+%H:%M:%S')] 全部进程已停止"
+echo "[$(TZ=Asia/Shanghai date '+%Y/%-m/%-d %H:%M:%S.%3N')] 全部进程已停止"
 EOF
 
 cat > "$BIN_DIR/fl-safe-api" << 'EOF'
@@ -1068,7 +1091,7 @@ if (!arg) {
   }
   fs.writeFileSync(cfgPath, JSON.stringify(data, null, 2), "utf-8");
   const model = modelOverride || cfg.model;
-  console.log("[" + new Date().toTimeString().slice(0,8) + "] 已切换为: " + providerName + " (" + model + ") — " + (cfg.label || ""));
+  console.log("[" + require('/root/monitor-suite/shared/display-format.cjs').formatBeijingTime() + "] 已切换为: " + providerName + " (" + model + ") — " + (cfg.label || ""));
   if (cfg.models && cfg.models.length > 1) {
     console.log("可选模型: " + cfg.models.join(", "));
   }

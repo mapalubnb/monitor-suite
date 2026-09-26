@@ -1,3 +1,4 @@
+import { formatDisplayText } from './display-format.cjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildCardJson, buildCardBodyElements } from './feishu-client.mjs';
@@ -26,7 +27,7 @@ function bodyText(elements) {
 
 // Compare every word, number, URL and existing color tag in source order.
 // Only whitespace, heading markup and layout dividers may differ.
-const words = value => value.replace(/^---\s*$/gm, '').replace(/^#{1,3}\s+/gm, '').replace(/\*\*/g, '').replace(/\s/g, '');
+const words = value => formatDisplayText(value).replace(/^---\s*$/gm, '').replace(/^#{1,3}\s+/gm, '').replace(/\*\*/g, '').replace(/\s/g, '');
 
 test('all notification families retain their original content through the shared layout', () => {
   const proposal = { type: 'ready', quoteToken: address, safe: address, safeTxHash: hash,
@@ -65,7 +66,7 @@ test('code fences keep headings, dividers, fields and numbered rows as literal c
     const code = `${marker}text\n**原始标题**\n---\n01　BNB｜状态 PUBLISH\n字段：原始值\n\n  缩进\n${marker}`;
     const elements = buildCardBodyElements('**执行结果**\n' + code + '\n更新时间：' + timestamp);
     const block = elements.find(element => element.element_id?.startsWith('code_'));
-    assert.equal(block.content, code);
+    assert.equal(block.content, formatDisplayText(code));
     assert.equal(elements.filter(element => element.tag === 'table').length, 0);
     assert.equal(elements.filter(element => element.element_id?.startsWith('section_')).length, 1);
   }
@@ -89,7 +90,8 @@ test('short subheadings stay compact and major sections receive a single divider
   assert.equal(headings[0].text.text_size, 'normal');
   assert.equal(headings[1].text.text_size, 'heading');
   assert.equal(elements.filter(element => element.tag === 'hr').length, 1);
-  assert.match(bodyText(elements), /\*\*字段：\*\*value/);
+  assert.match(bodyText(elements), /字段：value/);
+  assert.doesNotMatch(JSON.stringify(elements), /\*\*/);
 });
 
 test('long metric values use the full width without losing content', () => {

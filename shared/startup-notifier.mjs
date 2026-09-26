@@ -1,3 +1,4 @@
+import { formatBeijingTime } from "./display-format.cjs";
 import { randomUUID } from 'node:crypto';
 
 // Startup delivery is independent of scans. Retries reuse the same request id;
@@ -7,7 +8,7 @@ export function createStartupNotifier({ render, send, patch, onError = () => {},
   now = Date.now, maxAgeMs = 5 * 60_000 }) {
   const startedAt = now();
   const expiresAt = startedAt + maxAgeMs;
-  const startupTime = new Date(startedAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  const startupTime = formatBeijingTime(startedAt);
   const deliveryId = randomUUID();
   const sentParts = [];
   let initialCard = null;

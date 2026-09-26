@@ -1,3 +1,4 @@
+import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { readSnapshot } from "../shared/snapshot-store.cjs";
 /**
  * 飞书交互机器人 — 远程 Shell（长连接模式）
@@ -62,8 +63,8 @@ const CONFIG = {
 /* ══════════════════════════════════════════
    工具函数
    ══════════════════════════════════════════ */
-const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
-const log = (msg) => console.log(`[${ts()}] ${msg}`);
+const ts = () => formatBeijingTime();
+const log = (msg) => console.log(`[${ts()}] ${formatDisplayText(msg)}`);
 const FLAP_REGISTRY_ADDRESS = "0x90497450f2a706f1951b5bdda52b4e5d16f34c06";
 
 const API_ENDPOINT_LINKS = {
@@ -243,7 +244,7 @@ async function handleMessage(messageId, rawText) {
         } else {
           const lines = [`**最近 ${records.length} 条变更记录：**`, ""];
           for (const r of records) {
-            const time = new Date(r.ts).toLocaleString("zh-CN", { hour12: false });
+            const time = formatBeijingTime(r.ts);
             lines.push(`\`${time}\` **[${r.module}]** ${r.title}`);
           }
           reply = lines.join("\n");
@@ -340,7 +341,7 @@ function buildMonitorContext() {
       const stat = statSync(fmSnapPath);
       const snap = mergeActorCheckpoint(readSnapshot(fmSnapPath), dirname(fmSnapPath));
       parts.push("=== Four.meme 监控快照 ===");
-      parts.push(`更新时间: ${stat.mtime.toLocaleString("zh-CN", { hour12: false })}`);
+      parts.push(`更新时间: ${formatBeijingTime(stat.mtime)}`);
 
       // 底池
       const pools = (snap.poolConfig || []).filter(p => p.networkCode === "BSC");
@@ -435,7 +436,7 @@ function buildMonitorContext() {
   if (recent.length > 0) {
     parts.push("\n=== 最近变更历史 ===");
     for (const r of recent) {
-      const time = new Date(r.ts).toLocaleString("zh-CN", { hour12: false });
+      const time = formatBeijingTime(r.ts);
       parts.push(`${time} [${r.module}] ${r.title}`);
       if (r.summary) parts.push(`  ${r.summary.slice(0, 500)}`);
     }
@@ -725,7 +726,7 @@ function readFullPm2Log(command) {
 /** 为日志命令上传完整日志文件 */
 async function sendLogFile(messageId, command) {
   try {
-    const fullLog = readFullPm2Log(command);
+    const fullLog = formatDisplayText(readFullPm2Log(command));
     if (!fullLog || fullLog.length < 50) {
       await replyText(messageId, "日志文件为空或过短，跳过附件");
       return;

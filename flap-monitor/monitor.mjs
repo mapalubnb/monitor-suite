@@ -1,3 +1,4 @@
+import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
@@ -797,8 +798,8 @@ function recordSuccess(domain) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 /* ── 工具函数 ── */
-const ts = () => new Date().toLocaleString("zh-CN", { hour12: false });
-const log = createRpcErrorLogger(msg => console.log(`[${ts()}] ${msg}`));
+const ts = () => formatBeijingTime();
+const log = createRpcErrorLogger(msg => console.log(`[${ts()}] ${formatDisplayText(msg)}`));
 const md5 = (str) => createHash("md5").update(str).digest("hex");
 
 function emptyFlapChangeMeta() {
@@ -6873,9 +6874,9 @@ function safeProposalDisplay(state = {}) {
     healthyCount,
     active,
     lastSuccess: state.lastSuccessAt
-      ? new Date(state.lastSuccessAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" })
+      ? formatBeijingTime(state.lastSuccessAt)
       : "暂无",
-    retryAt: retryAt ? new Date(retryAt).toLocaleString("zh-CN", { hour12: false, timeZone: "Asia/Shanghai" }) : "暂无",
+    retryAt: retryAt ? formatBeijingTime(retryAt) : "暂无",
     usingCache: safeStates.some(item => item?.lastError && item?.lastSuccessAt),
   };
 }
