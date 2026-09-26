@@ -41,7 +41,7 @@ const IS_TEST_MODE = process.env.FOURMEME_MONITOR_TEST === "1";
 
 // 加载共享 .env + 本地 .env（兼容统一部署和独立部署）
 for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) {
-  if (existsSync(envPath)) {
+  if (process.env.MONITOR_TEST_NO_ENV !== "1" && existsSync(envPath)) {
     for (const line of readFileSync(envPath, "utf-8").split("\n")) {
       const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
       if (m && !(m[1] in process.env)) process.env[m[1]] = m[2].replace(/^["']|["']$/g, "");

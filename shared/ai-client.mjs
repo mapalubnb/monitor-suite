@@ -29,7 +29,7 @@ const log = (msg) => console.log(`[${ts()}] ${msg}`);
 
 /* ── .env 加载（简易实现，不依赖 dotenv） ── */
 function loadEnvFile() {
-  if (!existsSync(ENV_FILE)) return;
+  if (process.env.MONITOR_TEST_NO_ENV === "1" || !existsSync(ENV_FILE)) return;
   try {
     for (const line of readFileSync(ENV_FILE, "utf-8").split("\n")) {
       const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);

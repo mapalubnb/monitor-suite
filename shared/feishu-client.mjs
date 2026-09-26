@@ -34,7 +34,7 @@ const ENV_PATHS = [
 ];
 
 for (const envPath of ENV_PATHS) {
-  if (existsSync(envPath)) {
+  if (process.env.MONITOR_TEST_NO_ENV !== "1" && existsSync(envPath)) {
     try {
       for (const line of readFileSync(envPath, "utf-8").split("\n")) {
         const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);

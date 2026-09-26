@@ -76,7 +76,7 @@ const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
 
 // 加载 .env 文件（共享配置 + 本地配置）
 for (const envPath of [join(__dirname, "..", ".env"), join(__dirname, ".env")]) {
-  if (existsSync(envPath)) {
+  if (process.env.MONITOR_TEST_NO_ENV !== "1" && existsSync(envPath)) {
     try {
       for (const line of readFileSync(envPath, "utf-8").split("\n")) {
         const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
