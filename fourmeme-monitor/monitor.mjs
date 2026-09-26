@@ -1,3 +1,4 @@
+import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
  *
@@ -8809,6 +8810,8 @@ async function runActorHistoryCheck() {
   const root = ensureActorMonitorState();
   if (root.historyEndBlock == null) return;
   const history = snapshot.chainActorHistory ||= { ...structuredClone(root), realtime: undefined };
+  history.historyEndBlock ??= root.historyEndBlock;
+  if (activateHistoryGap(history, root.realtime || {}, 'lastBlock', 'historyEndBlock')) history.lastBlockHash = '';
   if (Date.now() < (history.historyNextAt || 0)) return;
   try {
     await runActorLane(false);
@@ -8832,7 +8835,11 @@ async function runActorLane(realtime) {
   }
 
   const latest = await fetchLatestBlockForActorCheck();
-  const safeLatest = Math.min(Math.max(0, latest - CONFIG.actorMonitor.confirmations), realtime ? Infinity : root.historyEndBlock ?? Infinity);
+  const safeLatest = Math.min(Math.max(0, latest - CONFIG.actorMonitor.confirmations), realtime ? Infinity : state.historyEndBlock ?? root.historyEndBlock ?? Infinity);
+  if (realtime && recoverLiveCursor(state, {head: safeLatest, cursorKey: 'lastBlock', hashKey: 'lastBlockHash'})) {
+    state.lastBlockTimestamp = 0;
+    log('[创建者] 已保留积压区间，恢复近期实时扫描');
+  }
   if (!state.lastBlock) {
     state.lastBlock = Math.max(0, safeLatest - CONFIG.actorMonitor.bootstrapLookbackBlocks);
     if (realtime && root.historyEndBlock == null) root.historyEndBlock = state.lastBlock;

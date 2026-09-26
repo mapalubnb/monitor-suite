@@ -373,6 +373,7 @@ export async function fetchSafeProposals({
 }
 
 async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
+  await fetchFn.waitForTurn?.();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
@@ -394,6 +395,37 @@ async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, now = Date.now,
+  sleep = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
+  const guarded = async (...args) => {
+    const response = await fetchFn(...args);
+    if (response.status === 429) {
+      state.apiRateLimitFailures = (state.apiRateLimitFailures || 0) + 1;
+      const delay = Math.max(retryAfterMilliseconds(response), Math.min(300_000, 60_000 * 2 ** Math.min(3, state.apiRateLimitFailures - 1)));
+      state.apiNextAttemptAtMs = now() + delay;
+    } else if (response.ok) {
+      state.apiRateLimitFailures = 0;
+      state.apiNextAttemptAtMs = 0;
+    }
+    return response;
+  };
+  guarded.waitForTurn = async () => {
+    const check = () => {
+      if (state.apiNextAttemptAtMs > now()) {
+        const error = new Error('Safe API 共享冷却中');
+        error.retryAfterMs = state.apiNextAttemptAtMs - now();
+        throw error;
+      }
+    };
+    check();
+    const slot = Math.max(now(), state.apiRequestNextAt || 0);
+    state.apiRequestNextAt = slot + intervalMs;
+    if (slot > now()) await sleep(slot - now());
+    check();
+  };
+  return guarded;
 }
 
 function safeNonceCalls(safes) {
@@ -446,9 +478,11 @@ export async function runSafeProposalScan({
   apiKey = "",
   timeoutMs = 5_000,
   baseBackoffMs = 5_000,
-  maxBackoffMs = 1_800_000,
+  maxBackoffMs = 300_000,
   suppressNotifications = false,
   includeOperations = true,
+  maxSafesPerRun = Infinity,
+  requestIntervalMs = 0,
   nowMs = Date.now(),
 } = {}) {
   if (!state || typeof state !== "object") throw new Error("缺少 Safe 提案状态");
@@ -466,6 +500,7 @@ export async function runSafeProposalScan({
 
   const migrated = migrateSafeProposalState(state, normalizedSafes);
   Object.assign(state, migrated);
+  if (requestIntervalMs > 0) fetchFn = createSafeRateLimitedFetch(state, fetchFn, {intervalMs: requestIntervalMs});
   const runAt = nowIso(nowMs);
   const nonceResults = await rpcBatch(safeNonceCalls(normalizedSafes));
   const currentNonces = new Map(normalizedSafes.map((safe, index) => {
@@ -474,6 +509,12 @@ export async function runSafeProposalScan({
   const changes = [];
   const errors = [];
   let successfulSafes = 0;
+  const start = (state.pollCursor || 0) % normalizedSafes.length;
+  const eligible = [...normalizedSafes.slice(start), ...normalizedSafes.slice(0, start)]
+    .filter(safe => !(state.safes[safe]?.nextAttemptAtMs > nowMs));
+  const selected = new Set(eligible.slice(0, maxSafesPerRun));
+  const lastSelected = [...selected].at(-1);
+  if (lastSelected) state.pollCursor = (normalizedSafes.indexOf(lastSelected) + 1) % normalizedSafes.length;
 
   const settled = await Promise.allSettled(normalizedSafes.map(async (safe, index) => {
     const safeState = state.safes[safe] || createSafeStatus(safe);
@@ -482,6 +523,7 @@ export async function runSafeProposalScan({
     if (currentNonce === null) throw new Error("Safe nonce 读取失败，保留该 Safe 的上次快照");
     safeState.currentNonce = currentNonce;
     safeState.lastNonceAt = runAt;
+    if (!selected.has(safe) || state.apiNextAttemptAtMs > nowMs) return { safe, skipped: true, currentNonce };
     if (Number(safeState.nextAttemptAtMs) > nowMs) return { safe, skipped: true, currentNonce };
     // 错开同一轮多个 Safe 请求，降低出口 IP 触发 Safe API 限流的概率。
     if (index > 0) await new Promise(resolve => setTimeout(resolve, index * SAFE_API_STAGGER_MS));
@@ -500,7 +542,7 @@ export async function runSafeProposalScan({
     const safe = normalizedSafes[index];
     const safeState = state.safes[safe];
     const outcome = settled[index];
-    safeState.lastPollAt = runAt;
+    if (outcome.status === 'rejected' || !outcome.value.skipped) safeState.lastPollAt = runAt;
     if (outcome.status === "rejected") {
       safeState.consecutiveFailures = (Number(safeState.consecutiveFailures) || 0) + 1;
       const retryAfterMs = Number(outcome.reason?.retryAfterMs) || 0;
@@ -581,7 +623,7 @@ export async function runSafeProposalScan({
     && record.nonce < currentNonces.get(record.safe));
   const allStaleHashes = [...new Set(staleRecords.map(record => record.safeTxHash))];
   const cursor = Math.max(0, Number(state.executionCursor) || 0) % Math.max(1, allStaleHashes.length);
-  const staleHashes = [...allStaleHashes.slice(cursor), ...allStaleHashes.slice(0, cursor)].slice(0, 10);
+  const staleHashes = [...allStaleHashes.slice(cursor), ...allStaleHashes.slice(0, cursor)].slice(0, Number.isFinite(maxSafesPerRun) ? 1 : 10);
   state.executionCursor = (cursor + staleHashes.length) % Math.max(1, allStaleHashes.length);
   for (const safeTxHash of staleHashes) {
     const records = staleRecords.filter(record => record.safeTxHash === safeTxHash);

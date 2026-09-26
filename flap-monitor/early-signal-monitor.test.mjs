@@ -366,6 +366,16 @@ test('historical lane stops at the saved realtime boundary without rescanning li
   assert.equal(state.realtimeCursor, 999);
 });
 
+test('stalled early live scan recovers near head and persists its unscanned range', async () => {
+  const state = createEarlySignalState(); state.cursor = 50; state.historyEndBlock = 90;
+  state.realtimeCursor = 100; state.realtimeCursorHash = BH;
+  const rpc = async calls => calls.map(c => ({eth_chainId: '0x38', eth_blockNumber: '0x2710', eth_getBlockByNumber: {hash: BH, transactions: []}, eth_getLogs: []})[c.method]);
+  await scanEarlyChain(state, {realtime: true, nativeTransactions: false, maxBlocksPerRun: 50}, rpc, nowMs);
+  assert.equal(state.realtimeCursor, 9999);
+  assert.equal(state.cursor, 50);
+  assert.deepEqual(state.realtimeGaps, [{from: 101, to: 9979}]);
+});
+
 test('unrelated public pair discovery does not download transaction receipts', async () => {
   const state = createEarlySignalState(); state.cursor = 99;
   const pair = log(DEX.v2Factory, [TOPICS.PairCreated, topic(TOKEN), topic(OWNER)], '0x' + word(POOL) + word(1));

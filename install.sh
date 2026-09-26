@@ -125,6 +125,7 @@ if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/feishu-client.mjs "$SHARED_DIR/"
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
   cp shared/startup-notifier.mjs "$SHARED_DIR/"
+  cp shared/scan-recovery.mjs "$SHARED_DIR/"
   cp .env.example "$SUITE_DIR/.env.example"
   if [ ! -f "$SUITE_DIR/ai-models.json" ]; then
     cp ai-models.json "$SUITE_DIR/"
@@ -404,6 +405,7 @@ if [ -f "$SNAP" ]; then
     console.log('**04｜性能指标**');
     const mem=runtime.memory||{};
     console.log('进程内存：RSS '+(mem.rss?Math.round(mem.rss/1024/1024)+' MB':'未知')+'｜堆使用 '+(mem.heapUsed?Math.round(mem.heapUsed/1024/1024)+' MB':'未知'));
+    console.log('创建者待补区间：'+JSON.stringify(am.realtimeGaps||[]));
     console.log('创建者历史补扫：'+(actorHistory.lastBlock??'未知')+' / '+(actorHistory.historyEndBlock??'未知')+(actorHistory.historyError?'｜'+actorHistory.historyError:''));
     console.log('创建者扫描：'+(runtime.actorScanMode==='validatedBlockBatch'?'区块完整性校验':runtime.actorScanMode==='rawBlockPreFilter'?'原始区块快速过滤':runtime.actorScanMode==='rawBlockParsed'?'监听地址命中并完整解析':runtime.actorScanMode==='batchFallback'?'标准 RPC 兼容模式':'等待指标')+'｜快速跳过 '+(runtime.actorFastSkips??0)+'｜回退 '+(runtime.actorFallbacks??0));
     if(s._notificationOutbox?.length) console.log('待发送通知：'+s._notificationOutbox.length+' 条｜失败后自动重试');
@@ -547,6 +549,7 @@ if [ -f "$SNAP" ]; then
     const sp=fs.existsSync('$SAFE_STATE')?JSON.parse(fs.readFileSync('$SAFE_STATE','utf-8')):{};
     const es=fs.existsSync('$EARLY_STATE')?JSON.parse(fs.readFileSync('$EARLY_STATE','utf-8')):{};
     console.log('**底池提前信号**');
+    console.log('提前信号待补区间：'+JSON.stringify(es.realtimeGaps||[]));
     console.log('实时扫描：'+(es.realtimeCursor??'未建立')+'｜历史补扫 '+(es.cursor??'未建立')+' / '+(es.historyEndBlock??'未知')+'｜最新 '+(es.latestBlock??'未知')+'｜候选资产 '+Object.keys(es.tokens||{}).length+'｜待推送 '+(es.pendingChanges||[]).length);
     for(const [name,h] of Object.entries(es.health||{})) if(h.lastError) console.log(name+'：'+h.lastError+'｜下次重试 '+new Date(h.nextAttemptAtMs||0).toISOString());
     const mdLink=(label,url)=>'['+label+']('+url+')';
@@ -689,6 +692,7 @@ if [ -f "$SNAP" ]; then
     console.log('监控状态：'+(integrityStatus==='运行正常'?ok(integrityStatus):warn(integrityStatus)));
     console.log('合约目录：'+integrityCatalog+' 个｜已知资产 '+integrityAssets+' 个｜待发送变更 '+((ci.pendingChanges||[]).length)+' 项');
     console.log('精准地址 WSS：'+(integrityWss.status||'尚未建立')+'｜已订阅 '+(Number(integrityWss.subscribedCount)||0)+'/'+(Number(integrityWss.configuredCount)||0));
+    console.log('合约事件待补区间：'+JSON.stringify(ci.realtimeGaps||[]));
     console.log('事件实时扫描：'+(ci.httpRealtimeLastBlock??'未建立')+'｜历史补扫 '+(ci.httpEventLastBlock??'未建立')+' / '+(ci.eventHistoryEndBlock??'未知'));
     if(ci.eventHistoryError) console.log('历史查询：'+ci.eventHistoryError);
     console.log('核心校验：'+(ci.lastCoreScanAt?fmtTime(ci.lastCoreScanAt):'尚未建立')+'｜扩展轮转 '+(ci.lastExtendedScanAt?fmtTime(ci.lastExtendedScanAt):'尚未建立')+'｜代码审计 '+(ci.lastCodeAuditAt?fmtTime(ci.lastCodeAuditAt):'尚未建立'));

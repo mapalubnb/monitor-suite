@@ -8,7 +8,7 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
   let draining = false;
   const context = new AsyncLocalStorage();
   const encode = value => JSON.stringify(value);
-  const scope = () => context.getStore();
+  const scope = () => { const tx = context.getStore(); return tx?.active ? tx : undefined; };
   function field(key) {
     const tx = scope();
     if (!tx) return root[key];
@@ -37,26 +37,35 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
   function write(next) { persist(next); root = next; }
   async function transaction(fn) {
     if (scope()) return fn();
-    const tx = { before: new Map(), values: new Map(), notifications: [] };
-    const result = await context.run(tx, fn);
-    const next = { ...root };
-    let dirty = false;
-    for (const [key, value] of tx.values) {
-      const encoded = encode(value);
-      if (encoded === tx.before.get(key)) continue;
-      if (encode(root[key]) !== tx.before.get(key)) {
-        throw new Error(`并发快照字段冲突：${String(key)}，下轮重试`);
+    const tx = { active: true, before: new Map(), values: new Map(), notifications: [] };
+    try {
+      const result = await context.run(tx, fn);
+      const next = { ...root };
+      let dirty = false;
+      for (const [key, value] of tx.values) {
+        const encoded = encode(value);
+        if (encoded === tx.before.get(key)) continue;
+        if (encode(root[key]) !== tx.before.get(key)) {
+          throw new Error(`并发快照字段冲突：${String(key)}，下轮重试`);
+        }
+        if (value === undefined) delete next[key];
+        else next[key] = value;
+        dirty = true;
       }
-      if (value === undefined) delete next[key];
-      else next[key] = value;
-      dirty = true;
+      if (tx.notifications.length) {
+        next._notificationOutbox = [...(root._notificationOutbox || []), ...tx.notifications];
+        dirty = true;
+      }
+      if (dirty) write(next);
+      return result;
+    } finally {
+      // Timers/requests created inside a scan inherit AsyncLocalStorage. Release
+      // large cloned snapshots even when those async resources outlive the scan.
+      tx.active = false;
+      tx.before.clear();
+      tx.values.clear();
+      tx.notifications.length = 0;
     }
-    if (tx.notifications.length) {
-      next._notificationOutbox = [...(root._notificationOutbox || []), ...tx.notifications];
-      dirty = true;
-    }
-    if (dirty) write(next);
-    return result;
   }
   async function enqueue(payload) {
     if (!scope()) return transaction(() => enqueue(payload));

@@ -20,6 +20,7 @@ import {
   runSafeProposalScan,
   saveSafeProposalState,
   encodeSafeExecutionSimulation,
+  createSafeRateLimitedFetch,
 } from "./safe-proposal-monitor.mjs";
 
 const FACTORY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -30,6 +31,34 @@ const OTHER = "0x1111111111111111111111111111111111111111";
 const SAFE_TX_HASH = `0x${"97".repeat(32)}`;
 const AWDH = JSON.parse(readFileSync(new URL("./fixtures/safe-awdh-proposal.json", import.meta.url), "utf8"));
 const MULTISEND = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
+
+test('Safe service cooldown survives state reload and respects Retry-After across addresses', async () => {
+  let now = 1000, requests = 0;
+  let state = {};
+  const fetchFn = async () => { requests++; return {status: 429, ok: false, headers: {get: () => '600'}}; };
+  let guarded = createSafeRateLimitedFetch(state, fetchFn, {now: () => now, sleep: async ms => { now += ms; }});
+  await guarded.waitForTurn(); await guarded('first');
+  assert.equal(state.apiNextAttemptAtMs, 601000);
+  state = JSON.parse(JSON.stringify(state));
+  guarded = createSafeRateLimitedFetch(state, fetchFn, {now: () => now});
+  await assert.rejects(guarded.waitForTurn(), /共享冷却/);
+  assert.equal(requests, 1);
+});
+
+test('Safe polling rotates one address per run without updating skipped poll times', async () => {
+  const state = createSafeProposalState([SAFE, OTHER]);
+  const calls = [];
+  const scan = nowMs => runSafeProposalScan({state, safes: [SAFE, OTHER], maxSafesPerRun: 1, nowMs,
+    rpcBatch: async calls => calls.map(() => '0x' + '0'.repeat(64)),
+    fetchFn: async url => { calls.push(url); return {ok: true, json: async () => ({results: [], next: null})}; },
+  });
+  await scan(1000);
+  assert.equal(calls.length, 1);
+  assert.equal(state.safes[OTHER].lastPollAt, '');
+  await scan(2000);
+  assert.equal(calls.length, 2);
+  assert.notEqual(calls[0], calls[1]);
+});
 const VAULT_CALLS = JSON.parse(readFileSync(new URL("./fixtures/safe-vault-factory-calls.json", import.meta.url), "utf8"));
 const jsonResponse = value => ({ ok: true, status: 200, json: async () => value });
 

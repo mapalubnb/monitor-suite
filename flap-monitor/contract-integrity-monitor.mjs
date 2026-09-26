@@ -1,3 +1,4 @@
+import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { createHash } from "node:crypto";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -506,6 +507,8 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
 
 export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock = 0, maxBlocks = 2_000, realtime = false, suppressFactoryUpgrade = false } = {}) {
   const cursorKey = realtime ? "httpRealtimeLastBlock" : "httpEventLastBlock";
+  if (realtime) recoverLiveCursor(state, {head: latestBlock || hexToNumber(await rpcCall('eth_blockNumber', [])), cursorKey});
+  else activateHistoryGap(state, state, 'httpEventLastBlock', 'eventHistoryEndBlock');
   const latest = Math.min(latestBlock || hexToNumber(await rpcCall("eth_blockNumber", [])), realtime ? Infinity : state.eventHistoryEndBlock ?? Infinity);
   if (!state[cursorKey]) {
     if (!realtime) {

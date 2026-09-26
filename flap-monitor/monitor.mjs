@@ -6611,6 +6611,7 @@ async function runCheck() {
         apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
         apiKey: CONFIG.safeProposalMonitor.apiKey,
         timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
+          maxSafesPerRun: 1, requestIntervalMs: 5000,
       });
       saveSafeProposalState(CONFIG.safeProposalMonitor.stateFile, safeProposalState);
       if (safeResult.changed) hasDetectedChange = true;
@@ -7029,6 +7030,7 @@ async function startMonitor() {
           apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
           apiKey: CONFIG.safeProposalMonitor.apiKey,
           timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
+          maxSafesPerRun: 1, requestIntervalMs: 5000,
           suppressNotifications,
         });
         saveSafeProposalState(CONFIG.safeProposalMonitor.stateFile, safeProposalState);

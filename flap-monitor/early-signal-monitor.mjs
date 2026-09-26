@@ -1,3 +1,4 @@
+import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { CORE_SAFES, AUXILIARY_SAFES, EXECUTION_WALLETS, CORE_OWNERS, ALLOWANCE_MODULE, PROXY_ADMINS,
@@ -464,6 +465,8 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   const latest = Number(await strictRpc(rpcBatch, "eth_blockNumber", []));
   state.latestBlock = latest;
   const confirmations = config.confirmations ?? 1;
+  if (config.realtime) recoverLiveCursor(state, {head: latest - confirmations, cursorKey, hashKey});
+  else if (activateHistoryGap(state, state, 'cursor', 'historyEndBlock')) state.cursorHash = '';
   const head = Math.min(latest - confirmations, config.realtime ? Infinity : state.historyEndBlock ?? Infinity);
   await validateFastBlocks(state, head, rpcBatch, nowMs);
   const bootstrap = state[cursorKey] == null;

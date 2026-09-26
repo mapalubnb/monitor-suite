@@ -2,6 +2,25 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTransactionalOutbox } from './transactional-outbox.mjs';
 
+test('completed transaction releases inherited async scope and delayed work sees current state', async () => {
+  const store = createTransactionalOutbox({initial: {large: {payload: 'x'.repeat(1_000_000)}, cursor: 1}, persist: () => {}});
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  let delayed;
+  await store.transaction(async () => {
+    void store.state.large;
+    delayed = gate.then(async () => {
+      assert.equal(store.inTransaction(), false);
+      assert.equal(store.state.cursor, 2);
+      await store.transaction(() => { store.state.cursor = 3; });
+    });
+  });
+  await store.transaction(() => { store.state.cursor = 2; });
+  release();
+  await delayed;
+  assert.equal(store.state.cursor, 3);
+});
+
 test('snapshot and alerts commit together, failed scans roll back both', async () => {
   let disk = { cursor: 1 };
   const store = createTransactionalOutbox({ initial: disk, persist: value => { disk = structuredClone(value); }, deliver: async () => 'message' });
