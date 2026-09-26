@@ -29,7 +29,7 @@ import { createStartupNotifier, buildStartupCard } from "../shared/startup-notif
 import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.mjs";
 import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
-import { sendCard, sendCardQueued, patchCard, waitQueueDrain } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard, waitQueueDrain, splitMessageContent, balanceCardFontTags } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
   FACTORY_POOL_STATE_EVENT_TOPICS,
@@ -69,7 +69,7 @@ import {
 
 import { EXECUTION_WALLETS } from "./early-signal-catalog.mjs";
 import { createEarlySignalState, loadEarlySignalState, saveEarlySignalState, runEarlySignalScan,
-  earlyLogFilters, acknowledgeEarlySignals, buildEarlySignalContent } from "./early-signal-monitor.mjs";
+  earlyLogFilters, acknowledgeEarlySignals, buildEarlySignalContent, formatEarlySignalAsset } from "./early-signal-monitor.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
@@ -6584,15 +6584,63 @@ function earlySignalConfig() {
     safeApiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl, safeApiKey: CONFIG.safeProposalMonitor.apiKey,
     safeApiKeys: CONFIG.safeProposalMonitor.apiKeys };
 }
-async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState } = {}) {
+const earlySignalNameFlights = new Set();
+async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState,
+  resolveMetadataFn = sendCardFn === sendCardViaApi ? resolveFactoryPoolTokenMetadata : null,
+  patchCardFn = patchCard, now = Date.now } = {}) {
   // Bound each card; acknowledge only successful sends and retain the remaining queue.
   const changes = state.pendingChanges.slice(0, 8);
   if (!changes.length) return { sent: false };
-  const id = await sendCardFn("Flap 底池提前信号", buildEarlySignalContent(changes, state), "orange");
+  const content = buildEarlySignalContent(changes, state);
+  const sentParts = [];
+  const id = await sendCardFn("Flap 底池提前信号", content, "orange", undefined, { sentParts });
   if (!id) return { sent: false };
   acknowledgeEarlySignals(state, changes.map(e => e.id));
   saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
-  return { sent: true };
+  const addresses = [...new Set(changes.map(change => normalizeAddress(change.token)).filter(address => address
+    && state.tokens[address] && !state.tokens[address].name && !state.tokens[address].symbol
+    && !(Date.parse(state.tokens[address].nameNextRetryAt || "") > now())))];
+  let metadataPromise;
+  if (resolveMetadataFn && addresses.length) {
+    const retryAt = new Date(now() + CONFIG.factoryPoolMonitor.tokenMetadataRetryMs).toISOString();
+    for (const address of addresses) state.tokens[address].nameNextRetryAt = retryAt;
+    saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+    metadataPromise = Promise.resolve().then(() => resolveMetadataFn(addresses)).then(async ({ metadata }) => {
+      let changed = false;
+      for (const address of addresses) {
+        const item = metadata?.[address];
+        if (!item?.name && !item?.symbol) continue;
+        const fields = { name: item.name || "", symbol: item.symbol || "", nameSource: item.source || "",
+          nameUpdatedAt: new Date(now()).toISOString(), nameNextRetryAt: "" };
+        if (state.tokens[address]) Object.assign(state.tokens[address], fields);
+        changed = true;
+      }
+      if (!changed) return;
+      saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+      const configuredLimit = Number(process.env.FEISHU_CARD_CHUNK_LIMIT);
+      const limit = Number.isFinite(configuredLimit) && configuredLimit >= 500 ? Math.floor(configuredLimit) : 3500;
+      const parts = balanceCardFontTags(splitMessageContent(content, limit - 40));
+      if (!sentParts.length && parts.length === 1) sentParts.push(id);
+      // Patch the original parts in place. Only add names, never recalculate
+      // signal stages or move evidence between already delivered cards.
+      for (const [index, part] of parts.entries()) {
+        let enriched = part;
+        for (const address of addresses) {
+          const item = metadata?.[address];
+          if (!item?.name && !item?.symbol) continue;
+          const original = formatEarlySignalAsset(address);
+          enriched = enriched.split("\n").map(line => line === original ? formatEarlySignalAsset(address, item) : line).join("\n");
+        }
+        if (sentParts[index] && enriched !== part) {
+          const title = "Flap 底池提前信号" + (parts.length > 1 ? ` (${index + 1}/${parts.length})` : "");
+          await patchCardFn(sentParts[index], title, enriched, "orange");
+        }
+      }
+    }).catch(error => log(`[Flap 提前信号名称] 补充失败：${error.message}`))
+      .finally(() => earlySignalNameFlights.delete(metadataPromise));
+    earlySignalNameFlights.add(metadataPromise);
+  }
+  return { sent: true, metadataPromise };
 }
 
 /* ══════════════════════════════════════════
@@ -6766,7 +6814,9 @@ async function runCheck() {
     const result = await runEarlySignalScan({ state: early, config: earlySignalConfig(), rpcBatch: bscRpcBatch, safeState: safe });
     saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, early);
     if (result.changed) hasDetectedChange = true;
-    if ((await deliverFlapEarlySignals(early)).sent) hasNotifiedChange = true;
+    const earlyDelivery = await deliverFlapEarlySignals(early);
+    if (earlyDelivery.sent) hasNotifiedChange = true;
+    await earlyDelivery.metadataPromise;
     for (const error of result.errors) log("[Flap 提前信号] " + error);
   }
   } catch (error) { log("[Flap 提前信号] 手动检测失败：" + error.message); }
@@ -7028,6 +7078,7 @@ async function startMonitor() {
     earlyFeeds.stop(); registryFeed?.stop(); headFeed?.stop();
     await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), registryJob.stop(), registryHistoryJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
     if (earlyDeliveryPromise) await earlyDeliveryPromise;
+    await Promise.allSettled([...earlySignalNameFlights]);
     saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
   };
   let contractIntegrityMutationQueue = Promise.resolve();

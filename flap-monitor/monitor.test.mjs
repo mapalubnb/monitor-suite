@@ -3445,3 +3445,57 @@ test('read, realtime logs and historical logs use isolated pools', async () => {
     assert.deepEqual(calls, [['https://blocks.test','eth_blockNumber'], ['https://read.test','eth_getCode'], ['https://live.test','eth_getLogs'], ['https://live.test','eth_blockNumber'], ['https://history-a.test','eth_getLogs'], ['https://history-b.test','eth_getLogs']]);
   } finally { globalThis.fetch = original; __testables.CONFIG.rpcPools = pools; __testables.resetBscRpcHealth(); }
 });
+
+
+test('early signals reuse token metadata after delivery and patch names without changing signal evidence', async () => {
+  const token = '0x46ceefda28dd7207059ed19b0acdc026955bb15c';
+  const state = { pendingChanges: [{id:'name-first',token,kind:'observation',detail:'准备操作',observedAt:'2026-09-26'}], tokens:{[token]:{}}, events:{}, health:{} };
+  let complete, calls = 0, original, patched;
+  const options = { saveStateFn:()=>{}, sendCardFn:async (_title,content)=>{original=content;return 'name-card';},
+    resolveMetadataFn:async addresses=>{calls++;assert.deepEqual(addresses,[token]);return new Promise(resolve=>{complete=resolve;});},
+    patchCardFn:async (id,_title,content)=>{assert.equal(id,'name-card');patched=content;} };
+  const result = await __testables.deliverFlapEarlySignals(state, options);
+  assert.equal(result.sent,true);
+  assert.equal(state.pendingChanges.length,0);
+  assert.equal(patched,undefined);
+  state.tokens[token].effectiveEnabled = true;
+  complete({metadata:{[token]:{name:'Example Asset',symbol:'EX',source:'goplus'}}});
+  await result.metadataPromise;
+  assert.equal(patched.replace('资产名称：Example Asset\n',''),original);
+  assert.equal(state.tokens[token].name,'Example Asset');
+  state.pendingChanges.push({id:'name-second',token,kind:'observation',detail:'后续操作'});
+  await __testables.deliverFlapEarlySignals(state, options);
+  assert.match(original,/资产名称：Example Asset/);
+  assert.equal(calls,1);
+});
+
+test('failed early name lookups keep delivered signals and respect metadata retry cooldown', async () => {
+  const token = '0x'+'1'.repeat(40);
+  const state = {pendingChanges:[{id:'lookup-fail',token,kind:'observation',detail:'准备'}],tokens:{[token]:{}},events:{},health:{}};
+  let calls=0, patches=0;
+  const options={sendCardFn:async()=> 'delivered',saveStateFn:()=>{},now:()=>1000,
+    resolveMetadataFn:async()=>{calls++;throw Error('name API unavailable');},patchCardFn:async()=>{patches++;}};
+  const result=await __testables.deliverFlapEarlySignals(state,options);
+  await result.metadataPromise;
+  assert.equal(state.pendingChanges.length,0);
+  assert.ok(Date.parse(state.tokens[token].nameNextRetryAt)>1000);
+  state.pendingChanges.push({id:'lookup-next',token,kind:'observation',detail:'后续'});
+  await __testables.deliverFlapEarlySignals(state,options);
+  assert.equal(calls,1);
+  assert.equal(patches,0);
+});
+
+test('multipart early signal cards enrich only their matching original part', async () => {
+  const {splitMessageContent,balanceCardFontTags}=await import('../shared/feishu-client.mjs');
+  const token='0x'+'3'.repeat(40), second='0x'+'4'.repeat(40);
+  const state={pendingChanges:[{id:'long-one',token,kind:'observation',detail:'完整证据'.repeat(1200)},{id:'long-two',token:second,kind:'observation',detail:'第二资产'}],tokens:{[token]:{},[second]:{}},events:{},health:{}};
+  let originals=[];const patched=[];
+  const result=await __testables.deliverFlapEarlySignals(state,{saveStateFn:()=>{},
+    sendCardFn:async (_title,content,_color,_file,opts)=>{originals=balanceCardFontTags(splitMessageContent(content,3460));originals.forEach((_,i)=>opts.sentParts.push('part-'+i));return 'part-0';},
+    resolveMetadataFn:async()=>({metadata:{[token]:{name:'First Asset'},[second]:{name:'Second Asset'}}}),
+    patchCardFn:async(id,title,content)=>patched.push({id,title,content})});
+  await result.metadataPromise;
+  assert.ok(originals.length>1);
+  assert.equal(patched.length,2);
+  for(const part of patched){const index=Number(part.id.split('-')[1]);assert.equal(part.content.replace(/资产名称：(First|Second) Asset\n/g,''),originals[index]);}
+});

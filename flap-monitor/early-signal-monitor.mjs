@@ -643,6 +643,13 @@ export function earlyAssetStage(state, token) {
   return "observation";
 }
 
+export function formatEarlySignalAsset(token, metadata = {}) {
+  const name = metadata.name || metadata.symbol;
+  const escaped = name ? String(name).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/[\\`*_[\]~]/g, "\\$&").replace(/[\r\n]+/g, " ") : "";
+  return `${escaped ? `资产名称：${escaped}\n` : ""}资产：[${token}](https://bscscan.com/address/${token})`;
+}
+
 export function buildEarlySignalContent(changes, state) {
   const groups = new Map();
   for (const e of changes) {
@@ -656,7 +663,7 @@ export function buildEarlySignalContent(changes, state) {
     const stage = token ? earlyAssetStage(state, token) : "observation";
     const color = stage === "opened" ? "green" : stage === "disabled" ? "red" : "orange";
     lines.push(`**🔎 <font color='${color}'>${token ? stageLabel(stage) : "关联操作"}</font>**`);
-    if (token) lines.push(`资产：[${token}](https://bscscan.com/address/${token})`);
+    if (token) lines.push(formatEarlySignalAsset(token, state.tokens[token]));
     if (state.tokens[token]?.underlying) lines.push(`原始资产：${state.tokens[token].underlying}`);
     if (state.tokens[token]?.configurationCheckedAt) lines.push(`链上状态最后复核：${state.tokens[token].configurationCheckedAt}`);
     if (state.health.assets?.lastError) lines.push("当前配置复核异常，上述状态为缓存快照。");
