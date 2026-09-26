@@ -3,6 +3,8 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRpcBudget } from './rpc-budget.mjs';
 
+export const RPC_BATCH_SIZE = 8;
+
 // Only provider-wide failures are shared. Archive/range errors stay with the
 // caller's range-specific policy and cannot quarantine recent reads.
 export function createRpcControl({ directory = '', now = Date.now, concurrency = 2, limits = JSON.parse(process.env.RPC_PROVIDER_LIMITS || '{}') } = {}) {

@@ -1,4 +1,4 @@
-import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane } from "../shared/rpc-control.mjs";
+import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
@@ -2924,9 +2924,9 @@ async function bscRpcCall(method, params = [], options = {}) {
 
 async function bscRpcBatch(calls = [], options = {}) {
   if (calls.length === 0) return [];
-  if (calls.length > 20) {
+  if (calls.length > RPC_BATCH_SIZE) {
     const results = [];
-    for (let i = 0; i < calls.length; i += 20) results.push(...await bscRpcBatch(calls.slice(i, i + 20), options));
+    for (let i = 0; i < calls.length; i += RPC_BATCH_SIZE) results.push(...await bscRpcBatch(calls.slice(i, i + RPC_BATCH_SIZE), options));
     return results;
   }
   if (calls.length > 1 && calls.some(call => call.method === 'eth_getLogs')) {
@@ -6460,11 +6460,14 @@ async function runFlapContractIntegrityPass(state, {
   forceCodeAudit = false,
   suppressNotifications = false,
   saveStateFn = saveContractIntegrityState,
+  stateScanFn = runContractIntegrityStateScan,
+  eventScanFn = scanContractIntegrityEvents,
 } = {}) {
   if (!CONFIG.contractIntegrityMonitor.enabled) return { changed: false, changes: [], state };
   const existingPendingIds = new Set(state.pendingChanges.map(change => change.id));
   syncFlapContractIntegrityCatalog(state, snapshot, factoryPoolState);
-  const stateResult = await runContractIntegrityStateScan({
+  let stateResult = { changed: false, changes: [] }, stateError;
+  try { stateResult = await stateScanFn({
     state,
     rpcCall: bscRpcCall,
     rpcBatch: calls => bscRpcBatch(calls),
@@ -6472,19 +6475,21 @@ async function runFlapContractIntegrityPass(state, {
     forceCodeAudit,
     trackedAssetLimit: CONFIG.contractIntegrityMonitor.trackedAssetLimit,
     suppressFactoryImplementationChange: CONFIG.factoryPoolMonitor.enabled,
-  });
-  const eventResult = await scanContractIntegrityEvents({
+  }); } catch (error) { stateError = error; }
+  // A state endpoint failure must not prevent the independent live log scan.
+  const eventResult = await eventScanFn({
     state,
-    rpcCall: bscRpcCall,
-    latestBlock: state.latestBlock,
-    maxBlocks: 50,
+    rpcCall: (method, params) => bscRpcCall(method, params, { history: false }),
+    latestBlock: stateError ? 0 : state.latestBlock,
+    maxBlocks: Math.min(CONFIG.contractIntegrityMonitor.eventMaxBlocksPerRun,
+      state.latestBlock - (state.httpRealtimeLastBlock || state.latestBlock) > 100 ? 200 : 50),
     realtime: true,
     suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
   });
   // History has its own retry schedule and cannot roll back a successful live scan.
   if (Date.now() >= (state.eventHistoryNextAt || 0)) {
     try {
-      await scanContractIntegrityEvents({ state, rpcCall: (method, params) => bscRpcCall(method, params, { history: true }), latestBlock: state.latestBlock,
+      await eventScanFn({ state, rpcCall: (method, params) => bscRpcCall(method, params, { history: true }), latestBlock: eventResult.latest || state.latestBlock,
         maxBlocks: CONFIG.contractIntegrityMonitor.eventMaxBlocksPerRun, suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled });
       state.eventHistoryError = "";
       state.eventHistoryNextAt = Date.now() + 10_000;
@@ -6497,6 +6502,7 @@ async function runFlapContractIntegrityPass(state, {
     acknowledgeContractIntegrityChanges(state, state.pendingChanges.filter(change => !existingPendingIds.has(change.id)).map(change => change.id));
   }
   saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
+  if (stateError) throw stateError;
   return {
     changed: stateResult.changed || eventResult.changed,
     changes: [...stateResult.changes, ...eventResult.changes],

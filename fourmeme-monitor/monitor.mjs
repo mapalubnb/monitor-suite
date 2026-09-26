@@ -1,4 +1,4 @@
-import { createRpcControl, rpcReadLane } from "../shared/rpc-control.mjs";
+import { createRpcControl, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 /**
@@ -1581,9 +1581,9 @@ function shouldLogRpcItemError(call, message) {
 // --- Batch RPC：一次 HTTP 调用执行多个 RPC ---
 async function bscRpcBatch(calls) {
   if (calls.length === 0) return [];
-  if (calls.length > 20) {
+  if (calls.length > RPC_BATCH_SIZE) {
     const results = [];
-    for (let i = 0; i < calls.length; i += 20) results.push(...await bscRpcBatch(calls.slice(i, i + 20)));
+    for (let i = 0; i < calls.length; i += RPC_BATCH_SIZE) results.push(...await bscRpcBatch(calls.slice(i, i + RPC_BATCH_SIZE)));
     return results;
   }
   // 单条也走 batch 逻辑，保持统一的错误语义（失败返回 null 而非抛异常）
@@ -8471,9 +8471,9 @@ async function fetchValidatedActorBlocks(
   rpcBatchFn = bscRpcBatch,
 ) {
   if (actorAddresses.length === 0) return [];
-  if (blockCalls.length > 20) {
+  if (blockCalls.length > RPC_BATCH_SIZE) {
     const blocks = [];
-    for (let i = 0; i < blockCalls.length; i += 20) blocks.push(...await fetchValidatedActorBlocks(blockCalls.slice(i, i + 20), actorAddresses, rpcRequestFn, rpcBatchFn));
+    for (let i = 0; i < blockCalls.length; i += RPC_BATCH_SIZE) blocks.push(...await fetchValidatedActorBlocks(blockCalls.slice(i, i + RPC_BATCH_SIZE), actorAddresses, rpcRequestFn, rpcBatchFn));
     validateActorBlocks(blockCalls, blocks);
     return blocks;
   }

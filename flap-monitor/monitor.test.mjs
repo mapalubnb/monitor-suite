@@ -2707,6 +2707,22 @@ test("generic Vault Portal known vaults never become contract-integrity WSS targ
   assert.equal(contractIntegritySubscriptionAddresses(state).includes(vault), false);
 });
 
+test('a failed contract state endpoint does not starve live event scanning or discard its progress', async () => {
+  const state = createContractIntegrityState(); let saved, liveScans = 0;
+  state.latestBlock = 500; state.httpRealtimeLastBlock = 100;
+  state.eventHistoryNextAt = Date.now() + 60_000;
+  await assert.rejects(__testables.runFlapContractIntegrityPass(state, {
+    stateScanFn: async () => { throw new Error('state endpoint unavailable'); },
+    eventScanFn: async options => {
+      assert.equal(options.realtime, true); assert.equal(options.latestBlock, 0); assert.equal(options.maxBlocks, 200);
+      liveScans++; options.state.httpRealtimeLastBlock = 123;
+      return { changed: false, changes: [], latest: 123 };
+    },
+    saveStateFn: (_, value) => { saved = structuredClone(value); },
+  }), /state endpoint unavailable/);
+  assert.equal(liveScans, 1); assert.equal(saved.httpRealtimeLastBlock, 123);
+});
+
 test("asset semantic profile classifies page chunks and shared runtime chunks", () => {
   const profile = __testables.buildAssetSemanticProfile([
     "/_next/static/chunks/webpack-167217394b1418fd.js",

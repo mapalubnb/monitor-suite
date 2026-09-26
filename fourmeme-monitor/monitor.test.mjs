@@ -168,11 +168,11 @@ test('large actor reads split before transport and validate across batch boundar
   let fork = false;
   const request = async (payload, _, options) => {
     sizes.push(payload.length);
-    const data = payload.map(item => { const n = Number(item.params[0]); return { id: item.id, result: { number: item.params[0], hash: hash(n), parentHash: hash(fork && n === 21 ? 0 : n - 1), transactions: [] } }; });
+    const data = payload.map(item => { const n = Number(item.params[0]); return { id: item.id, result: { number: item.params[0], hash: hash(n), parentHash: hash(fork && n === 17 ? 0 : n - 1), transactions: [] } }; });
     return options.parseResponse({ text: async () => JSON.stringify(data) });
   };
   assert.equal((await __testables.fetchValidatedActorBlocks(calls, ['actor'], request)).length, 45);
-  assert.deepEqual(sizes, [20, 20, 5]); fork = true;
+  assert.deepEqual(sizes, [8, 8, 8, 8, 8, 5]); fork = true;
   await assert.rejects(__testables.fetchValidatedActorBlocks(calls, ['actor'], request), /分叉/);
 });
 
