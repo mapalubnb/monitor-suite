@@ -1,0 +1,802 @@
+[
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:36:51.360Z",
+    "metricAgeMs": 11498,
+    "active": 4,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 316,
+    "timeouts": 1,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 77,
+    "coreAgeMs": 9447,
+    "coreError": "",
+    "coreBlock": 124133970,
+    "factoryHead": 124133990,
+    "factoryBlock": 124133990,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124133986,
+    "earlyBlock": 124133983,
+    "earlyLag": 3,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:36:47.851Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:36:38.866Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:36:48.864Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:36:48.853Z"
+      }
+    },
+    "fmContract": {
+      "runs": 14,
+      "lastDurationMs": 659,
+      "avgDurationMs": 1484,
+      "requestCount": 117,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:37:11.404Z",
+    "metricAgeMs": 9468,
+    "active": 2,
+    "queued": 0,
+    "inFlight": 6,
+    "requests": 756,
+    "timeouts": 3,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 79,
+    "coreAgeMs": 3260,
+    "coreError": "",
+    "coreBlock": 124134028,
+    "factoryHead": 124134034,
+    "factoryBlock": 124134034,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134033,
+    "earlyBlock": 124134032,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:37:09.941Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:37:02.877Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:37:08.868Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:37:08.854Z"
+      }
+    },
+    "fmContract": {
+      "runs": 29,
+      "lastDurationMs": 672,
+      "avgDurationMs": 1171,
+      "requestCount": 237,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:37:31.439Z",
+    "metricAgeMs": 8587,
+    "active": 4,
+    "queued": 0,
+    "inFlight": 5,
+    "requests": 1424,
+    "timeouts": 3,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 81,
+    "coreAgeMs": 3257,
+    "coreError": "",
+    "coreBlock": 124134073,
+    "factoryHead": 124134078,
+    "factoryBlock": 124134077,
+    "factoryLag": 1,
+    "factoryError": "",
+    "earlyHead": 124134078,
+    "earlyBlock": 124134077,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:37:30.436Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:37:22.878Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:37:28.868Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:37:28.854Z"
+      }
+    },
+    "fmContract": {
+      "runs": 43,
+      "lastDurationMs": 980,
+      "avgDurationMs": 1108,
+      "requestCount": 349,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:37:51.470Z",
+    "metricAgeMs": 7359,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 7,
+    "requests": 2054,
+    "timeouts": 3,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 85,
+    "coreAgeMs": 13262,
+    "coreError": "",
+    "coreBlock": 124134095,
+    "factoryHead": 124134124,
+    "factoryBlock": 124134124,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134120,
+    "earlyBlock": 124134117,
+    "earlyLag": 3,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:37:48.114Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:37:32.878Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:37:48.867Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:37:48.853Z"
+      }
+    },
+    "fmContract": {
+      "runs": 57,
+      "lastDurationMs": 770,
+      "avgDurationMs": 1083,
+      "requestCount": 461,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:38:11.500Z",
+    "metricAgeMs": 5119,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 2584,
+    "timeouts": 5,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 83,
+    "coreAgeMs": 7304,
+    "coreError": "",
+    "coreBlock": 124134151,
+    "factoryHead": 124134168,
+    "factoryBlock": 124134168,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134166,
+    "earlyBlock": 124134165,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:38:09.912Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:38:04.942Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:38:08.867Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:38:08.853Z"
+      }
+    },
+    "fmContract": {
+      "runs": 67,
+      "lastDurationMs": 757,
+      "avgDurationMs": 1125,
+      "requestCount": 541,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:38:31.559Z",
+    "metricAgeMs": 4202,
+    "active": 2,
+    "queued": 0,
+    "inFlight": 2,
+    "requests": 3144,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 89,
+    "coreAgeMs": 8279,
+    "coreError": "",
+    "coreBlock": 124134195,
+    "factoryHead": 124134212,
+    "factoryBlock": 124134211,
+    "factoryLag": 1,
+    "factoryError": "",
+    "earlyHead": 124134212,
+    "earlyBlock": 124134211,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:38:30.361Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:38:24.954Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:38:28.866Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:38:28.853Z"
+      }
+    },
+    "fmContract": {
+      "runs": 83,
+      "lastDurationMs": 665,
+      "avgDurationMs": 1079,
+      "requestCount": 669,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:38:51.605Z",
+    "metricAgeMs": 3571,
+    "active": 2,
+    "queued": 1,
+    "inFlight": 3,
+    "requests": 3734,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 107,
+    "coreAgeMs": 7469,
+    "coreError": "",
+    "coreBlock": 124134240,
+    "factoryHead": 124134258,
+    "factoryBlock": 124134257,
+    "factoryLag": 1,
+    "factoryError": "",
+    "earlyHead": 124134258,
+    "earlyBlock": 124134252,
+    "earlyLag": 6,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:38:50.034Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:38:44.954Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:38:48.865Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:38:48.856Z"
+      }
+    },
+    "fmContract": {
+      "runs": 96,
+      "lastDurationMs": 1023,
+      "avgDurationMs": 1082,
+      "requestCount": 773,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:39:11.638Z",
+    "metricAgeMs": 2715,
+    "active": 6,
+    "queued": 0,
+    "inFlight": 6,
+    "requests": 4286,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 117,
+    "coreAgeMs": 17454,
+    "coreError": "",
+    "coreBlock": 124134260,
+    "factoryHead": 124134302,
+    "factoryBlock": 124134302,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134301,
+    "earlyBlock": 124134297,
+    "earlyLag": 4,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:39:07.974Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:39:04.956Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:39:08.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:39:08.856Z"
+      }
+    },
+    "fmContract": {
+      "runs": 107,
+      "lastDurationMs": 2828,
+      "avgDurationMs": 1083,
+      "requestCount": 861,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:39:31.675Z",
+    "metricAgeMs": 1939,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 4813,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 124,
+    "coreAgeMs": 4261,
+    "coreError": "",
+    "coreBlock": 124134337,
+    "factoryHead": 124134347,
+    "factoryBlock": 124134347,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134346,
+    "earlyBlock": 124134345,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:39:30.737Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:39:24.957Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:39:28.924Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:39:28.859Z"
+      }
+    },
+    "fmContract": {
+      "runs": 117,
+      "lastDurationMs": 2190,
+      "avgDurationMs": 1093,
+      "requestCount": 941,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:39:51.712Z",
+    "metricAgeMs": 1880,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 5427,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 134,
+    "coreAgeMs": 4287,
+    "coreError": "",
+    "coreBlock": 124134382,
+    "factoryHead": 124134387,
+    "factoryBlock": 124134387,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134391,
+    "earlyBlock": 124134390,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:39:50.832Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:39:45.006Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:39:48.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:39:48.859Z"
+      }
+    },
+    "fmContract": {
+      "runs": 132,
+      "lastDurationMs": 1050,
+      "avgDurationMs": 1000,
+      "requestCount": 1061,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:40:11.760Z",
+    "metricAgeMs": 1754,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 6041,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 133,
+    "coreAgeMs": 4446,
+    "coreError": "",
+    "coreBlock": 124134426,
+    "factoryHead": 124134436,
+    "factoryBlock": 124134436,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134436,
+    "earlyBlock": 124134435,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:40:11.007Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:40:05.006Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:40:08.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:40:08.861Z"
+      }
+    },
+    "fmContract": {
+      "runs": 145,
+      "lastDurationMs": 1505,
+      "avgDurationMs": 1022,
+      "requestCount": 1165,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:40:31.810Z",
+    "metricAgeMs": 11577,
+    "active": 4,
+    "queued": 1,
+    "inFlight": 5,
+    "requests": 6316,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 146,
+    "coreAgeMs": 3148,
+    "coreError": "",
+    "coreBlock": 124134472,
+    "factoryHead": 124134479,
+    "factoryBlock": 124134479,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134478,
+    "earlyBlock": 124134471,
+    "earlyLag": 7,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:40:27.405Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:40:25.006Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:40:28.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:40:28.863Z"
+      }
+    },
+    "fmContract": {
+      "runs": 158,
+      "lastDurationMs": 1947,
+      "avgDurationMs": 1037,
+      "requestCount": 1269,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:40:51.843Z",
+    "metricAgeMs": 9425,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 6820,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 109,
+    "coreAgeMs": 6819,
+    "coreError": "",
+    "coreBlock": 124134508,
+    "factoryHead": 124134525,
+    "factoryBlock": 124134525,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134524,
+    "earlyBlock": 124134523,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:40:51.010Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:40:45.007Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:40:48.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:40:48.863Z"
+      }
+    },
+    "fmContract": {
+      "runs": 171,
+      "lastDurationMs": 1327,
+      "avgDurationMs": 1039,
+      "requestCount": 1373,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:41:11.886Z",
+    "metricAgeMs": 8084,
+    "active": 1,
+    "queued": 0,
+    "inFlight": 1,
+    "requests": 7466,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 148,
+    "coreAgeMs": 7587,
+    "coreError": "",
+    "coreBlock": 124134553,
+    "factoryHead": 124134569,
+    "factoryBlock": 124134569,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134568,
+    "earlyBlock": 124134567,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:41:10.804Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:41:05.007Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:41:08.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:41:08.862Z"
+      }
+    },
+    "fmContract": {
+      "runs": 186,
+      "lastDurationMs": 648,
+      "avgDurationMs": 996,
+      "requestCount": 1493,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:41:31.934Z",
+    "metricAgeMs": 7464,
+    "active": 1,
+    "queued": 0,
+    "inFlight": 1,
+    "requests": 8110,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 117,
+    "coreAgeMs": 7793,
+    "coreError": "",
+    "coreBlock": 124134597,
+    "factoryHead": 124134614,
+    "factoryBlock": 124134614,
+    "factoryLag": 0,
+    "factoryError": "",
+    "earlyHead": 124134613,
+    "earlyBlock": 124134612,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:41:31.012Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:41:25.035Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:41:28.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:41:28.862Z"
+      }
+    },
+    "fmContract": {
+      "runs": 200,
+      "lastDurationMs": 808,
+      "avgDurationMs": 1001,
+      "requestCount": 1605,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  },
+  {
+    "safeError": "",
+    "at": "2026-09-26T11:41:51.984Z",
+    "metricAgeMs": 6808,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 8670,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 145,
+    "coreAgeMs": 2896,
+    "coreError": "",
+    "coreBlock": 124134651,
+    "factoryHead": 124134659,
+    "factoryBlock": 124134658,
+    "factoryLag": 1,
+    "factoryError": "",
+    "earlyHead": 124134656,
+    "earlyBlock": 124134655,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:41:50.800Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:41:45.035Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:41:48.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:41:48.862Z"
+      }
+    },
+    "fmContract": {
+      "runs": 211,
+      "lastDurationMs": 2133,
+      "avgDurationMs": 1029,
+      "requestCount": 1693,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  }
+]

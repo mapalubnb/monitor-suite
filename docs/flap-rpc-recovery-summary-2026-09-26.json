@@ -1,0 +1,81 @@
+{
+  "start": "2026-09-26T11:36:51.360Z",
+  "end": "2026-09-26T11:41:51.984Z",
+  "samples": 16,
+  "heapMiB": {
+    "min": 77,
+    "max": 148
+  },
+  "metricAgeMs": {
+    "min": 1754,
+    "max": 11577
+  },
+  "coreAgeMs": {
+    "min": 2896,
+    "max": 17454
+  },
+  "factoryLag": {
+    "min": 0,
+    "max": 1
+  },
+  "earlyLag": {
+    "min": 1,
+    "max": 7
+  },
+  "safeErrorSamples": 0,
+  "coreErrorSamples": 0,
+  "factoryErrorSamples": 0,
+  "errors": [
+    "2026/9/26 19:40:25.507: [2026/9/26 19:40:25.507] [Flap Safe 提案] 检测失败：bsc-dataseed1.ninicoin.io: RPC 节点预算暂满，切换备用节点；bsc-dataseed1.defibit.io: RPC 节点预算暂满，切换备用节点；bsc-dataseed.bnbchain.org: RPC 节点预算暂满，切换备用节点；bnb-mainnet.g.alchemy.com: RPC 节点预算暂满，切换备用节点"
+  ],
+  "last": {
+    "safeError": "",
+    "at": "2026-09-26T11:41:51.984Z",
+    "metricAgeMs": 6808,
+    "active": 3,
+    "queued": 0,
+    "inFlight": 3,
+    "requests": 8670,
+    "timeouts": 6,
+    "rateLimit": 0,
+    "denied": 0,
+    "heapMiB": 145,
+    "coreAgeMs": 2896,
+    "coreError": "",
+    "coreBlock": 124134651,
+    "factoryHead": 124134659,
+    "factoryBlock": 124134658,
+    "factoryLag": 1,
+    "factoryError": "",
+    "earlyHead": 124134656,
+    "earlyBlock": 124134655,
+    "earlyLag": 1,
+    "health": {
+      "realtime": {
+        "error": "",
+        "last": "2026-09-26T11:41:50.800Z"
+      },
+      "chain": {
+        "error": "",
+        "last": "2026-09-26T11:41:45.035Z"
+      },
+      "assets": {
+        "error": "",
+        "last": "2026-09-26T11:41:48.922Z"
+      },
+      "balances": {
+        "error": "",
+        "last": "2026-09-26T11:41:48.862Z"
+      }
+    },
+    "fmContract": {
+      "runs": 211,
+      "lastDurationMs": 2133,
+      "avgDurationMs": 1029,
+      "requestCount": 1693,
+      "backoffCount": 0,
+      "errorCount": 0,
+      "intervalMs": 1000
+    }
+  }
+}
