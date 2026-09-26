@@ -2884,7 +2884,10 @@ async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResp
         const json = await fetchRpcJson(url, payload, timeoutMs, controller.signal, Boolean(options.history));
         if (!Array.isArray(json) && json?.error) throw new Error(json.error.message || "RPC error");
         if (Array.isArray(payload) ? !Array.isArray(json) : !json || !("result" in json)) throw new Error("RPC 返回无效结果");
-        if (Array.isArray(json) && json.every(item => item?.error || item?.result == null)) throw new Error("Batch RPC 全部读取失败");
+        if (Array.isArray(json) && json.every(item => item?.error || item?.result == null)
+          && !json.every(item => /execution reverted/i.test(item?.error?.message || ''))) {
+          throw new Error("Batch RPC 全部读取失败：" + [...new Set(json.map(item => item?.error?.message || '空结果'))].join('；').slice(0, 240));
+        }
         if (validateResponse) validateResponse(json);
         if (settled) throw new Error("RPC 请求已由其他节点完成");
         settled = true;

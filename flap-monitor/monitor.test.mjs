@@ -3435,6 +3435,17 @@ test('strict batch validation retries another node instead of accepting a partia
   } finally { globalThis.fetch = original; __testables.CONFIG.bscRpcUrls = urls; __testables.resetBscRpcHealth(); }
 });
 
+test('a batch of optional reverted getters remains distinct from an unavailable RPC provider', async () => {
+  const original = globalThis.fetch, urls = __testables.CONFIG.bscRpcUrls;
+  __testables.CONFIG.bscRpcUrls = ['https://optional.test']; __testables.resetBscRpcHealth();
+  globalThis.fetch = async (_url, options) => ({ ok: true, json: async () => JSON.parse(options.body).map(item => ({ id: item.id, error: { code: 3, message: 'execution reverted' } })) });
+  try {
+    const calls = [{ method: 'eth_call', params: [1] }, { method: 'eth_call', params: [2] }];
+    assert.deepEqual(await __testables.bscRpcBatch(calls), [null, null]);
+    await assert.rejects(__testables.bscRpcBatch(calls, { requireAllResults: true }), /空结果/);
+  } finally { globalThis.fetch = original; __testables.CONFIG.bscRpcUrls = urls; __testables.resetBscRpcHealth(); }
+});
+
 test('simultaneous Flap head reads share a request and provider quota blocks the ordinary lane too', async () => {
   const original = globalThis.fetch, urls = __testables.CONFIG.bscRpcUrls;
   __testables.CONFIG.bscRpcUrls = ['https://quota.test']; __testables.resetBscRpcHealth();
