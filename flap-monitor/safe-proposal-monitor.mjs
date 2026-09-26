@@ -444,6 +444,79 @@ export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, 
   return guarded;
 }
 
+export function normalizeSafeApiKeys(value, fallback = '') {
+  const values = Array.isArray(value) ? value : String(value || '').split(/[\s,]+/);
+  const keys = [...new Set(values.map(value => String(value).trim()).filter(Boolean))];
+  return keys.length ? keys : fallback.trim() ? [fallback.trim()] : [];
+}
+
+export function createSafeApiPoolFetch(state, fetchFn, { apiKeys, apiBaseUrl = DEFAULT_SAFE_API_BASE_URL,
+  intervalMs = 5000, now = Date.now } = {}) {
+  const keys = normalizeSafeApiKeys(apiKeys);
+  if (!keys.length) throw new Error('Safe API 轮换池为空');
+  state.apiAccounts ||= {};
+  const accounts = keys.map(key => {
+    const id = hashText(`${apiBaseUrl}|${key}`);
+    if (!state.apiAccounts[id]) {
+      const legacy = state.apiCredentialId === id;
+      state.apiAccounts[id] = legacy ? Object.fromEntries(['apiQuota', 'apiRequestNextAt', 'apiNextAttemptAtMs', 'apiRateLimitFailures']
+        .filter(field => state[field] !== undefined).map(field => [field, structuredClone(state[field])])) : {};
+    }
+    const health = state.apiAccounts[id];
+    return {id, key, health, fetch: createSafeRateLimitedFetch(health, fetchFn, {intervalMs, now})};
+  });
+  const ids = accounts.map(account => account.id);
+  const poolId = hashText([...ids].sort().join('|'));
+  if (state.apiPoolId !== poolId) {
+    // A newly available account must not inherit an old credential's Safe-level cooldown.
+    for (const health of Object.values(state.safes || {})) { health.nextAttemptAtMs = 0; health.consecutiveFailures = 0; }
+  }
+  state.apiPoolId = poolId;
+  state.apiAccountIds = ids;
+  const dueAt = account => Math.max(account.health.apiNextAttemptAtMs || 0, account.health.apiRequestNextAt || 0);
+  function sync() {
+    state.apiNextAttemptAtMs = Math.min(...accounts.map(dueAt));
+    state.apiRequestNextAt = 0;
+    delete state.apiQuota; // Quotas belong to individual accounts, never to the whole pool.
+  }
+  sync();
+  const guarded = async (url, options = {}) => {
+    const tried = new Set();
+    while (tried.size < accounts.length) {
+      const start = (state.apiAccountCursor || 0) % accounts.length;
+      const account = [...accounts.slice(start), ...accounts.slice(0, start)]
+        .find(item => !tried.has(item.id) && dueAt(item) <= now());
+      if (!account) break;
+      tried.add(account.id);
+      state.apiAccountCursor = (accounts.indexOf(account) + 1) % accounts.length;
+      try {
+        await account.fetch.waitForTurn();
+        const headers = new Headers(options.headers);
+        headers.set('Authorization', `Bearer ${account.key}`);
+        const response = await account.fetch(url, {...options, headers});
+        account.health.lastStatus = response.status;
+        account.health.lastAttemptAt = new Date(now()).toISOString();
+        if ([401, 403].includes(response.status)) account.health.apiNextAttemptAtMs = now() + 30 * 60_000;
+        else if (response.status >= 500) account.health.apiNextAttemptAtMs = now() + 30_000;
+        sync();
+        const retryable = [401, 403, 429].includes(response.status) || response.status >= 500;
+        if (!retryable || !accounts.some(item => !tried.has(item.id) && dueAt(item) <= now())) return response;
+        await response.body?.cancel?.();
+      } catch {
+        account.health.apiNextAttemptAtMs = Math.max(account.health.apiNextAttemptAtMs || 0, now() + 30_000);
+        account.health.lastStatus = 'network_error';
+        sync();
+        if (options.signal?.aborted) throw new Error('Safe API 请求超时');
+      }
+    }
+    sync();
+    const error = new Error('Safe API 轮换池暂无可用账户');
+    error.retryAfterMs = Math.max(0, state.apiNextAttemptAtMs - now());
+    throw error;
+  };
+  return guarded;
+}
+
 function safeNonceCalls(safes) {
   return safes.map(safe => ({
     method: "eth_call",
@@ -492,6 +565,7 @@ export async function runSafeProposalScan({
   fetchFn = globalThis.fetch,
   apiBaseUrl = DEFAULT_SAFE_API_BASE_URL,
   apiKey = "",
+  apiKeys = [],
   timeoutMs = 5_000,
   baseBackoffMs = 5_000,
   maxBackoffMs = 300_000,
@@ -516,16 +590,21 @@ export async function runSafeProposalScan({
 
   const migrated = migrateSafeProposalState(state, normalizedSafes);
   Object.assign(state, migrated);
-  const credentialId = hashText(`${apiBaseUrl}|${apiKey}`);
-  if (state.apiCredentialId && state.apiCredentialId !== credentialId) {
-    state.apiNextAttemptAtMs = 0;
-    state.apiRequestNextAt = 0;
-    state.apiRateLimitFailures = 0;
-    delete state.apiQuota;
-    for (const health of Object.values(state.safes)) { health.nextAttemptAtMs = 0; health.consecutiveFailures = 0; }
+  const poolKeys = normalizeSafeApiKeys(apiKeys, apiKey);
+  if (poolKeys.length) {
+    fetchFn = createSafeApiPoolFetch(state, fetchFn, {apiKeys: poolKeys, apiBaseUrl, intervalMs: requestIntervalMs || 5000});
+  } else {
+    const credentialId = hashText(`${apiBaseUrl}|${apiKey}`);
+    if (state.apiCredentialId && state.apiCredentialId !== credentialId) {
+      state.apiNextAttemptAtMs = 0;
+      state.apiRequestNextAt = 0;
+      state.apiRateLimitFailures = 0;
+      delete state.apiQuota;
+      for (const health of Object.values(state.safes)) { health.nextAttemptAtMs = 0; health.consecutiveFailures = 0; }
+    }
+    state.apiCredentialId = credentialId;
+    if (requestIntervalMs > 0) fetchFn = createSafeRateLimitedFetch(state, fetchFn, {intervalMs: requestIntervalMs});
   }
-  state.apiCredentialId = credentialId;
-  if (requestIntervalMs > 0) fetchFn = createSafeRateLimitedFetch(state, fetchFn, {intervalMs: requestIntervalMs});
   const runAt = nowIso(nowMs);
   const nonceResults = await rpcBatch(safeNonceCalls(normalizedSafes));
   const currentNonces = new Map(normalizedSafes.map((safe, index) => {

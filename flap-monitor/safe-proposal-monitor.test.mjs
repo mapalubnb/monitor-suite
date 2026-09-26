@@ -21,6 +21,8 @@ import {
   saveSafeProposalState,
   encodeSafeExecutionSimulation,
   createSafeRateLimitedFetch,
+  createSafeApiPoolFetch,
+  normalizeSafeApiKeys,
 } from "./safe-proposal-monitor.mjs";
 
 const FACTORY = "0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0";
@@ -31,6 +33,59 @@ const OTHER = "0x1111111111111111111111111111111111111111";
 const SAFE_TX_HASH = `0x${"97".repeat(32)}`;
 const AWDH = JSON.parse(readFileSync(new URL("./fixtures/safe-awdh-proposal.json", import.meta.url), "utf8"));
 const MULTISEND = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
+
+test('Safe API keys normalize duplicates and preserve legacy fallback', () => {
+  assert.deepEqual(normalizeSafeApiKeys(' a, b, a\n c '), ['a', 'b', 'c']);
+  assert.deepEqual(normalizeSafeApiKeys('', 'legacy'), ['legacy']);
+  assert.deepEqual(normalizeSafeApiKeys('new', 'legacy'), ['new']);
+});
+
+test('Safe API pool rotates credentials, persists per-account quota and does not expose keys', async () => {
+  let now = 1000;
+  const state = {safes: {}}, calls = [];
+  const fetchFn = async (_, opts) => {
+    calls.push(opts.headers.get('Authorization'));
+    return {ok: true, status: 200, headers: {get: key => ({'x-ratelimit-limit':'50000', 'x-ratelimit-remaining':'100', 'x-ratelimit-reset':'1000'})[key] ?? null}};
+  };
+  let pool = createSafeApiPoolFetch(state, fetchFn, {apiKeys:['secret-account-a', 'secret-account-b'], now: () => now});
+  await pool('url'); await pool('url');
+  assert.deepEqual(calls, ['Bearer secret-account-a', 'Bearer secret-account-b']);
+  await assert.rejects(pool('url'), /暂无可用/);
+  assert.equal(state.apiNextAttemptAtMs, 11000);
+  assert.doesNotMatch(JSON.stringify(state), /secret-account/);
+  now = 11000;
+  pool = createSafeApiPoolFetch(JSON.parse(JSON.stringify(state)), fetchFn, {apiKeys:['secret-account-a', 'secret-account-b'], now: () => now});
+  await pool('url');
+  assert.equal(calls.at(-1), 'Bearer secret-account-a');
+});
+
+test('Safe API pool fails over exhausted and unauthorized accounts without skipping healthy account', async () => {
+  const state = {}, calls = [];
+  const pool = createSafeApiPoolFetch(state, async (_, opts) => {
+    const key = opts.headers.get('Authorization'); calls.push(key);
+    const status = key.endsWith('empty') ? 429 : key.endsWith('invalid') ? 401 : 200;
+    return {status, ok: status === 200, headers: {get: key => status === 429 ? ({'x-ratelimit-limit':'50000', 'x-ratelimit-remaining':'0', 'x-ratelimit-reset':'600'})[key] ?? null : null}};
+  }, {apiKeys: ['empty','invalid','healthy'], now: () => 1000});
+  assert.equal((await pool('url')).status, 200);
+  assert.equal(calls.length, 3);
+  const accounts = state.apiAccountIds.map(id => state.apiAccounts[id]);
+  assert.equal(accounts[0].apiNextAttemptAtMs, 601000);
+  assert.equal(accounts[1].apiNextAttemptAtMs, 1801000);
+  assert.equal(accounts[2].lastStatus, 200);
+});
+
+test('Safe API pool migration preserves old exhausted key when adding a fresh account', async () => {
+  const {createHash} = await import('node:crypto');
+  const base = 'https://api.safe.global/tx-service/bnb/api/v1';
+  const id = createHash('sha256').update(base+'|old').digest('hex');
+  const state = {apiCredentialId:id, apiNextAttemptAtMs:999999, apiQuota:{remaining:0}, safes:{safe:{nextAttemptAtMs:999999}}};
+  const calls=[];
+  const pool = createSafeApiPoolFetch(state, async (_,opts)=>{calls.push(opts.headers.get('Authorization'));return {ok:true,status:200};}, {apiKeys:['old','fresh'], now:()=>1000});
+  await pool('url');
+  assert.deepEqual(calls,['Bearer fresh']);
+  assert.equal(state.apiAccounts[id].apiNextAttemptAtMs,999999);
+  assert.equal(state.safes.safe.nextAttemptAtMs,0);
+});
 
 test('Safe service cooldown survives state reload and respects Retry-After across addresses', async () => {
   let now = 1000, requests = 0;

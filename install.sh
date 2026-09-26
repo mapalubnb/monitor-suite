@@ -706,6 +706,11 @@ if [ -f "$SNAP" ]; then
     for(const [index,v] of safeStates.entries()) console.log(String(index+1).padStart(2,'0')+'　Safe '+mdLink(v.address,'https://app.safe.global/transactions/queue?safe=bnb:'+v.address)+'｜nonce '+(v.currentNonce??'未知')+'｜'+(v.lastError?'异常':v.baselineEstablished?'基线完成':'等待基线'));
     if(sp.lastSuccessAt) console.log('最后成功：'+fmtTime(sp.lastSuccessAt));
     if(sp.apiQuota) console.log('Safe 月度额度：'+sp.apiQuota.remaining+'/'+sp.apiQuota.limit+'｜重置 '+fmtTime(sp.apiQuota.resetsAt));
+    for(const [index,id] of (sp.apiAccountIds||[]).entries()) {
+      const account=sp.apiAccounts?.[id]||{};
+      const next=Math.max(account.apiNextAttemptAtMs||0,account.apiRequestNextAt||0);
+      console.log('API 账户 '+(index+1)+'：'+(next>Date.now()?'等待至 '+fmtTime(next):'可用')+'｜额度 '+(account.apiQuota?account.apiQuota.remaining+'/'+account.apiQuota.limit:'待查询')+(account.lastStatus?'｜最近状态 '+account.lastStatus:''));
+    }
     if(sp.apiNextAttemptAtMs>Date.now()) console.log('Safe API 下次尝试：'+fmtTime(sp.apiNextAttemptAtMs));
     if(sp.lastError) console.log('最近异常：'+sp.lastError);
     console.log('');

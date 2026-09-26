@@ -67,7 +67,7 @@ FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
 | --- | --- |
 | `FEISHU_ALLOWED_SENDERS` | 可操作机器人的用户 open_id，逗号分隔；留空拒绝交互操作，自动告警不受影响 |
 | `FEISHU_MENTION_OPEN_ID` | Flap 重点告警需要 @ 的用户，留空不提醒指定用户 |
-| `FLAP_SAFE_API_KEY` | Safe 提案查询认证 |
+| `FLAP_SAFE_API_KEYS` / `FLAP_SAFE_API_KEY` | Safe 多账户轮换 / 单 Key 兼容配置；多 Key 用英文逗号分隔，多 Key 配置优先 |
 | `GITHUB_TOKEN` | 提高 GitHub API 可用额度 |
 | `DOUBAO_API_KEY` / `DEEPSEEK_API_KEY` / `QWEN_API_KEY` / `OPENAI_API_KEY` | 可选，填写任意一个以启用 AI 摘要 |
 
@@ -78,7 +78,7 @@ FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
 编辑 `/root/monitor-suite/.env`，可修改监控频率、RPC 节点、监听地址及功能开关：
 
 - **Four.meme**：前端默认 7 秒、最低 5 秒；API 默认 10 秒、最低 8 秒；底池、模板、合约和链上参数默认 2 秒、最低 1 秒。
-- **Flap**：页面默认 1000ms、最低 500ms；Safe 提案默认每 10 秒轮转查询一个地址，有待执行提案时每 5 秒查询一个；同服务请求至少间隔 5 秒，依据剩余额度分配请求间隔，遇到 429 共享冷却并遵守 Retry-After，月度额度耗尽时等待服务返回的重置时间。
+- **Flap**：页面默认 1000ms、最低 500ms；Safe 提案默认每 10 秒轮转查询一个地址，有待执行提案时每 5 秒查询一个；同服务请求至少间隔 5 秒，依据剩余额度分配请求间隔，遇到 429 共享冷却并遵守 Retry-After，月度额度耗尽时等待服务返回的重置时间。配置多个独立账户时，按可用账户轮换，分别记录额度和冷却；失效、限流或服务错误时切换账户，全部不可用时等待最早恢复时间。`fl-status` 显示各账户状态，不显示 Key。
 - **RPC**：通过 `FOURMEME_BSC_RPC_URLS` 等对应模块配置指定节点；多个地址按 `.env.example` 的格式填写。
 - **源站限流**：适当增加检查间隔，或降低前端请求并发。
 

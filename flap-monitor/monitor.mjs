@@ -175,6 +175,7 @@ const CONFIG = {
     requestTimeoutMs: readPositiveIntEnv("FLAP_SAFE_PROPOSAL_TIMEOUT_MS", 5_000, 500),
     apiBaseUrl: process.env.FLAP_SAFE_API_BASE_URL || "https://api.safe.global/tx-service/bnb/api/v1",
     apiKey: String(process.env.FLAP_SAFE_API_KEY || "").trim(),
+    apiKeys: String(process.env.FLAP_SAFE_API_KEYS || "").split(/[\s,]+/).filter(Boolean),
     safes: [...new Set(([process.env.FLAP_ADMIN_SAFE_ADDRESSES || "", process.env.FLAP_SAFE_INCLUDE_CORE === "false" ? "" : DEFAULT_FLAP_ADMIN_SAFES.join(",")].filter(Boolean).join(","))
       .split(",").map(value => value.trim()).filter(value => /^0x[a-fA-F0-9]{40}$/.test(value)))],
   },
@@ -6610,6 +6611,7 @@ async function runCheck() {
         rpcBatch: bscRpcBatch,
         apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
         apiKey: CONFIG.safeProposalMonitor.apiKey,
+          apiKeys: CONFIG.safeProposalMonitor.apiKeys,
         timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
           maxSafesPerRun: 1, requestIntervalMs: 5000,
       });
@@ -7029,6 +7031,7 @@ async function startMonitor() {
           rpcBatch: bscRpcBatch,
           apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
           apiKey: CONFIG.safeProposalMonitor.apiKey,
+          apiKeys: CONFIG.safeProposalMonitor.apiKeys,
           timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
           maxSafesPerRun: 1, requestIntervalMs: 5000,
           suppressNotifications,
