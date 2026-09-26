@@ -479,8 +479,8 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
       scanCursor = state[cursorKey];
     }
   }
-  const from = scanCursor + 1;
-  const to = Math.min(head, from + (config.maxBlocksPerRun || 10) - 1);
+  const from = Math.max(0, scanCursor + 1 - (config.realtime ? 5 : 0));
+  const to = Math.min(head, scanCursor + (config.maxBlocksPerRun || 10));
   if (from > to) return;
   const reorgRevision = state.reorgRevision || 0;
   const boundary = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(to), false]);

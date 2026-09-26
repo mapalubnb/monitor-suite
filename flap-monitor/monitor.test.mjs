@@ -196,7 +196,7 @@ test("Factory RPC hedging uses the first valid low-latency node", async () => {
   }
 });
 
-test("Factory eth_getLogs ignores one empty RPC when another returns logs", async () => {
+test("Historical eth_getLogs ignores one empty RPC when another returns logs", async () => {
   const originalFetch = globalThis.fetch;
   const originalUrls = __testables.CONFIG.bscRpcUrls;
   const originalHedgeDelay = __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs;
@@ -219,7 +219,7 @@ test("Factory eth_getLogs ignores one empty RPC when another returns logs", asyn
     }),
   });
   try {
-    const result = await __testables.executeBscGetLogsRequest([{ fromBlock: "0x64", toBlock: "0x64" }]);
+    const result = await __testables.executeBscGetLogsRequest([{ fromBlock: "0x64", toBlock: "0x64" }], {history:true});
     assert.equal(result.length, 1);
     assert.equal(result[0].transactionHash, txHash);
   } finally {
@@ -3317,7 +3317,9 @@ test('archive endpoint failure never quarantines recent log queries and only two
   let active = 0, peak = 0;
   globalThis.fetch = async (url, opts) => {
     active++; peak = Math.max(peak, active);
-    const filter = JSON.parse(opts.body).params[0];
+    const request = JSON.parse(opts.body);
+    if (request.method === 'eth_blockNumber') { active--; return {ok:true,json:async()=>({result:'0x5000'})}; }
+    const filter = request.params[0];
     await new Promise(resolve => setTimeout(resolve, 2));
     active--;
     return { ok: true, json: async () => Number(filter.fromBlock) < 8192 ? { error: { message: 'public endpoint only serves recent blocks (last 8192)' } } : { result: [] } };
@@ -3379,4 +3381,22 @@ test("Factory startup backfill ignores a stale head and caps the recent window",
  assert.equal(result.latest,20000);
  assert.equal(result.fromBlock,15001);
  assert.equal(Number(ranges.at(-1).toBlock),20000);
+});
+
+
+test('realtime empty logs accept one synced provider while history still requires two', async()=>{
+ const original=globalThis.fetch;const calls=[];__testables.resetBscRpcHealth();
+ globalThis.fetch=async(url,opts)=>{const req=JSON.parse(opts.body);calls.push(req.method);return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x100':[]})};};
+ try{
+  assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://healthy.rpc']}),[]);
+  assert.deepEqual(calls,['eth_getLogs','eth_blockNumber']);
+  await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://healthy.rpc'],history:true}),/双节点/);
+ }finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
+});
+
+test('realtime empty logs reject a lagging provider and report provider names',async()=>{
+ const original=globalThis.fetch;__testables.resetBscRpcHealth();
+ globalThis.fetch=async(url,opts)=>{const req=JSON.parse(opts.body);return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x60':[]})};};
+ try{await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://lagging.rpc']}),/lagging.rpc: 节点尚未同步/);}
+ finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
 });

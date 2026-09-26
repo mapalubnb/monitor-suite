@@ -79,7 +79,7 @@ FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
 
 - **Four.meme**：前端默认 7 秒、最低 5 秒；API 默认 10 秒、最低 8 秒；底池、模板、合约和链上参数默认 2 秒、最低 1 秒。
 - **Flap**：页面默认 1000ms、最低 500ms；Safe 提案默认每 10 秒轮转查询一个地址，有待执行提案时每 5 秒查询一个；每个 Key 请求至少间隔 5 秒，不按月度剩余额度拉长间隔。配置多个独立账户时，优先持续使用当前 Key，额度耗尽或暂不可用时顺序切换，分别记录额度和冷却；429 遵守 Retry-After，额度耗尽等待服务返回的重置时间，全部不可用时等待最早恢复时间。`fl-status` 显示各账户状态，不显示 Key。
-- **RPC**：Flap 日志查询默认优先使用 `https://fast.bsc-rpc.com` 和 `https://bsc.publicnode.com`，可通过 `FLAP_LOG_RPC_URLS` 配置；通过 `FOURMEME_BSC_RPC_URLS` 等对应模块配置指定节点；多个地址按 `.env.example` 的格式填写。
+- **RPC**：Flap 日志查询默认优先使用 `https://fast.bsc-rpc.com` 和 `https://bsc.publicnode.com`，可通过 `FLAP_LOG_RPC_URLS` 配置；实时空日志经节点高度校验后接受，并重扫近期区块；历史空日志保留双来源确认，错误附节点域名；通过 `FOURMEME_BSC_RPC_URLS` 等对应模块配置指定节点；多个地址按 `.env.example` 的格式填写。
 - **源站限流**：适当增加检查间隔，或降低前端请求并发。
 
 修改配置后重启并查看状态：

@@ -519,7 +519,7 @@ export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock 
     state.eventHistoryEndBlock ??= state[cursorKey];
   }
   if (state[cursorKey] >= latest) return { changed: false, changes: [], latest };
-  const fromBlock = state[cursorKey] + 1;
+  const fromBlock = Math.max(0, state[cursorKey] + 1 - (realtime ? 5 : 0));
   const toBlock = Math.min(latest, state[cursorKey] + Math.max(1, maxBlocks));
   const otherAddresses = contractIntegritySubscriptionAddresses(state);
   const filters = [

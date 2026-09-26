@@ -116,9 +116,9 @@ const CONFIG = {
     minAssetFiles: 2,
   },
   assetStringLimit: 300,
-  bscRpcUrls: [...new Set((process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com,https://bsc-dataseed.binance.org/")
+  bscRpcUrls: [...new Set((process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://fast.bsc-rpc.com,https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com")
     .split(",").map(s => s.trim()).filter(Boolean)
-    .concat(process.env.FLAP_FACTORY_ARCHIVE_RPC_URL || "https://bsc-mainnet.public.blastapi.io"))],
+    .concat(process.env.FLAP_FACTORY_ARCHIVE_RPC_URL || []).filter(Boolean))],
   registryMonitor: {
     intervalMs: readPositiveIntEnv("FLAP_REGISTRY_INTERVAL_MS", 1_000, 500),
     wsEnabled: process.env.FLAP_REGISTRY_WS_ENABLED !== "false" && process.env.FLAP_FACTORY_WS_ENABLED !== "false",
@@ -2710,6 +2710,7 @@ function resetBscRpcHealth() {
   bscRpcHealthByKey.clear();
   logRpcCooldowns.clear();
   logRpcProviderCooldowns.clear();
+  logRpcHeads.clear();
 }
 
 function dedupeBscLogs(logs = []) {
@@ -2727,6 +2728,7 @@ function dedupeBscLogs(logs = []) {
 
 const logRpcCooldowns = new Map();
 const logRpcProviderCooldowns = new Map();
+const logRpcHeads = new Map();
 let activeLogRequests = 0, activeHistoryLogRequests = 0;
 const logRequestWaiters = [];
 function pumpLogRequests() {
@@ -2741,7 +2743,7 @@ function pumpLogRequests() {
   }
 }
 async function executeBscGetLogsRequest(params, options = {}) {
-  const history = options.history || bscRpcPreferenceKey("eth_getLogs", params).endsWith(":history");
+  const history = options.history ?? bscRpcPreferenceKey("eth_getLogs", params).endsWith(":history");
   await new Promise(resolve => { logRequestWaiters.push({ history, resolve }); pumpLogRequests(); });
   try { return await queryBscLogs(params, options); }
   finally { activeLogRequests--; if (history) activeHistoryLogRequests--; pumpLogRequests(); }
@@ -2752,10 +2754,11 @@ async function queryBscLogs(params, options) {
     ...CONFIG.bscRpcUrls,
   ])]);
   const errors = [], emptyProviders = new Set();
-  const history = options.history ? "eth_getLogs:history" : bscRpcPreferenceKey("eth_getLogs", params);
+  const history = options.history === undefined ? bscRpcPreferenceKey("eth_getLogs", params) : options.history ? "eth_getLogs:history" : "eth_getLogs:realtime";
   const timeoutMs = Math.max(4000, bscRpcTimeoutMs("eth_getLogs", params));
   for (const url of urls) {
     const from = Number(params[0]?.fromBlock || 0), to = Number(params[0]?.toBlock || 0);
+    const host = new URL(url).hostname;
     // Pruned archives and unsupported wide windows must not quarantine current blocks.
     const filterClass = JSON.stringify({ address: params[0]?.address || null, topics: params[0]?.topics || [] });
     const key = url + ":" + history + ":" + Math.floor(from / 8192) + ":" + (to - from > 49 ? "wide" : "narrow") + ":" + filterClass;
@@ -2776,16 +2779,30 @@ async function queryBscLogs(params, options) {
       const logs = dedupeBscLogs(json.result);
       logRpcCooldowns.delete(key);
       if (logs.length) return logs;
-      const host = new URL(url).hostname;
+      if (history === "eth_getLogs:realtime" && Number.isSafeInteger(to) && to > 0) {
+        let cached = logRpcHeads.get(url);
+        if (!cached || cached.head < to || Date.now() - cached.at > 10_000) {
+          const headResponse = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "eth_blockNumber", params: [] }), signal: AbortSignal.timeout(timeoutMs) });
+          if (!headResponse.ok) throw new Error("节点高度校验 HTTP " + headResponse.status);
+          const headJson = await headResponse.json();
+          if (headJson.error || !/^0x[0-9a-f]+$/i.test(headJson.result || "")) throw new Error("节点高度校验失败");
+          cached = { head: Number(headJson.result), at: Date.now() };
+          logRpcHeads.set(url, cached);
+        }
+        if (cached.head < to) throw new Error(`节点尚未同步到查询高度 ${to}，当前 ${cached.head}`);
+        return [];
+      }
       emptyProviders.add(host.endsWith("publicnode.com") ? "publicnode.com" : host);
       if (emptyProviders.size >= 2) return [];
     } catch (error) {
-      errors.push(error.message);
+      const message = `${host}: ${error.message}`;
+      errors.push(message);
       const cooldown = /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 30_000;
-      logRpcCooldowns.set(key, { until: Date.now() + cooldown, message: error.message });
+      logRpcCooldowns.set(key, { until: Date.now() + cooldown, message });
       if (/HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical/i.test(error.message)) {
         const scope = /only serves recent|archive|historical/i.test(error.message) ? archiveKey : providerKey;
-        logRpcProviderCooldowns.set(scope, { until: Date.now() + cooldown, message: error.message });
+        logRpcProviderCooldowns.set(scope, { until: Date.now() + cooldown, message });
       }
       if (logRpcCooldowns.size > 256) for (const [cached, entry] of logRpcCooldowns) if (entry.until <= Date.now()) logRpcCooldowns.delete(cached);
     }
@@ -3129,7 +3146,7 @@ async function scanFlapRegistryLogs(snapshot, { history = false, sendCardFn = se
     state.lagBlocks = Math.max(0, safeLatest - state.lastBlock);
     if (state.lastBlock >= safeLatest) return { changed: true, sent: false };
   }
-  const fromBlock = state[cursorKey] + 1;
+  const fromBlock = Math.max(0, state[cursorKey] + 1 - (history ? 0 : 5));
   const toBlock = Math.min(history ? state.historyEndBlock : state.safeLatestBlock,
     state[cursorKey] + (history ? CONFIG.registryMonitor.maxBlocksPerRun : Math.min(100, CONFIG.registryMonitor.maxBlocksPerRun)));
   const logs = await rpcCallFn("eth_getLogs", [{
@@ -3558,7 +3575,7 @@ async function checkFlapFactoryPools(factoryPoolState, {
   try {
     result = await scanFn({
       state: workingState,
-      rpcCall: bscRpcCall,
+      rpcCall: (method, params) => bscRpcCall(method, params, scanConfig.scanRealtime === false && scanConfig.scanCatchup === true ? { history: true } : {}),
       persistState: async candidateState => {
         await commitFactoryPoolScanState(factoryPoolState, candidateState, saveStateFn);
       },
