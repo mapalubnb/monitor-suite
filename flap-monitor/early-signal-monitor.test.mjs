@@ -450,3 +450,12 @@ test('full-block reuse revalidates canonical headers and refetches on reorg',asy
  const two=await readEarlyFullBlocks(state,[10,11],rpc);assert.equal(two[0].transactions.length,1);assert.equal(full,2);assert.equal(headers,2);
  hash='0x'+'b'.repeat(64);const three=await readEarlyFullBlocks(state,[10,11],rpc);assert.equal(full,4);assert.equal(three[0].hash,hash);
 });
+
+test('full block cache evicts by bytes and never retains oversized blocks',async()=>{
+ const {readEarlyFullBlocks}=await import('./early-signal-monitor.mjs');const state={};let full=0;
+ const rpc=async calls=>calls.map(c=>{if(c.params[1])full++;return {number:c.params[0],hash:'0x'+'a'.repeat(64),transactions:c.params[1]?[{input:'x'.repeat(1000)}]:[]};});
+ await readEarlyFullBlocks(state,[10,11],rpc,1500);
+ await readEarlyFullBlocks(state,[11],rpc,1500);assert.equal(full,2);
+ await readEarlyFullBlocks(state,[10],rpc,1500);assert.equal(full,3);
+ const small={};await readEarlyFullBlocks(small,[20],rpc,100);await readEarlyFullBlocks(small,[20],rpc,100);assert.equal(full,5);
+});

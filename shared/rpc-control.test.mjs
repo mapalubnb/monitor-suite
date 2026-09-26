@@ -76,3 +76,30 @@ test('expired queue deadline does not hide a later upstream timeout',async()=>{
  await assert.rejects(rpc.withEndpoint('https://node.test',async()=>{queue.abort();throw new DOMException('timeout','TimeoutError');},queue.signal,{payload:{method:'eth_getLogs'}}));
  assert.equal(rpc.summary().timeouts,1);
 });
+
+test('hung transport deadline releases local slot and shared lease; late result stays discarded', async () => {
+ const directory=mkdtempSync(join(tmpdir(),'rpc-hang-'));
+ try {
+  const rpc=createRpcControl({directory,concurrency:1}); let finish,signal;
+  const hung=rpc.withEndpoint('https://node.test', s=>{signal=s;return new Promise(resolve=>{finish=resolve;});},undefined,{operationTimeoutMs:30});
+  await assert.rejects(hung,e=>e.name==='TimeoutError');
+  assert.equal(signal.aborted,true); assert.equal(rpc.summary().active,0);
+  assert.equal(await rpc.withEndpoint('https://node.test',()=>42),42);
+  finish('late'); await new Promise(resolve=>setImmediate(resolve));
+  assert.equal(rpc.summary().active,0); assert.equal(rpc.summary().timeouts,1);
+ } finally {rmSync(directory,{recursive:true,force:true});}
+});
+
+test('losing hedge cancellation releases slot even when operation ignores abort',async()=>{
+ const rpc=createRpcControl({concurrency:1}),parent=new AbortController();
+ const hung=rpc.withEndpoint('https://node.test',()=>new Promise(()=>{}),undefined,{cancelSignal:parent.signal});
+ const next=rpc.withEndpoint('https://node.test',()=>7);
+ parent.abort(); await assert.rejects(hung); assert.equal(await next,7);
+ assert.equal(rpc.summary().active,0);assert.equal(rpc.summary().queued,0);
+});
+
+test('already cancelled transport never starts or retains capacity',async()=>{
+ const rpc=createRpcControl(),parent=new AbortController();parent.abort();
+ await assert.rejects(rpc.withEndpoint('https://node.test',()=>assert.fail('must not start'),undefined,{cancelSignal:parent.signal}));
+ assert.equal(rpc.summary().active,0);
+});

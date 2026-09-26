@@ -463,7 +463,8 @@ export async function refreshNativeBalances(state, config, rpcBatch, nowMs) {
   }
 }
 const fullBlockCaches = new WeakMap();
-export async function readEarlyFullBlocks(state, numbers, rpcBatch) {
+const FULL_BLOCK_CACHE_BYTES = 8 * 1024 * 1024;
+export async function readEarlyFullBlocks(state, numbers, rpcBatch, maxCacheBytes = FULL_BLOCK_CACHE_BYTES) {
   let cache = fullBlockCaches.get(state);
   if (!cache) { cache = new Map(); fullBlockCaches.set(state, cache); }
   const cachedNumbers = numbers.filter(number => cache.has(number));
@@ -482,7 +483,16 @@ export async function readEarlyFullBlocks(state, numbers, rpcBatch) {
     if (!Array.isArray(block?.transactions)) throw new Error('完整区块交易不可用');
     if (block.number != null && Number(block.number) !== missing[i]) throw new Error('完整区块高度不一致');
     verified.set(missing[i], block);
-    if (/^0x[0-9a-f]{64}$/i.test(block.hash || '')) cache.set(missing[i], { hash: lower(block.hash), block: structuredClone(block) });
+    const bytes = Buffer.byteLength(JSON.stringify(block));
+    if (/^0x[0-9a-f]{64}$/i.test(block.hash || '') && bytes <= maxCacheBytes) {
+      cache.set(missing[i], { hash: lower(block.hash), block: structuredClone(block), bytes });
+      let totalBytes = [...cache.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+      while (cache.size > 64 || totalBytes > maxCacheBytes) {
+        const oldest = cache.keys().next().value;
+        totalBytes -= cache.get(oldest).bytes;
+        cache.delete(oldest);
+      }
+    }
   }
   while (cache.size > 64) cache.delete(cache.keys().next().value);
   return numbers.map(number => structuredClone(verified.get(number)));

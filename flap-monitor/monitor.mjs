@@ -2759,14 +2759,12 @@ async function executeBscGetLogsUnshared(params, options = {}) {
   finally { activeLogRequests--; if (history) activeHistoryLogRequests--; pumpLogRequests(); }
 }
 async function fetchRpcJson(url, payload, timeoutMs, signal, history = false, scheduling = {}) {
-  const request = { payload, history, cancelSignal: signal, ...scheduling };
+  const request = { payload, history, cancelSignal: signal, operationTimeoutMs: timeoutMs, ...scheduling };
   const queueTimeout = AbortSignal.timeout(scheduling.critical ? 3000 : 1000);
   const queueSignal = signal ? AbortSignal.any([signal, queueTimeout]) : queueTimeout;
   let started = false;
-  try { return await rpcControl.withEndpoint(url, async () => {
+  try { return await rpcControl.withEndpoint(url, async effectiveSignal => {
     started = true;
-    const networkTimeout = AbortSignal.timeout(timeoutMs);
-    const effectiveSignal = signal ? AbortSignal.any([signal, networkTimeout]) : networkTimeout;
     try {
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload), signal: effectiveSignal });
@@ -6973,6 +6971,11 @@ async function startMonitor() {
     writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage() }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
   }
+  const rpcMetricsTimer = setInterval(() => {
+    if (isShuttingDown) return;
+    try { saveRpcMetrics(); } catch (error) { log(`[Flap RPC 状态] ${error.message}`); }
+  }, 10_000);
+  rpcMetricsTimer.unref();
   const receiptHints = new Map(), priorityTokens = new Set(), externalJobs = new Map();
   let earlyDeliveryPromise = null;
   function deliverEarly() {
@@ -7115,6 +7118,7 @@ async function startMonitor() {
         if (CONFIG.registryMonitor.enabled) void registryJob.wake();
       } }).start() : null;
   global.__earlySignalDrain = async () => {
+    clearInterval(rpcMetricsTimer);
     earlyFeeds.stop(); registryFeed?.stop(); headFeed?.stop();
     await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), registryJob.stop(), registryHistoryJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
     if (earlyDeliveryPromise) await earlyDeliveryPromise;
