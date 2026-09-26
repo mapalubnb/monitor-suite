@@ -59,7 +59,12 @@ export function loadEarlySignalState(path) {
     state.pendingChanges = state.pendingChanges.filter(e => !invalid(e));
     for (const [id, e] of Object.entries(state.events)) if (invalid(e)) delete state.events[id];
   }
-  if (state.health.chain) state.health.chain.nextAttemptAtMs = Math.min(state.health.chain.nextAttemptAtMs || 0, Date.now() + 60_000);
+  for (const name of ["chain", "realtime", "assets", "balances", "positions"]) {
+    const health = state.health[name];
+    if (health && (name === "chain" || /RPC 本地队列|RPC 节点预算|RPC 备用竞速/.test(health.lastError || ""))) {
+      health.nextAttemptAtMs = Math.min(health.nextAttemptAtMs || 0, Date.now() + 10_000);
+    }
+  }
   pruneDiscoveryPools(state);
   return state;
 }
@@ -291,7 +296,8 @@ async function sourcePass(state, name, fn, nowMs, intervalMs = 0) {
   } catch (error) {
     health.failures = (health.failures || 0) + 1;
     health.lastError = error.message;
-    health.nextAttemptAtMs = nowMs + Math.max(Number(error.retryAfterMs) || 0, Math.min(name === "chain" || name === "realtime" ? 60_000 : 1800000, 5000 * 2 ** Math.min(9, health.failures - 1)));
+    const rpcSource = ["chain", "realtime", "assets", "balances", "positions"].includes(name);
+    health.nextAttemptAtMs = nowMs + Math.max(Number(error.retryAfterMs) || 0, Math.min(rpcSource ? 60_000 : 1800000, 5000 * 2 ** Math.min(9, health.failures - 1)));
   }
 }
 

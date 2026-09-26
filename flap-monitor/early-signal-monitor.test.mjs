@@ -459,3 +459,21 @@ test('full block cache evicts by bytes and never retains oversized blocks',async
  await readEarlyFullBlocks(state,[10],rpc,1500);assert.equal(full,3);
  const small={};await readEarlyFullBlocks(small,[20],rpc,100);await readEarlyFullBlocks(small,[20],rpc,100);assert.equal(full,5);
 });
+test('RPC source failures recover within a minute instead of API half-hour backoff',async()=>{
+ const state=createEarlySignalState();state.health.balances={failures:10};
+ await runEarlySignalScan({state,config:{mode:'external',sources:['balances'],scheduledSource:true},rpcBatch:async()=>{throw new Error('RPC 本地队列已满');},nowMs});
+ assert.equal(state.health.balances.nextAttemptAtMs,nowMs+60000);
+ assert.match(state.health.balances.lastError,/本地队列/);
+});
+
+test('restart bounds local RPC backoff without changing API backoff or clearing errors',()=>{
+ const dir=mkdtempSync(join(tmpdir(),'early-retry-'));try{
+ const file=join(dir,'state.json'),state=createEarlySignalState(),future=Date.now()+1800000;
+ state.health.assets={nextAttemptAtMs:future,lastError:'RPC 本地队列已满'};
+ state.health.discovery={nextAttemptAtMs:future,lastError:'HTTP 429'};
+ saveEarlySignalState(file,state);const loaded=loadEarlySignalState(file);
+ assert.ok(loaded.health.assets.nextAttemptAtMs<=Date.now()+10000);
+ assert.equal(loaded.health.assets.lastError,'RPC 本地队列已满');
+ assert.equal(loaded.health.discovery.nextAttemptAtMs,future);
+ }finally{rmSync(dir,{recursive:true,force:true});}
+});
