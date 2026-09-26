@@ -3432,3 +3432,19 @@ test('simultaneous Flap head reads share a request and provider quota blocks the
     assert.equal(count, 1);
   } finally { globalThis.fetch = original; __testables.CONFIG.bscRpcUrls = urls; __testables.resetBscRpcHealth(); }
 });
+
+test('read, realtime logs and historical logs use isolated pools', async () => {
+  const original = globalThis.fetch, pools = __testables.CONFIG.rpcPools;
+  __testables.CONFIG.rpcPools = { read: ['https://read.test'], realtime: ['https://live.test'], history: ['https://history-a.test', 'https://history-b.test'] };
+  __testables.resetBscRpcHealth(); const calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const payload = JSON.parse(opts.body); calls.push([url, payload.method]);
+    return { ok: true, json: async () => ({ result: payload.method === 'eth_getLogs' ? [] : '0x100' }) };
+  };
+  try {
+    await __testables.bscRpcCall('eth_blockNumber');
+    await __testables.bscRpcCall('eth_getLogs', [{ fromBlock: '0x64', toBlock: '0x65' }], { history: false });
+    await __testables.bscRpcCall('eth_getLogs', [{ fromBlock: '0x64', toBlock: '0x65' }], { history: true });
+    assert.deepEqual(calls, [['https://read.test','eth_blockNumber'], ['https://live.test','eth_getLogs'], ['https://live.test','eth_blockNumber'], ['https://history-a.test','eth_getLogs'], ['https://history-b.test','eth_getLogs']]);
+  } finally { globalThis.fetch = original; __testables.CONFIG.rpcPools = pools; __testables.resetBscRpcHealth(); }
+});

@@ -1,10 +1,12 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createRpcBudget } from './rpc-budget.mjs';
 
 // Only provider-wide failures are shared. Archive/range errors stay with the
 // caller's range-specific policy and cannot quarantine recent reads.
-export function createRpcControl({ directory = '', now = Date.now, concurrency = 2 } = {}) {
+export function createRpcControl({ directory = '', now = Date.now, concurrency = 2, limits = JSON.parse(process.env.RPC_PROVIDER_LIMITS || '{}') } = {}) {
+  const budget = createRpcBudget({ directory, limits, now });
   const cooldowns = new Map(), checked = new Map(), active = new Map(), waiters = new Map(), inflight = new Map(), cache = new Map();
   const metrics = { requested: 0, reused: 0, cooled: 0, failures: 0 };
   function key(url) {
@@ -54,7 +56,7 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
     error.rpcCooldown = true;
     throw error;
   }
-  async function withEndpoint(url, operation, signal) {
+  async function withEndpoint(url, operation, signal, request = {}) {
     assertAvailable(url);
     const id = key(url);
     if ((active.get(id) || 0) >= concurrency) await new Promise((resolve, reject) => {
@@ -65,11 +67,20 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
       if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
     });
     else active.set(id, (active.get(id) || 0) + 1);
-    try { signal?.throwIfAborted(); assertAvailable(url); metrics.requested++; return await operation(); }
+    let release;
+    try {
+      signal?.throwIfAborted(); assertAvailable(url);
+      release = directory ? await budget.acquire(url, { ...request, signal }) : null;
+      signal?.throwIfAborted(); assertAvailable(url); metrics.requested++;
+      return await operation();
+    }
     finally {
-      const next = waiters.get(id)?.shift();
-      if (next) next.resolve(); // Transfer the occupied slot to the waiter.
-      else active.set(id, Math.max(0, (active.get(id) || 1) - 1));
+      try { if (release) await release(); }
+      finally {
+        const next = waiters.get(id)?.shift();
+        if (next) next.resolve(); // Transfer the occupied slot to the waiter.
+        else active.set(id, Math.max(0, (active.get(id) || 1) - 1));
+      }
     }
   }
   async function coalesce(id, operation, ttlMs = 0) {
@@ -89,7 +100,7 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
   }
   return { cooldown, failure, withEndpoint, coalesce, metrics,
     reset() { cooldowns.clear(); checked.clear(); cache.clear(); },
-    summary: () => ({ ...metrics, inFlight: inflight.size, queued: [...waiters.values()].reduce((n, q) => n + q.length, 0) }),
+    summary: () => ({ ...metrics, ...budget.metrics, inFlight: inflight.size, queued: [...waiters.values()].reduce((n, q) => n + q.length, 0) }),
   };
 }
 

@@ -5,7 +5,7 @@ import { CORE_SAFES, AUXILIARY_SAFES, EXECUTION_WALLETS, CORE_OWNERS, ALLOWANCE_
   DEX, POSITION_MANAGERS, BASE_ASSETS } from "./early-signal-catalog.mjs";
 import { TOPICS } from "./early-signal-topics.mjs";
 import { abiAddress, abiUint, hexWords } from "./operational-call-codec.mjs";
-import { normalizeAddress, extractFlapProposalActions } from "./safe-proposal-monitor.mjs";
+import { normalizeAddress, extractFlapProposalActions, createSafeApiPoolFetch, normalizeSafeApiKeys } from "./safe-proposal-monitor.mjs";
 import { FLAP_FACTORY_PROXY, QUOTE_CONFIG_SELECTOR, QUOTE_TOKEN_CREATION_DISABLED_SELECTOR } from "./factory-pool-monitor.mjs";
 
 export const EARLY_SIGNAL_SCHEMA_VERSION = 2;
@@ -272,6 +272,7 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
 }
 
 async function jsonGet(url, { fetchFn = globalThis.fetch, timeoutMs = 5000, apiKey = "" } = {}) {
+  await fetchFn.waitForTurn?.();
   const response = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs), headers: { Accept: "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) } });
   if (!response.ok) {
     const error = new Error(`HTTP ${response.status} (${new URL(url).hostname})`);
@@ -359,7 +360,8 @@ export async function scanAddressDiscovery(state, config, fetchFn, nowMs) {
   const base = (config.safeApiBaseUrl || "https://api.safe.global/tx-service/bnb/api/v1").replace(/\/$/, "");
   const opts = { fetchFn, timeoutMs: config.timeoutMs, apiKey: config.safeApiKey || "" };
   const safes = uniq([...(config.safes || CORE_SAFES.map(([a]) => a)), ...AUXILIARY_SAFES]);
-  for (const safe of safes) {
+  const progress = state.discoveryProgress ||= { safes: [], owners: [] };
+  for (const safe of safes.filter(safe => !progress.safes.includes(safe))) {
     const info = await jsonGet(`${base}/safes/${safe}/`, opts);
     if (lower(info.address) !== lower(safe) || !Array.isArray(info.owners) || !Array.isArray(info.modules)) throw new Error("Safe 元数据无效");
     const previous = state.safeInfo[lower(safe)];
@@ -368,9 +370,10 @@ export async function scanAddressDiscovery(state, config, fetchFn, nowMs) {
       id: `safe-info:${lower(safe)}:${hash(fp)}`, kind: "authority", source: "safe-api", detail: `Safe ${safe} 签名人/阈值/模块/guard 变化｜阈值 ${info.threshold}｜模块 ${info.modules.join(", ")}`,
     }, { nowMs });
     state.safeInfo[lower(safe)] = info;
+    progress.safes.push(safe);
   }
   const owners = uniq([...CORE_OWNERS, ...Object.values(state.safeInfo).flatMap(s => s.owners)]);
-  for (const owner of owners) {
+  for (const owner of owners.filter(owner => !progress.owners.includes(owner))) {
     const response = await jsonGet(`${base}/owners/${owner}/safes/`, opts);
     if (!Array.isArray(response.safes)) throw new Error("Safe owner 反查格式无效");
     for (const safe of response.safes) {
@@ -378,8 +381,10 @@ export async function scanAddressDiscovery(state, config, fetchFn, nowMs) {
       candidate(state, safe, `共同签名人 ${owner}（不代表官方归属）`, nowMs);
       if (!existing && state.lastDiscoveryAt && state.candidates[lower(safe)]) emit(state, { id: `discovery:${lower(safe)}`, kind: "candidate", source: "safe-api", detail: `新关联 Safe ${safe}｜共同签名人 ${owner}；仅列观察，不自动信任` }, { nowMs });
     }
+    progress.owners.push(owner);
   }
   state.lastDiscoveryAt = nowMs;
+  delete state.discoveryProgress;
 }
 
 export function rewindEarlySignals(state, fromBlock, nowMs = Date.now()) {
@@ -685,7 +690,12 @@ export async function runEarlySignalScan({ state, config = {}, rpcBatch, fetchFn
     if (enabled("assets")) await sourcePass(state, "assets", () => refreshEarlyAssets(state, config, rpcBatch, nowMs), nowMs, config.priorityTokens?.length || config.scheduledSource ? 0 : config.assetIntervalMs || 10000);
     if (enabled("positions")) await sourcePass(state, "positions", () => refreshEarlyPositions(state, rpcBatch), nowMs, periodicInterval);
     if (enabled("balances")) await sourcePass(state, "balances", () => refreshNativeBalances(state, config, rpcBatch, nowMs), nowMs, periodicInterval);
-    if (enabled("discovery")) await sourcePass(state, "discovery", () => scanAddressDiscovery(state, config, fetchFn, nowMs), nowMs, config.discoveryIntervalMs || DAY);
+    if (enabled("discovery")) await sourcePass(state, "discovery", () => {
+      const keys = normalizeSafeApiKeys(config.safeApiKeys, config.safeApiKey || '');
+      const safeFetch = keys.length ? createSafeApiPoolFetch(safeState || (state.safeApiState ||= {}), fetchFn,
+        { apiKeys: keys, apiBaseUrl: config.safeApiBaseUrl, intervalMs: 5000 }) : fetchFn;
+      return scanAddressDiscovery(state, config, safeFetch, nowMs);
+    }, nowMs, config.discoveryIntervalMs || DAY);
   }
   state.lastRunAt = iso(nowMs);
   prune(state, nowMs);

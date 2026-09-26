@@ -206,6 +206,8 @@ const CONFIG = {
   hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 60),
 
   // ── BSC RPC ──
+  rpcPools: Object.fromEntries(['read', 'logs'].map(lane => [lane,
+    (process.env[`FOURMEME_RPC_${lane.toUpperCase()}_URLS`] || '').split(/[\s,]+/).filter(Boolean)])),
   bscRpcUrls: [...new Set((process.env.FOURMEME_BSC_RPC_URLS || [
     "https://bsc.rpc.blxrbdn.com",
     "https://rpc.48.club",
@@ -1465,9 +1467,19 @@ function createAllRpcBackoffError() {
 const rpcControl = createRpcControl({ directory: IS_TEST_MODE ? "" : join(__dirname, "..", ".rpc-cooldowns") });
 const bscRpcEndpointPool = createRpcEndpointPool(CONFIG.bscRpcUrls, { isBackedOff: url => Boolean(currentBackoffState(getDomain(url))) || Boolean(rpcControl.cooldown(url)) });
 const bscRpcInflight = new Map();
+const routedRpcPools = new Map();
+function rpcPoolFor(payload) {
+  const lane = (Array.isArray(payload) ? payload : [payload]).some(item => item.method === 'eth_getLogs') ? 'logs' : 'read';
+  const urls = CONFIG.rpcPools[lane];
+  if (!urls.length) return bscRpcEndpointPool;
+  const key = JSON.stringify(urls);
+  if (!routedRpcPools.has(key)) routedRpcPools.set(key, createRpcEndpointPool(urls,
+    { isBackedOff: url => Boolean(currentBackoffState(getDomain(url))) || Boolean(rpcControl.cooldown(url)) }));
+  return routedRpcPools.get(key);
+}
 
 async function requestBscRpcPayload(payload, timeoutMs, {
-  pool = bscRpcEndpointPool,
+  pool = rpcPoolFor(payload),
   inflight = bscRpcInflight,
   fetchFn = fetchSafe,
   parseResponse = response => response.json(),
@@ -1497,9 +1509,13 @@ async function requestBscRpcPayload(payload, timeoutMs, {
         }, timeoutMs);
         if (!response.ok) rpcControl.failure(rpcUrl, new Error(`HTTP ${response.status}`), response);
         const parsed = await parseResponse(response, rpcUrl);
-        for (const item of Array.isArray(parsed) ? parsed : [parsed]) if (item?.error) rpcControl.failure(rpcUrl, new Error(item.error.message || "RPC error"));
+        for (const item of Array.isArray(parsed) ? parsed : [parsed]) if (item?.error) {
+          const error = new Error(item.error.message || "RPC error");
+          rpcControl.failure(rpcUrl, error);
+          if (/rate.?limit|compute units|too many requests|usage limit/i.test(error.message)) throw error;
+        }
         return parsed;
-        });
+        }, AbortSignal.timeout(timeoutMs + 1000), { cost: Array.isArray(payload) ? payload.length : 1 });
         pool.succeed(lease);
         return parsed;
       } catch (err) {
@@ -1565,6 +1581,11 @@ function shouldLogRpcItemError(call, message) {
 // --- Batch RPC：一次 HTTP 调用执行多个 RPC ---
 async function bscRpcBatch(calls) {
   if (calls.length === 0) return [];
+  if (calls.length > 20) {
+    const results = [];
+    for (let i = 0; i < calls.length; i += 20) results.push(...await bscRpcBatch(calls.slice(i, i + 20)));
+    return results;
+  }
   // 单条也走 batch 逻辑，保持统一的错误语义（失败返回 null 而非抛异常）
   if (calls.length === 1) {
     try {

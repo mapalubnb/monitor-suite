@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from 'node:timers/promises';
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
@@ -517,6 +518,11 @@ export function createSafeApiPoolFetch(state, fetchFn, { apiKeys, apiBaseUrl = D
     const error = new Error('Safe API 轮换池暂无可用账户');
     error.retryAfterMs = Math.max(0, state.apiNextAttemptAtMs - now());
     throw error;
+  };
+  guarded.waitForTurn = async () => {
+    const wait = Math.max(0, Math.min(...accounts.map(dueAt)) - now());
+    if (wait > intervalMs) throw Object.assign(new Error('Safe API 轮换池冷却中'), { retryAfterMs: wait });
+    if (wait) await delay(wait);
   };
   return guarded;
 }

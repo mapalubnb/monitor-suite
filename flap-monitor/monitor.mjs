@@ -118,6 +118,8 @@ const CONFIG = {
     minAssetFiles: 2,
   },
   assetStringLimit: 300,
+  rpcPools: Object.fromEntries(['read', 'realtime', 'history'].map(lane => [lane,
+    (process.env[`FLAP_RPC_${lane.toUpperCase()}_URLS`] || '').split(/[\s,]+/).filter(Boolean)])),
   bscRpcUrls: [...new Set((process.env.FLAP_BSC_RPC_URLS || process.env.BSC_RPC_URLS || "https://fast.bsc-rpc.com,https://rpc.48.club,https://bsc.rpc.blxrbdn.com,https://bsc.publicnode.com")
     .split(",").map(s => s.trim()).filter(Boolean)
     .concat(process.env.FLAP_FACTORY_ARCHIVE_RPC_URL || []).filter(Boolean))],
@@ -2675,10 +2677,10 @@ function bscRpcTimeoutMs(method, params = []) {
   return CONFIG.factoryPoolMonitor.rpcTimeoutMs;
 }
 
-function orderedBscRpcIndexes(preferenceKey) {
+function orderedBscRpcIndexes(preferenceKey, urls = CONFIG.bscRpcUrls) {
   const health = bscRpcHealthByKey.get(preferenceKey) || new Map();
   const preferredIndex = preferredBscRpcIndexByKey.get(preferenceKey);
-  return CONFIG.bscRpcUrls.map((_, index) => index).filter(index => !rpcControl.cooldown(CONFIG.bscRpcUrls[index])).sort((left, right) => {
+  return urls.map((_, index) => index).filter(index => !rpcControl.cooldown(urls[index])).sort((left, right) => {
     const leftHealth = health.get(left);
     const rightHealth = health.get(right);
     const leftLatency = leftHealth?.failedAt && Date.now() - leftHealth.failedAt > 60_000 ? null : leftHealth?.latencyMs;
@@ -2756,9 +2758,14 @@ async function executeBscGetLogsUnshared(params, options = {}) {
   try { return await queryBscLogs(params, options); }
   finally { activeLogRequests--; if (history) activeHistoryLogRequests--; pumpLogRequests(); }
 }
-async function fetchRpcJson(url, payload, timeoutMs, signal) {
-  const effectiveSignal = signal || AbortSignal.timeout(timeoutMs);
-  return rpcControl.withEndpoint(url, async () => {
+async function fetchRpcJson(url, payload, timeoutMs, signal, history = false) {
+  const queueTimeout = AbortSignal.timeout(1000);
+  const queueSignal = signal ? AbortSignal.any([signal, queueTimeout]) : queueTimeout;
+  let started = false;
+  try { return await rpcControl.withEndpoint(url, async () => {
+    started = true;
+    const networkTimeout = AbortSignal.timeout(timeoutMs);
+    const effectiveSignal = signal ? AbortSignal.any([signal, networkTimeout]) : networkTimeout;
     try {
       const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload), signal: effectiveSignal });
@@ -2772,16 +2779,21 @@ async function fetchRpcJson(url, payload, timeoutMs, signal) {
       for (const item of Array.isArray(json) ? json : [json]) if (item?.error) rpcControl.failure(url, new Error(item.error.message || "RPC error"));
       return json;
     } catch (error) { rpcControl.failure(url, error); throw error; }
-  }, effectiveSignal);
+  }, queueSignal, { cost: Array.isArray(payload) ? payload.length : 1, history }); }
+  catch (error) {
+    if (!started && queueTimeout.aborted && !signal?.aborted) throw Object.assign(new Error('RPC 本地队列已满，切换备用节点'), { rpcBudget: true });
+    throw error;
+  }
 }
 async function queryBscLogs(params, options) {
-  const urls = options.rpcUrls || (IS_TEST_MODE ? CONFIG.bscRpcUrls : [...new Set([
+  const history = options.history === undefined ? bscRpcPreferenceKey("eth_getLogs", params) : options.history ? "eth_getLogs:history" : "eth_getLogs:realtime";
+  const configured = CONFIG.rpcPools[history.endsWith(':history') ? 'history' : 'realtime'];
+  const urls = options.rpcUrls || (configured.length ? configured : IS_TEST_MODE ? CONFIG.bscRpcUrls : [...new Set([
     ...(options.history && process.env.FLAP_FACTORY_ARCHIVE_RPC_URL ? [process.env.FLAP_FACTORY_ARCHIVE_RPC_URL] : []),
     ...(process.env.FLAP_LOG_RPC_URLS || "https://fast.bsc-rpc.com,https://bsc.publicnode.com").split(",").map(s => s.trim()).filter(Boolean),
     ...CONFIG.bscRpcUrls,
   ])]);
   const errors = [], emptyProviders = new Set();
-  const history = options.history === undefined ? bscRpcPreferenceKey("eth_getLogs", params) : options.history ? "eth_getLogs:history" : "eth_getLogs:realtime";
   const timeoutMs = Math.max(4000, bscRpcTimeoutMs("eth_getLogs", params));
   for (const url of urls) {
     const from = Number(params[0]?.fromBlock || 0), to = Number(params[0]?.toBlock || 0);
@@ -2799,7 +2811,7 @@ async function queryBscLogs(params, options) {
     const cooling = logRpcCooldowns.get(key);
     if (cooling?.until > Date.now()) { errors.push(cooling.message); continue; }
     try {
-      const json = await fetchRpcJson(url, { jsonrpc: "2.0", id: 1, method: "eth_getLogs", params }, timeoutMs);
+      const json = await fetchRpcJson(url, { jsonrpc: "2.0", id: 1, method: "eth_getLogs", params }, timeoutMs, undefined, history.endsWith(':history'));
       if (json?.error) throw new Error(json.error.message || "RPC error");
       if (!Array.isArray(json?.result)) throw new Error("eth_getLogs 返回非数组");
       const logs = dedupeBscLogs(json.result);
@@ -2822,6 +2834,7 @@ async function queryBscLogs(params, options) {
     } catch (error) {
       const message = `${host}: ${error.message}`;
       errors.push(message);
+      if (error.rpcBudget) continue;
       const cooldown = /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 30_000;
       logRpcCooldowns.set(key, { until: Date.now() + cooldown, message });
       if (/HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical|header not found/i.test(error.message)) {
@@ -2841,15 +2854,18 @@ async function queryBscLogs(params, options) {
   throw new Error((emptyProviders.size ? "eth_getLogs 仅一个节点返回空结果，未达到双节点一致；" : "eth_getLogs 无可用节点；") + [...new Set(errors)].join("；"));
 }
 
-async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null, validationKey = "default") {
+async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null, validationKey = "default", options = {}) {
+  const lane = options.history ? 'history' : 'read';
+  const urls = CONFIG.rpcPools[lane].length ? CONFIG.rpcPools[lane] : CONFIG.bscRpcUrls;
+  preferenceKey += ':' + JSON.stringify(urls);
   // Validation belongs to each consumer; the shared operation validates the wire response.
-  const json = await rpcControl.coalesce(JSON.stringify([CONFIG.bscRpcUrls, payload, timeoutMs, validationKey]),
-    () => raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse), rpcCacheTtl(payload));
+  const json = await rpcControl.coalesce(JSON.stringify([urls, payload, timeoutMs, validationKey, lane]),
+    () => raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse, urls, options), rpcCacheTtl(payload));
   if (validateResponse) validateResponse(json);
   return json;
 }
-async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse) {
-  const indexes = orderedBscRpcIndexes(preferenceKey);
+async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse, urls, options) {
+  const indexes = orderedBscRpcIndexes(preferenceKey, urls);
   if (!indexes.length) throw new Error("所有 RPC 节点处于共享冷却，等待恢复");
   const controllers = [], errors = [];
   let settled = false, position = 0;
@@ -2860,12 +2876,11 @@ async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResp
   async function worker(secondary) {
     if (secondary) await hedgeReady;
     while (!settled && position < indexes.length) {
-      const index = indexes[position++], url = CONFIG.bscRpcUrls[index];
+      const index = indexes[position++], url = urls[index];
       const controller = new AbortController(); controllers.push(controller);
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
       const startedAt = Date.now();
       try {
-        const json = await fetchRpcJson(url, payload, timeoutMs, controller.signal);
+        const json = await fetchRpcJson(url, payload, timeoutMs, controller.signal, Boolean(options.history));
         if (!Array.isArray(json) && json?.error) throw new Error(json.error.message || "RPC error");
         if (Array.isArray(payload) ? !Array.isArray(json) : !json || !("result" in json)) throw new Error("RPC 返回无效结果");
         if (Array.isArray(json) && json.every(item => item?.error || item?.result == null)) throw new Error("Batch RPC 全部读取失败");
@@ -2877,8 +2892,8 @@ async function raceBscRpcRequest(payload, preferenceKey, timeoutMs, validateResp
         for (const other of controllers) if (other !== controller) other.abort();
         return json;
       } catch (error) {
-        if (!settled) { errors.push(new URL(url).hostname + ": " + error.message); updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt, true); }
-      } finally { clearTimeout(timer); }
+        if (!settled) { errors.push(new URL(url).hostname + ": " + error.message); if (!error.rpcBudget) updateBscRpcHealth(preferenceKey, index, Date.now() - startedAt, true); }
+      }
     }
     throw new Error(errors.at(-1) || "没有可用 RPC 结果");
   }
@@ -2901,13 +2916,24 @@ async function bscRpcCall(method, params = [], options = {}) {
     json => {
       if (json?.error) throw new Error(json.error.message || JSON.stringify(json.error));
       if (options.requireResult && json?.result == null) throw new Error(`${method} 返回空结果`);
-    }, options.requireResult ? "required-result" : "optional-result",
+    }, options.requireResult ? "required-result" : "optional-result", options,
   );
   return json.result;
 }
 
 async function bscRpcBatch(calls = [], options = {}) {
   if (calls.length === 0) return [];
+  if (calls.length > 20) {
+    const results = [];
+    for (let i = 0; i < calls.length; i += 20) results.push(...await bscRpcBatch(calls.slice(i, i + 20), options));
+    return results;
+  }
+  if (calls.length > 1 && calls.some(call => call.method === 'eth_getLogs')) {
+    return Promise.all(calls.map(async call => {
+      try { return await bscRpcCall(call.method, call.params || [], { ...options, requireResult: options.requireAllResults }); }
+      catch (error) { if (options.requireAllResults) throw error; return null; }
+    }));
+  }
   if (calls.length === 1) return [await bscRpcCall(calls[0].method, calls[0].params, { ...options, requireResult: options.requireAllResults })];
   const payload = calls.map((call, i) => ({ jsonrpc: "2.0", id: i + 1, method: call.method, params: call.params || [] }));
   const preferenceKey = bscRpcBatchPreferenceKey(calls);
@@ -2919,7 +2945,7 @@ async function bscRpcBatch(calls = [], options = {}) {
     if (payload.some(item => !byId.get(item.id) || byId.get(item.id).error || byId.get(item.id).result == null)) {
       throw new Error("Batch RPC 存在空结果");
     }
-  }, options.requireAllResults ? "all-results" : "partial-results");
+  }, options.requireAllResults ? "all-results" : "partial-results", options);
   if (!Array.isArray(json)) throw new Error("Batch RPC 返回非数组");
   const byId = new Map(json.map(item => [item.id, item]));
   const results = payload.map(item => {
@@ -6546,7 +6572,8 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
 function earlySignalConfig() {
   return { ...CONFIG.earlySignalMonitor, safes: CONFIG.safeProposalMonitor.safes,
     factoryAddress: CONFIG.factoryPoolMonitor.proxy,
-    safeApiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl, safeApiKey: CONFIG.safeProposalMonitor.apiKey };
+    safeApiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl, safeApiKey: CONFIG.safeProposalMonitor.apiKey,
+    safeApiKeys: CONFIG.safeProposalMonitor.apiKeys };
 }
 async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState } = {}) {
   // Bound each card; acknowledge only successful sends and retain the remaining queue.
@@ -6897,7 +6924,7 @@ async function startMonitor() {
   const earlyFastJob = createWakeableJob({ intervalMs: CONFIG.earlySignalMonitor.intervalMs,
     onError: error => {
       fastRetryAt = Date.now() + Math.min(30_000, 1000 * 2 ** Math.min(5, fastFailures++));
-      earlySignalState.health.fast = { lastError: error.message };
+      earlySignalState.health.fast = { lastError: error.message, nextAttemptAtMs: fastRetryAt };
       log(`[Flap 快速回执] ${error.message}`);
     }, run: async () => {
       if (isShuttingDown || Date.now() < fastRetryAt) return;

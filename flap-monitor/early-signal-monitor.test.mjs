@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createEarlySignalState, decodeEarlyReceipt, ingestCowOrders, earlyAssetStage, syncEarlyProposals,
   rewindEarlySignals, scanEarlyChain, refreshEarlyAssets, buildEarlySignalContent, loadEarlySignalState,
   saveEarlySignalState, acknowledgeEarlySignals, runEarlySignalScan, earlyLogFilters,
-  processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
+  processEarlyReceiptHints, shouldPrioritizeEarlyLog, scanAddressDiscovery } from "./early-signal-monitor.mjs";
 import { extractFlapProposalActions, DEFAULT_FLAP_ADMIN_SAFES } from "./safe-proposal-monitor.mjs";
 import { DEX, EXECUTION_WALLETS, CORE_SAFES, ALLOWANCE_MODULE } from "./early-signal-catalog.mjs";
 import { TOPICS } from "./early-signal-topics.mjs";
@@ -23,6 +23,35 @@ const BH = "0x" + "ab".repeat(32);
 const TX = "0x" + "cd".repeat(32);
 const log = (address, topics, data, index = 0) => ({ address, topics, data, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logIndex: `0x${index.toString(16)}` });
 const receipt = logs => ({ status: "0x1", from: OWNER, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logs });
+
+test('discovery resumes after a failed address without repeating completed requests', async () => {
+  const state = createEarlySignalState(), seen = []; let fail = true;
+  const fetchFn = async url => {
+    seen.push(url);
+    if (fail && seen.length === 3) return { ok: false, status: 429, headers: new Headers() };
+    const address = url.match(/\/safes\/(0x[0-9a-fA-F]+)\//)?.[1];
+    return { ok: true, json: async () => address ? { address, owners: [], modules: [], threshold: 1 } : { safes: [] } };
+  };
+  await assert.rejects(scanAddressDiscovery(state, {}, fetchFn, nowMs), /429/);
+  const completed = seen.slice(0, 2); fail = false;
+  await scanAddressDiscovery(state, {}, fetchFn, nowMs + 60_000);
+  for (const url of completed) assert.equal(seen.filter(value => value === url).length, 1);
+  assert.equal(state.discoveryProgress, undefined);
+  assert.equal(state.lastDiscoveryAt, nowMs + 60_000);
+});
+
+test('discovery uses the credential pool and shares account cooldowns with proposals', async () => {
+  const state = createEarlySignalState(), safeState = {}, headers = [];
+  const fetchFn = async (_url, options) => {
+    headers.push(new Headers(options.headers).get('Authorization'));
+    if (headers.length === 1) return { ok: false, status: 429, headers: new Headers({ 'retry-after': '60' }) };
+    return { ok: true, status: 200, headers: new Headers(), json: async () => ({ address: 'invalid' }) };
+  };
+  await runEarlySignalScan({ state, safeState, config: { mode: 'external', sources: ['discovery'], safeApiKeys: ['first', 'second'] }, rpcBatch: async () => [], fetchFn });
+  assert.deepEqual(headers, ['Bearer first', 'Bearer second']);
+  assert.equal(Object.keys(safeState.apiAccounts).length, 2);
+  assert.ok(Object.values(safeState.apiAccounts).some(account => account.apiNextAttemptAtMs > Date.now()));
+});
 
 test("fast receipt lane waits for confirmations, deduplicates replay and never advances scan cursor", async () => {
   const state = createEarlySignalState(), r = history.liquidityReceipt;

@@ -126,6 +126,7 @@ if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
   cp shared/snapshot-store.cjs "$SHARED_DIR/"
   cp shared/rpc-control.mjs "$SHARED_DIR/"
+  cp shared/rpc-budget.mjs "$SHARED_DIR/"
   cp shared/startup-notifier.mjs "$SHARED_DIR/"
   cp shared/scan-recovery.mjs "$SHARED_DIR/"
   cp shared/safe-api-setup.mjs "$SHARED_DIR/"
@@ -407,7 +408,7 @@ if [ -f "$SNAP" ]; then
     console.log('');
 
     console.log('**04｜性能指标**');
-    if(runtime.rpc) console.log('RPC：实际请求 '+runtime.rpc.requested+'｜复用 '+runtime.rpc.reused+'｜冷却跳过 '+runtime.rpc.cooled+'｜排队 '+runtime.rpc.queued);
+    if(runtime.rpc) console.log('RPC：实际请求 '+runtime.rpc.requested+'｜复用 '+runtime.rpc.reused+'｜冷却跳过 '+runtime.rpc.cooled+'｜排队 '+runtime.rpc.queued+'｜预算切换 '+(runtime.rpc.budgetRejected||0)+'｜预算等待 '+(runtime.rpc.budgetWaitMs||0)+'ms');
     const mem=runtime.memory||{};
     console.log('进程内存：RSS '+(mem.rss?Math.round(mem.rss/1024/1024)+' MB':'未知')+'｜堆使用 '+(mem.heapUsed?Math.round(mem.heapUsed/1024/1024)+' MB':'未知'));
     console.log('创建者待补区间：'+JSON.stringify(am.realtimeGaps||[]));
@@ -557,7 +558,7 @@ if [ -f "$SNAP" ]; then
     console.log('**底池提前信号**');
     console.log('提前信号待补区间：'+JSON.stringify(es.realtimeGaps||[]));
     console.log('实时扫描：'+(es.realtimeCursor??'未建立')+'｜历史补扫 '+(es.cursor??'未建立')+' / '+(es.historyEndBlock??'未知')+'｜最新 '+(es.latestBlock??'未知')+'｜候选资产 '+Object.keys(es.tokens||{}).length+'｜待推送 '+(es.pendingChanges||[]).length);
-    for(const [name,h] of Object.entries(es.health||{})) if(h.lastError) console.log(name+'：'+h.lastError+'｜下次重试 '+new Date(h.nextAttemptAtMs||0).toISOString());
+    for(const [name,h] of Object.entries(es.health||{})) if(h.lastError) console.log(name+'：'+h.lastError+(h.nextAttemptAtMs>0?'｜下次重试 '+new Date(h.nextAttemptAtMs).toISOString():'｜等待下轮检测'));
     const mdLink=(label,url)=>'['+label+']('+url+')';
     const vaultLink=(address,chain)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+(chain==='robinhood'?'robinhood':'bnb')+'&lang=zh');
     const robinhoodPage='https://flap.sh/robinhood/CAstore?lang=zh';
@@ -646,7 +647,7 @@ if [ -f "$SNAP" ]; then
     console.log('金库工厂：总数 '+factoryItems.length+' 个｜CAStore 可见 '+visibleFactories+' 个｜已启用 '+enabledVisibleFactories+' 个｜链上金库 '+knownVaults.length+' 个');
     console.log('Factory 底池：资产 '+poolAssets.length+' 个｜支持创建 '+enabledPoolAssets+' 个｜暂停创建 '+pausedPoolAssets+' 个｜已停用 '+disabledPoolAssets+' 个');
     console.log('Safe 提案：健康 '+healthySafes+'/'+safeStates.length+'｜跟踪中目标 '+activeSafeProposals.length+' 个');
-    if(runtime.rpc) console.log('RPC：实际请求 '+runtime.rpc.requested+'｜复用 '+runtime.rpc.reused+'｜冷却跳过 '+runtime.rpc.cooled+'｜排队 '+runtime.rpc.queued);
+    if(runtime.rpc) console.log('RPC：实际请求 '+runtime.rpc.requested+'｜复用 '+runtime.rpc.reused+'｜冷却跳过 '+runtime.rpc.cooled+'｜排队 '+runtime.rpc.queued+'｜预算切换 '+(runtime.rpc.budgetRejected||0)+'｜预算等待 '+(runtime.rpc.budgetWaitMs||0)+'ms');
     console.log('');
 
     console.log('**03｜页面监控**');
