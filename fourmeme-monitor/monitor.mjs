@@ -1403,7 +1403,7 @@ function createRpcEndpointPool(urls, {
     lastFailureAt: 0,
   }));
 
-  function acquire(excludedUrls = new Set()) {
+  function acquire(excludedUrls = new Set(), { pressure = () => 0, available = () => true } = {}) {
     const currentTime = now();
     for (const endpoint of endpoints) {
       if (endpoint.consecutiveFailures > 0 && currentTime - endpoint.lastFailureAt >= failureCooldownMs) {
@@ -1411,9 +1411,10 @@ function createRpcEndpointPool(urls, {
       }
     }
     const candidates = endpoints
-      .filter(endpoint => !excludedUrls.has(endpoint.url) && !isBackedOff(endpoint.url))
+      .filter(endpoint => !excludedUrls.has(endpoint.url) && !isBackedOff(endpoint.url) && available(endpoint.url))
       .sort((left, right) => (
-        left.inFlight - right.inFlight
+        pressure(left.url) - pressure(right.url)
+        || left.inFlight - right.inFlight
         || left.consecutiveFailures - right.consecutiveFailures
         || left.lastSelectedAt - right.lastSelectedAt
         || (left.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER) - (right.ewmaLatencyMs ?? Number.MAX_SAFE_INTEGER)
@@ -1430,6 +1431,7 @@ function createRpcEndpointPool(urls, {
     if (!lease?.endpoint) return;
     const endpoint = lease.endpoint;
     endpoint.inFlight = Math.max(0, endpoint.inFlight - 1);
+    if (succeeded === null) return;
     const latencyMs = Math.max(0, now() - lease.startedAt);
     if (succeeded) {
       endpoint.successCount++;
@@ -1449,6 +1451,7 @@ function createRpcEndpointPool(urls, {
     acquire,
     succeed: lease => release(lease, true),
     fail: lease => release(lease, false),
+    defer: lease => release(lease, null),
     snapshot: () => endpoints.map(endpoint => ({ ...endpoint })),
   };
 }
@@ -1479,7 +1482,13 @@ async function requestBscRpcPayload(payload, timeoutMs, {
   fetchFn = fetchWithTimeout,
   parseResponse = response => response.json(),
   dedupeKeySuffix = "json",
+  control = rpcControl,
 } = {}) {
+  const calls = Array.isArray(payload) ? payload : [payload];
+  // Code and proxy-slot checks may consume the reserve also used by Flap core
+  // checks. Ordinary reads and block backfill must leave that reserve intact.
+  const requestOptions = { payload, cost: calls.length,
+    critical: calls.length > 0 && calls.every(call => ["eth_getStorageAt", "eth_getCode"].includes(call.method)) };
   const dedupeKey = `${timeoutMs}:${dedupeKeySuffix}:${JSON.stringify(payload)}`;
   const existing = inflight.get(dedupeKey);
   if (existing) return existing;
@@ -1488,7 +1497,10 @@ async function requestBscRpcPayload(payload, timeoutMs, {
     const attempted = new Set();
     let lastErr;
     while (attempted.size < pool.size) {
-      const lease = pool.acquire(attempted);
+      const lease = pool.acquire(attempted, {
+        pressure: url => control.pressure(url, requestOptions),
+        available: url => !control.cooldown(url, requestOptions),
+      });
       if (!lease) {
         if (attempted.size === 0) throw createAllRpcBackoffError();
         break;
@@ -1496,26 +1508,27 @@ async function requestBscRpcPayload(payload, timeoutMs, {
       const rpcUrl = lease.endpoint.url;
       attempted.add(rpcUrl);
       try {
-        const parsed = await rpcControl.withEndpoint(rpcUrl, async () => {
+        const parsed = await control.withEndpoint(rpcUrl, async () => {
         const response = await fetchFn(rpcUrl, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         }, timeoutMs);
-        if (!response.ok) rpcControl.failure(rpcUrl, new Error(`HTTP ${response.status}`), response, { payload });
+        if (!response.ok) control.failure(rpcUrl, new Error(`HTTP ${response.status}`), response, { payload });
         const parsed = await parseResponse(response, rpcUrl);
         for (const item of Array.isArray(parsed) ? parsed : [parsed]) if (item?.error) {
           const error = new Error(item.error.message || "RPC error");
-          rpcControl.failure(rpcUrl, error, undefined, { payload });
+          control.failure(rpcUrl, error, undefined, { payload });
           if (/rate.?limit|compute units|too many requests|usage limit|resource.*not available|method.*not (found|supported)/i.test(error.message)) throw error;
         }
         return parsed;
-        }, AbortSignal.timeout(timeoutMs + 1000), { cost: Array.isArray(payload) ? payload.length : 1, payload });
+        }, AbortSignal.timeout(timeoutMs + 2000), requestOptions);
         pool.succeed(lease);
         return parsed;
       } catch (err) {
-        rpcControl.failure(rpcUrl, err, undefined, { payload });
-        pool.fail(lease);
+        control.failure(rpcUrl, err, undefined, { payload });
+        if (err.rpcBudget || err.rpcCooldown) pool.defer(lease);
+        else pool.fail(lease);
         lastErr = err;
       }
     }
@@ -1587,7 +1600,7 @@ async function bscRpcBatch(calls) {
       const result = await bscRpcCall(calls[0].method, calls[0].params);
       return [result];
     } catch (err) {
-      if (err?.code === "BSC_RPC_ALL_BACKED_OFF") throw err;
+      if (err?.code === "BSC_RPC_ALL_BACKED_OFF" || err?.rpcBudget || err?.rpcCooldown) throw err;
       const info = shouldLogRpcItemError(calls[0], err.message);
       if (info.shouldLog) {
         const suffix = info.suppressed ? `（已合并 ${info.suppressed} 条同类错误）` : "";

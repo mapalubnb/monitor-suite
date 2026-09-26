@@ -244,6 +244,54 @@ test("RPC endpoint pool rotates healthy nodes and favors lower in-flight", () =>
   assert.equal(pool.acquire().endpoint.url, "https://rpc-3.test");
 });
 
+test("RPC endpoint pool prefers shared budget capacity and defers without blaming provider", () => {
+  const pool = __testables.createRpcEndpointPool(["https://busy.test", "https://free.test"], { isBackedOff: () => false });
+  const lease = pool.acquire(new Set(), { pressure: url => url.includes("busy") ? 2 : 0 });
+  assert.equal(lease.endpoint.url, "https://free.test");
+  pool.defer(lease);
+  assert.equal(pool.snapshot()[1].inFlight, 0);
+  assert.equal(pool.snapshot()[1].failureCount, 0);
+  assert.equal(pool.snapshot()[1].successCount, 0);
+  const remaining = pool.acquire(new Set(), { available: url => url.includes("busy") });
+  assert.equal(remaining.endpoint.url, "https://busy.test");
+  pool.succeed(remaining);
+});
+
+test("contract RPC uses critical reserve while ordinary reads retain normal priority", async () => {
+  for (const methods of [["eth_getStorageAt", "eth_getCode"], ["eth_call"], ["eth_getBlockByNumber"]]) {
+    const seen = [];
+    const pool = __testables.createRpcEndpointPool(["https://busy.test", "https://free.test"], { isBackedOff: () => false });
+    const control = {
+      pressure: url => url.includes("busy") ? 2 : 0,
+      cooldown: () => null,
+      failure: () => {},
+      withEndpoint: async (url, operation, signal, options) => { seen.push({ url, options }); return operation(); },
+    };
+    const payload = methods.map((method, id) => ({ jsonrpc: "2.0", id, method, params: [] }));
+    await __testables.requestBscRpcPayload(payload, 1000, { pool, control, inflight: new Map(),
+      fetchFn: async () => ({ ok: true, json: async () => payload.map(item => ({ id: item.id, result: "0x1" })) }) });
+    assert.equal(seen[0].url, "https://free.test");
+    assert.equal(seen[0].options.critical, methods[0] === "eth_getStorageAt");
+    assert.equal(seen[0].options.cost, methods.length);
+  }
+});
+
+test("local budget exhaustion switches nodes without marking the provider failed", async () => {
+  const pool = __testables.createRpcEndpointPool(["https://busy.test", "https://free.test"], { isBackedOff: () => false });
+  const control = { pressure: () => 0, cooldown: () => null, failure: () => {},
+    withEndpoint: async (url, operation) => {
+      if (url.includes("busy")) throw Object.assign(new Error("budget busy"), { rpcBudget: true });
+      return operation();
+    } };
+  const result = await __testables.requestBscRpcPayload({ method: "eth_getStorageAt", params: [] }, 1000, {
+    pool, control, inflight: new Map(), fetchFn: async () => ({ ok: true, json: async () => ({ result: "0x1" }) }),
+  });
+  assert.equal(result.result, "0x1");
+  assert.equal(pool.snapshot()[0].failureCount, 0);
+  assert.equal(pool.snapshot()[0].inFlight, 0);
+  assert.equal(pool.snapshot()[1].successCount, 1);
+});
+
 test("RPC endpoint pool skips a backed-off node", () => {
   const pool = __testables.createRpcEndpointPool([
     "https://limited.test",
