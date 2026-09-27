@@ -1,3 +1,4 @@
+import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.mjs';
 import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
@@ -2567,39 +2568,29 @@ async function fetchSafe(url, opts = {}) {
   if (shouldBackoff(backoffKey)) throw new Error(`[退避中] ${backoffKey}`);
   const maxRetries = 2;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), CONFIG.fetchTimeoutMs);
     try {
-      const res = await fetch(url, { ...opts, signal: ctrl.signal });
+      const res = await withDeadline(async signal => {
+        const response = await fetch(url, { ...opts, signal });
+        const body = await response.text();
+        return { ok: response.ok, status: response.status, headers: response.headers, url: response.url, text: async () => body };
+      }, CONFIG.fetchTimeoutMs, opts.signal, '页面请求或响应体读取超时');
       if (res.status === 429 || res.status === 403) {
-        try { await res.text(); } catch {}
         recordFail(backoffKey, res.status);
         throw new Error(`HTTP ${res.status} (风控)`);
       }
       if (res.status >= 500) {
-        try { await res.text(); } catch {}
-        if (attempt < maxRetries) {
-          await sleep(1_000 * (attempt + 1));
-          continue;
-        }
+        if (attempt < maxRetries) { await sleep(1_000 * (attempt + 1)); continue; }
         recordFail(backoffKey, res.status);
         throw new Error(`HTTP ${res.status} (服务端错误，重试${maxRetries}次仍失败)`);
       }
-      // Keep the timeout alive until the body finishes, not just response headers.
-      const body = await res.text();
       if (res.ok) recordSuccess(backoffKey);
-      return { ok: res.ok, status: res.status, headers: res.headers, url: res.url, text: async () => body };
+      return res;
     } catch (err) {
-      if (err.name === "AbortError") {
-        if (attempt < maxRetries) {
-          await sleep(1_000 * (attempt + 1));
-          continue;
-        }
+      if (['AbortError', 'TimeoutError'].includes(err.name) && !opts.signal?.aborted) {
+        if (attempt < maxRetries) { await sleep(1_000 * (attempt + 1)); continue; }
         throw new Error(`请求超时 (重试${maxRetries}次): ${url}`);
       }
       throw err;
-    } finally {
-      clearTimeout(timer);
     }
   }
 }
@@ -2760,31 +2751,38 @@ async function executeBscGetLogsUnshared(params, options = {}) {
 }
 async function fetchRpcJson(url, payload, timeoutMs, signal, history = false, scheduling = {}) {
   const request = { payload, history, cancelSignal: signal, operationTimeoutMs: timeoutMs, ...scheduling };
-  const queueTimeout = AbortSignal.timeout(3000);
-  const queueSignal = signal ? AbortSignal.any([signal, queueTimeout]) : queueTimeout;
+  const queueDeadline = createDeadlineSignal(3000, signal, 'RPC 本地队列等待超时');
+  const queueSignal = queueDeadline.signal;
   let started = false;
   try { return await rpcControl.withEndpoint(url, async effectiveSignal => {
     started = true;
+    let response;
     try {
-      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+      response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload), signal: effectiveSignal });
+      effectiveSignal.throwIfAborted();
       if (!response.ok) {
         const error = new Error("HTTP " + response.status);
         rpcControl.failure(url, error, response, request);
+        error.rpcFailureRecorded = true;
         await response.body?.cancel?.();
         throw error;
       }
       const json = await response.json();
+      effectiveSignal.throwIfAborted();
       for (const item of Array.isArray(json) ? json : [json]) if (item?.error && !/execution reverted/i.test(item.error.message || '')) {
         throw new Error(item.error.message || 'RPC error');
       }
       return json;
-    } catch (error) { rpcControl.failure(url, error, undefined, request); throw error; }
+    } catch (error) {
+      if (!effectiveSignal.aborted && !error.rpcFailureRecorded) rpcControl.failure(url, error, response, request);
+      throw error;
+    }
   }, queueSignal, { cost: Array.isArray(payload) ? payload.length : 1, ...request }); }
   catch (error) {
-    if (!started && queueTimeout.aborted && !signal?.aborted) throw Object.assign(new Error('RPC 本地队列已满，切换备用节点'), { rpcBudget: true });
+    if (!started && queueSignal.aborted && !signal?.aborted) throw Object.assign(new Error('RPC 本地队列已满，切换备用节点'), { rpcBudget: true });
     throw error;
-  }
+  } finally { queueDeadline.dispose(); }
 }
 async function queryBscLogs(params, options) {
   const history = options.history === undefined ? bscRpcPreferenceKey("eth_getLogs", params) : options.history ? "eth_getLogs:history" : "eth_getLogs:realtime";
@@ -3075,15 +3073,12 @@ async function resolveFactoryPoolTokenMetadata(addresses, options = {}) {
     try {
       const url = new URL(apiUrl);
       url.searchParams.set("contract_addresses", tokens.join(","));
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      try {
-        const response = await fetchFn(url, { headers: { Accept: "application/json" }, signal: controller.signal });
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        Object.assign(metadata, parseGoPlusTokenMetadata(await response.json(), tokens));
-      } finally {
-        clearTimeout(timer);
-      }
+      const payload = await withDeadline(async signal => {
+        const response = await fetchFn(url, { headers: { Accept: "application/json" }, signal });
+        if (!response.ok) { await response.body?.cancel?.(); throw new Error(`HTTP ${response.status}`); }
+        return await response.json();
+      }, timeoutMs, undefined, 'GoPlus 请求或响应体读取超时');
+      Object.assign(metadata, parseGoPlusTokenMetadata(payload, tokens));
     } catch (error) {
       errors.push(`GoPlus: ${error.name === "AbortError" ? `超时 ${timeoutMs}ms` : error.message}`);
     }
@@ -6968,7 +6963,11 @@ async function startMonitor() {
   function saveRpcMetrics() {
     if (Date.now() - lastMetricsAt < 10_000) return;
     const file = join(__dirname, "runtime-metrics.json");
-    writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage() }));
+    const jobs = Object.fromEntries([
+      ['earlyRealtime', earlyChainJob], ['earlyHistory', earlyHistoryJob], ['earlyFast', earlyFastJob],
+      ...externalJobs, ['registry', registryJob], ['registryHistory', registryHistoryJob],
+    ].map(([name, job]) => [name, job.snapshot()]));
+    writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
   }
   const rpcMetricsTimer = setInterval(() => {

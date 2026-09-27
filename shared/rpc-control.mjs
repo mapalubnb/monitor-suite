@@ -2,36 +2,9 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { createRpcBudget } from './rpc-budget.mjs';
+import { withDeadline } from './request-deadline.mjs';
 
 export const RPC_BATCH_SIZE = 8;
-
-// A fetch abort alone is not a completion guarantee (including body reads).
-// Keep an independent timer and reject the logical request even if transport
-// cancellation never settles. Late transport results cannot reach the caller.
-async function boundedOperation(operation, timeoutMs, parentSignal) {
-  const controller = new AbortController();
-  let timer, abort;
-  const cancelled = new Promise((_, reject) => {
-    abort = () => { const reason = parentSignal.reason || new DOMException('RPC cancelled', 'AbortError'); reject(reason); controller.abort(reason); };
-    timer = setTimeout(() => {
-      const reason = new DOMException('RPC operation deadline exceeded', 'TimeoutError');
-      reject(reason); controller.abort(reason);
-    }, timeoutMs);
-    if (parentSignal?.aborted) abort();
-    else parentSignal?.addEventListener('abort', abort, { once: true });
-  });
-  try {
-    let work;
-    try {
-      controller.signal.throwIfAborted();
-      work = operation(controller.signal);
-    } catch (error) { work = Promise.reject(error); }
-    return await Promise.race([work, cancelled]);
-  } finally {
-    clearTimeout(timer);
-    parentSignal?.removeEventListener('abort', abort);
-  }
-}
 
 export function rpcRequestScope({ payload, history = false } = {}) {
   if (!payload) return '';
@@ -123,7 +96,7 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
       const started = now(), methodKey = new URL(url).hostname + ':' + rpcRequestScope(request);
       const stats = methods.get(methodKey) || { ok: 0, failed: 0, totalMs: 0, maxMs: 0 };
       methods.set(methodKey, stats);
-      try { const value = await boundedOperation(operation, request.operationTimeoutMs || 30_000, request.cancelSignal); stats.ok++; return value; }
+      try { const value = await withDeadline(operation, request.operationTimeoutMs || 30_000, request.cancelSignal, 'RPC operation deadline exceeded'); stats.ok++; return value; }
       catch (error) {
         if (!request.cancelSignal?.aborted) { stats.failed++; if (/429|rate.?limit/i.test(error.message)) metrics.upstream429++; else if (/403|401/.test(error.message)) metrics.denied++; else if (/timeout|timed out/i.test(error.message) || ['TimeoutError', 'AbortError'].includes(error.name)) metrics.timeouts++; }
         throw error;

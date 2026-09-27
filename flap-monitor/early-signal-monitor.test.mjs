@@ -40,6 +40,69 @@ test('discovery resumes after a failed address without repeating completed reque
   assert.equal(state.lastDiscoveryAt, nowMs + 60_000);
 });
 
+test('CoW hung body does not block the next address or accept a late order', async () => {
+  const state = createEarlySignalState(); let late;
+  const other = '0x' + '12'.repeat(20);
+  const config = { mode: 'external', sources: ['cow'], scheduledSource: true, wallets: [OWNER, other], safes: [], timeoutMs: 20 };
+  const fetchFn = async url => ({ ok: true, json: () => url.includes(OWNER)
+    ? new Promise(resolve => { late = resolve; }) : Promise.resolve([]) });
+  await runEarlySignalScan({ state, config, fetchFn, rpcBatch: async () => [], nowMs });
+  assert.match(state.health['cow:' + OWNER].lastError, /超时/);
+  assert.equal(state.health['cow:' + other].lastSuccessMs, nowMs);
+  late([{ uid: '0x' + 'ab'.repeat(56), owner: OWNER, buyToken: TOKEN, status: 'open', validTo: nowMs / 1000 + 600 }]);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(Object.keys(state.orders).length, 0);
+  await runEarlySignalScan({ state, config, fetchFn: async () => ({ ok: true, json: async () => [] }), rpcBatch: async () => [], nowMs: nowMs + 10000 });
+  assert.equal(state.health['cow:' + OWNER].lastError, '');
+});
+
+test('chain commit preserves in-progress discovery pagination for retry', async () => {
+  const state = createEarlySignalState(); let resume, count = 0;
+  const discovery = scanAddressDiscovery(state, { timeoutMs: 1000 }, async url => {
+    if (++count === 1) await new Promise(resolve => { resume = resolve; });
+    if (count === 2) throw new Error('temporary failure');
+    const address = url.match(/\/safes\/(0x[0-9a-fA-F]+)\//)?.[1];
+    return { ok: true, json: async () => ({ address, owners: [], modules: [], threshold: 1 }) };
+  }, nowMs);
+  while (!resume) await new Promise(resolve => setImmediate(resolve));
+  const progress = state.discoveryProgress;
+  const rpc = async calls => calls.map(c => ({ eth_chainId: '0x38', eth_blockNumber: '0x65', eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] })[c.method]);
+  await scanEarlyChain(state, { realtime: true, nativeTransactions: false }, rpc, nowMs);
+  assert.equal(state.discoveryProgress, progress);
+  resume(); await assert.rejects(discovery, /temporary failure/);
+  assert.equal(state.discoveryProgress.safes.length, 1);
+});
+
+test('a later chain commit cannot overwrite pool evidence learned during RPC awaits', async () => {
+  const state = createEarlySignalState(); state.cursor = 99;
+  state.pools[POOL] = { address: POOL, tokens: [TOKEN, OWNER], officialOperation: false };
+  let blockReads = 0;
+  const rpc = async calls => calls.map(c => {
+    if (c.method === 'eth_getBlockByNumber' && ++blockReads === 2) state.pools[POOL].officialOperation = true;
+    return { eth_chainId: '0x38', eth_blockNumber: '0x65', eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] }[c.method];
+  });
+  await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
+  assert.equal(state.pools[POOL].officialOperation, true);
+});
+
+test('replayed pool creation retains verified official liquidity evidence', () => {
+  const state = createEarlySignalState();
+  state.pools[POOL] = { address: POOL, tokens: [TOKEN, OWNER], officialOperation: true, verified: true };
+  const pair = log(DEX.v2Factory, [TOPICS.PairCreated, topic(TOKEN), topic(OWNER)], '0x' + word(POOL) + word(1));
+  decodeEarlyReceipt({ ...receipt([pair]), from: '0x' + '12'.repeat(20) }, state, { nowMs });
+  assert.equal(state.pools[POOL].officialOperation, true);
+  assert.equal(state.pools[POOL].verified, true);
+});
+
+test('outbox capacity must fail an incoming transfer scan instead of silently skipping it', () => {
+  const state = createEarlySignalState();
+  state.pendingChanges = Array.from({ length: 2000 }, (_, id) => ({ id: String(id) }));
+  const stranger = '0x' + '12'.repeat(20);
+  const transfer = log(TOKEN, [TOPICS.Transfer, topic(stranger), topic(OWNER)], '0x' + word(1));
+  assert.throws(() => decodeEarlyReceipt({ ...receipt([transfer]), from: stranger }, state, { nowMs }), /通知积压/);
+  assert.equal(Object.keys(state.events).length, 0);
+});
+
 test('discovery uses the credential pool and shares account cooldowns with proposals', async () => {
   const state = createEarlySignalState(), safeState = {}, headers = [];
   const fetchFn = async (_url, options) => {

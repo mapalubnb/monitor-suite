@@ -27,6 +27,44 @@ test("conditional page fetch reuses a 304 body and never caches a region error",
   assert.equal(cache.get(url).body, body);
 });
 
+test('metadata API body timeout still returns successful on-chain metadata', async () => {
+  const token = '0x' + 'ab'.repeat(20);
+  const result = await __testables.resolveFactoryPoolTokenMetadata([token], {
+    timeoutMs: 20,
+    fetchFn: async () => ({ ok: true, json: () => new Promise(() => {}) }),
+    rpcBatchFn: async () => ['0x' + Buffer.from('Token').toString('hex').padEnd(64, '0'), '0x' + Buffer.from('TOK').toString('hex').padEnd(64, '0'), '0x' + (18).toString(16).padStart(64, '0')],
+  });
+  assert.equal(result.metadata[token].name, 'Token');
+  assert.match(result.errors.join(), /超时/);
+});
+
+test('one HTTP 429 records one provider failure', async () => {
+  const original = globalThis.fetch, pools = __testables.CONFIG.rpcPools;
+  __testables.CONFIG.rpcPools = { read: ['https://single-quota.test'] };
+  __testables.resetBscRpcHealth();
+  const before = __testables.rpcControl.summary().failures;
+  globalThis.fetch = async () => ({ ok: false, status: 429, headers: new Headers(), body: { cancel: async () => {} } });
+  try {
+    await assert.rejects(__testables.bscRpcCall('eth_getCode', ['0x1', 'latest']), /429/);
+    assert.equal(__testables.rpcControl.summary().failures - before, 1);
+  } finally { globalThis.fetch = original; __testables.CONFIG.rpcPools = pools; __testables.resetBscRpcHealth(); }
+});
+
+test('RPC body returned after its deadline cannot quarantine a provider', async () => {
+  const original = globalThis.fetch, pools = __testables.CONFIG.rpcPools, timeout = __testables.CONFIG.factoryPoolMonitor.rpcTimeoutMs;
+  __testables.CONFIG.rpcPools = { read: ['https://late-quota.test'] };
+  __testables.CONFIG.factoryPoolMonitor.rpcTimeoutMs = 20;
+  __testables.resetBscRpcHealth(); let finish;
+  const before = __testables.rpcControl.summary().failures;
+  globalThis.fetch = async () => ({ ok: true, json: () => new Promise(resolve => { finish = resolve; }) });
+  try {
+    await assert.rejects(__testables.bscRpcCall('eth_getCode', ['0x1', 'latest']), /deadline/);
+    finish({ error: { message: 'rate limit' } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(__testables.rpcControl.summary().failures, before);
+  } finally { globalThis.fetch = original; __testables.CONFIG.rpcPools = pools; __testables.CONFIG.factoryPoolMonitor.rpcTimeoutMs = timeout; __testables.resetBscRpcHealth(); }
+});
+
 test("independent registry triggers serialize and retain cursor on delivery failure", async () => {
   const address = "0x1111111111111111111111111111111111111111";
   const snapshot = { registryMonitor: { lastBlock: 90, knownVaults: {} } };

@@ -34,6 +34,37 @@ const SAFE_TX_HASH = `0x${"97".repeat(32)}`;
 const AWDH = JSON.parse(readFileSync(new URL("./fixtures/safe-awdh-proposal.json", import.meta.url), "utf8"));
 const MULTISEND = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
 
+test('Safe request and response body deadlines finish even when fetch ignores abort', async () => {
+  for (const fetchFn of [() => new Promise(() => {}), async () => ({ ok: true, json: () => new Promise(() => {}) })]) {
+    await assert.rejects(fetchSafeProposals({ safe: SAFE, nonce: 0, timeoutMs: 20, fetchFn }), error => error.name === 'TimeoutError');
+  }
+});
+
+test('late Safe response cannot overwrite quota state after cancellation', async () => {
+  const state = {}; let resolve;
+  const controller = new AbortController();
+  const fetchFn = createSafeRateLimitedFetch(state, () => new Promise(r => { resolve = r; }));
+  const pending = fetchFn('https://safe.test', { signal: controller.signal });
+  controller.abort();
+  resolve({ ok: true, status: 200, headers: new Headers({ 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '3600' }) });
+  await assert.rejects(pending);
+  assert.equal(state.apiQuota, undefined);
+  assert.equal(state.apiNextAttemptAtMs, undefined);
+});
+
+test('a hung Safe account preserves its network cooldown and prevents late quota writes', async () => {
+  const state = {}; let finish;
+  const fetchFn = createSafeApiPoolFetch(state, () => new Promise(resolve => { finish = resolve; }), { apiKeys: ['test-key'], now: () => 1000 });
+  await assert.rejects(fetchSafeProposals({ safe: SAFE, nonce: 0, timeoutMs: 20, fetchFn }), /超时/);
+  await new Promise(resolve => setImmediate(resolve));
+  const account = Object.values(state.apiAccounts)[0];
+  assert.equal(account.apiNextAttemptAtMs, 31000);
+  finish({ ok: true, status: 200, headers: new Headers({ 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '3600' }) });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(account.apiQuota, undefined);
+  assert.equal(account.apiNextAttemptAtMs, 31000);
+});
+
 test('Safe API keys normalize duplicates and preserve legacy fallback', () => {
   assert.deepEqual(normalizeSafeApiKeys(' a, b, a\n c '), ['a', 'b', 'c']);
   assert.deepEqual(normalizeSafeApiKeys('', 'legacy'), ['legacy']);

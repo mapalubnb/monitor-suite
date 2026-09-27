@@ -128,6 +128,7 @@ if [ "$CURRENT_DIR" != "$SUITE_DIR" ]; then
   cp shared/transactional-outbox.mjs "$SHARED_DIR/"
   cp shared/snapshot-store.cjs "$SHARED_DIR/"
   cp shared/rpc-control.mjs "$SHARED_DIR/"
+  cp shared/request-deadline.mjs "$SHARED_DIR/"
   cp shared/rpc-budget.mjs "$SHARED_DIR/"
   cp shared/startup-notifier.mjs "$SHARED_DIR/"
   cp shared/scan-recovery.mjs "$SHARED_DIR/"
@@ -633,6 +634,16 @@ if [ -f "$SNAP" ]; then
     if(fp.realtimeError??fp.lastError)health.push(warn('Factory 实时扫描异常'));
     if(typeof headLag==='number'&&headLag>20)health.push(warn('Factory 延迟 '+headLag+' 块'));
     for(const [name,h] of Object.entries(es.health||{}))if(h.lastError)health.push(warn('提前信号 '+name+' 异常'));
+    const jobLabels={cow:'CoW 订单',assets:'资产配置',positions:'LP 仓位',balances:'余额',discovery:'Safe 关联发现',earlyRealtime:'提前信号实时扫描',earlyHistory:'提前信号历史补扫',earlyFast:'快速回执',registry:'金库实时扫描',registryHistory:'金库历史补扫'};
+    const jobWarnings=[];
+    for(const [name,job] of Object.entries(runtime.jobs||{})){
+      if(job.stopped||!job.lastStartedAtMs)continue;
+      const since=job.running?job.lastStartedAtMs:job.lastFinishedAtMs;
+      const limit=Math.max(name==='discovery'?600000:name==='cow'?120000:60000,3*(job.intervalMs||0));
+      if(since&&Date.now()-since>limit)jobWarnings.push((jobLabels[name]||name)+'已 '+Math.floor((Date.now()-since)/1000)+' 秒'+(job.running?'未完成':'未调度'));
+    }
+    for(const message of jobWarnings)health.push(warn(message));
+    if(runtime.updatedAt&&Date.now()-Date.parse(runtime.updatedAt)>60000)health.push(warn('运行指标已停止更新'));
     section('02｜📊 监控概览');
     console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
     console.log('覆盖：页面 '+keys.length+' · 资源 '+totalAssets+' · 金库工厂 '+factoryItems.length+' · 链上金库 '+knownVaults.length);
@@ -701,6 +712,10 @@ if [ -f "$SNAP" ]; then
     section('07｜🔎 底池提前信号');
     console.log('实时扫描：'+(es.realtimeCursor??'未建立')+' · 最新 '+(es.latestBlock??'未知')+' · 候选资产 '+Object.keys(es.tokens||{}).length+' · 待推送 '+(es.pendingChanges||[]).length);
     console.log('历史补扫：'+(es.cursor??'未建立')+' / '+(es.historyEndBlock??'未知')+' · 待补 '+gaps(es.realtimeGaps));
+    const cowHealth=Object.entries(es.health||{}).filter(([name])=>name.startsWith('cow:')).map(([,h])=>h);
+    const cowTimes=cowHealth.map(h=>Date.parse(h.lastSuccessAt||'')).filter(Number.isFinite);
+    if(cowHealth.length)console.log('CoW 订单：'+cowHealth.length+' 个地址｜最近成功范围 '+(cowTimes.length?fmtTime(Math.min(...cowTimes))+' — '+fmtTime(Math.max(...cowTimes)):'暂无'));
+    for(const message of jobWarnings)console.log(warn('⚠️ '+message));
     for(const [name,h] of Object.entries(es.health||{}))if(h.lastError)error(name,h.lastError+(h.nextAttemptAtMs>0?'；重试 '+fmtTime(h.nextAttemptAtMs):'；等待下轮检测'));
     console.log('---');
     console.log('更新时间：'+fmtTime(new Date()));

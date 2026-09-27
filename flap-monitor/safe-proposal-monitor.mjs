@@ -1,3 +1,4 @@
+import { withDeadline } from '../shared/request-deadline.mjs';
 import { formatBeijingTime } from "../shared/display-format.cjs";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from 'node:timers/promises';
@@ -375,29 +376,27 @@ export async function fetchSafeProposals({
 }
 
 async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
-  await fetchFn.waitForTurn?.();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
+  await withDeadline(() => fetchFn.waitForTurn?.(), timeoutMs + 5000, undefined, 'Safe API 排队超时');
+  return withDeadline(async signal => {
     const response = await fetchFn(url, {
       headers: {
         Accept: "application/json",
         ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
       },
-      signal: controller.signal,
+      signal,
     });
+    signal.throwIfAborted();
     if (!response?.ok) {
       const status = response?.status || "unknown";
       const suffix = status === 422 ? "（Safe 地址必须使用 EIP-55 校验和格式）" : "";
       const quotaExhausted = response?.headers?.get?.('x-ratelimit-remaining') === '0';
       const error = new Error(`Safe API HTTP ${status}${suffix}${quotaExhausted ? '（账户月度额度已耗尽）' : ''}`);
       error.retryAfterMs = retryAfterMilliseconds(response);
+      await response?.body?.cancel?.();
       throw error;
     }
     return await response.json();
-  } finally {
-    clearTimeout(timer);
-  }
+  }, timeoutMs, undefined, 'Safe API 请求或响应体读取超时');
 }
 
 export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, now = Date.now,
@@ -405,7 +404,9 @@ export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, 
   // Discard legacy monthly pacing while preserving server-imposed cooldowns.
   state.apiRequestNextAt = Math.min(state.apiRequestNextAt || 0, now() + intervalMs);
   const guarded = async (...args) => {
+    args[1]?.signal?.throwIfAborted();
     const response = await fetchFn(...args);
+    args[1]?.signal?.throwIfAborted();
     const headerNumber = key => {
       const raw = response.headers?.get?.(key);
       return raw !== null && raw !== undefined && Number.isFinite(Number(raw)) ? Number(raw) : null;
@@ -488,6 +489,7 @@ export function createSafeApiPoolFetch(state, fetchFn, { apiKeys, apiBaseUrl = D
   const guarded = async (url, options = {}) => {
     const tried = new Set();
     while (tried.size < accounts.length) {
+      options.signal?.throwIfAborted();
       const start = (state.apiAccountCursor || 0) % accounts.length;
       const account = [...accounts.slice(start), ...accounts.slice(0, start)]
         .find(item => !tried.has(item.id) && dueAt(item) <= now());
@@ -497,9 +499,12 @@ export function createSafeApiPoolFetch(state, fetchFn, { apiKeys, apiBaseUrl = D
       state.apiAccountCursor = accounts.indexOf(account);
       try {
         await account.fetch.waitForTurn();
+        options.signal?.throwIfAborted();
         const headers = new Headers(options.headers);
         headers.set('Authorization', `Bearer ${account.key}`);
-        const response = await account.fetch(url, {...options, headers});
+        // Keep the caller's signal on the Response body after headers arrive.
+        const response = await withDeadline(() => account.fetch(url, {...options, headers}),
+          30_000, options.signal, 'Safe API 请求超时');
         account.health.lastStatus = response.status;
         account.health.lastAttemptAt = new Date(now()).toISOString();
         if ([401, 403].includes(response.status)) account.health.apiNextAttemptAtMs = now() + 30 * 60_000;
@@ -508,7 +513,7 @@ export function createSafeApiPoolFetch(state, fetchFn, { apiKeys, apiBaseUrl = D
         const retryable = [401, 403, 429].includes(response.status) || response.status >= 500;
         if (!retryable || !accounts.some(item => !tried.has(item.id) && dueAt(item) <= now())) return response;
         await response.body?.cancel?.();
-      } catch {
+      } catch (error) {
         account.health.apiNextAttemptAtMs = Math.max(account.health.apiNextAttemptAtMs || 0, now() + 30_000);
         account.health.lastStatus = 'network_error';
         sync();

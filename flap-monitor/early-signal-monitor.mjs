@@ -1,3 +1,4 @@
+import { withDeadline } from '../shared/request-deadline.mjs';
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -87,7 +88,7 @@ export function acknowledgeEarlySignals(state, ids) {
 function emit(state, event, { silent = false, nowMs = Date.now() } = {}) {
   const id = event.id || hash(JSON.stringify(event));
   if (state.events[id]) return false;
-  if (!silent && state.pendingChanges.length >= MAX_PENDING) throw new Error("提前信号通知积压达到上限，停止推进以免丢失");
+  if (!silent && state.pendingChanges.length >= MAX_PENDING) throw Object.assign(new Error("提前信号通知积压达到上限，停止推进以免丢失"), { earlyOutboxFull: true });
   const record = { ...event, id, observedAt: iso(nowMs) };
   state.events[id] = record;
   if (!silent) state.pendingChanges.push(record);
@@ -189,7 +190,7 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
       const offset = pool.poolId ? 2 : 1;
       pool.tokens = [addressTopic(l.topics[offset]), addressTopic(l.topics[offset + 1])];
       pool.blockNumber = Number(l.blockNumber || receipt.blockNumber);
-      if (related) pool.officialOperation = true;
+      pool = { ...state.pools[pool.address], ...pool, officialOperation: Boolean(related || state.pools[pool.address]?.officialOperation) };
       if (!poolSignalTokens(pool).length) {
         // A bounded discovery cache is useful when a token is observed shortly afterwards.
         // Cached unrelated pools must never enter active liquidity subscriptions.
@@ -202,7 +203,7 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         trackToken(state, token, "已核验 DEX 建池", nowMs);
         add(l, { kind: "poolCreated", token, stage: "observation", detail: `${pool.protocol} 建池/初始化｜${pool.address}` });
       }
-    } catch (error) { if (related) add(l, { kind: "decodeError", detail: `${a} ${t}：${error.message}（保留原始日志）`, raw: l }); }
+    } catch (error) { if (error.earlyOutboxFull) throw error; if (related) add(l, { kind: "decodeError", detail: `${a} ${t}：${error.message}（保留原始日志）`, raw: l }); }
   }
   for (const l of logs) {
     const t = lower(l.topics?.[0]), a = lower(l.address);
@@ -271,21 +272,25 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         detail: `${pool.protocol} ${direction > 0 ? "增加" : "减少"}流动性｜${pool.address}`, raw: l,
         });
       }
-    } catch (error) { if (related) add(l, { kind: "decodeError", detail: `${a} ${t}：${error.message}`, raw: l }); }
+    } catch (error) { if (error.earlyOutboxFull) throw error; if (related) add(l, { kind: "decodeError", detail: `${a} ${t}：${error.message}`, raw: l }); }
   }
   return emitted;
 }
 
 async function jsonGet(url, { fetchFn = globalThis.fetch, timeoutMs = 5000, apiKey = "" } = {}) {
-  await fetchFn.waitForTurn?.();
-  const response = await fetchFn(url, { signal: AbortSignal.timeout(timeoutMs), headers: { Accept: "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) } });
-  if (!response.ok) {
-    const error = new Error(`HTTP ${response.status} (${new URL(url).hostname})`);
-    const raw = response.headers?.get?.("retry-after");
-    error.retryAfterMs = Number.isFinite(Number(raw)) ? Number(raw) * 1000 : Math.max(0, Date.parse(raw) - Date.now()) || 0;
-    throw error;
-  }
-  return response.json();
+  await withDeadline(() => fetchFn.waitForTurn?.(), timeoutMs + 5000, undefined, 'API 排队超时');
+  return withDeadline(async signal => {
+    const response = await fetchFn(url, { signal, headers: { Accept: "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) } });
+    signal.throwIfAborted();
+    if (!response.ok) {
+      const error = new Error(`HTTP ${response.status} (${new URL(url).hostname})`);
+      const raw = response.headers?.get?.("retry-after");
+      error.retryAfterMs = Number.isFinite(Number(raw)) ? Number(raw) * 1000 : Math.max(0, Date.parse(raw) - Date.now()) || 0;
+      await response.body?.cancel?.();
+      throw error;
+    }
+    return await response.json();
+  }, timeoutMs, undefined, 'API 请求或响应体读取超时');
 }
 async function sourcePass(state, name, fn, nowMs, intervalMs = 0) {
   const health = state.health[name] ||= {};
@@ -572,7 +577,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   if ((state.reorgRevision || 0) !== reorgRevision) throw new Error("并发快速通道检测到重组，保留游标重试");
   // Commit a complete window atomically in memory. Any malformed response leaves the old cursor intact.
   const draft = structuredClone(state);
-  Object.assign(draft.pools, resolved.pools);
+  for (const [address, pool] of Object.entries(resolved.pools)) draft.pools[address] ||= pool;
   for (const receipt of receipts.sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber) || Number(a.transactionIndex) - Number(b.transactionIndex))) {
     const tx = transactionMap.get(lower(receipt.transactionHash));
     decodeEarlyReceipt(receipt, draft, { config, nowMs, silent: bootstrap, transaction: tx });
@@ -587,7 +592,9 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   draft.chainBaselineAt ||= iso(nowMs);
   for (const block of Object.keys(draft.fastBlocks || {})) if (Number(block) <= to) delete draft.fastBlocks[block];
   // Source health entries can be held by a concurrent API pass across an await.
-  Object.assign(state, draft, { health: state.health });
+  // An API pass can hold its pagination progress across an await. Do not
+  // replace that live object with the chain transaction's cloned copy.
+  Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress });
 }
 
 async function validateFastBlocks(state, head, rpcBatch, nowMs) {
@@ -626,11 +633,12 @@ export async function processEarlyReceiptHints(state, hints, config, rpcBatch, n
     if (lower(check.hash) !== lower(receipt.blockHash)) continue;
     if ((state.reorgRevision || 0) !== reorgRevision) continue;
     const draft = structuredClone(state);
-    Object.assign(draft.pools, resolved.pools);
+    for (const [address, pool] of Object.entries(resolved.pools)) draft.pools[address] ||= pool;
     const events = decodeEarlyReceipt(receipt, draft, { config, nowMs });
     draft.fastBlocks ||= {};
     if (Number(receipt.blockNumber) > (state.realtimeCursor ?? state.cursor ?? 0)) draft.fastBlocks[Number(receipt.blockNumber)] = lower(receipt.blockHash);
-    Object.assign(state, draft, { health: state.health });
+    // Preserve live API progress across the synchronous chain commit.
+    Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress });
     for (const event of events) if (event.token) tokens.add(event.token);
     processed.push(hint.transactionHash);
   }

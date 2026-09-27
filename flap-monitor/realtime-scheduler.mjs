@@ -1,6 +1,7 @@
 // One in-flight run per job. Wakes during a run are coalesced, never discarded.
 export function createWakeableJob({ run, intervalMs, onError = () => {}, setTimer = setTimeout, clearTimer = clearTimeout }) {
   let timer = null, running = null, dirty = false, stopped = false;
+  const health = { intervalMs, runs: 0, lastStartedAtMs: 0, lastFinishedAtMs: 0, lastError: '' };
   function arm(delay) {
     if (stopped) return;
     if (timer !== null) clearTimer(timer);
@@ -11,7 +12,13 @@ export function createWakeableJob({ run, intervalMs, onError = () => {}, setTime
     if (running) { dirty = true; return running; }
     if (timer !== null) { clearTimer(timer); timer = null; }
     const started = Date.now();
-    running = Promise.resolve().then(run).catch(onError).finally(() => {
+    health.lastStartedAtMs = started;
+    health.runs++;
+    running = Promise.resolve().then(run).then(() => { health.lastError = ''; }).catch(error => {
+      health.lastError = error.message;
+      onError(error);
+    }).finally(() => {
+      health.lastFinishedAtMs = Date.now();
       running = null;
       const delay = dirty ? 0 : Math.max(0, intervalMs - (Date.now() - started));
       dirty = false;
@@ -19,7 +26,7 @@ export function createWakeableJob({ run, intervalMs, onError = () => {}, setTime
     });
     return running;
   }
-  return { wake, start: () => { void wake(); }, stop: async () => {
+  return { wake, snapshot: () => ({ ...health, running: !!running, stopped }), start: () => { void wake(); }, stop: async () => {
     stopped = true;
     if (timer !== null) clearTimer(timer);
     if (running) await running;

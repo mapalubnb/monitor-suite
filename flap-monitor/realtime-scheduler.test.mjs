@@ -31,6 +31,19 @@ test("slow external job cannot block independent asset checks", async () => {
   await Promise.all([slow.stop(), assets.stop()]);
 });
 
+test('job health exposes a pending run and records completion without changing interval', async () => {
+  let finish;
+  const job = createWakeableJob({ intervalMs: 10000, run: () => new Promise(resolve => { finish = resolve; }) });
+  const pending = job.wake(); await Promise.resolve();
+  assert.equal(job.snapshot().running, true);
+  assert.equal(job.snapshot().lastFinishedAtMs, 0);
+  assert.equal(job.snapshot().intervalMs, 10000);
+  finish(); await pending;
+  assert.equal(job.snapshot().running, false);
+  assert.ok(job.snapshot().lastFinishedAtMs >= job.snapshot().lastStartedAtMs);
+  await job.stop(); assert.equal(job.snapshot().stopped, true);
+});
+
 test("subscription updates keep unchanged feeds and stop obsolete pool filters", () => {
   const created = [], stopped = [];
   const feeds = createSubscriptionSet(filter => ({ start() { created.push(filter); return this; }, stop() { stopped.push(filter); } }));

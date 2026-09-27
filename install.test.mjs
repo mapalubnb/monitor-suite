@@ -46,7 +46,7 @@ function renderFourmemeStatus(snapshot) {
   }
 }
 
-function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safeProposalState = {}, earlyState = {}) {
+function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safeProposalState = {}, earlyState = {}, runtime = {}) {
   const source = extractHeredoc("fl-status");
   const script = extractNodeEvalScripts(source).find(item => item.includes("vaultLink"));
   assert.ok(script, "未找到 Flap 快照状态渲染器");
@@ -62,6 +62,7 @@ function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safe
     writeFileSync(integrityStatePath, JSON.stringify(integrityState), "utf-8");
     writeFileSync(safeProposalStatePath, JSON.stringify(safeProposalState), "utf-8");
     writeFileSync(earlyStatePath, JSON.stringify(earlyState), "utf-8");
+    writeFileSync(join(dir, "runtime-metrics.json"), JSON.stringify(runtime), "utf-8");
     const runnable = script
       .replaceAll("'$SNAP'", JSON.stringify(snapshotPath))
       .replaceAll("'$FACTORY_STATE'", JSON.stringify(factoryStatePath))
@@ -328,6 +329,18 @@ test("Flap status resolves its own early state and exposes lag and source errors
   const text = renderFlapStatus({pages:{}}, {}, {}, {}, {cursor:123, latestBlock:130, tokens:{one:{}}, pendingChanges:[{}], health:{chain:{lastError:"RPC 限流",nextAttemptAtMs:1}}});
   assert.match(text, /已扫|扫描区块：123/);
   assert.match(text, /RPC 限流/);
+});
+
+test('Flap status reports a hung CoW job but does not call daily discovery stale', () => {
+  const now = Date.now();
+  const text = renderFlapStatus({ pages: {} }, {}, {}, {}, {
+    health: { discovery: { lastSuccessAt: new Date(now - 3600000).toISOString() } },
+  }, { updatedAt: new Date(now).toISOString(), jobs: {
+    cow: { running: true, intervalMs: 10000, lastStartedAtMs: now - 180000 },
+    discovery: { running: false, intervalMs: 60000, lastStartedAtMs: now - 1000, lastFinishedAtMs: now - 1000 },
+  } });
+  assert.match(text, /CoW 订单已 180 秒未完成/);
+  assert.doesNotMatch(text, /Safe 关联发现已/);
 });
 
 
