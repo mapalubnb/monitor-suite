@@ -548,6 +548,7 @@ async function fetchRangeLogs(rpcCall, proxy, fromBlock, toBlock, topics) {
   if (fromBlock > toBlock) return { logs: [], toBlock };
   let end = toBlock;
   let lastError;
+  let headRetries = 0;
   while (end >= fromBlock) {
     try {
       const filter = {
@@ -560,6 +561,16 @@ async function fetchRangeLogs(rpcCall, proxy, fromBlock, toBlock, topics) {
       return { logs: logs || [], toBlock: end };
     } catch (error) {
       lastError = error;
+      // A log node may trail the independent head provider. Only acknowledge
+      // the smaller range after actually querying it; leave its tail pending.
+      if (Number.isSafeInteger(error.availableHead) && error.availableHead >= fromBlock && error.availableHead < end) {
+        end = error.availableHead;
+        continue;
+      }
+      if (error.rpcHeadLag && end > fromBlock && headRetries++ < 2) {
+        end--;
+        continue;
+      }
       if (!/maximum block range|exceed.*range|range.*limit|response too large|too many results/i.test(error.message)) throw error;
       if (end === fromBlock) break;
       end = fromBlock + Math.floor((end - fromBlock) / 2);

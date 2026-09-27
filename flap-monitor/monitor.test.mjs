@@ -855,6 +855,15 @@ test("parallel Factory WSS feeds subscribe together and queue duplicate logs onc
   assert.equal(healthSnapshots.at(-1).subscribedCount, 0);
   await new Promise(resolve => setTimeout(resolve, 5));
   assert.equal(FakeWebSocket.instances.length, 4);
+  for (const socket of FakeWebSocket.instances.slice(2)) {
+    socket.emit('open');
+    socket.emit('message', JSON.stringify({id: 1, result: 'reconnected-' + socket.url}));
+  }
+  assert.equal(feed.snapshot().subscribedCount, 2);
+  FakeWebSocket.instances[0].emit('close', 1013, 'late timeout');
+  FakeWebSocket.instances[0].emit('message', JSON.stringify({id: 1, result: 'stale-subscription'}));
+  assert.equal(feed.snapshot().status, 'healthy');
+  assert.equal(feed.snapshot().subscribedCount, 2);
   feed.stop();
 });
 
@@ -3413,9 +3422,9 @@ test('realtime empty logs check head while history accepts one provider', async(
  globalThis.fetch=async(url,opts)=>{const req=JSON.parse(opts.body);calls.push(req.method);return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x100':[]})};};
  try{
   assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://healthy.rpc']}),[]);
-  assert.deepEqual(calls,['eth_getLogs','eth_blockNumber']);
+  assert.deepEqual(calls,['eth_blockNumber','eth_getLogs']);
   assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://healthy.rpc'],history:true}),[]);
-  assert.deepEqual(calls,['eth_getLogs','eth_blockNumber','eth_getLogs']);
+  assert.deepEqual(calls,['eth_blockNumber','eth_getLogs','eth_getLogs']);
  }finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
 });
 
@@ -3435,6 +3444,59 @@ test('realtime empty logs reject a lagging provider and report provider names',a
  globalThis.fetch=async(url,opts)=>{const req=JSON.parse(opts.body);return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x60':[]})};};
  try{await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://lagging.rpc']}),/lagging.rpc: 节点尚未同步/);}
  finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
+});
+
+test('live logs avoid a lagging node before requesting logs and use a synced fallback', async () => {
+ const original=globalThis.fetch;__testables.resetBscRpcHealth();const calls=[];
+ globalThis.fetch=async(url,options)=>{const req=JSON.parse(options.body);calls.push([url,req.method]);return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?(url.includes('lag')?'0x63':'0x65'):[]})};};
+ try {
+  assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://lag.test','https://synced.test'],history:false}),[]);
+  assert.ok(!calls.some(([url,method])=>url.includes('lag')&&method==='eth_getLogs'));
+  assert.ok(calls.some(([url,method])=>url.includes('synced')&&method==='eth_getLogs'));
+ } finally {globalThis.fetch=original;__testables.resetBscRpcHealth();}
+});
+
+test('address-required log nodes are skipped for discovery without poisoning address filters', async () => {
+ const original=globalThis.fetch;__testables.resetBscRpcHealth();const calls=[];
+ globalThis.fetch=async(url,options)=>{const req=JSON.parse(options.body);calls.push(url);return {ok:true,json:async()=>url.includes('learn')&&!req.params[0].address?{error:{message:'Please specify an address in your request'}}:{result:[]}};};
+ const filter={fromBlock:'0x64',toBlock:'0x65',topics:['topic']};
+ try {
+  await __testables.executeBscGetLogsRequest([filter],{rpcUrls:['https://bsc.publicnode.com','https://good.test'],history:true});
+  assert.deepEqual(calls,['https://good.test']);
+  calls.length=0;
+  await __testables.executeBscGetLogsRequest([filter],{rpcUrls:['https://learn.test','https://good.test'],history:true});
+  assert.ok(calls.includes('https://learn.test'));
+  calls.length=0;
+  await assert.rejects(__testables.executeBscGetLogsRequest([filter],{rpcUrls:['https://learn.test'],history:true}),/不支持无合约地址/);
+  assert.equal(calls.length,0);
+  await __testables.executeBscGetLogsRequest([{...filter,address:FLAP_FACTORY_PROXY}],{rpcUrls:['https://learn.test'],history:true});
+  assert.deepEqual(calls,['https://learn.test']);
+ } finally {globalThis.fetch=original;__testables.resetBscRpcHealth();}
+});
+
+test('Factory only advances to a successfully queried log head and later catches its tail', async () => {
+ const original=globalThis.fetch;__testables.resetBscRpcHealth();let logHead=103;const ranges=[];
+ const state=createFactoryPoolState();const implementation='0x'+'1'.repeat(40);
+ Object.assign(state,{deploymentBlock:1,deploymentTxChecked:true,currentImplementation:implementation,lastScannedBlock:100,headLastScannedBlock:100});
+ // The provider's advertised head can itself be ahead of its log backend.
+ globalThis.fetch=async(_url,options)=>{const req=JSON.parse(options.body);if(req.method==='eth_blockNumber')return {ok:true,json:async()=>({result:'0x69'})};const end=Number(req.params[0].toBlock);ranges.push(end);return {ok:true,json:async()=>end>logHead?{error:{message:`block range extends beyond current head block: requested ${end}, head ${logHead}`}}:{result:[]}};};
+ const rpcCall=async(method,params)=>{
+  if(method==='eth_chainId')return '0x38';if(method==='eth_blockNumber')return '0x69';
+  if(method==='eth_getLogs')return __testables.executeBscGetLogsRequest(params,{history:false,rpcUrls:['https://head.test']});
+  if(method==='eth_getStorageAt')return '0x'+'0'.repeat(24)+implementation.slice(2);
+  if(method==='eth_getCode')return '0x6000';throw new Error('unexpected '+method);
+ };
+ try {
+  const options={state,rpcCall,config:{confirmations:0,scanCatchup:false,scanAssets:false}};
+  await runFactoryPoolScan(options);
+  assert.equal(state.headLastScannedBlock,103);
+  assert.equal(state.lastScannedBlock,103);
+  assert.deepEqual(ranges,[105,103]);
+  logHead=105;await new Promise(r=>setTimeout(r,550));
+  await runFactoryPoolScan(options);
+  assert.equal(state.headLastScannedBlock,105);
+  assert.equal(state.lastScannedBlock,105);
+ } finally {globalThis.fetch=original;__testables.resetBscRpcHealth();}
 });
 
 
@@ -3493,7 +3555,7 @@ test('read, realtime logs and historical logs use isolated pools', async () => {
     await __testables.bscRpcCall('eth_getCode', ['0x1', 'latest']);
     await __testables.bscRpcCall('eth_getLogs', [{ fromBlock: '0x64', toBlock: '0x65' }], { history: false });
     await __testables.bscRpcCall('eth_getLogs', [{ fromBlock: '0x64', toBlock: '0x65' }], { history: true });
-    assert.deepEqual(calls, [['https://blocks.test','eth_blockNumber'], ['https://read.test','eth_getCode'], ['https://live.test','eth_getLogs'], ['https://live.test','eth_blockNumber'], ['https://history-a.test','eth_getLogs']]);
+    assert.deepEqual(calls, [['https://blocks.test','eth_blockNumber'], ['https://read.test','eth_getCode'], ['https://live.test','eth_blockNumber'], ['https://live.test','eth_getLogs'], ['https://history-a.test','eth_getLogs']]);
   } finally { globalThis.fetch = original; __testables.CONFIG.rpcPools = pools; __testables.resetBscRpcHealth(); }
 });
 

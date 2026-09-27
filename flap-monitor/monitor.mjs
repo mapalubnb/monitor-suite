@@ -2706,6 +2706,7 @@ function resetBscRpcHealth() {
   logRpcCooldowns.clear();
   logRpcProviderCooldowns.clear();
   logRpcHeads.clear();
+  logRpcAddressRequired.clear();
   rpcControl.reset();
 }
 
@@ -2725,6 +2726,17 @@ function dedupeBscLogs(logs = []) {
 const logRpcCooldowns = new Map();
 const logRpcProviderCooldowns = new Map();
 const logRpcHeads = new Map();
+const logRpcAddressRequired = new Map();
+
+async function logNodeHead(url, timeoutMs) {
+  const json = await rpcControl.coalesce('head:' + url,
+    () => fetchRpcJson(url, { jsonrpc: '2.0', id: 2, method: 'eth_blockNumber', params: [] }, timeoutMs), 100);
+  if (json.error || !/^0x[0-9a-f]+$/i.test(json.result || '')) throw new Error('节点高度校验失败');
+  const head = Number(json.result);
+  if (!Number.isSafeInteger(head)) throw new Error('节点高度校验失败');
+  logRpcHeads.set(url, { head, at: Date.now() });
+  return head;
+}
 let activeLogRequests = 0, activeHistoryLogRequests = 0;
 const logRequestWaiters = [];
 let liveLogTurns = 0;
@@ -2792,13 +2804,20 @@ async function queryBscLogs(params, options) {
     ...(process.env.FLAP_LOG_RPC_URLS || "https://fast.bsc-rpc.com,https://bsc.publicnode.com").split(",").map(s => s.trim()).filter(Boolean),
     ...CONFIG.bscRpcUrls,
   ])]);
-  const errors = [];
+  const errors = [], availableHeads = [];
+  let headLag = false;
   const timeoutMs = Math.max(4000, bscRpcTimeoutMs("eth_getLogs", params));
   const healthKey = history + ':' + JSON.stringify(urls) + (history.endsWith(':history') ? ':' + Math.floor(Number(params[0]?.fromBlock || 0) / 8192) : '');
   for (const index of orderedBscRpcIndexes(healthKey, urls)) {
     const url = urls[index];
     const from = Number(params[0]?.fromBlock || 0), to = Number(params[0]?.toBlock || 0);
     const host = new URL(url).hostname;
+    const hasAddress = Array.isArray(params[0]?.address) ? params[0].address.length > 0 : Boolean(params[0]?.address);
+    const publicAddressRequired = (host === 'publicnode.com' || host.endsWith('.publicnode.com')) && new URL(url).pathname === '/';
+    if (!hasAddress && (publicAddressRequired || logRpcAddressRequired.get(url) > Date.now())) {
+      errors.push(host + ': 不支持无合约地址的日志查询');
+      continue;
+    }
     const sharedCooling = rpcControl.cooldown(url, { payload: { method: 'eth_getLogs' }, history: history.endsWith(':history') });
     if (sharedCooling) { errors.push(host + ": " + sharedCooling.reason); continue; }
     // Pruned archives and unsupported wide windows must not quarantine current blocks.
@@ -2810,9 +2829,19 @@ async function queryBscLogs(params, options) {
       .find(entry => entry?.until > Date.now());
     if (providerCooling?.until > Date.now()) { errors.push(providerCooling.message); continue; }
     const cooling = logRpcCooldowns.get(key);
-    if (cooling?.until > Date.now()) { errors.push(cooling.message); continue; }
+    if (cooling?.until > Date.now() && !(Number.isSafeInteger(cooling.availableHead) && cooling.availableHead >= to)) {
+      errors.push(cooling.message);
+      headLag ||= Boolean(cooling.headLag);
+      if (Number.isSafeInteger(cooling.availableHead)) availableHeads.push(cooling.availableHead);
+      continue;
+    }
     try {
       const startedAt = Date.now();
+      if (history.endsWith(':realtime') && Number.isSafeInteger(to) && to > 0) {
+        const cached = logRpcHeads.get(url);
+        const head = cached && cached.head >= to && Date.now() - cached.at < 10_000 ? cached.head : await logNodeHead(url, timeoutMs);
+        if (head < to) throw Object.assign(new Error(`节点尚未同步到查询高度 ${to}，当前 ${head}`), { availableHead: head });
+      }
       const json = await fetchRpcJson(url, { jsonrpc: "2.0", id: 1, method: "eth_getLogs", params }, timeoutMs, undefined, history.endsWith(':history'));
       if (json?.error) throw new Error(json.error.message || "RPC error");
       if (!Array.isArray(json?.result)) throw new Error("eth_getLogs 返回非数组");
@@ -2820,28 +2849,33 @@ async function queryBscLogs(params, options) {
       updateBscRpcHealth(healthKey, index, Date.now() - startedAt);
       logRpcCooldowns.delete(key);
       if (logs.length) return logs;
-      if (history === "eth_getLogs:realtime" && Number.isSafeInteger(to) && to > 0) {
-        let cached = logRpcHeads.get(url);
-        if (!cached || cached.head < to || Date.now() - cached.at > 10_000) {
-          const headJson = await rpcControl.coalesce("head:" + url,
-            () => fetchRpcJson(url, { jsonrpc: "2.0", id: 2, method: "eth_blockNumber", params: [] }, timeoutMs), 100);
-          if (headJson.error || !/^0x[0-9a-f]+$/i.test(headJson.result || "")) throw new Error("节点高度校验失败");
-          cached = { head: Number(headJson.result), at: Date.now() };
-          logRpcHeads.set(url, cached);
-        }
-        if (cached.head < to) throw new Error(`节点尚未同步到查询高度 ${to}，当前 ${cached.head}`);
-        return [];
-      }
       // Historical empty results use the same single-success policy as nonempty logs.
       return [];
     } catch (error) {
       const message = `${host}: ${error.message}`;
       errors.push(message);
       if (error.rpcBudget) continue;
-      const lagging = /尚未同步|invalid block range/i.test(error.message) || (history.endsWith(':realtime') && /header not found/i.test(error.message));
+      if (!hasAddress && /specify an address|address.*required/i.test(error.message)) {
+        logRpcAddressRequired.set(url, Date.now() + 1800_000);
+        if (logRpcAddressRequired.size > 64) for (const [node, until] of logRpcAddressRequired) if (until <= Date.now()) logRpcAddressRequired.delete(node);
+        continue;
+      }
+      const lagging = history.endsWith(':realtime') && /尚未同步|invalid block range|beyond current head|header not found/i.test(error.message);
+      headLag ||= lagging;
+      if (lagging && !Number.isSafeInteger(error.availableHead)) {
+        logRpcHeads.delete(url);
+        const reported = error.message.match(/head(?: block)?[: ]+(\d+)/i);
+        if (reported) error.availableHead = Number(reported[1]);
+        else { try { error.availableHead = await logNodeHead(url, timeoutMs); } catch { /* Preserve original error and cursor. */ } }
+        // Head and log backends can differ behind one URL. Without an explicit
+        // lower log head, do not pretend reducing the end by one proves coverage.
+        if (!(error.availableHead < to)) delete error.availableHead;
+      }
+      if (Number.isSafeInteger(error.availableHead)) availableHeads.push(error.availableHead);
       const cooldown = lagging ? 500 : /403|401|archive|header not found|historical/i.test(error.message) ? 300_000 : 10_000;
       if (!lagging) updateBscRpcHealth(healthKey, index, 0, true);
-      logRpcCooldowns.set(key, { until: Date.now() + cooldown, message });
+      // A head-specific refusal must not block another end within this bucket.
+      if (!lagging || Number.isSafeInteger(error.availableHead)) logRpcCooldowns.set(key, { until: Date.now() + cooldown, message, availableHead: error.availableHead, headLag: lagging });
       if (/timeout|timed out/i.test(error.message)) logRpcProviderCooldowns.set(providerKey, { until: Date.now() + cooldown, message });
       if (!lagging && /HTTP (?:401|403|429)|usage limit|only serves recent|archive|historical|header not found/i.test(error.message)) {
         const scope = /only serves recent|archive|historical|header not found/i.test(error.message) ? archiveKey : providerKey;
@@ -2857,7 +2891,10 @@ async function queryBscLogs(params, options) {
     const right = await queryBscLogs([{ ...params[0], fromBlock: numberToHex(middle + 1) }], options);
     return dedupeBscLogs([...left, ...right]);
   }
-  throw new Error("eth_getLogs 无可用节点；" + [...new Set(errors)].join("；"));
+  const error = new Error("eth_getLogs 无可用节点；" + [...new Set(errors)].join("；"));
+  error.rpcHeadLag = headLag;
+  if (availableHeads.length) error.availableHead = Math.max(...availableHeads);
+  throw error;
 }
 
 async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null, validationKey = "default", options = {}) {
@@ -3887,6 +3924,7 @@ function createFactoryPoolWsFeed({
     endpoint.ws = ws;
     endpoint.subscriptionId = "";
     ws.on("open", () => {
+      if (endpoint.ws !== ws || stopped || endpoint.stopped) return;
       endpoint.awaitingPong = false;
       endpoint.status = "subscribing";
       endpoint.connectedAt = nowIso();
@@ -3902,6 +3940,7 @@ function createFactoryPoolWsFeed({
       }));
     });
     ws.on("message", raw => {
+      if (endpoint.ws !== ws || stopped || endpoint.stopped) return;
       endpoint.awaitingPong = false;
       let message;
       try { message = JSON.parse(String(raw)); } catch {
@@ -3948,6 +3987,7 @@ function createFactoryPoolWsFeed({
       });
     });
     ws.on("close", (code, reason) => {
+      if (endpoint.ws !== ws) return;
       if (endpoint.ws === ws) endpoint.ws = null;
       endpoint.subscriptionId = "";
       endpoint.status = "reconnecting";
@@ -3955,6 +3995,7 @@ function createFactoryPoolWsFeed({
       scheduleReconnect(endpoint, `close ${code}${reason ? ` ${reason}` : ""}`);
     });
     ws.on("error", error => {
+      if (endpoint.ws !== ws || stopped || endpoint.stopped) return;
       endpoint.status = "error";
       endpoint.lastError = error.message;
       endpoint.lastErrorAt = nowIso();
@@ -3962,7 +4003,7 @@ function createFactoryPoolWsFeed({
       logFn(`[${label}] ${safeUrl(endpoint.url)} 异常：${error.message}`);
       try { ws.terminate(); } catch { try { ws.close(); } catch {} }
     });
-    ws.on("pong", () => { endpoint.awaitingPong = false; });
+    ws.on("pong", () => { if (endpoint.ws === ws) endpoint.awaitingPong = false; });
   }
 
   function start() {
@@ -6880,10 +6921,10 @@ async function runCheck() {
 function safeProposalDisplay(state = {}) {
   const safeStates = Object.values(state.safes || {});
   const active = Object.values(state.proposals || {}).filter(proposal => ["pending", "ready", "confirming"].includes(proposal?.status));
-  const healthyCount = safeStates.filter(item => item?.baselineEstablished && !item?.lastError).length;
+  const healthyCount = safeStates.filter(item => item?.baselineEstablished && !item?.lastError && !item?.lastNonceError).length;
   const status = !CONFIG.safeProposalMonitor.enabled
     ? "未启用"
-    : safeStates.some(item => item?.lastError)
+    : safeStates.some(item => item?.lastError || item?.lastNonceError)
       ? "部分异常"
       : safeStates.every(item => item?.baselineEstablished)
         ? "运行正常"
@@ -6901,7 +6942,7 @@ function safeProposalDisplay(state = {}) {
       ? formatBeijingTime(state.lastSuccessAt)
       : "暂无",
     retryAt: retryAt ? formatBeijingTime(retryAt) : "暂无",
-    usingCache: safeStates.some(item => item?.lastError && item?.lastSuccessAt),
+    usingCache: safeStates.some(item => (item?.lastError || item?.lastNonceError) && item?.lastSuccessAt),
   };
 }
 

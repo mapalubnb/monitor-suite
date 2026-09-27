@@ -183,6 +183,7 @@ function createSafeStatus(address) {
     baselineEstablished: false,
     currentNonce: null,
     lastNonceAt: "",
+    lastNonceError: "",
     lastPollAt: "",
     lastSuccessAt: "",
     lastError: "",
@@ -622,7 +623,21 @@ export async function runSafeProposalScan({
     if (requestIntervalMs > 0) fetchFn = createSafeRateLimitedFetch(state, fetchFn, {intervalMs: requestIntervalMs});
   }
   const runAt = nowIso(nowMs);
-  const nonceResults = await rpcBatch(safeNonceCalls(normalizedSafes));
+  // Small, bounded-concurrency critical reads can use reserved capacity without
+  // demanding eight tokens at once. A failed chunk must not abort other Safes.
+  const nonceResults = [], nonceErrors = new Map();
+  const nonceCalls = safeNonceCalls(normalizedSafes);
+  for (let start = 0; start < nonceCalls.length; start += 4) {
+    await Promise.all([start, start + 2].filter(offset => offset < nonceCalls.length).map(async offset => {
+      const calls = nonceCalls.slice(offset, offset + 2);
+      try {
+        const values = await rpcBatch(calls, { critical: true });
+        for (let i = 0; i < calls.length; i++) nonceResults[offset + i] = values?.[i];
+      } catch (error) {
+        for (let i = 0; i < calls.length; i++) nonceErrors.set(normalizedSafes[offset + i], error.message);
+      }
+    }));
+  }
   const currentNonces = new Map(normalizedSafes.map((safe, index) => {
     try { return [safe, decodeUintWord(nonceResults[index])]; } catch { return [safe, null]; }
   }));
@@ -640,7 +655,13 @@ export async function runSafeProposalScan({
     const safeState = state.safes[safe] || createSafeStatus(safe);
     state.safes[safe] = safeState;
     const currentNonce = currentNonces.get(safe);
-    if (currentNonce === null) throw new Error("Safe nonce 读取失败，保留该 Safe 的上次快照");
+    if (currentNonce === null) {
+      safeState.lastNonceError = 'Safe nonce 读取失败：' + (nonceErrors.get(safe) || 'RPC 返回无效结果');
+      // RPC admission/transport failures are not Safe API failures. Retry nonce
+      // on the next unchanged poll, without backing off a healthy API account.
+      return { safe, skipped: true, currentNonce };
+    }
+    safeState.lastNonceError = '';
     safeState.currentNonce = currentNonce;
     safeState.lastNonceAt = runAt;
     if (!selected.has(safe) || state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs) return { safe, skipped: true, currentNonce };
@@ -810,7 +831,7 @@ export async function runSafeProposalScan({
   state.lastRunAt = runAt;
   if (successfulSafes > 0) state.lastSuccessAt = runAt;
   const safeErrors = normalizedSafes
-    .map(safe => state.safes[safe]?.lastError ? `${safe}: ${state.safes[safe].lastError}` : "")
+    .map(safe => [state.safes[safe]?.lastNonceError, state.safes[safe]?.lastError].filter(Boolean).map(error => `${safe}: ${error}`).join('；'))
     .filter(Boolean);
   state.lastError = [...new Set([...errors, ...safeErrors])].join("；");
   pruneProposalRecords(state);

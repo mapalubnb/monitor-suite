@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRpcBudget } from '../shared/rpc-budget.mjs';
 
 import {
   SAFE_MULTISEND_SELECTOR,
@@ -33,6 +34,57 @@ const OTHER = "0x1111111111111111111111111111111111111111";
 const SAFE_TX_HASH = `0x${"97".repeat(32)}`;
 const AWDH = JSON.parse(readFileSync(new URL("./fixtures/safe-awdh-proposal.json", import.meta.url), "utf8"));
 const MULTISEND = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
+
+test('Safe nonce admission uses small critical batches and isolates failure without API backoff', async () => {
+  const safes = Array.from({length: 8}, (_, i) => '0x' + (i + 1).toString(16).padStart(40, '0'));
+  const state = createSafeProposalState(safes);
+  let active = 0, peak = 0, fail = true;
+  const callsSeen = [], fetched = [];
+  const rpcBatch = async (calls, options) => {
+    assert.equal(options.critical, true);
+    assert.ok(calls.length <= 2);
+    callsSeen.push(...calls.map(c => c.params[0].to));
+    peak = Math.max(peak, ++active);
+    try {
+      await new Promise(resolve => setImmediate(resolve));
+      if (fail && calls[0].params[0].to === safes[0]) throw new Error('RPC 节点预算暂满');
+      return calls.map(() => uintResult(12));
+    } finally { active--; }
+  };
+  const fetchFn = async url => { fetched.push(url); return response([]); };
+  const result = await runSafeProposalScan({state, safes, rpcBatch, fetchFn});
+  assert.deepEqual(callsSeen.sort(), [...safes].sort());
+  assert.ok(peak <= 2);
+  assert.equal(result.successfulSafes, 6);
+  assert.equal(fetched.length, 6);
+  for (const address of safes.slice(0, 2)) {
+    assert.match(state.safes[address].lastNonceError, /预算/);
+    assert.equal(state.safes[address].currentNonce, null);
+    assert.equal(state.safes[address].nextAttemptAtMs, 0);
+    assert.equal(state.safes[address].consecutiveFailures, 0);
+  }
+  assert.match(state.lastError, /nonce/);
+  fail = false;
+  const recovered = await runSafeProposalScan({state, safes, rpcBatch, fetchFn});
+  assert.equal(recovered.successfulSafes, 8);
+  assert.equal(state.lastError, '');
+  assert.ok(Object.values(state.safes).every(s=>s.currentNonce===12 && s.lastNonceError===''));
+});
+
+test('Safe nonce polling completes using the real reserved budget after ordinary traffic', async t => {
+ const directory=mkdtempSync(join(tmpdir(),'safe-budget-'));t.after(()=>rmSync(directory,{recursive:true,force:true}));
+ const budget=createRpcBudget({directory,maxWaitMs:0,limits:{'node.test':{rps:0.001,burst:40}}});
+ const ordinary=await budget.acquire('https://node.test',{cost:32});await ordinary();
+ await assert.rejects(budget.acquire('https://node.test',{cost:8}),e=>e.rpcBudget);
+ const safes=Array.from({length:8},(_,i)=>'0x'+(i+1).toString(16).padStart(40,'0'));
+ const state=createSafeProposalState(safes);
+ const result=await runSafeProposalScan({state,safes,fetchFn:async()=>response([]),rpcBatch:async(calls,options)=>{
+  const release=await budget.acquire('https://node.test',{cost:calls.length,...options});
+  try{return calls.map(()=>uintResult(12));}finally{await release();}
+ }});
+ assert.equal(result.successfulSafes,8);assert.equal(state.lastError,'');
+ assert.equal(budget.metrics.budgetRejected,1); // Only the old ordinary batch was rejected.
+});
 
 test('Safe request and response body deadlines finish even when fetch ignores abort', async () => {
   for (const fetchFn of [() => new Promise(() => {}), async () => ({ ok: true, json: () => new Promise(() => {}) })]) {
@@ -573,7 +625,9 @@ test("future nonce prevents executable claim and one missing nonce does not bloc
   const record = Object.values(state.proposals)[0];
   assert.equal(record.nonceBlocked, true);
   assert.equal(record.executionCheck.status, "blocked");
-  assert.match(state.safes[OTHER].lastError, /nonce/);
+  assert.match(state.safes[OTHER].lastNonceError, /nonce/);
+  assert.equal(state.safes[OTHER].lastError, '');
+  assert.equal(state.safes[OTHER].nextAttemptAtMs, 0);
   assert.equal(state.safes[SAFE].baselineEstablished, true);
 });
 

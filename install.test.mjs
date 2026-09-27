@@ -385,3 +385,9 @@ test('integrity status discloses abandoned history separately from new recovery 
  assert.match(output,/已放弃旧补扫：11–20 · 未扫描；后续缺口仍自动补扫/);
  assert.match(output,/待补区间：101–105/);
 });
+
+test('Safe status marks nonce failures unhealthy even when the API last succeeded',()=>{
+ const text=renderFlapStatus({}, {}, {}, {lastError:'nonce 读取失败',safes:{one:{address:'0x'+'1'.repeat(40),baselineEstablished:true,currentNonce:12,lastError:'',lastNonceError:'RPC 预算暂满'}}});
+ assert.match(text,/健康 Safe：0\/1/);
+ assert.match(text,/nonce 12｜状态 .*异常/);
+});

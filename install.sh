@@ -567,7 +567,7 @@ if [ -f "$SNAP" ]; then
     const integrityWss=ci.wssHealth?.contracts||{};
     const safeStates=Object.values(sp.safes||{});
     const activeSafeProposals=Object.values(sp.proposals||{}).filter(v=>v&&['pending','ready','confirming'].includes(v.status));
-    const healthySafes=safeStates.filter(v=>v&&v.baselineEstablished&&!v.lastError).length;
+    const healthySafes=safeStates.filter(v=>v&&v.baselineEstablished&&!v.lastError&&!v.lastNonceError).length;
     const poolAssets=Object.values(fp.assets||{}).sort((a,b)=>String(a.quoteToken||'').localeCompare(String(b.quoteToken||'')));
     const poolConfigured=v=>Boolean(v&&(v.configured??v.enabled));
     const poolPaused=v=>poolConfigured(v)&&Boolean(v.creationDisabled);
@@ -700,7 +700,7 @@ if [ -f "$SNAP" ]; then
     const safeStatus=sp.lastError?'部分异常':safeStates.length&&safeStates.every(v=>v.baselineEstablished)?'运行正常':'尚未建立';
     console.log('监控状态：'+(safeStatus==='运行正常'?ok(safeStatus):warn(safeStatus)));
     console.log('健康 Safe：'+healthySafes+'/'+safeStates.length+'｜跟踪中目标 '+activeSafeProposals.length+' 个｜待发送变更 '+((sp.pendingChanges||[]).length)+' 项');
-    for(const [index,v] of safeStates.entries())console.log(String(index+1).padStart(2,'0')+'　'+mdLink(short(v.address),'https://app.safe.global/transactions/queue?safe=bnb:'+v.address)+'｜nonce '+(v.currentNonce??'未知')+'｜状态 '+(v.lastError?warn('异常'):v.baselineEstablished?'基线完成':'等待基线'));
+    for(const [index,v] of safeStates.entries())console.log(String(index+1).padStart(2,'0')+'　'+mdLink(short(v.address),'https://app.safe.global/transactions/queue?safe=bnb:'+v.address)+'｜nonce '+(v.currentNonce??'未知')+'｜状态 '+(v.lastError||v.lastNonceError?warn('异常'):v.baselineEstablished?'基线完成':'等待基线'));
     if(sp.lastSuccessAt)console.log('最后成功：'+fmtTime(sp.lastSuccessAt));
     if(sp.apiQuota)console.log('Safe 月度额度：'+sp.apiQuota.remaining+'/'+sp.apiQuota.limit+' · 重置 '+fmtTime(sp.apiQuota.resetsAt));
     for(const [index,id] of (sp.apiAccountIds||[]).entries()){
