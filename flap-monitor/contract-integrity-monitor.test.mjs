@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, readdirSync } from "node:fs";
+import { abandonContractHistory, abandonContractHistoryFile } from './abandon-contract-history.mjs';
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,6 +23,62 @@ import {
 } from "./contract-integrity-monitor.mjs";
 
 const { __testables } = await import("./contract-integrity-monitor.mjs");
+
+test('abandon old history preserves live state and future gap recovery across reload', async () => {
+  const state = createContractIntegrityState();
+  Object.assign(state, { httpEventLastBlock: 10, eventHistoryEndBlock: 20, httpRealtimeLastBlock: 110,
+    realtimeGaps: [{from: 101, to: 105}], historyRangeRetries: {11: 999, 101: 888},
+    eventHistoryError: 'header not found', lastError: 'separate live error' });
+  state.pendingChanges.push({id: 'pending', type: 'state'});
+  assert.equal(abandonContractHistory(state, 11, 20), true);
+  assert.equal(state.httpRealtimeLastBlock, 110);
+  assert.equal(state.eventHistoryError, '');
+  assert.equal(state.lastError, 'separate live error');
+  assert.deepEqual(state.historyRangeRetries, {101: 888});
+  const restored = migrateContractIntegrityState(JSON.parse(JSON.stringify(state)));
+  const filters = [];
+  await scanContractIntegrityEvents({ state: restored, latestBlock: 110, rpcCall: async (method, params) => {
+    assert.equal(method, 'eth_getLogs'); filters.push(params[0]); return [];
+  } });
+  assert.equal(restored.httpEventLastBlock, 105);
+  assert.equal(restored.eventHistoryEndBlock, 105);
+  assert.ok(filters.length > 0);
+  assert.ok(filters.every(filter => Number(filter.fromBlock) === 101 && Number(filter.toBlock) === 105));
+  assert.equal(restored.historyAbandonments.length, 1);
+  assert.equal(restored.pendingChanges[0].id, 'pending');
+  const before = JSON.stringify(restored);
+  assert.equal(abandonContractHistory(restored, 11, 20), false);
+  assert.equal(JSON.stringify(restored), before);
+});
+
+test('abandon history rejects changed ranges and overlapping queued work without mutation', () => {
+  for (const state of [
+    {httpEventLastBlock: 12, eventHistoryEndBlock: 20},
+    {httpEventLastBlock: 10, eventHistoryEndBlock: 20, realtimeGaps: [{from: 15, to: 25}]},
+  ]) {
+    const before = JSON.stringify(state);
+    assert.throws(() => abandonContractHistory(state, 11, 20), /未修改状态/);
+    assert.equal(JSON.stringify(state), before);
+  }
+  assert.throws(() => abandonContractHistory({}, NaN, 20), /有效/);
+});
+
+test('abandon history file previews without writing and backs up exact original before apply', t => {
+  const dir = mkdtempSync(join(tmpdir(), 'flap-abandon-'));
+  t.after(() => rmSync(dir, {recursive: true, force: true}));
+  const path = join(dir, 'state.json');
+  const raw = '{"httpEventLastBlock":10,"eventHistoryEndBlock":20,"custom":"preserve"}\n';
+  writeFileSync(path, raw);
+  assert.equal(abandonContractHistoryFile(path, 11, 20).applied, false);
+  assert.equal(readFileSync(path, 'utf8'), raw);
+  assert.equal(readdirSync(dir).length, 1);
+  const result = abandonContractHistoryFile(path, 11, 20, true);
+  assert.equal(result.applied, true);
+  assert.equal(readFileSync(result.backup, 'utf8'), raw);
+  assert.equal(JSON.parse(readFileSync(path, 'utf8')).custom, 'preserve');
+  assert.equal(abandonContractHistoryFile(path, 11, 20, true).changed, false);
+  assert.equal(readdirSync(dir).length, 2);
+});
 
 test('Vault Factory 合约变更附带金库链接，Portal 不误生成链接', () => {
   const factory = '0x15cbf6b763b102acef6b4db9c62ed96fd3c0ab73';

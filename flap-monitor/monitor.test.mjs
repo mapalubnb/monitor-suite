@@ -234,7 +234,7 @@ test("Factory RPC hedging uses the first valid low-latency node", async () => {
   }
 });
 
-test("Historical eth_getLogs ignores one empty RPC when another returns logs", async () => {
+test("Historical eth_getLogs accepts one empty RPC without querying another", async () => {
   const originalFetch = globalThis.fetch;
   const originalUrls = __testables.CONFIG.bscRpcUrls;
   const originalHedgeDelay = __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs;
@@ -242,7 +242,8 @@ test("Historical eth_getLogs ignores one empty RPC when another returns logs", a
   __testables.CONFIG.bscRpcUrls = ["https://empty.rpc", "https://logs.rpc"];
   __testables.CONFIG.factoryPoolMonitor.rpcHedgeDelayMs = 50;
   __testables.resetBscRpcHealth();
-  globalThis.fetch = async url => ({
+  const queried = [];
+  globalThis.fetch = async url => { queried.push(String(url)); return ({
     ok: true,
     status: 200,
     json: async () => ({
@@ -255,11 +256,11 @@ test("Historical eth_getLogs ignores one empty RPC when another returns logs", a
         transactionIndex: "0x0",
       }],
     }),
-  });
+  }); };
   try {
     const result = await __testables.executeBscGetLogsRequest([{ fromBlock: "0x64", toBlock: "0x64" }], {history:true});
-    assert.equal(result.length, 1);
-    assert.equal(result[0].transactionHash, txHash);
+    assert.deepEqual(result, []);
+    assert.deepEqual(queried, ["https://empty.rpc"]);
   } finally {
     globalThis.fetch = originalFetch;
     __testables.CONFIG.bscRpcUrls = originalUrls;
@@ -3407,14 +3408,26 @@ test("Factory startup backfill ignores a stale head and caps the recent window",
 });
 
 
-test('realtime empty logs accept one synced provider while history still requires two', async()=>{
+test('realtime empty logs check head while history accepts one provider', async()=>{
  const original=globalThis.fetch;const calls=[];__testables.resetBscRpcHealth();
  globalThis.fetch=async(url,opts)=>{const req=JSON.parse(opts.body);calls.push(req.method);return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x100':[]})};};
  try{
   assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://healthy.rpc']}),[]);
   assert.deepEqual(calls,['eth_getLogs','eth_blockNumber']);
-  await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://healthy.rpc'],history:true}),/双节点/);
+  assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://healthy.rpc'],history:true}),[]);
+  assert.deepEqual(calls,['eth_getLogs','eth_blockNumber','eth_getLogs']);
  }finally{globalThis.fetch=original;__testables.resetBscRpcHealth();}
+});
+
+test('historical logs fall back on invalid response and reject all failed providers', async () => {
+ const original=globalThis.fetch; __testables.resetBscRpcHealth(); const calls=[];
+ globalThis.fetch=async url=>{calls.push(String(url));return {ok:true,json:async()=>({result:String(url).includes('bad')?null:[]})};};
+ try {
+  assert.deepEqual(await __testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://bad.rpc','https://good.rpc'],history:true}),[]);
+  assert.deepEqual(calls,['https://bad.rpc','https://good.rpc']);
+  __testables.resetBscRpcHealth();
+  await assert.rejects(__testables.executeBscGetLogsRequest([{fromBlock:'0x64',toBlock:'0x65'}],{rpcUrls:['https://bad.rpc'],history:true}),/无可用节点.*非数组/);
+ } finally {globalThis.fetch=original;__testables.resetBscRpcHealth();}
 });
 
 test('realtime empty logs reject a lagging provider and report provider names',async()=>{
@@ -3480,7 +3493,7 @@ test('read, realtime logs and historical logs use isolated pools', async () => {
     await __testables.bscRpcCall('eth_getCode', ['0x1', 'latest']);
     await __testables.bscRpcCall('eth_getLogs', [{ fromBlock: '0x64', toBlock: '0x65' }], { history: false });
     await __testables.bscRpcCall('eth_getLogs', [{ fromBlock: '0x64', toBlock: '0x65' }], { history: true });
-    assert.deepEqual(calls, [['https://blocks.test','eth_blockNumber'], ['https://read.test','eth_getCode'], ['https://live.test','eth_getLogs'], ['https://live.test','eth_blockNumber'], ['https://history-a.test','eth_getLogs'], ['https://history-b.test','eth_getLogs']]);
+    assert.deepEqual(calls, [['https://blocks.test','eth_blockNumber'], ['https://read.test','eth_getCode'], ['https://live.test','eth_getLogs'], ['https://live.test','eth_blockNumber'], ['https://history-a.test','eth_getLogs']]);
   } finally { globalThis.fetch = original; __testables.CONFIG.rpcPools = pools; __testables.resetBscRpcHealth(); }
 });
 

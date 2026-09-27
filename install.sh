@@ -186,6 +186,7 @@ if [ "$(cd flap-monitor && pwd)" != "$(cd "$FLAP_DIR" 2>/dev/null && pwd)" ]; th
   cp flap-monitor/factory-pool-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/compact-factory-pool-state.mjs "$FLAP_DIR/"
   cp flap-monitor/contract-integrity-monitor.mjs "$FLAP_DIR/"
+  cp flap-monitor/abandon-contract-history.mjs "$FLAP_DIR/"
   cp flap-monitor/safe-proposal-monitor.mjs "$FLAP_DIR/"
   cp flap-monitor/vault-links.mjs "$FLAP_DIR/"
   cp flap-monitor/quote-token-codec.mjs "$FLAP_DIR/"
@@ -690,6 +691,7 @@ if [ -f "$SNAP" ]; then
     console.log('精准地址 WSS：'+(wssStatusMap[integrityWss.status]||integrityWss.status||'尚未建立')+'｜已订阅 '+(Number(integrityWss.subscribedCount)||0)+'/'+(Number(integrityWss.configuredCount)||0));
     console.log('事件实时扫描：'+(ci.httpRealtimeLastBlock??'未建立')+' · 延迟 '+integrityLag+' 块 · 历史 '+(ci.httpEventLastBlock??'未建立')+' / '+(ci.eventHistoryEndBlock??'未知'));
     console.log('待补区间：'+gaps(ci.realtimeGaps));
+    if(ci.historyAbandonments?.length) console.log('已放弃旧补扫：'+gaps(ci.historyAbandonments)+' · 未扫描；后续缺口仍自动补扫');
     console.log('核心校验：'+fmtTime(ci.lastCoreScanAt)+' · 扩展 '+fmtTime(ci.lastExtendedScanAt)+' · 代码 '+fmtTime(ci.lastCodeAuditAt));
     if(ci.lastCoreScanAt&&coreAge>coreLimit)console.log(warn('⚠️ 核心校验已 '+Math.floor(coreAge/1000)+' 秒未成功'));
     error('历史查询',ci.eventHistoryError);error('最近异常',ci.lastError);

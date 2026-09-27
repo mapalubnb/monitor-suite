@@ -2792,7 +2792,7 @@ async function queryBscLogs(params, options) {
     ...(process.env.FLAP_LOG_RPC_URLS || "https://fast.bsc-rpc.com,https://bsc.publicnode.com").split(",").map(s => s.trim()).filter(Boolean),
     ...CONFIG.bscRpcUrls,
   ])]);
-  const errors = [], emptyProviders = new Set();
+  const errors = [];
   const timeoutMs = Math.max(4000, bscRpcTimeoutMs("eth_getLogs", params));
   const healthKey = history + ':' + JSON.stringify(urls) + (history.endsWith(':history') ? ':' + Math.floor(Number(params[0]?.fromBlock || 0) / 8192) : '');
   for (const index of orderedBscRpcIndexes(healthKey, urls)) {
@@ -2832,8 +2832,8 @@ async function queryBscLogs(params, options) {
         if (cached.head < to) throw new Error(`节点尚未同步到查询高度 ${to}，当前 ${cached.head}`);
         return [];
       }
-      emptyProviders.add(host.endsWith("publicnode.com") ? "publicnode.com" : host);
-      if (emptyProviders.size >= 2) return [];
+      // Historical empty results use the same single-success policy as nonempty logs.
+      return [];
     } catch (error) {
       const message = `${host}: ${error.message}`;
       errors.push(message);
@@ -2857,7 +2857,7 @@ async function queryBscLogs(params, options) {
     const right = await queryBscLogs([{ ...params[0], fromBlock: numberToHex(middle + 1) }], options);
     return dedupeBscLogs([...left, ...right]);
   }
-  throw new Error((emptyProviders.size ? "eth_getLogs 仅一个节点返回空结果，未达到双节点一致；" : "eth_getLogs 无可用节点；") + [...new Set(errors)].join("；"));
+  throw new Error("eth_getLogs 无可用节点；" + [...new Set(errors)].join("；"));
 }
 
 async function executeBscRpcRequest(payload, preferenceKey, timeoutMs, validateResponse = null, validationKey = "default", options = {}) {

@@ -378,3 +378,10 @@ test('integrity status flags stale core checks even when event cursor is caught 
  const output=renderFlapStatus({}, {},{lastCoreScanAt:'2026-01-01T00:00:00Z',latestBlock:100,httpRealtimeLastBlock:100});
  assert.match(output,/核心校验已 .*秒未成功/);
 });
+
+test('integrity status discloses abandoned history separately from new recovery gaps',()=>{
+ const output=renderFlapStatus({}, {},{httpEventLastBlock:20,eventHistoryEndBlock:20,
+  historyAbandonments:[{from:11,to:20}],realtimeGaps:[{from:101,to:105}]});
+ assert.match(output,/已放弃旧补扫：11–20 · 未扫描；后续缺口仍自动补扫/);
+ assert.match(output,/待补区间：101–105/);
+});
