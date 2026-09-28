@@ -500,9 +500,9 @@ test('early asset names retain the contract link and escape API-provided formatt
   const state=createEarlySignalState();
   state.tokens[TOKEN]={name:'Name <tag> [link]*'};
   const content=buildEarlySignalContent([{token:TOKEN,kind:'observation',detail:'原始证据',observedAt:'2026-09-26'}],state);
-  assert.match(content,/资产名称：Name &lt;tag&gt;/);
+  assert.match(content,/资产：\[Name &lt;tag&gt;/);
   assert.ok(content.includes('\\[link\\]\\*'));
-  assert.ok(content.includes('资产：['+TOKEN+'](https://bscscan.com/address/'+TOKEN+')'));
+  assert.ok(content.includes('](https://bscscan.com/address/'+TOKEN+')'));
   assert.match(content,/原始证据/);
 });
 

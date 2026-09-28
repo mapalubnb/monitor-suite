@@ -3574,11 +3574,11 @@ test('early signals reuse token metadata after delivery and patch names without 
   state.tokens[token].effectiveEnabled = true;
   complete({metadata:{[token]:{name:'Example Asset',symbol:'EX',source:'goplus'}}});
   await result.metadataPromise;
-  assert.equal(patched.replace('资产名称：Example Asset\n',''),original);
+  assert.equal(patched.replace('[Example Asset]', '[0x46ce…b15c]'),original);
   assert.equal(state.tokens[token].name,'Example Asset');
   state.pendingChanges.push({id:'name-second',token,kind:'observation',detail:'后续操作'});
   await __testables.deliverFlapEarlySignals(state, options);
-  assert.match(original,/资产名称：Example Asset/);
+  assert.match(original,/资产：\[Example Asset\]/);
   assert.equal(calls,1);
 });
 
@@ -3609,7 +3609,7 @@ test('multipart early signal cards enrich only their matching original part', as
   await result.metadataPromise;
   assert.ok(originals.length>1);
   assert.equal(patched.length,2);
-  for(const part of patched){const index=Number(part.id.split('-')[1]);assert.equal(part.content.replace(/资产名称：(First|Second) Asset\n/g,''),originals[index]);}
+  for(const part of patched){const index=Number(part.id.split('-')[1]);assert.equal(part.content.replace('[First Asset]', '[0x3333…3333]').replace('[Second Asset]', '[0x4444…4444]'),originals[index]);}
 });
 
 test('history full blocks use the dedicated history block pool', async()=>{
@@ -3646,23 +3646,27 @@ test('early multipart restart resumes the persisted plan without acknowledging n
   assert.equal(state.notificationDelivery, undefined);
 });
 
-test('deferred early records do not block important notifications or disappear after restart', async () => {
+test('silent routine records never send a digest and important failed delivery survives restart', async () => {
   const now = Date.parse('2026-09-28T03:00:00Z');
   const state = { pendingChanges: [
     { id: 'small', kind: 'nativeBalance', deltaWei: '-1', observedAt: new Date(now).toISOString(), detail: '扣费' },
     { id: 'important', kind: 'configuration', detail: '停用' },
   ], events: {}, tokens: {}, health: {} };
   let disk;
-  await __testables.deliverFlapEarlySignals(state, { now: () => now,
+  await assert.rejects(__testables.deliverFlapEarlySignals(state, { now: () => now,
     saveStateFn: (_path, value) => { disk = JSON.stringify(value); },
-    sendCardFn: async (_title, content) => { assert.match(content, /停用/); assert.doesNotMatch(content, /扣费/); return 'important'; } });
+    sendCardFn: async (_title, content) => { assert.match(content, /停用/); assert.doesNotMatch(content, /扣费/); throw Error('offline'); } }), /offline/);
   const restart = JSON.parse(disk);
-  assert.deepEqual(restart.pendingChanges.map(e => e.id), ['small']);
-  await __testables.deliverFlapEarlySignals(restart, { now: () => now + 300001,
-    saveStateFn: () => {}, sendCardFn: async (title, content) => {
-      assert.equal(title, 'Flap 日常操作汇总'); assert.match(content, /1 次小额/); return 'digest';
-    } });
+  assert.deepEqual(restart.pendingChanges.map(e => e.id), ['important']);
+  assert.equal(restart.events.small.notificationDisposition, 'silent');
+  let sends = 0;
+  const opts = { now: () => now + 300001, saveStateFn: () => {}, sendCardFn: async title => {
+    sends++; assert.notEqual(title, 'Flap 日常操作汇总'); return 'important';
+  } };
+  await __testables.deliverFlapEarlySignals(restart, opts);
+  await __testables.deliverFlapEarlySignals(restart, opts);
   assert.equal(restart.pendingChanges.length, 0);
+  assert.equal(sends, 1);
 });
 
 test('history denial leaves same-provider live logs working',async()=>{

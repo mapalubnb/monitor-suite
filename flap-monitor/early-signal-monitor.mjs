@@ -697,11 +697,48 @@ export function earlyAssetStage(state, token) {
   return "observation";
 }
 
+const shortAddress = address => `${address.slice(0, 6)}…${address.slice(-4)}`;
+const escapeLabel = value => String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  .replace(/[\\`*_[\]~]/g, '\\$&').replace(/[\r\n]+/g, ' ');
+function addressLink(address, label) {
+  return /^0x[a-f\d]{40}$/i.test(address || '')
+    ? `[${escapeLabel(label || shortAddress(address))}](https://bscscan.com/address/${address})` : escapeLabel(address || '待核验');
+}
 export function formatEarlySignalAsset(token, metadata = {}) {
-  const name = metadata.name || metadata.symbol;
-  const escaped = name ? String(name).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    .replace(/[\\`*_[\]~]/g, "\\$&").replace(/[\r\n]+/g, " ") : "";
-  return `${escaped ? `资产名称：${escaped}\n` : ""}资产：[${token}](https://bscscan.com/address/${token})`;
+  const baseName = { '0x55d398326f99059ff775485246999027b3197955': 'USDT',
+    '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': 'WBNB',
+    '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': 'USDC' }[lower(token)];
+  return `资产：${addressLink(token, metadata.name || metadata.symbol || baseName)}`;
+}
+function readableBnb(raw) {
+  try {
+    const value = BigInt(raw), absolute = value < 0n ? -value : value;
+    const fraction = (absolute % 10n ** 18n).toString().padStart(18, '0').replace(/0+$/, '');
+    return `${value < 0n ? '-' : '+'}${absolute / 10n ** 18n}${fraction ? '.' + fraction : ''} BNB`;
+  } catch { return '金额待核验'; }
+}
+function earlyOperationDetail(event) {
+  if (['liquidityAdded', 'liquidityRemoved', 'poolCreated'].includes(event.kind) && event.detail?.includes('｜')) {
+    const [action, pool] = event.detail.split('｜');
+    return `${action.match(/^(V[234]|Infinity CL|Infinity Bin)/)?.[0] || 'DEX'} 池：${addressLink(pool.trim())}`;
+  }
+  if (event.kind === 'transfer' && event.from && event.to) return `${addressLink(event.from)} → ${addressLink(event.to)}`;
+  if (event.kind === 'approval' && event.to) return `授权对象：${addressLink(event.to)}`;
+  if (['positionTransfer', 'nftTransfer'].includes(event.kind) && event.from && event.to)
+    return `${addressLink(event.from)} → ${addressLink(event.to)}｜NFT #${escapeLabel(event.tokenId || event.amount || '待核验')}`;
+  if (event.kind === 'nativeBalance') {
+    const address = event.address || event.detail?.match(/0x[a-f\d]{40}/i)?.[0];
+    const raw = event.deltaWei ?? event.detail?.match(/wei (-?\d+)/)?.[1];
+    return `${addressLink(address)}｜净变动 ${readableBnb(raw)}（含 Gas／内部转账影响）`;
+  }
+  // Keep semantic status/permissions/errors, but omit raw token-unit integers.
+  return String(event.detail || '')
+    .replace(/｜原始(?:卖出)?数量[^｜；\n]*/g, '')
+    .replace(/｜累计成交原始数量[^｜；\n]*/g, '')
+    .replace(/｜原始参数[^；\n]*/g, '')
+    .replace(/；asset\(\) 映射待复核/g, '')
+    .replace(/wei (-?\d+)/g, (_, raw) => readableBnb(raw))
+    .replace(/0x[a-f\d]{40}(?![a-f\d])/gi, address => addressLink(address));
 }
 
 export function buildEarlySignalContent(changes, state) {
@@ -713,33 +750,39 @@ export function buildEarlySignalContent(changes, state) {
   }
   const lines = [];
   for (const group of groups.values()) {
-    // A deposit card describes the liquidity action, not its mechanical token
+    // A liquidity card describes the action, not its mechanical token
     // transfers/approvals/NFT mint. Raw events and acknowledgement stay intact.
-    const events = group.some(e => e.kind === 'liquidityAdded')
+    const events = group.some(e => ['liquidityAdded', 'liquidityRemoved'].includes(e.kind))
       ? group.filter(e => !['transfer', 'approval', 'positionTransfer'].includes(e.kind)) : group;
     const kinds = new Set(events.map(e => e.kind));
-    const action = kinds.has('liquidityRemoved') ? '撤出流动性（保留即时提醒）'
-      : kinds.has('liquidityAdded') ? '增加流动性'
+    const action = kinds.has('liquidityRemoved') && kinds.has('liquidityAdded') ? '🔄 调整流动性'
+      : kinds.has('liquidityRemoved') ? '🔴 撤出流动性'
+      : kinds.has('liquidityAdded') ? '🟢 增加流动性'
       : events.every(e => e.passiveIncoming) ? '被动收币｜尚无主动采购证据'
-      : kinds.has('configuration') ? '创建状态变化'
-      : kinds.has('order') ? '采购订单进展'
-      : kinds.has('proposal') ? '提案进展' : '关联操作';
-    lines.push(`🔎 本次动作：${action}`);
+      : kinds.has('configuration') ? '⚙️ 创建状态变化'
+      : kinds.has('order') ? '🛒 订单状态／成交进度更新'
+      : kinds.has('proposal') ? '📝 提案进展'
+      : kinds.has('transfer') || kinds.has('nativeTransfer') || kinds.has('nativeBalance') ? '💸 资金变动'
+      : kinds.has('approval') ? '🔑 代币授权' : '🔎 关联操作';
+    if (lines.length) lines.push('---');
+    lines.push(action);
     for (const token of [...new Set(events.map(e => e.token).filter(Boolean))]) {
       const stage = earlyAssetStage(state, token);
       const color = stage === 'opened' ? 'green' : stage === 'disabled' ? 'red' : 'orange';
       lines.push(formatEarlySignalAsset(token, state.tokens[token]));
-      lines.push(`当前状态：<font color='${color}'>${stageLabel(stage)}</font>`);
-      if (state.tokens[token]?.underlying) lines.push(`原始资产：${state.tokens[token].underlying}`);
-      if (state.tokens[token]?.configurationCheckedAt) lines.push(`链上状态最后复核：${state.tokens[token].configurationCheckedAt}`);
+      if (!BASE_ASSETS.has(token)) lines.push(`状态：<font color='${color}'>${stageLabel(stage)}</font>`);
+      if (state.tokens[token]?.underlying) lines.push(`底层资产：${addressLink(state.tokens[token].underlying)}`);
     }
     if (state.health?.assets?.lastError) lines.push("当前配置复核异常，上述状态为缓存快照。");
     for (const e of events) {
-      lines.push(`• ${e.detail}`);
+      const mixedLiquidity = kinds.has('liquidityAdded') && kinds.has('liquidityRemoved');
+      const direction = mixedLiquidity && e.kind === 'liquidityAdded' ? '加池 · '
+        : mixedLiquidity && e.kind === 'liquidityRemoved' ? '撤池 · ' : '';
+      lines.push(`• ${direction}${earlyOperationDetail(e)}`);
       if (e.sourceTime) lines.push(`来源时间：${e.sourceTime}`);
     }
     const times = [...new Set(events.map(e => e.observedAt).filter(Boolean))].sort();
-    if (times.length) lines.push(`首次观测：${times[0]}${times.length > 1 ? ` — ${times.at(-1)}` : ''}`);
+    if (times.length) lines.push(`🕒 ${times[0]}${times.length > 1 ? ` — ${times.at(-1)}` : ''}`);
     const tx = events[0];
     if (tx.transactionHash) lines.push(`[交易](https://bscscan.com/tx/${tx.transactionHash})｜区块 ${tx.blockNumber}`);
     lines.push("");
