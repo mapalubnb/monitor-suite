@@ -658,7 +658,13 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
         const link = (address, name) => `[${shortValue(name || `${address.slice(0, 6)}…${address.slice(-4)}`).replace(/[\[\]\\`*_]/g, '\\$&')}](https://bscscan.com/address/${address})`;
         if (audit.token) lines.push(`  🪙 关联代币：${link(audit.token, audit.name)}`);
         if (audit.vault) lines.push(`  🏦 金库${audit.mappingAt === 'current' ? '（当前映射）' : ''}：${link(audit.vault)}`);
-        if (audit.description) lines.push(`  描述：${shortValue(audit.description).replace(/[\[\]\\`*_]/g, '\\$&')}`);
+        if (audit.token) {
+          const description = audit.description
+            ? shortValue(audit.description).replace(/[\[\]\\`*_]/g, '\\$&') : audit.vault ? '未填写' : '待核验';
+          const official = audit.isOfficial === true ? "<font color='green'>🟢 是</font>"
+            : audit.isOfficial === false ? '⚪ 否（未标记为官方）' : '待核验';
+          lines.push(`  Portal 登记描述：${description}`, `  官方标记：${official}`);
+        }
         if (audit.factory) lines.push(`  工厂：${link(audit.factory)}｜[创建入口](${buildVaultFactoryLaunchUrl(audit.factory)})`);
         if (audit.token && !audit.vault) lines.push(`  金库关联：${audit.lookupFailed ? '暂未核验' : '待核验'}`);
         lines.push('  审计报告已提交，不代表审计通过');

@@ -48,6 +48,13 @@ test('真实审计事件直接识别代币并使用事件区块，不混淆代�
   const content = buildContractIntegrityContent(enriched.slice(0, 1), state);
   assert.match(content, /\[Stocks\]/);
   assert.match(content, /bbk-v4/);
+  assert.match(content, /Portal 登记描述：bbk-v4/);
+  assert.match(content, /官方标记：⚪ 否（未标记为官方）/);
+  const officialContent = buildContractIntegrityContent([{ ...enriched[0], audit: {
+    ...enriched[0].audit, description: '', isOfficial: true,
+  } }]);
+  assert.match(officialContent, /Portal 登记描述：未填写/);
+  assert.match(officialContent, /官方标记：<font color='green'>🟢 是/);
   assert.match(content, /vaultfactory=0xe26a5988e889e0f0467a54b7b6aa1618c647dc26/);
   assert.match(content, /不代表审计通过/);
   assert.equal(change.audit.name, undefined, 'enrichment must not mutate queued records');
@@ -64,6 +71,8 @@ test('审计映射失败明确降级到当前映射；空值或畸形结果不�
   assert.match(buildContractIntegrityContent(current), /金库（当前映射）/);
   const failed = await resolveVaultAuditDetails([change], { rpcCall: async () => '0x' });
   assert.match(buildContractIntegrityContent(failed), /暂未核验/);
+  assert.match(buildContractIntegrityContent(failed), /Portal 登记描述：待核验/);
+  assert.match(buildContractIntegrityContent(failed), /官方标记：待核验/);
   assert.doesNotMatch(buildContractIntegrityContent(failed), /vaultfactory=/);
   for (const raw of ['0x', '0x' + 'f'.repeat(64), auditFixture.vaultResult.slice(0, -64)]) {
     assert.throws(() => decodeVaultAuditInfo(raw));
