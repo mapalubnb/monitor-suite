@@ -2638,6 +2638,57 @@ test("integrity delivery drains a bounded batch without dropping remaining chang
   assert.equal(state.pendingChanges[0].id, "change-8");
 });
 
+test('审计关联查询不阻塞首次推送，完成后仅编辑原卡并保留其他待发送变更', async () => {
+  const token = '0x4dfe693e1b9c7c2f99b870adafccfaa6590f7777';
+  const change = { id: 'audit', type: 'event', field: 'Vault 审计报告提交',
+    address: '0x90497450f2a706f1951b5bdda52b4e5d16f34c06', blockNumber: 124543350, audit: { token } };
+  const state = { pendingChanges: [change, { ...change, id: 'next' }] };
+  const calls = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const sent = await __testables.deliverFlapContractIntegrityChanges(state, {
+    sendCardFn: async (_title, content) => { calls.push(['send', content]); return 'audit-card'; },
+    saveStateFn: () => {},
+    resolveAuditFn: async changes => { calls.push(['lookup']); await gate;
+      return changes.map(c => ({ ...c, audit: { ...c.audit, name: 'Stocks',
+        vault: '0x84731aadbe94a7af4bad60d539a3ac26e73e1a5d', factory: '0xe26a5988e889e0f0467a54b7b6aa1618c647dc26' } })); },
+    patchCardFn: async (id, title, content) => { calls.push(['patch', id, content]); },
+  });
+  assert.equal(sent.sent, true);
+  assert.equal(calls[0][0], 'send');
+  assert.equal(calls.some(c => c[0] === 'patch'), false);
+  assert.equal(state.pendingChanges[0].id, 'next');
+  release(); await sent.enrichmentPromise;
+  const patch = calls.find(c => c[0] === 'patch');
+  assert.equal(patch[1], 'audit-card');
+  assert.match(patch[2], /Stocks/);
+  assert.match(patch[2], /创建入口/);
+  assert.equal(calls.filter(c => c[0] === 'send').length, 1);
+});
+
+test('审计补充超时不会撤回原通知，迟到结果不再改卡，发送失败不启动查询', async () => {
+  const makeState = () => ({ pendingChanges: [{ id: 'audit', type: 'event', field: '审计报告',
+    address: '0x90497450f2a706f1951b5bdda52b4e5d16f34c06', audit: { token: '0x4dfe693e1b9c7c2f99b870adafccfaa6590f7777' } }] });
+  const state = makeState();
+  const patches = []; let release;
+  const sent = await __testables.deliverFlapContractIntegrityChanges(state, {
+    sendCardFn: async () => 'sent', saveStateFn: () => {}, enrichmentTimeoutMs: 10,
+    resolveAuditFn: () => new Promise(resolve => { release = resolve; }),
+    patchCardFn: async (_id, _title, content) => { patches.push(content); },
+  });
+  await sent.enrichmentPromise;
+  assert.equal(state.pendingChanges.length, 0);
+  assert.match(patches[0], /暂未核验/);
+  release([]); await new Promise(resolve => setImmediate(resolve));
+  assert.equal(patches.length, 1);
+  const failed = makeState();
+  await __testables.deliverFlapContractIntegrityChanges(failed, {
+    sendCardFn: async () => '', saveStateFn: () => {},
+    resolveAuditFn: () => { assert.fail('send failed: no lookup'); },
+  });
+  assert.equal(failed.pendingChanges.length, 1);
+});
+
 test("route cards hide zero extension words but preserve nonzero unknown values", () => {
   const hop = { poolType: 1, dexId: 0, fee: 2500, tickSpacing: 0,
     tokenOut: "0x4ebf5fd25b02022afad96e2fa25da54a246fded0", extraWord: `0x${"0".repeat(64)}` };

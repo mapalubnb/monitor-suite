@@ -10,6 +10,8 @@ import {
   FLAP_CORE_CONTRACTS,
   acknowledgeContractIntegrityChanges,
   buildContractIntegrityContent,
+  decodeVaultAuditInfo,
+  resolveVaultAuditDetails,
   contractIntegritySubscriptionAddresses,
   createContractIntegrityState,
   decodeContractValue,
@@ -23,6 +25,62 @@ import {
 } from "./contract-integrity-monitor.mjs";
 
 const { __testables } = await import("./contract-integrity-monitor.mjs");
+
+const auditFixture = JSON.parse(readFileSync(new URL('./fixtures/vault-audit-stocks.json', import.meta.url), 'utf8'));
+test('真实审计事件直接识别代币并使用事件区块，不混淆代币与金库', async () => {
+  const state = createContractIntegrityState();
+  state.latestBlock = 124543332;
+  const { change } = ingestContractIntegrityEvent(state, auditFixture.event);
+  assert.equal(change.audit.token, '0x4dfe693e1b9c7c2f99b870adafccfaa6590f7777');
+  assert.equal(change.audit.vault, undefined);
+  const initial = buildContractIntegrityContent([change], state);
+  assert.match(initial, /关联代币/);
+  assert.match(initial, /区块 124543350/);
+  assert.doesNotMatch(initial, /124543332|vaultfactory=0x4dfe/);
+  const queries = [];
+  const enriched = await resolveVaultAuditDetails([change, { ...change, id: 'same-subject' }], {
+    rpcCall: async (_method, params) => { queries.push(params); return auditFixture.vaultResult; },
+    resolveMetadata: async () => ({ metadata: auditFixture.metadata }),
+  });
+  assert.equal(queries.length, 1);
+  assert.equal(queries[0][1], auditFixture.event.blockNumber);
+  assert.equal(enriched[0].audit.vault, '0x84731aadbe94a7af4bad60d539a3ac26e73e1a5d');
+  const content = buildContractIntegrityContent(enriched.slice(0, 1), state);
+  assert.match(content, /\[Stocks\]/);
+  assert.match(content, /bbk-v4/);
+  assert.match(content, /vaultfactory=0xe26a5988e889e0f0467a54b7b6aa1618c647dc26/);
+  assert.match(content, /不代表审计通过/);
+  assert.equal(change.audit.name, undefined, 'enrichment must not mutate queued records');
+});
+
+test('审计映射失败明确降级到当前映射；空值或畸形结果不生成错误金库链接', async () => {
+  const { change } = ingestContractIntegrityEvent(createContractIntegrityState(), auditFixture.event);
+  const current = await resolveVaultAuditDetails([change], {
+    rpcCall: async (_method, params) => {
+      if (params[1] !== 'latest') throw Error('missing trie node');
+      return auditFixture.vaultResult;
+    }, resolveMetadata: async () => { throw Error('API down'); },
+  });
+  assert.match(buildContractIntegrityContent(current), /金库（当前映射）/);
+  const failed = await resolveVaultAuditDetails([change], { rpcCall: async () => '0x' });
+  assert.match(buildContractIntegrityContent(failed), /暂未核验/);
+  assert.doesNotMatch(buildContractIntegrityContent(failed), /vaultfactory=/);
+  for (const raw of ['0x', '0x' + 'f'.repeat(64), auditFixture.vaultResult.slice(0, -64)]) {
+    assert.throws(() => decodeVaultAuditInfo(raw));
+  }
+});
+
+test('工厂审计直接链接工厂；同名事件来自其他合约时不套用 Portal 解码', () => {
+  const state = createContractIntegrityState();
+  const factoryTopic = '0x4a8f046a4ca2bbc769fd8fc279ed7147e8a63c3f515ef382d5f53eb723a548bd';
+  const event = { ...auditFixture.event, topics: [factoryTopic, auditFixture.event.topics[1]] };
+  const { change } = ingestContractIntegrityEvent(state, event);
+  assert.equal(change.audit.token, undefined);
+  assert.ok(change.audit.factory);
+  assert.match(buildContractIntegrityContent([change]), /创建入口/);
+  const other = { ...auditFixture.event, address: FLAP_CORE_CONTRACTS.factory };
+  assert.equal(ingestContractIntegrityEvent(createContractIntegrityState(), other).change.audit, undefined);
+});
 
 test('abandon old history preserves live state and future gap recovery across reload', async () => {
   const state = createContractIntegrityState();

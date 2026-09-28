@@ -52,6 +52,7 @@ import {
   CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS,
   acknowledgeContractIntegrityChanges,
   buildContractIntegrityContent,
+  resolveVaultAuditDetails,
   contractIntegritySubscriptionAddresses,
   ingestContractIntegrityEvent,
   loadContractIntegrityState,
@@ -6581,24 +6582,62 @@ async function runFlapContractIntegrityPass(state, {
   };
 }
 
+const contractAuditFlights = new Set();
 async function deliverFlapContractIntegrityChanges(state, {
   titlePrefix = "",
   sendCardFn = sendCardViaApi,
   saveStateFn = saveContractIntegrityState,
   acknowledgeFn = acknowledgeContractIntegrityChanges,
+  resolveAuditFn = sendCardFn === sendCardViaApi ? changes => resolveVaultAuditDetails(changes, {
+    rpcCall: (method, params) => bscRpcCall(method, params, { history: true }),
+    resolveMetadata: tokens => resolveFactoryPoolTokenMetadata(tokens, {
+      rpcBatchFn: calls => bscRpcBatch(calls, { history: true }),
+    }),
+  }) : null,
+  patchCardFn = patchCard,
+  enrichmentTimeoutMs = 20_000,
 } = {}) {
-  const changes = (state.pendingChanges || []).slice(0, 8);
+  const pending = state.pendingChanges || [];
+  // Keep an audit in a single compact card so a later edit never replaces one
+  // fragment of a mixed/multipart notification and hides other changes.
+  const auditIndex = pending.slice(0, 8).findIndex(change => change.audit);
+  const changes = pending.slice(0, auditIndex === 0 ? 1 : auditIndex > 0 ? auditIndex : 8);
   if (changes.length === 0) return { sent: false, changes: [] };
+  const title = `${titlePrefix}Flap 合约与配置完整性变更`;
+  const content = buildContractIntegrityContent(changes, state);
   const messageId = await sendAlertCard(
     sendCardFn,
-    `${titlePrefix}Flap 合约与配置完整性变更`,
-    buildContractIntegrityContent(changes, state),
+    title,
+    content,
     "red",
   );
   if (!messageId) return { sent: false, changes };
   await acknowledgeFn(state, changes.map(change => change.id));
   saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
-  return { sent: true, changes, messageId };
+  let enrichmentPromise;
+  if (resolveAuditFn && changes.some(change => change.audit?.token)) {
+    if (contractAuditFlights.size >= 2) {
+      log('[Flap 审计关联] 补充任务繁忙，已保留代币和交易原提醒');
+    } else {
+      const snapshot = { catalog: structuredClone(state.catalog || {}) };
+      const originals = structuredClone(changes);
+      enrichmentPromise = withDeadline(() => resolveAuditFn(structuredClone(originals)), enrichmentTimeoutMs,
+        undefined, '审计关联补充超时').catch(error => {
+          log(`[Flap 审计关联] 查询失败：${error.message}`);
+          return originals.map(change => ({ ...change, audit: { ...change.audit, lookupFailed: true } }));
+        }).then(async enrichedChanges => {
+          const enriched = buildContractIntegrityContent(enrichedChanges, snapshot);
+          const opts = alertMentionCardOptions();
+          if (enriched !== content && !isTooLongForSingleCard(content, title, 'red', opts)
+            && !isTooLongForSingleCard(enriched, title, 'red', opts)) {
+            await patchCardFn(messageId, title, enriched, 'red', opts);
+          }
+        }).catch(error => log(`[Flap 审计关联] 卡片补充失败，原提醒保留：${error.message}`))
+        .finally(() => contractAuditFlights.delete(enrichmentPromise));
+      contractAuditFlights.add(enrichmentPromise);
+    }
+  }
+  return { sent: true, changes, messageId, enrichmentPromise };
 }
 
 async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
@@ -7997,6 +8036,7 @@ async function gracefulShutdown(signal) {
   if (global.__contractIntegrityDeliveryDrain) {
     try { await global.__contractIntegrityDeliveryDrain(); } catch {}
   }
+  await Promise.allSettled([...contractAuditFlights]);
   if (global.__contractIntegrityMutationDrain) {
     try { await global.__contractIntegrityMutationDrain(); } catch {}
   }

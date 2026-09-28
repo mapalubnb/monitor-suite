@@ -53,6 +53,76 @@ const EVENT_LABELS = Object.freeze({
 
 const VAULT_FACTORY_REGISTERED_TOPIC = "0xd8cf270eb9827992a063745f0afaa72431f8c63fc46736f8b484862dcc709787";
 const VAULT_FACTORY_CATEGORY_SET_TOPIC = "0x566b7414cab715cde3c8bcc93daec35325367d6c648327d19a1867d1006af3b3";
+const VAULT_AUDIT_TOPIC = "0x8f1ffc4dc704963c0165ea4062458f75bdba4310a1732e2a074c7c885e1dadb1";
+const FACTORY_AUDIT_TOPIC = "0x4a8f046a4ca2bbc769fd8fc279ed7147e8a63c3f515ef382d5f53eb723a548bd";
+
+// Verified Vault Portal ABI: indexed subject is taxToken for vault audits,
+// factory for factory audits. Never treat taxToken as the vault address.
+function decodeAuditSubject(logEntry) {
+  if (normalizeAddress(logEntry.address) !== FLAP_CORE_CONTRACTS.vaultPortal) return undefined;
+  const topic = String(logEntry.topics?.[0] || '').toLowerCase();
+  if (![VAULT_AUDIT_TOPIC, FACTORY_AUDIT_TOPIC].includes(topic)) return undefined;
+  const subject = /^0x0{24}[a-f\d]{40}$/i.test(logEntry.topics?.[1] || '')
+    ? addressFromWord(logEntry.topics[1]) : '';
+  if (!subject) return undefined;
+  return topic === VAULT_AUDIT_TOPIC ? { token: subject } : { factory: subject };
+}
+
+export function decodeVaultAuditInfo(raw) {
+  const hex = String(raw || '').replace(/^0x/, '');
+  if (!/^[a-f\d]+$/i.test(hex) || hex.length % 64) throw new Error('金库映射返回格式无效');
+  const uint = (data, pos) => {
+    const word = data.slice(pos, pos + 64);
+    if (word.length !== 64) throw new Error('金库映射返回不完整');
+    const value = Number(BigInt(`0x${word}`));
+    if (!Number.isSafeInteger(value)) throw new Error('金库映射偏移无效');
+    return value;
+  };
+  if (uint(hex, 0) !== 32) throw new Error('金库映射结构无效');
+  const data = hex.slice(64);
+  const address = index => {
+    const word = data.slice(index * 64, (index + 1) * 64);
+    if (!/^0{24}[a-f\d]{40}$/i.test(word)) throw new Error('金库映射地址无效');
+    return addressFromWord(word);
+  };
+  const vault = address(0), factory = address(1), offset = uint(data, 128);
+  const official = uint(data, 192);
+  if (!vault || !factory || official > 1 || offset < 160 || offset % 32) throw new Error('金库映射内容无效');
+  const length = uint(data, offset * 2);
+  if (length > 8192 || offset * 2 + 64 + length * 2 > data.length) throw new Error('金库描述不完整');
+  const description = Buffer.from(data.slice(offset * 2 + 64, offset * 2 + 64 + length * 2), 'hex')
+    .toString('utf8').replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 160);
+  return { vault, factory, description, isOfficial: official === 1 };
+}
+
+export async function resolveVaultAuditDetails(changes, { rpcCall, resolveMetadata } = {}) {
+  const tokens = [...new Set(changes.map(change => change.audit?.token).filter(Boolean))];
+  const metadataTask = tokens.length && resolveMetadata
+    ? Promise.resolve().then(() => resolveMetadata(tokens)).catch(() => ({ metadata: {} })) : Promise.resolve({ metadata: {} });
+  const results = new Map();
+  for (const change of changes) {
+    if (!change.audit?.token) continue;
+    const key = `${change.address}:${change.audit.token}:${change.blockNumber}`;
+    if (results.has(key)) continue;
+    try {
+      if (!Number.isSafeInteger(change.blockNumber) || change.blockNumber <= 0) throw new Error('事件区块缺失');
+      const call = { to: change.address, data: encodeAddressCall('0x0eb9af38', change.audit.token) };
+      try {
+        const raw = await rpcCall('eth_call', [call, numberToHex(change.blockNumber)]);
+        results.set(key, { ...decodeVaultAuditInfo(raw), mappingAt: 'event' });
+      } catch {
+        // Public nodes may have pruned historical state. Explicitly label a
+        // current mapping instead of attributing a refreshed vault to the past.
+        const raw = await rpcCall('eth_call', [call, 'latest']);
+        results.set(key, { ...decodeVaultAuditInfo(raw), mappingAt: 'current' });
+      }
+    } catch { results.set(key, { lookupFailed: true }); }
+  }
+  const { metadata = {} } = await metadataTask;
+  return changes.map(change => !change.audit ? change : { ...change, audit: { ...change.audit,
+    ...results.get(`${change.address}:${change.audit.token}:${change.blockNumber}`),
+    name: metadata[change.audit.token]?.name || metadata[change.audit.token]?.symbol || '' } });
+}
 const IGNORED_OPERATIONAL_TOPICS = new Set([
   "0x504e7f360b2e5fe33cbaaae4c593bc55305328341bf79009e43e0e3b7f699603", // TokenCreated
   "0x1a9fe01bcb4855c926d7757a81014e36cae596a0e3047d297d2cf88ca298a77d", // FlapTaxVaultTokenCreated
@@ -509,6 +579,8 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
     blockNumber,
     txHash: String(logEntry?.transactionHash || "").toLowerCase(),
     logIndex: hexToNumber(logEntry?.logIndex),
+    audit: decodeAuditSubject(logEntry),
+    eventTime: logEntry?.blockTimestamp ? new Date(hexToNumber(logEntry.blockTimestamp) * 1000).toISOString() : '',
     source,
   });
   return { processed: true, change };
@@ -570,7 +642,6 @@ function shortValue(value) {
 export function buildContractIntegrityContent(changes = [], state = {}) {
   const lines = [
     `🔧 合约变更 ${changes.length} 项`,
-    `区块：${state.latestBlock || Math.max(0, ...changes.map(change => change.blockNumber || 0)) || "未知"}`,
     "",
   ];
   for (const change of changes) {
@@ -582,12 +653,25 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
     if (launchUrl) lines.push(`  🏦 金库链接：[打开金库](${launchUrl})`);
     if (change.type === "event") {
       lines.push(`  🟠 ${change.field}`);
-      if (change.txHash) lines.push(`  交易: [${change.txHash}](https://bscscan.com/tx/${change.txHash})`);
+      const audit = change.audit;
+      if (audit) {
+        const link = (address, name) => `[${shortValue(name || `${address.slice(0, 6)}…${address.slice(-4)}`).replace(/[\[\]\\`*_]/g, '\\$&')}](https://bscscan.com/address/${address})`;
+        if (audit.token) lines.push(`  🪙 关联代币：${link(audit.token, audit.name)}`);
+        if (audit.vault) lines.push(`  🏦 金库${audit.mappingAt === 'current' ? '（当前映射）' : ''}：${link(audit.vault)}`);
+        if (audit.description) lines.push(`  描述：${shortValue(audit.description).replace(/[\[\]\\`*_]/g, '\\$&')}`);
+        if (audit.factory) lines.push(`  工厂：${link(audit.factory)}｜[创建入口](${buildVaultFactoryLaunchUrl(audit.factory)})`);
+        if (audit.token && !audit.vault) lines.push(`  金库关联：${audit.lookupFailed ? '暂未核验' : '待核验'}`);
+        lines.push('  审计报告已提交，不代表审计通过');
+      }
+      if (change.txHash) lines.push(`  [交易](https://bscscan.com/tx/${change.txHash})｜区块 ${change.blockNumber || '未知'}`);
+      else if (change.blockNumber) lines.push(`  区块 ${change.blockNumber}`);
+      if (change.eventTime) lines.push(`  🕒 ${change.eventTime}`);
+      else if (change.detectedAt) lines.push(`  发现时间：${change.detectedAt}`);
     } else if (change.type === "selectors") {
       if (change.added?.length) lines.push(`  新增函数选择器: ${change.added.join(", ")}`);
       if (change.removed?.length) lines.push(`  移除函数选择器: ${change.removed.join(", ")}`);
     } else {
-      lines.push(`  **${change.field}**`, `  <font color='red'>− ${shortValue(change.previous)}</font>`, `  <font color='green'>+ ${shortValue(change.current)}</font>`);
+      lines.push(`  ${change.field}`, `  <font color='red'>− ${shortValue(change.previous)}</font>`, `  <font color='green'>+ ${shortValue(change.current)}</font>`);
     }
   }
   return lines.join("\n");
