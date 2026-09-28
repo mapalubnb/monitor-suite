@@ -3,7 +3,6 @@ import { buildEarlySignalContent } from './early-signal-monitor.mjs';
 
 export const EARLY_DIGEST_MS = 5 * 60_000;
 const SMALL_DEBIT_WEI = 100_000_000_000_000n; // 0.0001 BNB; defer, never discard.
-const ROUTINE_KINDS = new Set(['transfer', 'approval', 'liquidityAdded', 'positionTransfer']);
 
 export function earlyTransactionGroups(changes) {
   const groups = new Map();
@@ -30,9 +29,11 @@ export function earlyNotificationPriority(events, state, nowMs) {
     }) ? 'digest' : 'immediate';
   }
   if (events.every(e => e.kind === 'transfer' && e.passiveIncoming === true)) return 'digest';
-  // Every withdrawal, proposal, status change, purchase, wrap, native transfer,
+  // Every deposit, withdrawal, proposal, status change, purchase, wrap, native transfer,
   // authority change, reorg and unknown kind remains immediate.
-  if (!events.every(e => ROUTINE_KINDS.has(e.kind))) return 'immediate';
+  // Only standalone approvals can qualify below. A deposit selects its entire
+  // receipt for immediate acknowledgement; presentation omits ancillary logs.
+  if (!events.every(e => e.kind === 'approval')) return 'immediate';
   const tokens = [...new Set(events.map(e => e.token).filter(t => t && !BASE_ASSETS.has(t)))];
   if (!tokens.length) return 'immediate';
   if (events.some(e => e.token && !BASE_ASSETS.has(e.token) && e.enabledAtObservation !== true)) return 'immediate';
@@ -41,13 +42,6 @@ export function earlyNotificationPriority(events, state, nowMs) {
     const age = nowMs - Date.parse(meta?.configurationCheckedAt || '');
     return meta?.effectiveEnabled === true && age >= 0 && age <= 120_000 && !state.health?.assets?.lastError;
   };
-  // An unrelated NFT or a payment to an unknown recipient is not routine just
-  // because another token in its receipt is already open.
-  const hasDeposit = events.some(e => e.kind === 'liquidityAdded');
-  if (events.some(e => ['transfer', 'positionTransfer'].includes(e.kind)) && !hasDeposit) return 'immediate';
-  const depositPools = new Set(events.filter(e => e.kind === 'liquidityAdded').map(e => e.raw?.address?.toLowerCase()).filter(Boolean));
-  if (events.some(e => e.kind === 'transfer' && !depositPools.has(e.to?.toLowerCase()))) return 'immediate';
-  if (events.some(e => e.kind === 'positionTransfer' && !/^0x0{40}$/.test(e.from || ''))) return 'immediate';
   // Only known LP-manager approvals qualify. Arbitrary spender changes remain urgent.
   if (events.some(e => e.kind === 'approval' && !e.knownLiquiditySpender)) return 'immediate';
   return tokens.every(freshOpened) ? 'digest' : 'immediate';

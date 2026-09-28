@@ -34,8 +34,8 @@ test('incoming, large, unknown or malformed balance changes remain immediate', (
   }
 });
 
-test('every withdrawal, purchase, wrap, proposal, config and unrecognized event stays immediate', () => {
-  for (const kind of ['liquidityRemoved', 'order', 'wrap', 'redeem', 'proposal', 'configuration', 'nativeTransfer', 'authority', 'safeOperation', 'allowance', 'reorg', 'decodeError', 'futureKind']) {
+test('every deposit, withdrawal, purchase, wrap, proposal, config and unrecognized event stays immediate', () => {
+  for (const kind of ['liquidityAdded', 'liquidityRemoved', 'order', 'wrap', 'redeem', 'proposal', 'configuration', 'nativeTransfer', 'authority', 'safeOperation', 'allowance', 'reorg', 'decodeError', 'futureKind']) {
     const important = event(kind, { token: TOKEN, transactionHash: 'tx' });
     const accompanying = { ...approval(), id: 'a', transactionHash: 'tx' };
     const state = stateFor([important, accompanying]);
@@ -57,14 +57,29 @@ test('only fresh, already-open, known-manager approvals are routine', () => {
   assert.equal(earlyNotificationPriority(state.pendingChanges, state, NOW), 'immediate');
 });
 
-test('a known deposit combines its transfer and NFT; unexpected outgoing funds never defer', () => {
+test('already-open deposits notify immediately with only the liquidity action while retaining ancillary evidence', () => {
   const common = { token: TOKEN, enabledAtObservation: true, transactionHash: 'tx' };
   const changes = [event('liquidityAdded', { ...common, raw: { address: POOL } }),
-    event('transfer', { ...common, to: POOL }), event('positionTransfer', { transactionHash: 'tx', from: '0x' + '0'.repeat(40) })];
+    event('transfer', { ...common, to: POOL }), event('positionTransfer', { transactionHash: 'tx', from: '0x' + '0'.repeat(40) }),
+    { ...approval(), transactionHash: 'tx' }];
   const state = stateFor(changes);
-  assert.equal(selectEarlyNotification(state, NOW), null);
+  const plan = selectEarlyNotification(state, NOW);
+  assert.equal(plan.mode, 'immediate');
+  assert.deepEqual(plan.changes, changes);
+  const content = buildEarlyNotificationContent(plan.changes, state, plan.mode);
+  assert.match(content, /liquidityAdded/);
+  assert.doesNotMatch(content, /• transfer|• approval|• positionTransfer/);
+  assert.equal(state.pendingChanges.length, 4);
   changes.push(event('transfer', { ...common, id: 'unexpected', to: TOKEN }));
   assert.equal(selectEarlyNotification(state, NOW).mode, 'immediate');
+});
+
+test('deposit presentation never hides withdrawal, authority or proposal evidence in a mixed transaction', () => {
+  const changes = ['liquidityAdded', 'liquidityRemoved', 'authority', 'proposal', 'transfer'].map(kind => event(kind, { transactionHash: 'mixed' }));
+  const state = stateFor(changes);
+  const content = buildEarlyNotificationContent(changes, state, 'immediate');
+  for (const kind of ['liquidityAdded', 'liquidityRemoved', 'authority', 'proposal']) assert.ok(content.includes('• ' + kind));
+  assert.doesNotMatch(content, /• transfer/);
 });
 
 test('passive receipts defer but first active transfer is immediate, regardless of amount', () => {

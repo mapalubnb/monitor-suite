@@ -712,7 +712,11 @@ export function buildEarlySignalContent(changes, state) {
     groups.get(key).push(e);
   }
   const lines = [];
-  for (const events of groups.values()) {
+  for (const group of groups.values()) {
+    // A deposit card describes the liquidity action, not its mechanical token
+    // transfers/approvals/NFT mint. Raw events and acknowledgement stay intact.
+    const events = group.some(e => e.kind === 'liquidityAdded')
+      ? group.filter(e => !['transfer', 'approval', 'positionTransfer'].includes(e.kind)) : group;
     const kinds = new Set(events.map(e => e.kind));
     const action = kinds.has('liquidityRemoved') ? '撤出流动性（保留即时提醒）'
       : kinds.has('liquidityAdded') ? '增加流动性'
