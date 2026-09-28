@@ -30,6 +30,7 @@ import { parseHTML } from "linkedom";
 import { createStartupNotifier, buildStartupCard } from "../shared/startup-notifier.mjs";
 import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.mjs";
 import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
+import { selectEarlyNotification, buildEarlyNotificationContent } from './early-signal-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
 import {
@@ -71,7 +72,7 @@ import {
 
 import { EXECUTION_WALLETS } from "./early-signal-catalog.mjs";
 import { createEarlySignalState, loadEarlySignalState, saveEarlySignalState, runEarlySignalScan,
-  earlyLogFilters, acknowledgeEarlySignals, buildEarlySignalContent, formatEarlySignalAsset } from "./early-signal-monitor.mjs";
+  earlyLogFilters, acknowledgeEarlySignals, formatEarlySignalAsset } from "./early-signal-monitor.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const IS_TEST_MODE = process.env.FLAP_MONITOR_TEST === "1";
@@ -6655,15 +6656,39 @@ const earlySignalNameFlights = new Set();
 async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState,
   resolveMetadataFn = sendCardFn === sendCardViaApi ? resolveFactoryPoolTokenMetadata : null,
   patchCardFn = patchCard, now = Date.now } = {}) {
-  // Bound each card; acknowledge only successful sends and retain the remaining queue.
-  const changes = state.pendingChanges.slice(0, 8);
-  if (!changes.length) return { sent: false };
-  const content = buildEarlySignalContent(changes, state);
-  const sentParts = [];
-  const cardParts = planCardParts("Flap 底池提前信号", content, "orange");
-  const id = await sendCardFn("Flap 底池提前信号", content, "orange", undefined, { sentParts, cardParts });
+  // Persist the exact selection and each delivered part. Restart/retry must not
+  // recut a transaction or acknowledge evidence arriving while a send is pending.
+  const pendingIds = new Set(state.pendingChanges.map(e => e.id));
+  if (state.notificationDelivery?.ids.some(id => !pendingIds.has(id))) delete state.notificationDelivery;
+  let delivery = state.notificationDelivery;
+  if (!delivery) {
+    const selection = selectEarlyNotification(state, now());
+    if (!selection) return { sent: false };
+    const { changes, title, template, mode } = selection;
+    const content = buildEarlyNotificationContent(changes, state, mode);
+    delivery = { ids: changes.map(e => e.id), title, template, mode, content, sentParts: [],
+      deliveryId: createHash('sha256').update(JSON.stringify(changes.map(e => e.id))).digest('hex'),
+      cardParts: planCardParts(title, content, template) };
+    state.notificationDelivery = delivery;
+    saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+  }
+  const changes = state.pendingChanges.filter(e => delivery.ids.includes(e.id));
+  const { content, title, template, cardParts, sentParts } = delivery;
+  const persistPart = async parts => {
+    // Chain commits may clone root fields while the request is in flight.
+    if (state.notificationDelivery?.deliveryId === delivery.deliveryId) {
+      state.notificationDelivery.sentParts = [...parts];
+      saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+    }
+  };
+  const id = await sendCardFn(title, content, template, undefined,
+    { sentParts, cardParts, deliveryId: delivery.deliveryId, onPartSent: persistPart });
   if (!id) return { sent: false };
   acknowledgeEarlySignals(state, changes.map(e => e.id));
+  if (state.notificationDelivery?.deliveryId === delivery.deliveryId) delete state.notificationDelivery;
+  state.notificationStats = { ...state.notificationStats, lastMode: delivery.mode, lastSentAt: new Date(now()).toISOString(),
+    lastEventCount: changes.length,
+    sentEvents: (state.notificationStats?.sentEvents || 0) + changes.length };
   saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
   const addresses = [...new Set(changes.map(change => normalizeAddress(change.token)).filter(address => address
     && state.tokens[address] && !state.tokens[address].name && !state.tokens[address].symbol
@@ -6698,8 +6723,8 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
           enriched = enriched.split("\n").map(line => line === original ? formatEarlySignalAsset(address, item) : line).join("\n");
         }
         if (sentParts[index] && enriched !== part) {
-          const title = "Flap 底池提前信号" + (parts.length > 1 ? ` (${index + 1}/${parts.length})` : "");
-          await patchCardFn(sentParts[index], title, enriched, "orange");
+          const partTitle = title + (parts.length > 1 ? ` (${index + 1}/${parts.length})` : "");
+          await patchCardFn(sentParts[index], partTitle, enriched, template);
         }
       }
     }).catch(error => log(`[Flap 提前信号名称] 补充失败：${error.message}`))
@@ -7014,6 +7039,8 @@ async function startMonitor() {
   const rpcMetricsTimer = setInterval(() => {
     if (isShuttingDown) return;
     try { saveRpcMetrics(); } catch (error) { log(`[Flap RPC 状态] ${error.message}`); }
+    // Drain due notification digests even while every data source is backing off.
+    void deliverEarly();
   }, 10_000);
   rpcMetricsTimer.unref();
   const receiptHints = new Map(), priorityTokens = new Set(), externalJobs = new Map();

@@ -3340,7 +3340,7 @@ test("early signal delivery retains failed cards and acknowledges only the deliv
   }, saveStateFn: () => { saved++; } });
   assert.equal(ok.sent, true);
   assert.deepEqual(state.pendingChanges.map(x => x.id), ["during-send"]);
-  assert.equal(saved, 1);
+  assert.equal(saved, 2); // Persist the delivery plan before sending, then acknowledge.
 });
 
 test('archive endpoint failure never quarantines recent log queries and only two queries run at once', async () => {
@@ -3618,6 +3618,51 @@ test('history full blocks use the dedicated history block pool', async()=>{
  globalThis.fetch=async url=>{seen.push(url);return {ok:true,json:async()=>({result:{hash:'block'}})};};
  try{await __testables.bscRpcCall('eth_getBlockByNumber',['0x1',true],{history:true});assert.deepEqual(seen,['https://history.test']);}
  finally{globalThis.fetch=original;__testables.CONFIG.rpcPools=pools;__testables.resetBscRpcHealth();}
+});
+
+test('early multipart restart resumes the persisted plan without acknowledging new arrivals', async () => {
+  let state = { pendingChanges: [{ id: 'durable', kind: 'authority', detail: '重要证据'.repeat(2000) }], events: {}, tokens: {}, health: {} };
+  let disk;
+  const saveStateFn = (_path, value) => { disk = JSON.stringify(value); };
+  await assert.rejects(__testables.deliverFlapEarlySignals(state, { saveStateFn,
+    sendCardFn: async (_title, _content, _color, _file, opts) => {
+      assert.ok(opts.cardParts.length > 1);
+      opts.sentParts.push('sent-first');
+      await opts.onPartSent(opts.sentParts);
+      throw Error('second part failed');
+    } }), /second part failed/);
+  state = JSON.parse(disk);
+  const originalParts = state.notificationDelivery.cardParts;
+  assert.deepEqual(state.pendingChanges.map(e => e.id), ['durable']);
+  state.pendingChanges.push({ id: 'new-arrival', kind: 'authority', detail: '新证据' });
+  await __testables.deliverFlapEarlySignals(state, { saveStateFn,
+    sendCardFn: async (_title, _content, _color, _file, opts) => {
+      assert.deepEqual(opts.sentParts, ['sent-first']);
+      assert.deepEqual(opts.cardParts, originalParts);
+      assert.ok(opts.deliveryId);
+      return 'sent-first';
+    } });
+  assert.deepEqual(state.pendingChanges.map(e => e.id), ['new-arrival']);
+  assert.equal(state.notificationDelivery, undefined);
+});
+
+test('deferred early records do not block important notifications or disappear after restart', async () => {
+  const now = Date.parse('2026-09-28T03:00:00Z');
+  const state = { pendingChanges: [
+    { id: 'small', kind: 'nativeBalance', deltaWei: '-1', observedAt: new Date(now).toISOString(), detail: '扣费' },
+    { id: 'important', kind: 'configuration', detail: '停用' },
+  ], events: {}, tokens: {}, health: {} };
+  let disk;
+  await __testables.deliverFlapEarlySignals(state, { now: () => now,
+    saveStateFn: (_path, value) => { disk = JSON.stringify(value); },
+    sendCardFn: async (_title, content) => { assert.match(content, /停用/); assert.doesNotMatch(content, /扣费/); return 'important'; } });
+  const restart = JSON.parse(disk);
+  assert.deepEqual(restart.pendingChanges.map(e => e.id), ['small']);
+  await __testables.deliverFlapEarlySignals(restart, { now: () => now + 300001,
+    saveStateFn: () => {}, sendCardFn: async (title, content) => {
+      assert.equal(title, 'Flap 日常操作汇总'); assert.match(content, /1 次小额/); return 'digest';
+    } });
+  assert.equal(restart.pendingChanges.length, 0);
 });
 
 test('history denial leaves same-provider live logs working',async()=>{

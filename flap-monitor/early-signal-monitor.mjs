@@ -170,7 +170,8 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
     && (related || state.tokens[token] && state.tokens[token].effectiveEnabled !== true));
   const emitted = [];
   const add = (log, event) => {
-    const e = { ...event, id: `${logId(log)}:${event.kind}:${event.token || ""}`, blockNumber: Number(log.blockNumber || receipt.blockNumber),
+    const e = { ...event, enabledAtObservation: state.tokens[event.token]?.effectiveEnabled,
+      id: `${logId(log)}:${event.kind}:${event.token || ""}`, blockNumber: Number(log.blockNumber || receipt.blockNumber),
       logIndex: Number(log.logIndex || 0),
       blockHash: lower(log.blockHash || receipt.blockHash), transactionHash: lower(receipt.transactionHash),
       source: "chain", chainId: 56, provisional: true };
@@ -222,6 +223,8 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         // Incoming dust never expands the monitored address set or implies stocking.
         if (t === TOPICS.Transfer && wallets.has(from)) candidate(state, to, `资金/仓位接收 ${receipt.transactionHash}`, nowMs);
         add(l, { kind, token: nft ? "" : a, stage: "observation", from, to, amount, tokenId: nft ? amount : undefined,
+          passiveIncoming: kind === 'transfer' && !related && !wallets.has(from) && wallets.has(to),
+          knownLiquiditySpender: kind === 'approval' && POSITION_MANAGERS.includes(to),
           detail: `${kind === "positionTransfer" ? "LP NFT 转移" : kind === "approval" ? "授权" : nft ? "NFT 转移" : "代币收支"} ${a}｜${from} → ${to}｜${nft ? "tokenId" : "原始数量"} ${amount}` });
         if (kind === "positionTransfer") {
           const key = `${a}:${amount}`, next = { manager: a, tokenId: amount, owner: to, blockNumber: Number(receipt.blockNumber), logIndex: Number(l.logIndex || 0) };
@@ -323,7 +326,7 @@ export function ingestCowOrders(state, owner, orders, { nowMs = Date.now(), boot
     const stage = ["fulfilled", "open", "presignaturePending"].includes(status) ? "stocking" : "observation";
     emit(state, { id: `cow:${order.uid}:${next.revision}:${fingerprint}`, source: "cow", kind: "order", token, stage,
       orderUid: order.uid, status, sourceTime: order.creationDate,
-      detail: `CoW ${status}｜${owner}｜卖出 ${order.sellToken} → 买入 ${token}｜原始卖出数量 ${order.sellAmount}｜有效期 ${iso(Number(order.validTo) * 1000)}` }, { nowMs });
+      detail: `CoW ${status}｜${owner}｜卖出 ${order.sellToken} → 买入 ${token}｜原始卖出数量 ${order.sellAmount}｜累计成交原始数量：卖出 ${order.executedSellAmount ?? '未知'} / 买入 ${order.executedBuyAmount ?? '未知'}｜有效期 ${iso(Number(order.validTo) * 1000)}` }, { nowMs });
     state.orders[order.uid] = next;
   }
 }
@@ -469,6 +472,7 @@ export async function refreshNativeBalances(state, config, rpcBatch, nowMs) {
     if (!/^0x[a-f0-9]+$/i.test(balances[i] || "")) throw new Error("BNB 余额无效");
     const address = wallets[i], current = BigInt(balances[i]).toString(), previous = state.balances[address];
     if (previous !== undefined && previous !== current) emit(state, { id: `balance:${address}:${nowMs}`, kind: "nativeBalance", source: "rpc",
+      address, deltaWei: (BigInt(current) - BigInt(previous)).toString(),
       detail: `BNB 余额净变动 ${address}｜wei ${BigInt(current) - BigInt(previous)}；含 Gas/内部转账影响，不等同单笔转账` }, { nowMs });
     state.balances[address] = current;
   }
@@ -703,26 +707,37 @@ export function formatEarlySignalAsset(token, metadata = {}) {
 export function buildEarlySignalContent(changes, state) {
   const groups = new Map();
   for (const e of changes) {
-    const key = e.token || e.kind;
+    const key = e.transactionHash || e.id || e.token || e.kind;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(e);
   }
   const lines = [];
-  for (const [key, events] of groups) {
-    const token = events[0].token;
-    const stage = token ? earlyAssetStage(state, token) : "observation";
-    const color = stage === "opened" ? "green" : stage === "disabled" ? "red" : "orange";
-    lines.push(`**🔎 <font color='${color}'>${token ? stageLabel(stage) : "关联操作"}</font>**`);
-    if (token) lines.push(formatEarlySignalAsset(token, state.tokens[token]));
-    if (state.tokens[token]?.underlying) lines.push(`原始资产：${state.tokens[token].underlying}`);
-    if (state.tokens[token]?.configurationCheckedAt) lines.push(`链上状态最后复核：${state.tokens[token].configurationCheckedAt}`);
-    if (state.health.assets?.lastError) lines.push("当前配置复核异常，上述状态为缓存快照。");
+  for (const events of groups.values()) {
+    const kinds = new Set(events.map(e => e.kind));
+    const action = kinds.has('liquidityRemoved') ? '撤出流动性（保留即时提醒）'
+      : kinds.has('liquidityAdded') ? '增加流动性'
+      : events.every(e => e.passiveIncoming) ? '被动收币｜尚无主动采购证据'
+      : kinds.has('configuration') ? '创建状态变化'
+      : kinds.has('order') ? '采购订单进展'
+      : kinds.has('proposal') ? '提案进展' : '关联操作';
+    lines.push(`🔎 本次动作：${action}`);
+    for (const token of [...new Set(events.map(e => e.token).filter(Boolean))]) {
+      const stage = earlyAssetStage(state, token);
+      const color = stage === 'opened' ? 'green' : stage === 'disabled' ? 'red' : 'orange';
+      lines.push(formatEarlySignalAsset(token, state.tokens[token]));
+      lines.push(`当前状态：<font color='${color}'>${stageLabel(stage)}</font>`);
+      if (state.tokens[token]?.underlying) lines.push(`原始资产：${state.tokens[token].underlying}`);
+      if (state.tokens[token]?.configurationCheckedAt) lines.push(`链上状态最后复核：${state.tokens[token].configurationCheckedAt}`);
+    }
+    if (state.health?.assets?.lastError) lines.push("当前配置复核异常，上述状态为缓存快照。");
     for (const e of events) {
       lines.push(`• ${e.detail}`);
       if (e.sourceTime) lines.push(`来源时间：${e.sourceTime}`);
-      lines.push(`首次观测：${e.observedAt}`);
-      if (e.transactionHash) lines.push(`[交易](https://bscscan.com/tx/${e.transactionHash})｜区块 ${e.blockNumber}`);
     }
+    const times = [...new Set(events.map(e => e.observedAt).filter(Boolean))].sort();
+    if (times.length) lines.push(`首次观测：${times[0]}${times.length > 1 ? ` — ${times.at(-1)}` : ''}`);
+    const tx = events[0];
+    if (tx.transactionHash) lines.push(`[交易](https://bscscan.com/tx/${tx.transactionHash})｜区块 ${tx.blockNumber}`);
     lines.push("");
   }
   return lines.join("\n");
