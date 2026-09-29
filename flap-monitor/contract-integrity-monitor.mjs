@@ -655,8 +655,8 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
       lines.push(`### 🟠 ${change.field}`);
       const audit = change.audit;
       if (audit) {
-        const link = (address, name) => `[${shortValue(name || `${address.slice(0, 6)}…${address.slice(-4)}`).replace(/[\[\]\\`*_]/g, '\\$&')}](https://bscscan.com/address/${address})`;
-        if (audit.token) lines.push(`🪙 关联代币：${link(audit.token, audit.name)}`);
+        const link = (address, name, baseUrl = 'https://bscscan.com/address/') => `[${shortValue(name || `${address.slice(0, 6)}…${address.slice(-4)}`).replace(/[\[\]\\`*_]/g, '\\$&')}](${baseUrl}${address})`;
+        if (audit.token) lines.push(`🪙 关联代币：${link(audit.token, audit.name, 'https://gmgn.ai/bsc/token/')}`);
         if (audit.vault) lines.push(`🏦 金库${audit.mappingAt === 'current' ? '（当前映射）' : ''}：${link(audit.vault)}`);
         if (audit.factory) lines.push(`工厂：${link(audit.factory)}｜[创建入口](${buildVaultFactoryLaunchUrl(audit.factory)})`);
         if (audit.token) {
