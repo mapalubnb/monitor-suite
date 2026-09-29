@@ -59,19 +59,56 @@ export function decodeOperationalCall(transaction, path = "0") {
   } catch (error) { return unknown(error.message); }
 }
 
-export function describeOperationalAction(a) {
+const ZERO_ADDRESS = `0x${"0".repeat(40)}`;
+const MAX_UINT256 = (1n << 256n) - 1n;
+const tokenKey = value => String(value || "").toLowerCase();
+const addressLink = address => `[${address}](https://bscscan.com/address/${address})`;
+const plainLabel = value => String(value || "").replace(/[\\`*_[\]<>\r\n]/g, "");
+export const hasTokenDecimals = metadata => Number.isInteger(metadata?.decimals)
+  && metadata.decimals >= 0 && metadata.decimals <= 255;
+
+// Exact decimal placement, without Number conversion, rounding or precision loss.
+export function formatOperationalAmount(raw, decimals) {
+  if (!hasTokenDecimals({ decimals }) || !/^\d+$/.test(String(raw ?? ""))) return "金额待确认（精度或数值未核验）";
+  const digits = BigInt(raw).toString().padStart(decimals + 1, "0");
+  if (!decimals) return digits;
+  const fraction = digits.slice(-decimals).replace(/0+$/, "");
+  return digits.slice(0, -decimals) + (fraction ? `.${fraction}` : "");
+}
+
+export function operationalAmountToken(action, metadata = {}) {
+  if (action.kind === "funding") return "BNB";
+  if (action.kind === "allowance" && tokenKey(action.asset) === ZERO_ADDRESS) return "BNB";
+  const token = tokenKey(action.asset);
+  if (action.kind !== "wrapping") return token;
+  // ERC-4626 mint/redeem use shares; deposit/withdraw use underlying assets.
+  const underlying = tokenKey(metadata[token]?.underlying);
+  if (!/^0x[0-9a-f]{40}$/.test(underlying) || underlying === ZERO_ADDRESS || underlying === token) return "";
+  return ["0x94bf804d", "0xba087652"].includes(action.selector) ? token : underlying;
+}
+
+export function describeOperationalAction(a, metadata = {}) {
+  const token = operationalAmountToken(a, metadata);
+  const meta = token === "BNB" ? { decimals: 18, symbol: "BNB" } : metadata[token] || {};
+  const unit = plainLabel(meta.symbol || meta.name);
+  const formatted = formatOperationalAmount(a.amount, meta.decimals);
+  const quantity = hasTokenDecimals(meta) && /^\d+$/.test(String(a.amount ?? ""))
+    ? `${formatted}${unit ? ` ${unit}` : ""}` : formatted;
+  const unlimited = a.kind === "approval" && /^\d+$/.test(String(a.amount ?? "")) && BigInt(a.amount) === MAX_UINT256;
+  const wrapLabel = ({ "0x6e553f65": "存入底层资产", "0x94bf804d": "铸造份额",
+    "0xb460af94": "提取底层资产", "0xba087652": "赎回份额" })[a.selector] || "包装／赎回";
   const descriptions = {
-    funding: `BNB 调拨 → ${a.recipient}｜原始数量 ${a.amount}`,
-    transfer: `代币转账 ${a.asset} → ${a.recipient}｜原始数量 ${a.amount}`,
-    approval: `代币授权 ${a.asset} → ${a.spender}｜原始额度 ${a.amount}`,
+    funding: `💸 BNB 调拨\n金额：${quantity}\n接收地址：${addressLink(a.recipient)}`,
+    transfer: `💸 代币转账\n资产：${addressLink(a.asset)}\n金额：${quantity}\n接收地址：${addressLink(a.recipient)}`,
+    approval: `🔑 代币授权\n资产：${addressLink(a.asset)}\n额度：${unlimited ? "无限额度" : quantity}\n授权对象：${addressLink(a.spender)}`,
     positionTransfer: `LP NFT ${a.asset} #${a.tokenId} → ${a.recipient}`,
     cowPresign: `CoW 订单${a.signed ? "预签名" : "撤销预签名"}：${a.orderUid}`,
     upgrade: `合约升级 ${a.proxy} → ${a.implementation}`,
     role: `${a.granted ? "授予" : "撤销"}角色 ${a.role} → ${a.account}`,
     ownership: `管理员变更 → ${a.account}`,
     module: `${a.enabled ? "启用" : "停用"} Safe 模块 ${a.module}`,
-    allowance: `${a.reason} ${a.selector}${a.delegate ? `｜委托 ${a.delegate}` : ""}${a.asset ? `｜资产 ${a.asset}｜原始额度 ${a.amount}｜重置间隔 ${a.resetMinutes} 分钟` : ""}`,
-    wrapping: `${a.reason}｜${a.asset}｜原始数量 ${a.amount}`,
+    allowance: `${a.reason} ${a.selector}${a.delegate ? `\n委托：${addressLink(a.delegate)}` : ""}${a.asset ? `\n资产：${token === "BNB" ? "BNB" : addressLink(a.asset)}\n额度：${quantity}\n重置间隔：${a.resetMinutes} 分钟` : ""}`,
+    wrapping: `${wrapLabel}\n包装合约：${addressLink(a.asset)}\n${token ? `数量：${quantity}\n计量资产：${addressLink(token)}` : "金额待确认（底层资产映射未核验）"}`,
   };
   return descriptions[a.kind] || `未解析调用 ${a.to}｜${a.selector}｜${a.reason || ""}`;
 }

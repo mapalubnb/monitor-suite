@@ -881,7 +881,7 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
           + "｜兑换类型 " + c.nativeToQuoteSwapType + "｜DEX ID " + c.dexId);
       } else if (action.kind === "route") lines.push(...formatQuoteRoute(action.hops));
       else if (action.kind === "creation") lines.push("创建开关：" + (action.disabled ? "暂停创建" : "解除暂停创建"));
-      else lines.push(describeOperationalAction(action));
+      else lines.push(describeOperationalAction(action, factoryAssets));
     }
     if (change.nonceBlocked) lines.push("⏳ 前序 nonce 未执行");
     if (change.executionCheck?.status === "passed") lines.push("✅ 只读执行模拟通过｜" + formatDate(change.executionCheck.checkedAt));

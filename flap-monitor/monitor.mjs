@@ -33,6 +33,7 @@ import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-sign
 import { selectEarlyNotification, archiveRoutineEarlySignals } from './early-signal-notifications.mjs';
 import { selectCowNotification } from './cow-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
+import { hasTokenDecimals, operationalAmountToken } from "./operational-call-codec.mjs";
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
@@ -6641,11 +6642,41 @@ async function deliverFlapContractIntegrityChanges(state, {
   return { sent: true, changes, messageId, enrichmentPromise };
 }
 
+async function resolveSafeAmountMetadata(addresses, { wrappers = [], metadata = {},
+  resolveMetadataFn = resolveFactoryPoolTokenMetadata, rpcBatchFn = bscRpcBatch } = {}) {
+  const result = await resolveMetadataFn(addresses);
+  const enriched = { ...metadata, ...result.metadata };
+  // Only queried after delivery, through the existing RPC budget.
+  for (const wrapper of wrappers) {
+    if (metadata[wrapper]?.underlying) {
+      enriched[wrapper] = { ...enriched[wrapper], underlying: metadata[wrapper].underlying };
+      continue;
+    }
+    try {
+      const [value] = await rpcBatchFn([{ method: "eth_call", params: [{ to: wrapper, data: "0x38d52e0f" }, "latest"] }]);
+      if (!/^0x0{24}[a-f0-9]{40}$/i.test(value || "")) continue;
+      const underlying = `0x${value.slice(-40)}`.toLowerCase();
+      if (/^0x0{40}$/.test(underlying) || underlying === wrapper) continue;
+      enriched[wrapper] = { ...enriched[wrapper], underlying };
+    } catch (error) { log(`[Flap Safe 金额] 底层资产查询失败：${error.message}`); }
+  }
+  const underlyingTokens = [...new Set(wrappers.map(token => enriched[token]?.underlying)
+    .filter(token => token && !hasTokenDecimals(enriched[token])))];
+  if (underlyingTokens.length) {
+    const underlying = await resolveMetadataFn(underlyingTokens);
+    Object.assign(enriched, underlying.metadata);
+  }
+  const updated = new Set([...addresses, ...wrappers, ...underlyingTokens]);
+  return { metadata: Object.fromEntries([...updated].filter(token => enriched[token]).map(token => [token, enriched[token]])) };
+}
+
 async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
   titlePrefix = "",
   sendCardFn = sendCardViaApi,
   saveStateFn = saveSafeProposalState,
   acknowledgeFn = acknowledgeSafeProposalChanges,
+  resolveMetadataFn = sendCardFn === sendCardViaApi ? resolveSafeAmountMetadata : null,
+  patchCardFn = patchCard,
 } = {}) {
   const pending = [...(state.pendingChanges || [])];
   if (pending.length === 0) return { sent: false, changes: [] };
@@ -6653,6 +6684,7 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
     .map(type => pending.filter(change => change.type === type));
   const delivered = [];
   const messageIds = [];
+  const enrichments = [];
   for (const changes of groups) {
     const invalidated = ["invalidated", "failed"].includes(changes[0].type);
     const suffix = ({ existing: "当前待执行", proposed: "已提交", ready: "签名已满足，等待执行",
@@ -6660,7 +6692,12 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
     const subject = changes.every(change => change.vaultFactory) ? "Vault Factory 注册／配置提案"
       : changes.every(change => change.quoteToken) ? "计价代币管理提案" : "Safe 资金／权限／管理提案";
     const title = `${titlePrefix}Flap ${subject}：${suffix}`;
-    const content = buildSafeProposalContent(changes, factoryPoolState?.assets || {});
+    const metadata = { ...state.tokenMetadata };
+    for (const [token, asset] of Object.entries(factoryPoolState?.assets || {})) {
+      metadata[token] = { ...metadata[token], ...asset,
+        decimals: hasTokenDecimals(asset) ? asset.decimals : metadata[token]?.decimals };
+    }
+    const content = buildSafeProposalContent(changes, metadata);
     const messageId = invalidated
       ? await sendCardFn(title, content, "yellow")
       : await sendAlertCard(sendCardFn, title, content, "red");
@@ -6669,21 +6706,30 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
     saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
     delivered.push(...changes);
     messageIds.push(messageId);
-    const missingNames = [...new Set(changes.map(change => change.quoteToken).filter(address => address
-      && !factoryPoolState?.assets?.[address]?.name && !factoryPoolState?.assets?.[address]?.symbol))];
-    // Resolve new tokens after delivery, without requiring Factory catalog enrollment.
-    if (missingNames.length && sendCardFn === sendCardViaApi) {
-      void resolveFactoryPoolTokenMetadata(missingNames).then(async ({ metadata }) => {
-        if (!Object.keys(metadata).length) return;
-        const enriched = buildSafeProposalContent(changes, { ...factoryPoolState?.assets, ...metadata });
+    const actions = changes.flatMap(change => change.actions || []);
+    const wrappers = [...new Set(actions.filter(a => a.kind === 'wrapping').map(a => a.asset.toLowerCase()))];
+    const amountTokens = actions.filter(a => ['transfer', 'approval', 'allowance', 'wrapping'].includes(a.kind))
+      .map(a => operationalAmountToken(a, metadata)).filter(token => /^0x[0-9a-f]{40}$/.test(token));
+    const missing = [...new Set([
+      ...changes.map(change => change.quoteToken).filter(token => token && !metadata[token]?.name && !metadata[token]?.symbol),
+      ...amountTokens.filter(token => !hasTokenDecimals(metadata[token]) || !metadata[token]?.name && !metadata[token]?.symbol),
+      ...wrappers.filter(token => !metadata[token]?.underlying),
+    ])];
+    // No metadata query blocks the primary alert or its acknowledgement.
+    if (missing.length && resolveMetadataFn) {
+      enrichments.push(Promise.resolve().then(() => resolveMetadataFn(missing, { wrappers, metadata })).then(async ({ metadata: resolved }) => {
+        if (!Object.keys(resolved).length) return;
+        state.tokenMetadata = Object.fromEntries(Object.entries({ ...state.tokenMetadata, ...resolved }).slice(-512));
+        saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
+        const enriched = buildSafeProposalContent(changes, { ...metadata, ...resolved });
         const color = invalidated ? 'yellow' : 'red';
-        if (!isTooLongForSingleCard(content, title, color) && !isTooLongForSingleCard(enriched, title, color)) {
-          await patchCard(messageId, title, enriched, invalidated ? "yellow" : "red");
+        if (enriched !== content && !isTooLongForSingleCard(content, title, color) && !isTooLongForSingleCard(enriched, title, color)) {
+          await patchCardFn(messageId, title, enriched, invalidated ? "yellow" : "red");
         }
-      }).catch(error => log(`[Flap Safe 名称] 补充失败：${error.message}`));
+      }).catch(error => log(`[Flap Safe 金额／名称] 补充失败：${error.message}`)));
     }
   }
-  return { sent: delivered.length > 0, changes: delivered, messageIds };
+  return { sent: delivered.length > 0, changes: delivered, messageIds, enrichmentDone: Promise.all(enrichments) };
 }
 
 function earlySignalConfig() {
@@ -8133,6 +8179,7 @@ export const __testables = {
   runFlapContractIntegrityPass,
   deliverFlapContractIntegrityChanges,
   deliverFlapSafeProposalChanges,
+  resolveSafeAmountMetadata,
   buildCaStoreVaultChangeNotification,
   getStandaloneCaStoreVaultDiffs,
   shouldSuppressCaStoreOnlyPageNotification,

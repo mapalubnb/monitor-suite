@@ -2746,6 +2746,77 @@ test("Safe proposal delivery preserves unsent alerts and acknowledges successful
   __testables.CONFIG.feishuMentionOpenId = previousMentionOpenId;
 });
 
+test('Safe amount enrichment never delays delivery and reuses saved precision on later cards', async () => {
+  const token = '0x1111111111111111111111111111111111111111';
+  const change = { id: 'amount-1', type: 'ready', actions: [{ kind: 'transfer', asset: token, recipient: token, amount: '1234500' }] };
+  const state = { pendingChanges: [change] };
+  const cards = [], patches = [];
+  let finish;
+  const lookup = new Promise(resolve => { finish = resolve; });
+  const options = {
+    sendCardFn: async (_title, content) => { cards.push(content); return 'om_amount'; },
+    patchCardFn: async (id, _title, content) => { patches.push({ id, content }); },
+    saveStateFn: () => {},
+    resolveMetadataFn: async addresses => { assert.deepEqual(addresses, [token]); assert.equal(cards.length, 1); return lookup; },
+  };
+  const delivery = await __testables.deliverFlapSafeProposalChanges(state, {}, options);
+  assert.equal(delivery.sent, true);
+  assert.equal(state.pendingChanges.length, 0);
+  assert.match(cards[0], /金额待确认/);
+  assert.equal(patches.length, 0);
+  finish({ metadata: { [token]: { decimals: 6, symbol: 'USD' } } });
+  await delivery.enrichmentDone;
+  assert.equal(patches[0].id, 'om_amount');
+  assert.match(patches[0].content, /金额：1.2345 USD/);
+  assert.equal(state.tokenMetadata[token].decimals, 6);
+  state.pendingChanges = [{ ...change, id: 'amount-2' }];
+  await __testables.deliverFlapSafeProposalChanges(state, {}, { ...options, resolveMetadataFn: () => assert.fail('cached precision must not query') });
+  assert.match(cards[1], /金额：1.2345 USD/);
+});
+
+test('Safe BNB and cached token amounts need no metadata request; failed sends retain alerts', async () => {
+  const action = { kind: 'funding', recipient: '0x1111111111111111111111111111111111111111', amount: '5000000000000000000' };
+  const state = { pendingChanges: [{ id: 'bnb', type: 'ready', actions: [action] }] };
+  const options = { saveStateFn: () => {}, resolveMetadataFn: () => assert.fail('native BNB must not query'),
+    sendCardFn: async (_title, content) => { assert.match(content, /金额：5 BNB/); return ''; } };
+  await __testables.deliverFlapSafeProposalChanges(state, {}, options);
+  assert.equal(state.pendingChanges.length, 1);
+  const result = await __testables.deliverFlapSafeProposalChanges(state, {}, { ...options, sendCardFn: async () => 'om_bnb' });
+  await result.enrichmentDone;
+  assert.equal(state.pendingChanges.length, 0);
+});
+
+test('Safe metadata failures keep the first reminder and never guess token precision', async () => {
+  const token = '0x1111111111111111111111111111111111111111';
+  const state = { pendingChanges: [{ id: 'unknown-amount', type: 'ready', actions: [{ kind: 'transfer', asset: token, amount: '5000000000000000000' }] }] };
+  const result = await __testables.deliverFlapSafeProposalChanges(state, {}, {
+    saveStateFn: () => {}, sendCardFn: async (_title, content) => { assert.match(content, /金额待确认/); return 'om_unknown'; },
+    resolveMetadataFn: async () => { throw new Error('metadata unavailable'); },
+    patchCardFn: () => assert.fail('must not fabricate a converted amount'),
+  });
+  await result.enrichmentDone;
+  assert.equal(result.sent, true);
+  assert.equal(state.pendingChanges.length, 0);
+});
+
+test('Safe amount resolver verifies underlying mapping and resolves different precisions', async () => {
+  const wrapper = '0x1111111111111111111111111111111111111111', underlying = '0x2222222222222222222222222222222222222222';
+  const queried = [];
+  const result = await __testables.resolveSafeAmountMetadata([wrapper], {
+    wrappers: [wrapper],
+    rpcBatchFn: async calls => { assert.equal(calls[0].params[0].data, '0x38d52e0f'); return ['0x' + underlying.slice(2).padStart(64, '0')]; },
+    resolveMetadataFn: async tokens => { queried.push(tokens); return { metadata: Object.fromEntries(tokens.map(t => [t, { decimals: t === wrapper ? 18 : 6 }])) }; },
+  });
+  assert.deepEqual(queried, [[wrapper], [underlying]]);
+  assert.equal(result.metadata[wrapper].underlying, underlying);
+  assert.equal(result.metadata[underlying].decimals, 6);
+  const invalid = await __testables.resolveSafeAmountMetadata([wrapper], {
+    wrappers: [wrapper], rpcBatchFn: async () => ['0x' + '0'.repeat(64)],
+    resolveMetadataFn: async () => ({ metadata: { [wrapper]: { decimals: 18 } } }),
+  });
+  assert.equal(invalid.metadata[wrapper].underlying, undefined);
+});
+
 test("Flap frontend contract hints bind each address to its nearest configuration field", () => {
   const source = "const config={"
     + "factory:'0x1111111111111111111111111111111111111111',"

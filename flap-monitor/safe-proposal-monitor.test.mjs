@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRpcBudget } from '../shared/rpc-budget.mjs';
+import { describeOperationalAction, formatOperationalAmount } from './operational-call-codec.mjs';
 
 import {
   SAFE_MULTISEND_SELECTOR,
@@ -34,6 +35,43 @@ const OTHER = "0x1111111111111111111111111111111111111111";
 const SAFE_TX_HASH = `0x${"97".repeat(32)}`;
 const AWDH = JSON.parse(readFileSync(new URL("./fixtures/safe-awdh-proposal.json", import.meta.url), "utf8"));
 const MULTISEND = "0x9641d764fc13c8b624c04430c7356c1c7c8102e2";
+
+test('Safe amounts use exact native and token units, including tiny and large values', () => {
+  assert.equal(formatOperationalAmount('5000000000000000000', 18), '5');
+  assert.equal(formatOperationalAmount('1', 18), '0.000000000000000001');
+  assert.equal(formatOperationalAmount('1234500', 6), '1.2345');
+  assert.equal(formatOperationalAmount('0', 0), '0');
+  assert.equal(formatOperationalAmount('9007199254740993000001', 6), '9007199254740993.000001');
+  for (const decimals of [undefined, null, '18', -1, 256]) assert.match(formatOperationalAmount('5000', decimals), /待确认/);
+  assert.match(formatOperationalAmount('1e18', 18), /待确认/);
+  const action = { kind: 'funding', recipient: OTHER, amount: '5000000000000000000' };
+  const content = buildSafeProposalContent([{ actions: [action], type: 'ready', safe: SAFE }]);
+  assert.match(content, /金额：5 BNB/);
+  assert.doesNotMatch(content, /原始数量|5000000000000000000/);
+  assert.equal(action.amount, '5000000000000000000');
+  const transfer = { kind: 'transfer', asset: TOKEN, recipient: OTHER, amount: '1234500' };
+  assert.match(describeOperationalAction(transfer, { [TOKEN]: { decimals: 6, symbol: 'TEST' } }), /金额：1.2345 TEST/);
+  assert.match(describeOperationalAction(transfer), /金额待确认/);
+});
+
+test('Safe allowance distinguishes native units, finite and unlimited approvals', () => {
+  const approval = { kind: 'approval', asset: TOKEN, spender: OTHER, amount: ((1n << 256n) - 1n).toString() };
+  assert.match(describeOperationalAction(approval), /额度：无限额度/);
+  assert.match(describeOperationalAction({ ...approval, amount: '0' }, { [TOKEN]: { decimals: 18, symbol: 'TEST' } }), /额度：0 TEST/);
+  assert.match(describeOperationalAction({ kind: 'allowance', asset: `0x${'0'.repeat(40)}`, amount: '5000000000000000000' }), /额度：5 BNB/);
+});
+
+test('Safe wrapping uses underlying units for deposit/withdraw and share units for mint/redeem', () => {
+  const metadata = { [TOKEN]: { decimals: 18, symbol: 'SHARE', underlying: OTHER }, [OTHER]: { decimals: 6, symbol: 'USD' } };
+  const action = { kind: 'wrapping', asset: TOKEN, amount: '1500000' };
+  for (const selector of ['0x6e553f65', '0xb460af94']) {
+    assert.match(describeOperationalAction({ ...action, selector }, metadata), /数量：1.5 USD/);
+  }
+  for (const selector of ['0x94bf804d', '0xba087652']) {
+    assert.match(describeOperationalAction({ ...action, selector, amount: '2000000000000000000' }, metadata), /数量：2 SHARE/);
+  }
+  assert.match(describeOperationalAction({ ...action, selector: '0x6e553f65' }, { [TOKEN]: { decimals: 18 } }), /底层资产映射未核验/);
+});
 
 test('Safe nonce admission uses small critical batches and isolates failure without API backoff', async () => {
   const safes = Array.from({length: 8}, (_, i) => '0x' + (i + 1).toString(16).padStart(40, '0'));
