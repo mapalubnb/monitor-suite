@@ -8,6 +8,7 @@ import { TOPICS } from "./early-signal-topics.mjs";
 import { abiAddress, abiUint, hexWords } from "./operational-call-codec.mjs";
 import { normalizeAddress, extractFlapProposalActions, createSafeApiPoolFetch, normalizeSafeApiKeys } from "./safe-proposal-monitor.mjs";
 import { FLAP_FACTORY_PROXY, QUOTE_CONFIG_SELECTOR, QUOTE_TOKEN_CREATION_DISABLED_SELECTOR } from "./factory-pool-monitor.mjs";
+import { decodeCowTrades, matchCowTransfers, cowDirection } from './cow-notifications.mjs';
 
 export const EARLY_SIGNAL_SCHEMA_VERSION = 2;
 const ZERO = "0x" + "0".repeat(40);
@@ -32,7 +33,7 @@ export const stageLabel = stage => STAGES[stage] || stage;
 export function createEarlySignalState() {
   return { schemaVersion: EARLY_SIGNAL_SCHEMA_VERSION, chainId: 56, cursor: null, cursorHash: "", events: {},
     pendingChanges: [], tokens: {}, pools: {}, positions: {}, orders: {}, candidates: {}, safeInfo: {},
-    balances: {}, stages: {}, proposalVersions: {}, fastBlocks: {}, health: {}, discoveryCursor: 0, lastDiscoveryAt: 0, lastRunAt: "" };
+    balances: {}, stages: {}, proposalVersions: {}, fastBlocks: {}, cowNotifications: {}, health: {}, discoveryCursor: 0, lastDiscoveryAt: 0, lastRunAt: "" };
 }
 export function loadEarlySignalState(path) {
   if (!existsSync(path)) return createEarlySignalState();
@@ -40,7 +41,7 @@ export function loadEarlySignalState(path) {
   const raw = JSON.parse(readFileSync(path, "utf8"));
   if (raw.chainId !== 56) throw new Error("提前监控状态不是 BSC");
   const state = { ...createEarlySignalState(), ...raw, schemaVersion: EARLY_SIGNAL_SCHEMA_VERSION };
-  for (const name of ["events", "tokens", "pools", "positions", "orders", "candidates", "safeInfo", "balances", "stages", "proposalVersions", "fastBlocks", "health"]) {
+  for (const name of ["events", "tokens", "pools", "positions", "orders", "candidates", "safeInfo", "balances", "stages", "proposalVersions", "fastBlocks", "cowNotifications", "health"]) {
     if (!state[name] || typeof state[name] !== "object" || Array.isArray(state[name])) throw new Error(`提前监控状态 ${name} 无效`);
   }
   if (!Array.isArray(state.pendingChanges)) throw new Error("提前监控队列无效");
@@ -177,6 +178,12 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
       source: "chain", chainId: 56, provisional: true };
     if (emit(state, e, options)) emitted.push(e);
   };
+  const cowTrades = decodeCowTrades(logs, wallets, state.orders);
+  const cowTransfers = matchCowTransfers(logs, cowTrades, TOPICS.Transfer);
+  for (const { log, ...trade } of cowTrades) {
+    trackToken(state, trade.token, trade.direction === '资产采购' ? 'CoW 采购目标' : 'CoW 卖出资产', nowMs);
+    add(log, trade);
+  }
   // Initialize first even when a receipt contains activity before the pool creation log.
   for (const l of logs) {
     const t = lower(l.topics?.[0]), a = lower(l.address);
@@ -223,6 +230,7 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         // Incoming dust never expands the monitored address set or implies stocking.
         if (t === TOPICS.Transfer && wallets.has(from)) candidate(state, to, `资金/仓位接收 ${receipt.transactionHash}`, nowMs);
         add(l, { kind, token: nft ? "" : a, stage: "observation", from, to, amount, tokenId: nft ? amount : undefined,
+          ...(kind === 'transfer' && cowTransfers.has(l) ? { cowOrderUid: cowTransfers.get(l) } : {}),
           passiveIncoming: kind === 'transfer' && !related && !wallets.has(from) && wallets.has(to),
           knownLiquiditySpender: kind === 'approval' && POSITION_MANAGERS.includes(to),
           detail: `${kind === "positionTransfer" ? "LP NFT 转移" : kind === "approval" ? "授权" : nft ? "NFT 转移" : "代币收支"} ${a}｜${from} → ${to}｜${nft ? "tokenId" : "原始数量"} ${amount}` });
@@ -317,16 +325,22 @@ export function ingestCowOrders(state, owner, orders, { nowMs = Date.now(), boot
     const previous = state.orders[order.uid];
     const status = ["open", "presignaturePending"].includes(order.status) && Number(order.validTo) * 1000 <= nowMs ? "expired" : order.status;
     const fingerprint = [status, order.executedSellAmount, order.executedBuyAmount].join(":");
-    const next = { uid: order.uid, owner: lower(owner), buyToken: lower(order.buyToken), sellToken: lower(order.sellToken),
+    const next = { uid: order.uid, owner: lower(owner), receiver: lower(order.receiver || owner), buyToken: lower(order.buyToken), sellToken: lower(order.sellToken),
+      executedSellAmount: String(order.executedSellAmount ?? '0'), executedBuyAmount: String(order.executedBuyAmount ?? '0'),
+      sellAmount: String(order.sellAmount ?? '0'), orderKind: order.kind,
       fingerprint, status, revision: (previous?.revision || 0) + (previous?.fingerprint === fingerprint ? 0 : 1), creationDate: order.creationDate, validTo: order.validTo, lastSeenAt: iso(nowMs) };
     const active = ["open", "presignaturePending"].includes(order.status) && Number(order.validTo) * 1000 > nowMs;
     if (bootstrap && !active || previous?.fingerprint === fingerprint) { state.orders[order.uid] = next; continue; }
-    const token = lower(order.buyToken);
-    trackToken(state, token, "CoW 采购目标", nowMs);
-    const stage = ["fulfilled", "open", "presignaturePending"].includes(status) ? "stocking" : "observation";
+    const buying = !BASE_ASSETS.has(next.buyToken);
+    const token = buying ? next.buyToken : next.sellToken;
+    trackToken(state, token, buying ? "CoW 采购目标" : "CoW 卖出资产", nowMs);
+    const stage = buying && ["fulfilled", "open", "presignaturePending"].includes(status) ? "stocking" : "observation";
     emit(state, { id: `cow:${order.uid}:${next.revision}:${fingerprint}`, source: "cow", kind: "order", token, stage,
       orderUid: order.uid, status, sourceTime: order.creationDate,
-      detail: `CoW ${status}｜${owner}｜卖出 ${order.sellToken} → 买入 ${token}｜原始卖出数量 ${order.sellAmount}｜累计成交原始数量：卖出 ${order.executedSellAmount ?? '未知'} / 买入 ${order.executedBuyAmount ?? '未知'}｜有效期 ${iso(Number(order.validTo) * 1000)}` }, { nowMs });
+      owner: next.owner, sellToken: next.sellToken, buyToken: next.buyToken, direction: cowDirection(next.sellToken, next.buyToken),
+      executedSellAmount: next.executedSellAmount, executedBuyAmount: next.executedBuyAmount, sellAmount: next.sellAmount, orderKind: next.orderKind,
+      orderChange: !previous ? 'new' : previous.status !== status ? 'status' : 'progress',
+      detail: `CoW ${status}｜${owner}｜卖出 ${order.sellToken} → 买入 ${order.buyToken}｜原始卖出数量 ${order.sellAmount}｜累计成交原始数量：卖出 ${order.executedSellAmount ?? '未知'} / 买入 ${order.executedBuyAmount ?? '未知'}｜有效期 ${iso(Number(order.validTo) * 1000)}` }, { nowMs });
     state.orders[order.uid] = next;
   }
 }
@@ -683,6 +697,7 @@ export async function refreshEarlyAssets(state, config, rpcBatch, nowMs) {
 }
 
 export function earlyAssetStage(state, token) {
+  if (BASE_ASSETS.has(token)) return 'observation';
   const meta = state.tokens[token] || {};
   if (meta.effectiveEnabled === true) return "opened";
   const signals = Object.values(state.events).filter(e => e.token === token);
@@ -691,7 +706,7 @@ export function earlyAssetStage(state, token) {
   if (meta.effectiveEnabled === false && meta.everEnabled) return "disabled";
   const liquidity = signals.filter(e => ["liquidityAdded", "liquidityRemoved"].includes(e.kind)).sort(chainOrder).at(-1);
   if (liquidity?.kind === "liquidityAdded") return "prepared";
-  const order = signals.filter(e => e.kind === "order").at(-1);
+  const order = signals.filter(e => ['order', 'cowTrade'].includes(e.kind)).at(-1);
   const wrapping = signals.filter(e => ["wrap", "redeem"].includes(e.kind)).sort(chainOrder).at(-1);
   if (order?.stage === "stocking" || wrapping?.kind === "wrap" && meta.underlying) return "stocking";
   return "observation";
@@ -797,7 +812,14 @@ function prune(state, nowMs) {
     const removable = entries.filter(([id, e]) => !protectedIds.has(id) && (!e.blockNumber || e.blockNumber < state.cursor - REORG_WINDOW));
     for (const [id] of removable.slice(0, entries.length - MAX_EVENTS)) delete state.events[id];
   }
-  for (const [uid, order] of Object.entries(state.orders)) if (nowMs - Date.parse(order.lastSeenAt) > 30 * DAY && !["open", "presignaturePending"].includes(order.status)) delete state.orders[uid];
+  for (const [uid, order] of Object.entries(state.orders)) if (nowMs - Date.parse(order.lastSeenAt) > 30 * DAY && !["open", "presignaturePending"].includes(order.status)) {
+    delete state.orders[uid];
+    if (state.cowNotifications) delete state.cowNotifications[uid];
+  }
+  const pendingOrders = new Set(state.pendingChanges.map(e => e.orderUid || e.cowOrderUid));
+  for (const [uid, record] of Object.entries(state.cowNotifications || {})) {
+    if (!state.orders[uid] && !pendingOrders.has(uid) && nowMs - Date.parse(record.lastUpdatedAt) > 30 * DAY) delete state.cowNotifications[uid];
+  }
 }
 export async function runEarlySignalScan({ state, config = {}, rpcBatch, fetchFn = globalThis.fetch, safeState, nowMs = Date.now() }) {
   if (!state || typeof rpcBatch !== "function") throw new Error("缺少提前监控状态或 RPC");

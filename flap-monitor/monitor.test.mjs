@@ -3720,6 +3720,72 @@ test('silent routine records never send a digest and important failed delivery s
   assert.equal(sends, 1);
 });
 
+test('CoW notice and progress patch survive restart and only acknowledge the persisted selection', async () => {
+  const { createEarlySignalState, ingestCowOrders } = await import('./early-signal-monitor.mjs');
+  let state = createEarlySignalState(), disk, patches = 0, sends = 0;
+  const owner = '0x81459cd6b1bdf55d01a824350a79a0c201530992';
+  const order = { uid: '0x' + 'ab'.repeat(56), owner, sellToken: '0x' + '12'.repeat(20),
+    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', executedSellAmount: '100', executedBuyAmount: '500', validTo: Date.now() / 1000 + 600 };
+  ingestCowOrders(state, owner, [order]);
+  const opts = { saveStateFn: (_path, value) => { disk = JSON.stringify(value); },
+    sendCardFn: async () => { sends++; return 'cow-card'; }, patchCardFn: async id => {
+      assert.equal(id, 'cow-card'); patches++;
+      ingestCowOrders(state, owner, [{ ...order, executedSellAmount: '300' }]);
+      // Reproduce a concurrent chain commit replacing the root objects.
+      Object.assign(state, structuredClone(state));
+    } };
+  await __testables.deliverFlapEarlySignals(state, opts);
+  state = JSON.parse(disk);
+  ingestCowOrders(state, owner, [{ ...order, executedSellAmount: '200' }]);
+  await __testables.deliverFlapEarlySignals(state, opts);
+  assert.equal(sends, 1); assert.equal(patches, 1);
+  assert.equal(state.cowNotifications[order.uid].totals.executedSellAmount, '200');
+  assert.equal(state.pendingChanges.length, 1);
+  assert.equal(state.pendingChanges[0].executedSellAmount, '300');
+  assert.equal(state.events[state.pendingChanges[0].id].notificationDisposition, undefined);
+});
+
+test('failed CoW edit retains events, retries without creating another message, and terminal status bypasses backoff', async () => {
+  const { createEarlySignalState, ingestCowOrders } = await import('./early-signal-monitor.mjs');
+  const state = createEarlySignalState(); let time = Date.now(), sends = 0;
+  const owner = '0x81459cd6b1bdf55d01a824350a79a0c201530992';
+  const order = { uid: '0x' + 'ab'.repeat(56), owner, sellToken: '0x' + '12'.repeat(20),
+    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', executedSellAmount: '100', validTo: time / 1000 + 600 };
+  const opts = { now: () => time, saveStateFn: () => {}, sendCardFn: async () => { sends++; return 'cow-card'; }, patchCardFn: async () => { throw Error('temporary patch failure'); } };
+  ingestCowOrders(state, owner, [order]);
+  await __testables.deliverFlapEarlySignals(state, opts);
+  ingestCowOrders(state, owner, [{ ...order, executedSellAmount: '200' }]);
+  await assert.rejects(__testables.deliverFlapEarlySignals(state, opts), /temporary patch failure/);
+  assert.equal(state.pendingChanges.length, 1); assert.equal(state.notificationDelivery, undefined);
+  assert.equal((await __testables.deliverFlapEarlySignals(state, opts)).sent, false);
+  time += 60000;
+  await __testables.deliverFlapEarlySignals(state, { ...opts, patchCardFn: async () => {} });
+  assert.equal(sends, 1); assert.equal(state.pendingChanges.length, 0);
+  ingestCowOrders(state, owner, [{ ...order, executedSellAmount: '300' }]);
+  await assert.rejects(__testables.deliverFlapEarlySignals(state, opts), /temporary patch failure/);
+  ingestCowOrders(state, owner, [{ ...order, status: 'fulfilled', executedSellAmount: '400' }]);
+  await __testables.deliverFlapEarlySignals(state, opts);
+  assert.equal(sends, 2); assert.equal(state.pendingChanges.length, 0);
+  assert.equal(state.cowNotifications[order.uid].status, 'fulfilled');
+});
+
+test('failed CoW initial send persists exact delivery and retries once across restart', async () => {
+  const { createEarlySignalState, ingestCowOrders } = await import('./early-signal-monitor.mjs');
+  let state = createEarlySignalState(), disk;
+  const owner = '0x81459cd6b1bdf55d01a824350a79a0c201530992';
+  ingestCowOrders(state, owner, [{ uid: '0x' + 'ab'.repeat(56), owner, sellToken: '0x' + '12'.repeat(20),
+    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', validTo: Date.now() / 1000 + 600 }]);
+  const opts = { saveStateFn: (_path, value) => { disk = JSON.stringify(value); } };
+  await assert.rejects(__testables.deliverFlapEarlySignals(state, { ...opts, sendCardFn: async () => { throw Error('offline'); } }), /offline/);
+  state = JSON.parse(disk);
+  const id = state.notificationDelivery.deliveryId;
+  await __testables.deliverFlapEarlySignals(state, { ...opts, sendCardFn: async (_t, _c, _color, _file, plan) => {
+    assert.equal(plan.deliveryId, id); return 'sent-card';
+  } });
+  assert.equal(state.pendingChanges.length, 0);
+  assert.equal(Object.values(state.cowNotifications)[0].messageId, 'sent-card');
+});
+
 test('history denial leaves same-provider live logs working',async()=>{
  const original=globalThis.fetch;__testables.resetBscRpcHealth();let denied=true;
  globalThis.fetch=async(_url,options)=>{const req=JSON.parse(options.body);if(denied)return {ok:false,status:403,body:{cancel:async()=>{}}};return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x100':[]})};};

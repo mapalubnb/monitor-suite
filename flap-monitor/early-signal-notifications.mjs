@@ -1,4 +1,5 @@
 import { BASE_ASSETS } from './early-signal-catalog.mjs';
+import { cowGroupUid } from './cow-notifications.mjs';
 
 const SMALL_DEBIT_WEI = 100_000_000_000_000n; // 0.0001 BNB; record silently; retain raw evidence.
 
@@ -20,6 +21,7 @@ export function nativeBalanceDelta(event) {
 // Default to immediate delivery. Unknown/old state is never evidence that an
 // operation is routine. No raw event is dropped by the notification policy.
 export function earlyNotificationPriority(events, state, nowMs) {
+  if (cowGroupUid(events)) return 'cow';
   if (events.every(e => e.kind === 'nativeBalance')) {
     return events.every(e => {
       const delta = nativeBalanceDelta(e);

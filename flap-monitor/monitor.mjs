@@ -31,6 +31,7 @@ import { createStartupNotifier, buildStartupCard } from "../shared/startup-notif
 import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.mjs";
 import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
 import { selectEarlyNotification, archiveRoutineEarlySignals } from './early-signal-notifications.mjs';
+import { selectCowNotification } from './cow-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
 import {
@@ -6703,11 +6704,12 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
   if (state.notificationDelivery?.ids.some(id => !pendingIds.has(id))) delete state.notificationDelivery;
   let delivery = state.notificationDelivery;
   if (!delivery) {
-    const selection = selectEarlyNotification(state, now());
+    const selection = selectEarlyNotification(state, now()) || selectCowNotification(state, now());
     if (!selection) return { sent: false };
     const { changes, title, template, mode } = selection;
-    const content = buildEarlySignalContent(changes, state);
+    const content = selection.content || buildEarlySignalContent(changes, state);
     delivery = { ids: changes.map(e => e.id), title, template, mode, content, sentParts: [],
+      cowUid: selection.cowUid, cowRecord: selection.cowRecord, patchMessageId: selection.patchMessageId,
       deliveryId: createHash('sha256').update(JSON.stringify(changes.map(e => e.id))).digest('hex'),
       cardParts: planCardParts(title, content, template) };
     state.notificationDelivery = delivery;
@@ -6722,17 +6724,45 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
       saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
     }
   };
-  const id = await sendCardFn(title, content, template, undefined,
-    { sentParts, cardParts, deliveryId: delivery.deliveryId, onPartSent: persistPart });
+  let id;
+  if (delivery.patchMessageId) {
+    try {
+      await patchCardFn(delivery.patchMessageId, title, content, template);
+      id = delivery.patchMessageId;
+    } catch (error) {
+      // Keep the evidence; back off only this order. A terminal transition and
+      // unrelated urgent alerts can still bypass a failed progress edit.
+      state.cowNotifications ||= {};
+      const record = state.cowNotifications[delivery.cowUid] ||= {};
+      record.failures = (record.failures || 0) + 1;
+      record.lastError = error.message;
+      record.nextAttemptAtMs = now() + Math.min(60000, 5000 * 2 ** Math.min(record.failures, 4));
+      if (state.notificationDelivery?.deliveryId === delivery.deliveryId) delete state.notificationDelivery;
+      saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+      throw error;
+    }
+  } else {
+    id = await sendCardFn(title, content, template, undefined,
+      { sentParts, cardParts, deliveryId: delivery.deliveryId, onPartSent: persistPart });
+  }
   if (!id) return { sent: false };
+  if (delivery.cowUid) {
+    state.cowNotifications ||= {};
+    state.cowNotifications[delivery.cowUid] = { ...delivery.cowRecord, messageId: id,
+      lastUpdatedAt: new Date(now()).toISOString(), failures: 0, lastError: '', nextAttemptAtMs: 0 };
+    for (const event of changes) if (state.events[event.id]) Object.assign(state.events[event.id], {
+      notificationDisposition: delivery.mode, notificationMessageId: id, notificationHandledAt: new Date(now()).toISOString() });
+    log(`[Flap CoW 通知] ${delivery.patchMessageId ? '更新原卡' : '即时提醒'}｜${delivery.cowUid.slice(0, 18)}｜合并 ${changes.length} 条记录`);
+  }
   acknowledgeEarlySignals(state, changes.map(e => e.id));
   if (state.notificationDelivery?.deliveryId === delivery.deliveryId) delete state.notificationDelivery;
   state.notificationStats = { ...state.notificationStats, lastMode: delivery.mode, lastSentAt: new Date(now()).toISOString(),
     lastEventCount: changes.length,
-    sentEvents: (state.notificationStats?.sentEvents || 0) + changes.length };
+    sentEvents: (state.notificationStats?.sentEvents || 0) + changes.length,
+    cowPatchedCards: (state.notificationStats?.cowPatchedCards || 0) + (delivery.patchMessageId ? 1 : 0) };
   saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
-  const addresses = [...new Set(changes.map(change => normalizeAddress(change.token)).filter(address => address
-    && state.tokens[address] && !state.tokens[address].name && !state.tokens[address].symbol
+  const addresses = [...new Set(changes.flatMap(change => [change.token, ...(delivery.cowUid ? [change.sellToken, change.buyToken] : [])]).map(normalizeAddress).filter(address => address
+    && state.tokens[address] && ((!state.tokens[address].name && !state.tokens[address].symbol) || delivery.cowUid && !Number.isInteger(state.tokens[address].decimals))
     && !(Date.parse(state.tokens[address].nameNextRetryAt || "") > now())))];
   let metadataPromise;
   if (resolveMetadataFn && addresses.length) {
@@ -6745,12 +6775,17 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
         const item = metadata?.[address];
         if (!item?.name && !item?.symbol) continue;
         const fields = { name: item.name || "", symbol: item.symbol || "", nameSource: item.source || "",
-          nameUpdatedAt: new Date(now()).toISOString(), nameNextRetryAt: "" };
+          ...(Number.isInteger(item.decimals) ? { decimals: item.decimals } : {}),
+          nameUpdatedAt: new Date(now()).toISOString(),
+          nameNextRetryAt: delivery.cowUid && !Number.isInteger(item.decimals) ? retryAt : "" };
         if (state.tokens[address]) Object.assign(state.tokens[address], fields);
         changed = true;
       }
       if (!changed) return;
       saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+      // The next order edit uses refreshed metadata. Never overwrite a newer
+      // cumulative progress card with this asynchronous name lookup's old body.
+      if (delivery.cowUid) return;
       const parts = cardParts.map(part => part.content);
       if (!sentParts.length && parts.length === 1) sentParts.push(id);
       // Patch the original parts in place. Only add names, never recalculate
