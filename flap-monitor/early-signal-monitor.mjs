@@ -770,6 +770,7 @@ export function buildEarlySignalContent(changes, state) {
       const stage = earlyAssetStage(state, token);
       const color = stage === 'opened' ? 'green' : stage === 'disabled' ? 'red' : 'orange';
       lines.push(formatEarlySignalAsset(token, state.tokens[token]));
+      lines.push(`合约：${addressLink(token, token)}`);
       if (!BASE_ASSETS.has(token)) lines.push(`状态：<font color='${color}'>${stageLabel(stage)}</font>`);
       if (state.tokens[token]?.underlying) lines.push(`底层资产：${addressLink(state.tokens[token].underlying)}`);
     }
