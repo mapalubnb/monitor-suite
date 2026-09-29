@@ -640,47 +640,47 @@ function shortValue(value) {
 }
 
 export function buildContractIntegrityContent(changes = [], state = {}) {
-  const lines = [
-    `🔧 合约变更 ${changes.length} 项`,
-    "",
-  ];
+  const lines = [`🔧 合约变更 ${changes.length} 项`];
   for (const change of changes) {
     const contract = state.catalog?.[change.address];
     const label = contract?.label || change.address || "未知合约";
-    lines.push(`- ${label}: [${change.address}](https://bscscan.com/address/${change.address})`);
+    // Feishu folds indented list continuations into one paragraph. Use
+    // independent sections and unindented paragraphs for every change.
+    lines.push(`## ${shortValue(label).replace(/[\r\n]+/g, ' ')}`,
+      `合约：[${change.address}](https://bscscan.com/address/${change.address})`);
     const launchUrl = contract?.kind === "vaultFactory" || contract?.hintedKind === "vaultFactory"
       ? buildVaultFactoryLaunchUrl(change.address) : "";
-    if (launchUrl) lines.push(`  🏦 金库链接：[打开金库](${launchUrl})`);
+    if (launchUrl) lines.push(`🏦 金库链接：[打开金库](${launchUrl})`);
     if (change.type === "event") {
-      lines.push(`  🟠 ${change.field}`);
+      lines.push(`### 🟠 ${change.field}`);
       const audit = change.audit;
       if (audit) {
         const link = (address, name) => `[${shortValue(name || `${address.slice(0, 6)}…${address.slice(-4)}`).replace(/[\[\]\\`*_]/g, '\\$&')}](https://bscscan.com/address/${address})`;
-        if (audit.token) lines.push(`  🪙 关联代币：${link(audit.token, audit.name)}`);
-        if (audit.vault) lines.push(`  🏦 金库${audit.mappingAt === 'current' ? '（当前映射）' : ''}：${link(audit.vault)}`);
+        if (audit.token) lines.push(`🪙 关联代币：${link(audit.token, audit.name)}`);
+        if (audit.vault) lines.push(`🏦 金库${audit.mappingAt === 'current' ? '（当前映射）' : ''}：${link(audit.vault)}`);
+        if (audit.factory) lines.push(`工厂：${link(audit.factory)}｜[创建入口](${buildVaultFactoryLaunchUrl(audit.factory)})`);
         if (audit.token) {
           const description = audit.description
             ? shortValue(audit.description).replace(/[\[\]\\`*_]/g, '\\$&') : audit.vault ? '未填写' : '待核验';
           const official = audit.isOfficial === true ? "<font color='green'>🟢 是</font>"
             : audit.isOfficial === false ? '⚪ 否（未标记为官方）' : '待核验';
-          lines.push(`  Portal 登记描述：${description}`, `  官方标记：${official}`);
+          lines.push(`官方标记：${official}`, '### 📝 Portal 登记描述', description);
         }
-        if (audit.factory) lines.push(`  工厂：${link(audit.factory)}｜[创建入口](${buildVaultFactoryLaunchUrl(audit.factory)})`);
-        if (audit.token && !audit.vault) lines.push(`  金库关联：${audit.lookupFailed ? '暂未核验' : '待核验'}`);
-        lines.push('  审计报告已提交，不代表审计通过');
+        if (audit.token && !audit.vault) lines.push(`金库关联：${audit.lookupFailed ? '暂未核验' : '待核验'}`);
+        lines.push('### 🔎 链上记录', "<font color='orange'>审计报告已提交，不代表审计通过</font>");
       }
-      if (change.txHash) lines.push(`  [交易](https://bscscan.com/tx/${change.txHash})｜区块 ${change.blockNumber || '未知'}`);
-      else if (change.blockNumber) lines.push(`  区块 ${change.blockNumber}`);
-      if (change.eventTime) lines.push(`  🕒 ${change.eventTime}`);
-      else if (change.detectedAt) lines.push(`  发现时间：${change.detectedAt}`);
+      if (change.txHash) lines.push(`[交易](https://bscscan.com/tx/${change.txHash})｜区块 ${change.blockNumber || '未知'}`);
+      else if (change.blockNumber) lines.push(`区块 ${change.blockNumber}`);
+      if (change.eventTime) lines.push(`🕒 区块时间：${change.eventTime}`);
+      else if (change.detectedAt) lines.push(`发现时间：${change.detectedAt}`);
     } else if (change.type === "selectors") {
-      if (change.added?.length) lines.push(`  新增函数选择器: ${change.added.join(", ")}`);
-      if (change.removed?.length) lines.push(`  移除函数选择器: ${change.removed.join(", ")}`);
+      if (change.added?.length) lines.push(`新增函数选择器: ${change.added.join(", ")}`);
+      if (change.removed?.length) lines.push(`移除函数选择器: ${change.removed.join(", ")}`);
     } else {
-      lines.push(`  ${change.field}`, `  <font color='red'>− ${shortValue(change.previous)}</font>`, `  <font color='green'>+ ${shortValue(change.current)}</font>`);
+      lines.push(`### ⚙️ ${change.field}`, `<font color='red'>− ${shortValue(change.previous)}</font>`, `<font color='green'>+ ${shortValue(change.current)}</font>`);
     }
   }
-  return lines.join("\n");
+  return lines.join("\n\n");
 }
 
 export const __testables = {

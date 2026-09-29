@@ -116,3 +116,21 @@ test('multiline colored paragraphs remain one balanced Markdown block', () => {
   const block = elements.find(element => element.tag === 'markdown');
   assert.equal(block.content, text);
 });
+
+test('integrity audit fields stay outside list continuations and the description has its own block', () => {
+  const description = 'CAPITAL gold mine vault: long registration description. '.repeat(3);
+  const source = buildContractIntegrityContent([{ type: 'event', address, field: 'Vault 审计报告提交',
+    txHash: hash, blockNumber: 124671401, eventTime: timestamp,
+    audit: { token: address, name: '资本家', vault: address, factory: address, description, isOfficial: false },
+  }, { type: 'modified', address, field: 'owner', previous: 'old owner', current: 'new owner' }], {
+    catalog: { [address]: { label: 'Flap Vault Portal' } },
+  });
+  assert.doesNotMatch(source, /^(?:\s{2,}\S|- )/m);
+  const elements = buildCardBodyElements(source + '\n更新时间：' + timestamp);
+  const descriptionBlock = elements.find(e => e.tag === 'markdown' && e.content.includes(description.trim()));
+  assert.equal(descriptionBlock.content, description.trim());
+  assert.ok(elements.some(e => e.tag === 'hr'));
+  assert.match(bodyText(elements), /官方标记：⚪ 否/);
+  assert.match(bodyText(elements), /区块时间：2026\/9\/26 14:00:00.000/);
+  assert.equal(words(bodyText(elements)), words(source + '\n更新时间：' + timestamp));
+});
