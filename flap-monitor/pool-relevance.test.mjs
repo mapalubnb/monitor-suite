@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { createEarlySignalState, decodeEarlyReceipt, earlyAssetStage, earlyLogFilters, rewindEarlySignals, watchedWallets } from './early-signal-monitor.mjs';
+import { createEarlySignalState, decodeEarlyReceipt, earlyAssetStage, earlyLogFilters, rewindEarlySignals, watchedWallets, runEarlySignalScan } from './early-signal-monitor.mjs';
 import { poolOperationRelevance, migratePoolEvidence } from './pool-relevance.mjs';
 import { selectEarlyNotification } from './early-signal-notifications.mjs';
 import { selectPublicPoolNotification } from './public-pool-notifications.mjs';
@@ -106,4 +106,15 @@ test('V2 委托撤池消耗监控钱包的 LP 代币仍即时识别', () => {
   const burn={address:pool.address,topics:[TOPICS.V2Burn,topic(stranger)],data:'0x'+[1,2].map(word).join('')};
   const transfer={address:pool.address,topics:[TOPICS.Transfer,topic(owner),topic(pool.address)],data:'0x'+word(10)};
   assert.equal(poolOperationRelevance(pool,burn,[burn,transfer],stranger,makeState(),wallets),'related');
+});
+
+test('历史游标停留不妨碍记录清理，保留有效准备证据、待发和重组窗口', async () => {
+  const state=makeState();state.cursor=1;state.realtimeCursor=1000;
+  state.events.prepared={id:'prepared',token:fixture.token,kind:'liquidityAdded',poolRelevance:'related',blockNumber:10};
+  state.events.pending={id:'pending',kind:'authority',blockNumber:11};state.pendingChanges=[state.events.pending];
+  for(let i=0;i<12010;i++)state.events['public'+i]={id:'public'+i,token:fixture.token,kind:'liquidityRemoved',poolRelevance:'public',blockNumber:i===0?990:100};
+  await runEarlySignalScan({state,config:{mode:'external',sources:[]},rpcBatch:async()=>[]});
+  assert.equal(Object.keys(state.events).length,12000);
+  assert.ok(state.events.public0);assert.ok(state.events.pending);assert.ok(state.events.prepared);
+  assert.equal(earlyAssetStage(state,fixture.token),'prepared');
 });

@@ -834,8 +834,17 @@ export function buildEarlySignalContent(changes, state) {
 function prune(state, nowMs) {
   const protectedIds = new Set(state.pendingChanges.map(e => e.id));
   const entries = Object.entries(state.events);
+  const latestLiquidity = new Map();
+  for (const [id, event] of entries) if (event.poolRelevance === 'related' && ['liquidityAdded', 'liquidityRemoved'].includes(event.kind)) {
+    const previous = latestLiquidity.get(event.token);
+    if (!previous || chainOrder(event, previous.event) > 0) latestLiquidity.set(event.token, { id, event });
+  }
+  for (const { id } of latestLiquidity.values()) protectedIds.add(id);
   if (entries.length > MAX_EVENTS) {
-    const removable = entries.filter(([id, e]) => !protectedIds.has(id) && (!e.blockNumber || e.blockNumber < state.cursor - REORG_WINDOW));
+    // Historical gaps must not pin every newer public-market record forever.
+    const liveCursor = Math.max(state.cursor || 0, state.realtimeCursor || 0);
+    const removable = entries.filter(([id, e]) => !protectedIds.has(id)
+      && (!e.blockNumber || e.blockNumber < (e.poolRelevance === 'public' ? liveCursor : state.cursor) - REORG_WINDOW));
     for (const [id] of removable.slice(0, entries.length - MAX_EVENTS)) delete state.events[id];
   }
   for (const [uid, order] of Object.entries(state.orders)) if (nowMs - Date.parse(order.lastSeenAt) > 30 * DAY && !["open", "presignaturePending"].includes(order.status)) {
