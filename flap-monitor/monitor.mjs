@@ -34,6 +34,7 @@ import { selectEarlyNotification, archiveRoutineEarlySignals } from './early-sig
 import { selectCowNotification } from './cow-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { hasTokenDecimals, operationalAmountToken } from "./operational-call-codec.mjs";
+import { decodeRegistryLog, ingestRegistryLog, drainRegistryNotifications, auditRegistryNotifications } from './registry-notifications.mjs';
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
@@ -133,7 +134,7 @@ const CONFIG = {
     wsEnabled: process.env.FLAP_REGISTRY_WS_ENABLED !== "false" && process.env.FLAP_FACTORY_WS_ENABLED !== "false",
     enabled: process.env.FLAP_REGISTRY_MONITOR !== "false",
     address: (process.env.FLAP_REGISTRY_ADDRESS || "0x90497450f2a706f1951b5bdda52b4e5d16f34c06").toLowerCase(),
-    confirmations: Number.parseInt(process.env.FLAP_REGISTRY_CONFIRMATIONS || "5", 10),
+    confirmations: Math.max(0, Number.parseInt(process.env.FLAP_REGISTRY_CONFIRMATIONS || "0", 10) || 0),
     bootstrapLookbackBlocks: Number.parseInt(process.env.FLAP_REGISTRY_BOOTSTRAP_LOOKBACK_BLOCKS || "20", 10),
     maxBlocksPerRun: Number.parseInt(process.env.FLAP_REGISTRY_MAX_BLOCKS_PER_RUN || "3000", 10),
     watchedEventTopics: new Set([
@@ -3178,43 +3179,28 @@ async function enrichFactoryPoolTokenMetadata(state, preferredAddresses = []) {
 }
 
 function extractRegistryVaultAddressesFromLog(logEntry) {
-  const registry = CONFIG.registryMonitor.address;
-  if (normalizeAddress(logEntry?.address) !== registry) return [];
-  const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
-  if (CONFIG.registryMonitor.watchedEventTopics.size > 0 && !CONFIG.registryMonitor.watchedEventTopics.has(topic0)) return [];
-  const data = String(logEntry?.data || "");
-  const found = [];
-  for (const m of data.matchAll(/000000000000000000000000([a-fA-F0-9]{40})/g)) {
-    const addr = `0x${m[1]}`.toLowerCase();
-    if (addr !== "0x0000000000000000000000000000000000000000"
-      && !/^0x0{24,}/.test(addr)) {
-      found.push(addr);
-    }
-  }
-  return uniqueStrings(found);
-}
-
-async function filterContractAddresses(addresses) {
-  const unique = uniqueStrings(addresses.map(normalizeAddress).filter(Boolean));
-  if (unique.length === 0) return [];
-  const codes = await bscRpcBatch(unique.map(addr => ({ method: "eth_getCode", params: [addr, "latest"] })));
-  return unique.filter((addr, i) => codes[i] && codes[i] !== "0x");
+  const event = decodeRegistryLog(logEntry, CONFIG.registryMonitor.address);
+  return event ? [event.vault] : [];
 }
 
 function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
   const primaryLines = [];
   for (const event of events) {
-    primaryLines.push(`- Vault: ${addressLink(event.vault)}`);
+    primaryLines.push(`🏦 Vault：${addressLink(event.vault)}`);
     const launchUrl = buildVaultFactoryLaunchUrl(event.vault);
-    if (launchUrl) primaryLines.push(`  金库链接: ${flapLink("打开金库", launchUrl)}`);
-    primaryLines.push(`  交易: ${txLink(event.txHash)} / 区块: ${blockLink(event.blockNumber)}`);
-    primaryLines.push("  状态: 链上已注册");
+    if (launchUrl) primaryLines.push(`金库链接：${flapLink("打开金库", launchUrl)}`);
+    primaryLines.push(`交易：${txLink(event.txHash)}｜区块：${blockLink(event.blockNumber)}`);
+    primaryLines.push(event.revoked ? '🔴 区块重组：原注册记录已撤销'
+      : event.codeStatus === 'missing' ? '🟠 已发现注册事件，当前未检测到合约代码'
+      : '🟢 链上已注册（即时信号）');
+    if (event.firstSeenAt) primaryLines.push(`首次观测：${formatBeijingTime(event.firstSeenAt)}`);
+    primaryLines.push('');
   }
   const content = buildFlapCardContent({
     summary: [
-      `- Vault Portal 发现新金库 ${events.length} 个`,
+      events.some(event => event.revoked) ? 'Vault Portal 注册记录纠正' : `Vault Portal 发现新金库 ${events.length} 个`,
       `- Vault Portal: ${addressLink(CONFIG.registryMonitor.address)}`,
-      `- 扫描区块: ${fromBlock} → ${toBlock}`,
+      ...(fromBlock != null && toBlock != null ? [`扫描区块：${fromBlock} → ${toBlock}`] : []),
     ],
     primaryTitle: "链上新金库注册",
     primary: primaryLines,
@@ -3240,16 +3226,35 @@ function formatVaultContractLinks(value) {
 
 let registryScanQueue = Promise.resolve();
 let registryHistoryQueue = Promise.resolve();
-let registryCommitQueue = Promise.resolve();
+function deliverRegistryChanges(snapshot, { sendCardFn = sendCardViaApi, patchCardFn = patchCard,
+  persistStateFn = sendCardFn === sendCardViaApi ? saveRegistrySnapshot : () => {}, titlePrefix = '' } = {}) {
+  const state = snapshot.registryMonitor;
+  return drainRegistryNotifications(state, {
+    persist: () => persistStateFn(snapshot),
+    send: async (record, deliveryId) => {
+      const id = await sendCardFn(`${titlePrefix}Flap 链上金库注册变更`,
+        buildRegistryMonitorContent([record]), 'green', undefined, { ...alertMentionCardOptions(), deliveryId });
+      if (id) log(`[Flap 金库注册推送] ${record.source}｜${record.vault}｜发现至发送 ${Math.max(0, Date.now() - Date.parse(record.firstSeenAt))}ms｜区块 ${record.blockNumber}`);
+      return id;
+    },
+    patch: (record, version) => patchCardFn(record.messageId, `${titlePrefix}Flap 链上金库注册变更`,
+      buildRegistryMonitorContent([{ ...record, revoked: version === 'revoked' }]), version === 'revoked' ? 'red' : 'orange'),
+  });
+}
 function checkFlapRegistryLogs(snapshot, options = {}) {
   const run = (options.history ? registryHistoryQueue : registryScanQueue).then(() => scanFlapRegistryLogs(snapshot, options));
   if (options.history) registryHistoryQueue = run.catch(() => {});
   else registryScanQueue = run.catch(() => {});
   return run;
 }
-async function scanFlapRegistryLogs(snapshot, { history = false, sendCardFn = sendCardViaApi, titlePrefix = "", rpcCallFn = bscRpcCall, filterContractsFn = filterContractAddresses } = {}) {
+async function scanFlapRegistryLogs(snapshot, { history = false, sendCardFn = sendCardViaApi, titlePrefix = "", rpcCallFn = bscRpcCall,
+  persistStateFn = sendCardFn === sendCardViaApi ? saveRegistrySnapshot : () => {} } = {}) {
   if (!CONFIG.registryMonitor.enabled) return { changed: false, sent: false };
   const state = snapshot.registryMonitor || (snapshot.registryMonitor = {});
+  const deliveryOptions = { sendCardFn, titlePrefix, persistStateFn };
+  // Delivery also has its own job: a slow/failing RPC never holds the WSS queue.
+  const pendingDelivery = await deliverRegistryChanges(snapshot, deliveryOptions);
+  if (pendingDelivery.errors.length) throw new Error(pendingDelivery.errors.join('；'));
   const cursorKey = history ? "historyLastBlock" : "lastBlock";
   if (history) {
     if (!Number.isFinite(state.historyLastBlock)) state.historyLastBlock = state.historyEndBlock = 0;
@@ -3277,49 +3282,17 @@ async function scanFlapRegistryLogs(snapshot, { history = false, sendCardFn = se
 
   const candidates = [];
   for (const item of logs || []) {
-    for (const addr of extractRegistryVaultAddressesFromLog(item)) {
-      candidates.push({
-        vault: addr,
-        txHash: String(item.transactionHash || "").toLowerCase(),
-        blockNumber: hexToNumber(item.blockNumber),
-        logIndex: hexToNumber(item.logIndex),
-        topic0: String(item.topics?.[0] || "").toLowerCase(),
-      });
-    }
+    const event = ingestRegistryLog(state, item, { portal: CONFIG.registryMonitor.address,
+      persist: () => persistStateFn(snapshot), source: 'http' });
+    if (event) candidates.push(event);
   }
-
-  const contractSet = new Set(await filterContractsFn(candidates.map(c => c.vault)));
-  const commit = registryCommitQueue.then(async () => {
-    state.knownVaults = state.knownVaults || {};
-    const newEvents = [];
-    const nextKnownVaults = { ...state.knownVaults };
-    for (const event of candidates) {
-      if (!contractSet.has(event.vault)) continue;
-      if (nextKnownVaults[event.vault]) continue;
-      nextKnownVaults[event.vault] = {
-        firstSeenAt: ts(),
-        txHash: event.txHash,
-        blockNumber: event.blockNumber,
-        topic0: event.topic0,
-      };
-      newEvents.push(event);
-    }
-
-    let messageId = null;
-    if (newEvents.length) {
-      const content = buildRegistryMonitorContent(newEvents, { fromBlock, toBlock });
-      const title = `${titlePrefix}Flap 链上金库注册变更`;
-      messageId = await sendAlertCard(sendCardFn, title, content, "green");
-      if (!messageId) throw new Error("金库注册消息未送达，保留区块游标等待重试");
-    }
-    state.knownVaults = nextKnownVaults;
-    state[cursorKey] = toBlock;
-    state[history ? "historyLastSuccessAt" : "lastBlockAt"] = ts();
-    if (!history) state.lagBlocks = Math.max(0, state.safeLatestBlock - state.lastBlock);
-    return { changed: true, sent: Boolean(messageId), events: newEvents };
-  });
-  registryCommitQueue = commit.catch(() => {});
-  return await commit;
+  const delivery = await deliverRegistryChanges(snapshot, deliveryOptions);
+  if (delivery.errors.length) throw new Error(delivery.errors.join('；'));
+  state[cursorKey] = toBlock;
+  state[history ? "historyLastSuccessAt" : "lastBlockAt"] = ts();
+  if (!history) state.lagBlocks = Math.max(0, state.safeLatestBlock - state.lastBlock);
+  persistStateFn(snapshot);
+  return { changed: true, sent: pendingDelivery.sent || delivery.sent, events: candidates };
 }
 
 function formatFactoryPoolAssetName(asset = {}) {
@@ -7154,6 +7127,7 @@ async function startMonitor() {
     const jobs = Object.fromEntries([
       ['earlyRealtime', earlyChainJob], ['earlyHistory', earlyHistoryJob], ['earlyFast', earlyFastJob],
       ...externalJobs, ['registry', registryJob], ['registryHistory', registryHistoryJob],
+      ['registryDelivery', registryDeliveryJob], ['registryAudit', registryAuditJob],
     ].map(([name, job]) => [name, job.snapshot()]));
     writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
@@ -7288,11 +7262,35 @@ async function startMonitor() {
         throw error;
       } finally { saveRegistrySnapshot(snapshot); }
     } });
-  if (CONFIG.registryMonitor.enabled) { registryJob.start(); registryHistoryJob.start(); }
+  snapshot.registryMonitor ||= {};
+  const registryDeliveryJob = createWakeableJob({ intervalMs: CONFIG.registryMonitor.intervalMs,
+    onError: error => log(`[Flap 金库注册推送] ${error.message}`), run: async () => {
+      if (isShuttingDown) return;
+      const result = await deliverRegistryChanges(snapshot);
+      if (result.errors.length) throw new Error(result.errors.join('；'));
+    } });
+  const registryAuditJob = createWakeableJob({ intervalMs: CONFIG.registryMonitor.intervalMs,
+    onError: error => log(`[Flap 金库注册核验] ${error.message}`), run: async () => {
+      if (isShuttingDown) return;
+      await auditRegistryNotifications(snapshot.registryMonitor, { rpc: bscRpcCall,
+        persist: () => saveRegistrySnapshot(snapshot) });
+      void registryDeliveryJob.wake();
+    } });
+  const receiveRegistryLog = event => {
+    if (isShuttingDown) return;
+    if (CONFIG.registryMonitor.confirmations > 0 && !event.removed) { void registryJob.wake(); return; }
+    const record = ingestRegistryLog(snapshot.registryMonitor, event, {
+      portal: CONFIG.registryMonitor.address, persist: () => saveRegistrySnapshot(snapshot) });
+    if (record) void registryDeliveryJob.wake();
+  };
+  if (CONFIG.registryMonitor.enabled) {
+    registryJob.start(); registryHistoryJob.start(); registryDeliveryJob.start(); registryAuditJob.start();
+    log(`[Flap 金库注册] WSS 直接推送=${CONFIG.registryMonitor.wsEnabled && CONFIG.registryMonitor.confirmations === 0}｜额外确认块=${CONFIG.registryMonitor.confirmations}｜HTTP 补漏=${CONFIG.registryMonitor.intervalMs}ms`);
+  }
   const registryFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.wsEnabled ? createFactoryPoolWsFeed({
     urls: CONFIG.factoryPoolMonitor.wsUrls, proxy: CONFIG.registryMonitor.address,
     topics: [...CONFIG.registryMonitor.watchedEventTopics], label: "Flap 金库注册 WSS",
-    onEvent: () => { void registryJob.wake(); }, onSubscribed: () => { void registryJob.wake(); },
+    onEvent: receiveRegistryLog, onRemoved: receiveRegistryLog, onSubscribed: () => { void registryJob.wake(); },
   }).start() : null;
   let lastHeadKey = "";
   const headFeed = (CONFIG.earlySignalMonitor.enabled && CONFIG.earlySignalMonitor.wsEnabled) || (CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.wsEnabled)
@@ -7308,7 +7306,9 @@ async function startMonitor() {
   global.__earlySignalDrain = async () => {
     clearInterval(rpcMetricsTimer);
     earlyFeeds.stop(); registryFeed?.stop(); headFeed?.stop();
-    await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), registryJob.stop(), registryHistoryJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
+    await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), registryJob.stop(), registryHistoryJob.stop(),
+      registryDeliveryJob.stop(), registryAuditJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
+    saveRegistrySnapshot(snapshot);
     if (earlyDeliveryPromise) await earlyDeliveryPromise;
     await Promise.allSettled([...earlySignalNameFlights]);
     saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
@@ -8140,6 +8140,7 @@ if (!IS_TEST_MODE) {
 export const __testables = {
   buildFlapRestartCard,
   checkFlapRegistryLogs,
+  deliverRegistryChanges,
   fetchPage,
   extractCaStoreVaultSections,
   CONFIG,

@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { QUOTE_ROUTE_EVENT_TOPIC, decodeQuoteRoute, formatQuoteRoute } from "./quote-token-codec.mjs";
+import { ingestRegistryLog, REGISTRY_TOPIC } from './registry-notifications.mjs';
 
 process.env.FLAP_MONITOR_TEST = "1";
 
@@ -71,17 +72,43 @@ test("independent registry triggers serialize and retain cursor on delivery fail
   const rpcCallFn = async method => method === "eth_blockNumber" ? "0x64" : [{
     address: __testables.CONFIG.registryMonitor.address,
     topics: [[...__testables.CONFIG.registryMonitor.watchedEventTopics][0]],
-    data: "0x" + address.slice(2).padStart(64, "0"), blockNumber: "0x5f", logIndex: "0x0", transactionHash: "0x" + "aa".repeat(32),
+    data: "0x" + address.slice(2).padStart(64, "0") + '1'.padStart(64, '0') + '0'.repeat(128),
+    blockHash: '0x' + 'bb'.repeat(32), blockNumber: "0x5f", logIndex: "0x0", transactionHash: "0x" + "aa".repeat(32),
   }];
   const options = { rpcCallFn, filterContractsFn: async addresses => addresses };
   await assert.rejects(__testables.checkFlapRegistryLogs(snapshot, { ...options, sendCardFn: async () => null }), /未送达/);
   assert.equal(snapshot.registryMonitor.lastBlock, 90);
+  Object.values(snapshot.registryMonitor.notifications).forEach(r => { r.nextAttemptAt = 0; });
   let sends = 0;
   const sendCardFn = async () => { sends++; return "sent"; };
   await Promise.all([1, 2].map(() => __testables.checkFlapRegistryLogs(snapshot, { ...options, sendCardFn })));
   assert.equal(sends, 1);
-  assert.equal(snapshot.registryMonitor.lastBlock, 95);
+  assert.equal(snapshot.registryMonitor.lastBlock, 100);
   assert.ok(snapshot.registryMonitor.knownVaults[address]);
+});
+
+test('registry WSS sends at current block even while HTTP lookup is blocked, then HTTP deduplicates', async () => {
+  assert.equal(__testables.CONFIG.registryMonitor.confirmations, 0);
+  const snapshot={registryMonitor:{lastBlock:99,knownVaults:{}}};
+  const entry={address:__testables.CONFIG.registryMonitor.address,topics:[REGISTRY_TOPIC],
+    data:'0x'+'1'.repeat(40).padStart(64,'0')+'1'.padStart(64,'0')+'0'.repeat(128),
+    blockNumber:'0x64',blockHash:'0x'+'ab'.repeat(32),transactionHash:'0x'+'cd'.repeat(32),logIndex:'0x0'};
+  let release, started;
+  const blocked=new Promise(resolve=>{release=resolve;});
+  const entered=new Promise(resolve=>{started=resolve;});
+  const calls=[],cards=[];
+  const sendCardFn=async(_title,content,_color,_file,opts)=>{cards.push(content);assert.match(opts.deliveryId,/registry:/);return 'registry-card';};
+  const scan=__testables.checkFlapRegistryLogs(snapshot,{sendCardFn,rpcCallFn:async(method)=>{
+    calls.push(method);if(method==='eth_blockNumber'){started();await blocked;return '0x64';}return [entry];
+  }});
+  await entered;
+  ingestRegistryLog(snapshot.registryMonitor,entry,{portal:__testables.CONFIG.registryMonitor.address});
+  await __testables.deliverRegistryChanges(snapshot,{sendCardFn});
+  assert.equal(cards.length,1);assert.equal(snapshot.registryMonitor.lastBlock,99);
+  assert.match(cards[0],/即时信号/);assert.deepEqual(calls,['eth_blockNumber']);
+  release();await scan;
+  assert.equal(cards.length,1);assert.equal(snapshot.registryMonitor.lastBlock,100);
+  assert.deepEqual(calls,['eth_blockNumber','eth_getLogs']);
 });
 
 test("newHeads feed validates subscription identity and forwards removed-log notifications", () => {
@@ -3255,7 +3282,8 @@ test("Vault Portal log extraction detects on-chain registered vault address", ()
   const log = {
     address: "0x90497450f2a706f1951b5bdda52b4e5d16f34c06",
     topics: ["0xd8cf270eb9827992a063745f0afaa72431f8c63fc46736f8b484862dcc709787"],
-    data: "0x0000000000000000000000005418f7e8ff90354db0ecd48c8b710219244eb3c50000000000000000000000000000000000000000000000000000000000000001",
+    data: "0x0000000000000000000000005418f7e8ff90354db0ecd48c8b710219244eb3c50000000000000000000000000000000000000000000000000000000000000001" + '0'.repeat(128),
+    blockHash: '0x' + 'bb'.repeat(32), logIndex: '0x0',
     blockNumber: "0x66c7754",
     transactionHash: "0x9e239cd0483e66d8f077f786fd5bfdee4036e838c0dedf680f63eabbd2614e68",
   };
@@ -3273,7 +3301,7 @@ test("Vault Portal log extraction detects on-chain registered vault address", ()
   assert.match(content, /Vault Portal:/);
   assert.doesNotMatch(content, /证据详情/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
-  assert.match(content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh\)/);
+  assert.match(content, /金库链接：\[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh\)/);
   assert.match(content, /0x9e239cd0/);
   assert.equal(
     __testables.buildVaultFactoryLaunchUrl(addresses[0]),
@@ -3494,9 +3522,9 @@ test("registry preserves old gap and continues live scans while history RPC is b
   const rpcCallFn=async method=>method==='eth_blockNumber'?'0x'+head.toString(16):[];
   await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn});
   const state=snapshot.registryMonitor;
-  assert.equal(state.lastBlock,9995);
+  assert.equal(state.lastBlock,10000);
   assert.equal(state.lagBlocks,0);
-  assert.deepEqual(state.realtimeGaps,[{from:101,to:9975}]);
+  assert.deepEqual(state.realtimeGaps,[{from:101,to:9980}]);
   let release, started;
   const entered=new Promise(resolve=>{started=resolve;});
   const waiting=new Promise(resolve=>{release=resolve;});
@@ -3507,15 +3535,15 @@ test("registry preserves old gap and continues live scans while history RPC is b
   await entered;
   head=10010;
   await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn});
-  assert.equal(state.lastBlock,10005);
+  assert.equal(state.lastBlock,10010);
   assert.equal(state.historyLastBlock,100);
-  assert.equal(state.historyEndBlock,9975);
+  assert.equal(state.historyEndBlock,9980);
   release();await rejected;
   const reloaded=JSON.parse(JSON.stringify(snapshot));
   const ranges=[];
   await __testables.checkFlapRegistryLogs(reloaded,{history:true,rpcCallFn:async (_method,params)=>{ranges.push(params[0]);return [];}});
   assert.equal(Number(ranges[0].fromBlock),101);
-  assert.equal(reloaded.registryMonitor.lastBlock,10005);
+  assert.equal(reloaded.registryMonitor.lastBlock,10010);
   assert.equal(reloaded.registryMonitor.historyLastBlock,3100);
 });
 
@@ -3525,7 +3553,7 @@ test("registry recalculates lag even on RPC failure without losing the recovered
   if(method==='eth_blockNumber')return '0x2710';throw new Error('RPC down');
  }}),/RPC down/);
  assert.equal(snapshot.registryMonitor.lagBlocks,20);
- assert.deepEqual(snapshot.registryMonitor.realtimeGaps,[{from:101,to:9975}]);
+ assert.deepEqual(snapshot.registryMonitor.realtimeGaps,[{from:101,to:9980}]);
 });
 
 test("Factory startup backfill ignores a stale head and caps the recent window",async()=>{
