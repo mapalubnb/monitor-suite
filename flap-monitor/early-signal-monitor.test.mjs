@@ -81,7 +81,7 @@ test('a later chain commit cannot overwrite pool evidence learned during RPC awa
     if (c.method === 'eth_getBlockByNumber' && ++blockReads === 2) state.pools[POOL].officialOperation = true;
     return { eth_chainId: '0x38', eth_blockNumber: '0x65', eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] }[c.method];
   });
-  await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
+  await scanEarlyChain(state, { confirmations: 1, nativeTransactions: false }, rpc, nowMs);
   assert.equal(state.pools[POOL].officialOperation, true);
 });
 
@@ -195,7 +195,7 @@ test("failed initial chain scan retains null bootstrap cursor", async () => {
     if (calls.some(c => c.method === "eth_getLogs")) throw new Error("timeout");
     return calls.map(c => ({ eth_chainId: "0x38", eth_blockNumber: "0x65", eth_getBlockByNumber: { hash: BH, transactions: [] } })[c.method]);
   };
-  await assert.rejects(scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs), /timeout/);
+  await assert.rejects(scanEarlyChain(state, { confirmations: 1, nativeTransactions: false }, rpc, nowMs), /timeout/);
   assert.equal(state.cursor, null);
   assert.equal(state.pendingChanges.length, 0);
 });
@@ -341,7 +341,7 @@ test("failed receipt cannot produce transfers or liquidity preparation", () => {
 test("scan commits only complete canonical windows and respects RPC chain identity", async () => {
   const state = createEarlySignalState();
   const rpc = async calls => calls.map(c => ({ eth_chainId: "0x38", eth_blockNumber: "0x65", eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] })[c.method]);
-  await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
+  await scanEarlyChain(state, { confirmations: 1, nativeTransactions: false }, rpc, nowMs);
   assert.equal(state.cursor, 100);
   const cursor = state.cursor;
   await assert.rejects(scanEarlyChain(state, {}, async calls => calls.map(c => c.method === "eth_chainId" ? "0x1" : null), nowMs), /不是 BSC/);
@@ -438,7 +438,7 @@ test('real-time lane advances independently while historical scan remains backed
   const state = createEarlySignalState(); state.cursor = 100; state.cursorHash = BH;
   state.health.chain = { nextAttemptAtMs: nowMs + 60_000, lastError: 'archive unavailable' };
   const rpc = async calls => calls.map(c => ({ eth_chainId: '0x38', eth_blockNumber: '0x3e8', eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] })[c.method]);
-  await runEarlySignalScan({ state, config: { mode: 'chain', realtime: true, nativeTransactions: false }, rpcBatch: rpc, nowMs });
+  await runEarlySignalScan({ state, config: { mode: 'chain', confirmations: 1, realtime: true, nativeTransactions: false }, rpcBatch: rpc, nowMs });
   assert.equal(state.realtimeCursor, 999);
   assert.equal(state.cursor, 100);
   assert.equal(state.historyEndBlock, 997);
@@ -453,7 +453,7 @@ test('real-time lane advances independently while historical scan remains backed
 test('historical lane stops at the saved realtime boundary without rescanning live events', async () => {
   const state = createEarlySignalState(); state.cursor = 97; state.historyEndBlock = 99; state.realtimeCursor = 999;
   const rpc = async calls => calls.map(c => ({ eth_chainId: '0x38', eth_blockNumber: '0x3e8', eth_getBlockByNumber: { hash: BH, transactions: [] }, eth_getLogs: [] })[c.method]);
-  await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
+  await scanEarlyChain(state, { confirmations: 1, nativeTransactions: false }, rpc, nowMs);
   assert.equal(state.cursor, 99);
   assert.equal(state.realtimeCursor, 999);
 });
@@ -462,7 +462,7 @@ test('stalled early live scan recovers near head and persists its unscanned rang
   const state = createEarlySignalState(); state.cursor = 50; state.historyEndBlock = 90;
   state.realtimeCursor = 100; state.realtimeCursorHash = BH;
   const rpc = async calls => calls.map(c => ({eth_chainId: '0x38', eth_blockNumber: '0x2710', eth_getBlockByNumber: {hash: BH, transactions: []}, eth_getLogs: []})[c.method]);
-  await scanEarlyChain(state, {realtime: true, nativeTransactions: false, maxBlocksPerRun: 50}, rpc, nowMs);
+  await scanEarlyChain(state, {confirmations: 1, realtime: true, nativeTransactions: false, maxBlocksPerRun: 50}, rpc, nowMs);
   assert.equal(state.realtimeCursor, 9999);
   assert.equal(state.cursor, 50);
   assert.deepEqual(state.realtimeGaps, [{from: 101, to: 9979}]);
@@ -475,7 +475,7 @@ test('unrelated public pair discovery does not download transaction receipts', a
     assert.notEqual(c.method, 'eth_getTransactionReceipt');
     return { eth_chainId: '0x38', eth_blockNumber: '0x65', eth_getBlockByNumber: {hash: BH, transactions: []}, eth_getLogs: [pair] }[c.method];
   });
-  await scanEarlyChain(state, { nativeTransactions: false }, rpc, nowMs);
+  await scanEarlyChain(state, { confirmations: 1, nativeTransactions: false }, rpc, nowMs);
   assert.equal(state.cursor, 100);
   assert.equal(state.pendingChanges.length, 0);
 });
@@ -539,4 +539,53 @@ test('restart bounds local RPC backoff without changing API backoff or clearing 
  assert.equal(loaded.health.assets.lastError,'RPC 本地队列已满');
  assert.equal(loaded.health.discovery.nextAttemptAtMs,future);
  }finally{rmSync(dir,{recursive:true,force:true});}
+});
+
+
+test('zero-confirmation fast lane uses fresh WSS head, one canonical check and complete receipt', async () => {
+  const state = createEarlySignalState(), r = history.liquidityReceipt, block = Number(r.blockNumber);
+  state.cursor = block - 1; state.chainBaselineAt = new Date(nowMs).toISOString();
+  const fastRuntime = { head: { number: block, receivedAt: nowMs }, chainVerifiedAt: nowMs, deferAnchorAudit: true };
+  const methods = [];
+  const rpc = async calls => calls.map(c => { methods.push(c.method); return { eth_getTransactionReceipt: r, eth_getBlockByNumber: { hash: r.blockHash }, eth_call: '0x' }[c.method]; });
+  const result = await processEarlyReceiptHints(state, [{ transactionHash: r.transactionHash, blockNumber: block, blockHash: r.blockHash }], { fastRuntime }, rpc, nowMs);
+  assert.equal(result.processed.length, 1);
+  assert.ok(state.pendingChanges.some(event => event.kind === 'liquidityAdded'));
+  assert.equal(methods.includes('eth_blockNumber'), false);
+  assert.equal(methods.includes('eth_chainId'), false);
+  assert.equal(methods.filter(method => method === 'eth_getBlockByNumber').length, 1);
+  assert.equal(state.cursor, block - 1);
+});
+
+test('stale WSS head falls back to HTTP and a removed receipt cannot commit mid-flight', async () => {
+  const state = createEarlySignalState(), r = history.liquidityReceipt, block = Number(r.blockNumber);
+  state.cursor = block - 1; state.chainBaselineAt = new Date(nowMs).toISOString();
+  const methods = [];
+  const rpc = async calls => calls.map(c => {
+    methods.push(c.method);
+    if (c.method === 'eth_getBlockByNumber') state.reorgRevision = (state.reorgRevision || 0) + 1;
+    return { eth_chainId: '0x38', eth_blockNumber: r.blockNumber, eth_getTransactionReceipt: r, eth_getBlockByNumber: { hash: r.blockHash }, eth_call: '0x' }[c.method];
+  });
+  const result = await processEarlyReceiptHints(state, [{ transactionHash: r.transactionHash, blockNumber: block }], { fastRuntime: { head: { number: block - 1, receivedAt: nowMs - 6000 } } }, rpc, nowMs);
+  assert.equal(result.processed.length, 0);
+  assert.ok(methods.includes('eth_blockNumber'));
+  assert.equal(state.pendingChanges.length, 0);
+});
+
+
+test('fast lane commits the first receipt before waiting for a later receipt', async () => {
+  const state = createEarlySignalState(), r = history.liquidityReceipt, block = Number(r.blockNumber);
+  state.cursor = block - 1; state.chainBaselineAt = new Date(nowMs).toISOString();
+  let commits = 0;
+  const rpc = async calls => calls.map(c => {
+    if (c.method === 'eth_getTransactionReceipt' && c.params[0] !== r.transactionHash) {
+      assert.equal(commits, 1);
+      throw new Error('later receipt unavailable');
+    }
+    return { eth_chainId: '0x38', eth_blockNumber: r.blockNumber, eth_getTransactionReceipt: r, eth_getBlockByNumber: { hash: r.blockHash }, eth_call: '0x' }[c.method];
+  });
+  await assert.rejects(processEarlyReceiptHints(state, [{ transactionHash: r.transactionHash, blockNumber: block },
+    { transactionHash: '0x' + 'ef'.repeat(32), blockNumber: block }], { onReceiptCommitted: () => { commits++; } }, rpc, nowMs), /later receipt/);
+  assert.equal(commits, 1);
+  assert.ok(state.pendingChanges.some(event => event.kind === 'liquidityAdded'));
 });

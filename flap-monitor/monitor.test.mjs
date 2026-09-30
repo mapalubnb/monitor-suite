@@ -3930,3 +3930,131 @@ test('extended integrity batches yield to due core and live-event checks',async(
  assert.equal(core,2);assert.equal(extended,1);assert.equal(events,2);
  }finally{__testables.CONFIG.contractIntegrityMonitor.coreIntervalMs=old;}
 });
+
+
+function instantFactoryLog(hash = 'ab') {
+  const token = '0x' + '12'.repeat(20);
+  return { address: FLAP_FACTORY_PROXY, topics: [QUOTE_TOKEN_CONFIGURATION_V2_EVENT_TOPIC],
+    data: '0x' + token.slice(2).padStart(64, '0') + [1, 35, 34, 7, 2].map(n => n.toString(16).padStart(64, '0')).join(''),
+    transactionHash: '0x' + 'cd'.repeat(32), blockHash: '0x' + hash.repeat(32), blockNumber: '0x64', logIndex: '0x2' };
+}
+
+test('Factory instant event sends without RPC or metadata, survives restart and corrects a reorg', async () => {
+  const state = createFactoryPoolState(), entry = instantFactoryLog(), cards = [], lifecycle = [];
+  const opts = { awaitDelivery: true, saveStateFn: () => lifecycle.push('persist'),
+    sendCardFn: async (_title, content) => { lifecycle.push('send'); cards.push(content); return 'mock'; },
+    scheduleMetadataFn: () => { lifecycle.push('metadata'); } };
+  await __testables.processFactoryPoolFeedEvent(state, entry, 'factory-wss', opts);
+  assert.equal(cards.length, 1);
+  assert.ok(lifecycle.indexOf('persist') < lifecycle.indexOf('send'));
+  assert.ok(lifecycle.indexOf('send') < lifecycle.indexOf('metadata'));
+  assert.match(cards[0], /当前状态待复核/);
+  const token = '0x' + '12'.repeat(20);
+  assert.equal(state.candidates[token].pendingVerification, true);
+  assert.equal(state.assets[token].effectiveEnabled, undefined);
+  const restored = migrateFactoryPoolState(JSON.parse(JSON.stringify(state)));
+  assert.equal(restored.assets[token].effectiveEnabled, undefined);
+  await __testables.processFactoryPoolFeedEvent(restored, entry, 'http-backfill', opts);
+  assert.equal(cards.length, 1);
+  await __testables.processFactoryPoolFeedEvent(restored, { ...entry, removed: true }, 'factory-wss', opts);
+  assert.equal(cards.length, 2);
+  assert.match(cards[1], /重组.*撤销/);
+  await __testables.processFactoryPoolFeedEvent(restored, entry, 'factory-wss', opts);
+  assert.equal(cards.length, 2, 'late old-fork log stays tombstoned');
+  await __testables.processFactoryPoolFeedEvent(restored, instantFactoryLog('ef'), 'factory-wss', opts);
+  assert.equal(cards.length, 3, 're-inclusion remains observable');
+});
+
+test('slow Factory scan cannot overwrite or delay a newer WSS event', async () => {
+  const state = createFactoryPoolState(), entry = instantFactoryLog();
+  let release, started;
+  const begin = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  let sent = 0;
+  const options = { awaitDelivery: true, saveStateFn: () => {}, scheduleMetadataFn: () => {}, sendCardFn: async () => { sent++; return 'mock'; } };
+  const scan = __testables.checkFlapFactoryPools(state, { ...options, scanFn: async ({ state: draft }) => {
+    started(); await gate;
+    draft.assets['0x' + '12'.repeat(20)] = { quoteToken: '0x' + '12'.repeat(20), configured: false, fingerprint: 'old', lastVerifiedBlock: 100, lastVerifiedAtMs: Date.now() + 1000 };
+    return { changes: [{ type: 'disabled', current: draft.assets['0x' + '12'.repeat(20)] }], state: draft };
+  } });
+  await begin;
+  await __testables.processFactoryPoolFeedEvent(state, entry, 'factory-wss', options);
+  assert.equal(sent, 1, 'event delivered while periodic RPC is blocked');
+  release();
+  assert.equal((await scan).stale, true);
+  assert.equal(state.assets['0x' + '12'.repeat(20)].configured, true);
+  assert.equal(sent, 1);
+});
+
+test('Factory upgrade sends before implementation code lookup and can be revoked', async () => {
+  const state = createFactoryPoolState(), cards = [];
+  state.currentImplementation = '0x' + '11'.repeat(20);
+  const entry = { ...instantFactoryLog(), topics: [UPGRADED_EVENT_TOPIC, '0x' + '22'.repeat(20).padStart(64, '0')], data: '0x' };
+  const options = { awaitDelivery: true, saveStateFn: () => {}, scheduleMetadataFn: () => {}, sendCardFn: async (_title, content) => { cards.push(content); return 'mock'; } };
+  await __testables.processFactoryPoolFeedEvent(state, entry, 'factory-wss', options);
+  assert.equal(state.currentImplementation, '0x' + '22'.repeat(20));
+  assert.equal(state.implementationNeedsCodeRefresh, true);
+  assert.match(cards[0], /Factory 已升级/);
+  await __testables.processFactoryPoolFeedEvent(state, { ...entry, removed: true }, 'factory-wss', options);
+  assert.equal(state.currentImplementation, '0x' + '11'.repeat(20));
+  assert.match(cards[1], /升级事件已撤销/);
+});
+
+test('integrity baseline cannot swallow WSS alerts received while a state scan is blocked', async () => {
+  const { ingestContractIntegrityEvent } = await import('./contract-integrity-monitor.mjs');
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/vault-audit-stocks.json', import.meta.url), 'utf8'));
+  const state = createContractIntegrityState();
+  let release, started;
+  const begin = new Promise(resolve => { started = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const scan = __testables.runFlapContractIntegrityPass(state, { suppressNotifications: true, saveStateFn: () => {},
+    stateScanFn: async () => { started(); await gate; return { changed: false, changes: [] }; },
+    eventScanFn: async () => ({ changed: false, changes: [] }) });
+  await begin;
+  const { change } = ingestContractIntegrityEvent(state, fixture.event);
+  let sent = false;
+  await __testables.deliverFlapContractIntegrityChanges(state, { sendCardFn: async () => { sent = true; return 'mock'; }, saveStateFn: () => {} });
+  assert.equal(sent, true);
+  // A second event remains queued through baseline suppression.
+  const next = ingestContractIntegrityEvent(state, { ...fixture.event, transactionHash: '0x' + 'fa'.repeat(32) }).change;
+  release(); await scan;
+  assert.equal(state.pendingChanges.some(item => item.id === next.id), true);
+  assert.notEqual(change.id, next.id);
+});
+
+
+test('Factory removed route is not resurrected by merge or a late metadata task', async () => {
+  const state = createFactoryPoolState();
+  const options = { awaitDelivery: true, saveStateFn: () => {}, scheduleMetadataFn: () => {}, sendCardFn: async () => 'mock' };
+  const route = { ...awdhRouteLog, blockHash: '0x' + 'ab'.repeat(32) };
+  await __testables.processFactoryPoolFeedEvent(state, route, 'factory-wss', options);
+  const token = extractFactoryLogCandidates(route)[0].quoteToken;
+  assert.ok(state.assets[token].swapRoute);
+  await __testables.processFactoryPoolFeedEvent(state, { ...route, removed: true }, 'factory-wss', options);
+  assert.equal(state.assets[token].swapRoute, undefined);
+  assert.equal(state.candidates[token].eventRoute, undefined);
+  await __testables.processFactoryPoolFeedEvent(state, { ...route, blockHash: '0x' + 'cd'.repeat(32) }, 'factory-wss', options);
+  assert.ok(state.assets[token].swapRoute);
+  await __testables.processFactoryPoolFeedEvent(state, { ...route, removed: true }, 'factory-wss', options);
+  assert.ok(state.assets[token].swapRoute, 'late duplicate removal cannot erase the replacement');
+});
+
+test('Factory malformed instant ABI cannot enter the notification queue', async () => {
+  const state = createFactoryPoolState(), entry = instantFactoryLog();
+  await assert.rejects(ingestFactoryPoolEvent({ state, eventOnly: true, logEntry: { ...entry, data: entry.data.slice(0, -64) }, rpcCall: async () => { throw new Error('must not query'); } }), /ABI/);
+  assert.equal(Object.keys(state.recentEvents).length, 0);
+  assert.equal(Object.keys(state.assets).length, 0);
+});
+
+
+test('Factory replacement fork arriving before removed stays active and sends its own signal', async () => {
+  const state = createFactoryPoolState(), cards = [], first = instantFactoryLog();
+  const options = { awaitDelivery: true, saveStateFn: () => {}, scheduleMetadataFn: () => {}, sendCardFn: async (_title, content) => { cards.push(content); return 'mock'; } };
+  await __testables.processFactoryPoolFeedEvent(state, first, 'factory-wss', options);
+  const replacement = instantFactoryLog('ef');
+  await __testables.processFactoryPoolFeedEvent(state, replacement, 'factory-wss', options);
+  assert.equal(cards.length, 2);
+  await __testables.processFactoryPoolFeedEvent(state, { ...first, removed: true }, 'factory-wss', options);
+  assert.equal(cards.length, 3);
+  assert.equal(state.assets['0x' + '12'.repeat(20)].eventKey, factoryPoolEventKey(replacement));
+});

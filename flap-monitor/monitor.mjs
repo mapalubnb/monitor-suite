@@ -29,7 +29,7 @@ import WebSocket from "ws";
 import { parseHTML } from "linkedom";
 import { createStartupNotifier, buildStartupCard } from "../shared/startup-notifier.mjs";
 import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.mjs";
-import { processEarlyReceiptHints, shouldPrioritizeEarlyLog } from "./early-signal-monitor.mjs";
+import { processEarlyReceiptHints, shouldPrioritizeEarlyLog, rewindEarlySignals, validateFastBlocks } from "./early-signal-monitor.mjs";
 import { selectEarlyNotification, archiveRoutineEarlySignals } from './early-signal-notifications.mjs';
 import { selectCowNotification } from './cow-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
@@ -39,6 +39,7 @@ import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isM
 import {
   BNB_QUOTE_TOKEN,
   FACTORY_POOL_STATE_EVENT_TOPICS,
+  UPGRADED_EVENT_TOPIC,
   FLAP_FACTORY_PROXY,
   classifyFactoryPoolChange,
   assetFingerprint,
@@ -199,7 +200,7 @@ const CONFIG = {
     discoveryIntervalMs: readPositiveIntEnv("FLAP_EARLY_DISCOVERY_INTERVAL_MS", 86_400_000, 60_000),
     maxBlocksPerRun: readPositiveIntEnv("FLAP_EARLY_MAX_BLOCKS", 20, 1),
     nativeTransactions: process.env.FLAP_EARLY_NATIVE_TX_SCAN !== "false",
-    confirmations: Math.max(0, Number.parseInt(process.env.FLAP_EARLY_CONFIRMATIONS || "1", 10) || 0),
+    confirmations: Math.max(0, Number.parseInt(process.env.FLAP_EARLY_CONFIRMATIONS || "0", 10) || 0),
     wallets: (process.env.FLAP_EARLY_WALLETS || EXECUTION_WALLETS.join(",")).split(",").map(s => s.trim()).filter(s => /^0x[a-f0-9]{40}$/i.test(s)),
     cowApiBaseUrl: process.env.FLAP_COW_API_BASE_URL || "https://api.cow.fi/bnb/api/v1",
     wsEnabled: process.env.FLAP_EARLY_WS_ENABLED !== "false", timeoutMs: 5_000,
@@ -3301,6 +3302,7 @@ function formatFactoryPoolAssetName(asset = {}) {
 }
 
 function formatFactoryPoolAssetStatus(asset = {}) {
+  if (asset.stateVerified === false) return "事件已发现，当前状态待复核";
   if (!asset.configured) return "已停用";
   if (asset.creationDisabled) return "暂停创建";
   return "支持创建";
@@ -3343,31 +3345,33 @@ function buildFactoryPoolMonitorContent(result) {
   const changeCounts = { added: 0, modified: 0, paused: 0, resumed: 0, disabled: 0, route: 0 };
   for (const change of result.changes || []) changeCounts[change.type] = (changeCounts[change.type] || 0) + 1;
   const summary = [
-    `📋 本次变更：${Object.entries({ added: "新增支持", modified: "配置修改", route: "路径更新", paused: "暂停", resumed: "恢复", disabled: "停用" }).filter(([key]) => changeCounts[key]).map(([key, label]) => `${label} ${changeCounts[key]} 个`).join("｜") || "合约升级"}`,
+    `📋 本次变更：${Object.entries({ added: result.changes.some(change => change.type === "added" && change.current?.stateVerified === false) ? "新增配置" : "新增支持", modified: "配置修改", reorg: "重组撤销", route: "路径更新", paused: "暂停", resumed: "恢复", disabled: "停用" }).filter(([key]) => changeCounts[key]).map(([key, label]) => `${label} ${changeCounts[key]} 个`).join("｜") || "合约升级"}`,
     `当前资产：支持创建 ${enabledCount} 个｜暂停创建 ${pausedCount} 个｜已停用 ${disabledCount} 个`,
   ];
   const primary = [];
   for (const change of result.changes) {
     const item = change.current;
     const label = {
-      added: "新增支持",
+      added: item.stateVerified === false ? "新增配置事件" : "新增支持",
+      reorg: "链重组：原事件已撤销",
       modified: "配置修改",
       route: "兑换路径更新",
       paused: "暂停创建",
       resumed: "恢复创建",
       disabled: "停用",
     }[change.type] || "配置修改";
-    const color = !item.configured || item.creationDisabled ? "red" : "green";
+    const color = change.type === "reorg" ? "red" : item.stateVerified === false ? "orange" : !item.configured || item.creationDisabled ? "red" : "green";
     const icon = ({ added: "🟢", resumed: "🟢", paused: "⏸️", disabled: "🔴", route: "🔀", modified: "⚙️" })[change.type] || "⚙️";
     primary.push(`**${icon} ${label}：${formatFactoryPoolAssetName(item)}**`);
     primary.push(`<font color='${color}'>状态：${formatFactoryPoolAssetStatus(item)}</font>`);
     primary.push(`地址：${addressLink(item.quoteToken)}`);
-    if (item.swapRoute) primary.push(...formatQuoteRoute(item.swapRoute));
+    if (change.type === "reorg") primary.push(`撤销区块：${item.blockNumber}｜[原交易](https://bscscan.com/tx/${item.transactionHash})`);
+    if (change.type !== "reorg" && item.swapRoute) primary.push(...formatQuoteRoute(item.swapRoute));
     if (change.type === "route" && item.routeEvidence?.txHash) primary.push(`🔗 [查看交易](https://bscscan.com/tx/${item.routeEvidence.txHash})`);
   }
   if (result.implementationChange?.previous) {
     const upgrade = result.implementationChange;
-    primary.push("Factory 已升级");
+    primary.push(upgrade.removed ? "🔴 链重组：Factory 升级事件已撤销" : "Factory 已升级");
     primary.push(`原地址：${addressLink(upgrade.previous)}`);
     primary.push(`新地址：${addressLink(upgrade.current)}`);
   }
@@ -3434,7 +3438,7 @@ function mergeFactoryPoolCandidate(current = {}, incoming = {}) {
   const latest = incomingBlock > currentBlock || (incomingBlock === currentBlock && incomingAttempt >= currentAttempt)
     ? incoming
     : current;
-  const routeState = [current, incoming].filter(item => item.routeEvidence).sort((a, b) =>
+  const routeState = [incoming, current].filter(item => item.routeEvidence).sort((a, b) =>
     b.routeEvidence.blockNumber - a.routeEvidence.blockNumber || b.routeEvidence.logIndex - a.routeEvidence.logIndex)[0];
   const firstSeenBlocks = [current.firstSeenBlock, incoming.firstSeenBlock].filter(Number.isFinite);
   const lastSeenBlocks = [current.lastSeenBlock, incoming.lastSeenBlock].filter(Number.isFinite);
@@ -3470,6 +3474,8 @@ function mergeFactoryPoolVerificationHealth(state) {
 
 function mergeFactoryPoolScanState(target, incoming) {
   if (!incoming || incoming === target) return target;
+  if ((incoming.eventRevision || 0) < (target.eventRevision || 0)) return target;
+  target.eventRevision = incoming.eventRevision || 0;
   const targetLatestBlock = Number(target.latestBlock) || 0;
   const incomingLatestBlock = Number(incoming.latestBlock) || 0;
   const maxFields = [
@@ -3479,6 +3485,7 @@ function mergeFactoryPoolScanState(target, incoming) {
     "schemaVersion", "chainId", "proxy", "deploymentBlock", "deploymentTxHash", "deployer",
     "deploymentTxChecked", "deploymentDetection", "implementationSelectors",
     "assetRefreshCursor", "lastRealtimeRunAt", "lastCatchupRunAt", "lastRunAt",
+    "implementationEventBlock", "implementationEventKey", "implementationNeedsCodeRefresh",
   ];
   for (const field of copyFields) {
     if (incoming[field] !== undefined && incoming[field] !== null && incoming[field] !== "") target[field] = incoming[field];
@@ -3504,7 +3511,7 @@ function mergeFactoryPoolScanState(target, incoming) {
     if (!current || incomingBlock > currentBlock || (incomingBlock === currentBlock && incomingVersion >= currentVersion)) {
       target.assets[address] = asset;
     }
-    const routeAsset = [current, asset].filter(item => item?.routeEvidence).sort((a, b) =>
+    const routeAsset = [asset, current].filter(item => item?.routeEvidence).sort((a, b) =>
       b.routeEvidence.blockNumber - a.routeEvidence.blockNumber || b.routeEvidence.logIndex - a.routeEvidence.logIndex)[0];
     if (routeAsset) {
       const selected = target.assets[address];
@@ -3519,6 +3526,14 @@ function mergeFactoryPoolScanState(target, incoming) {
   ).sort((left, right) => (right.blockNumber || 0) - (left.blockNumber || 0))
     .slice(0, 20_000)
     .map(({ key, ...event }) => [key, event]));
+  for (const event of Object.values(incoming.recentEvents || {})) {
+    if (!event.removed || !event.transactionHash) continue;
+    const revoked = evidence => evidence?.txHash === event.transactionHash && evidence.logIndex === event.logIndex
+      && (!evidence.blockHash || evidence.blockHash === event.blockHash);
+    for (const asset of Object.values(target.assets)) if (revoked(asset.routeEvidence)) { delete asset.swapRoute; delete asset.routeEvidence; }
+    for (const candidate of Object.values(target.candidates)) if (revoked(candidate.routeEvidence)) { delete candidate.eventRoute; delete candidate.routeEvidence; }
+  }
+  target.pendingChanges = (target.pendingChanges || []).filter(change => change.type === "reorg" || !target.recentEvents[change.current?.eventKey]?.removed);
   target.implementationHistory = mergeUniqueFactoryPoolRecords(
     target.implementationHistory,
     incoming.implementationHistory,
@@ -3591,6 +3606,7 @@ async function enrichFactoryPoolMetadataAfterSend({
   const before = new Map(workAddresses.map(address => [address, factoryPoolMetadataStateFingerprint(state.assets?.[address])]));
   const beforeCard = new Map(addresses.map(address => [address, factoryPoolMetadataFingerprint(state.assets?.[address])]));
   await enrichFn(workingState, workAddresses);
+  if (changes.some(change => state.recentEvents?.[change.current?.eventKey]?.removed)) return { patched: false, metadataChanged: false };
   const stateChanged = workAddresses.some(address =>
     before.get(address) !== factoryPoolMetadataStateFingerprint(workingState.assets?.[address]));
   if (stateChanged) {
@@ -3675,8 +3691,10 @@ async function checkFlapFactoryPools(factoryPoolState, {
       log,
     });
   } catch (error) {
+    if ((workingState.eventRevision || 0) < (factoryPoolState.eventRevision || 0)) return { changed: false, changes: [], stale: true, state: factoryPoolState };
     const partialChanges = collectFactoryPoolStateChanges(previousAssets, workingState);
     await withFactoryPoolStateWrite(() => {
+      if ((workingState.eventRevision || 0) < (factoryPoolState.eventRevision || 0)) return;
       mergeFactoryPoolScanState(factoryPoolState, workingState);
       factoryPoolState.lastError = error.message;
       for (const field of healthFields) factoryPoolState[field] = error.message;
@@ -3695,6 +3713,7 @@ async function checkFlapFactoryPools(factoryPoolState, {
     });
     throw error;
   }
+  if ((workingState.eventRevision || 0) < (factoryPoolState.eventRevision || 0)) return { changed: false, changes: [], stale: true, state: factoryPoolState };
   await withFactoryPoolStateWrite(() => {
     for (const field of healthFields) factoryPoolState[field] = "";
   });
@@ -3706,6 +3725,7 @@ async function checkFlapFactoryPools(factoryPoolState, {
   }
 
   await withFactoryPoolStateWrite(() => {
+    if ((workingState.eventRevision || 0) < (factoryPoolState.eventRevision || 0)) return;
     mergeFactoryPoolScanState(factoryPoolState, workingState);
     factoryPoolState.pendingChanges = mergePendingFactoryPoolChanges(factoryPoolState.pendingChanges, result.changes);
     if (result.implementationChange?.previous) factoryPoolState.pendingImplementationChange = result.implementationChange;
@@ -3791,7 +3811,14 @@ async function checkFlapFactoryPools(factoryPoolState, {
   };
   if (factoryPoolDeliveryQueued) return { ...result, sent: false, deliveryQueued: true };
   factoryPoolDeliveryQueued = true;
-  const delivery = factoryPoolDeliveryQueue.then(deliver, deliver);
+  const deliverAll = async () => {
+    let delivered;
+    do { delivered = await deliver(); }
+    while (delivered.sent && (factoryPoolState.pendingChanges.length || factoryPoolState.pendingImplementationChange)
+      && (sendCardFn !== sendCardViaApi || canAttemptFeishuDelivery()));
+    return delivered;
+  };
+  const delivery = factoryPoolDeliveryQueue.then(deliverAll, deliverAll);
   factoryPoolDeliveryQueue = delivery.catch(error => {
     log(`[Flap Factory] 待发送通知保留，异步发送失败：${error.message}`);
   }).finally(() => { factoryPoolDeliveryQueued = false; });
@@ -4033,9 +4060,10 @@ function createFactoryPoolWsFeed({
   return api;
 }
 
-async function processFactoryPoolFeedEvent(factoryPoolState, logEntry, source = "factory-wss") {
+async function processFactoryPoolFeedEvent(factoryPoolState, logEntry, source = "factory-wss", options = {}) {
   const result = await checkFlapFactoryPools(factoryPoolState, {
     awaitDelivery: false,
+    ...options,
     scanFn: async ({ state, rpcCall, persistState, log: scanLog }) => {
       const ingested = await ingestFactoryPoolEvent({
         state,
@@ -4043,31 +4071,14 @@ async function processFactoryPoolFeedEvent(factoryPoolState, logEntry, source = 
         rpcCall,
         persistState,
         source,
+        eventOnly: true,
         log: scanLog,
       });
       if (!ingested.processed) {
         return { changed: false, changes: [], implementationChange: null, state, ...ingested };
       }
+      if (!ingested.item) return { ...ingested, changed: Boolean(ingested.implementationChange) };
       const quoteToken = ingested.item.quoteToken;
-      const asset = state.assets?.[quoteToken];
-      if (asset?.configured) {
-        const metadataResult = await resolveFactoryPoolTokenMetadata([quoteToken], { onchainOnly: true });
-        const metadata = metadataResult.metadata[quoteToken];
-        if (metadata) {
-          asset.name = metadata.name || asset.name || "";
-          asset.symbol = metadata.symbol || asset.symbol || "";
-          if (Number.isInteger(metadata.decimals)) asset.decimals = metadata.decimals;
-          asset.metadataSource = metadata.source || asset.metadataSource || "";
-          asset.metadataUpdatedAt = new Date().toISOString();
-          asset.metadataError = metadataResult.errors.join("｜");
-          const candidate = state.candidates?.[quoteToken];
-          if (candidate) {
-            candidate.name = asset.name;
-            candidate.symbol = asset.symbol;
-            candidate.decimals = asset.decimals;
-          }
-        }
-      }
       const current = state.assets?.[quoteToken];
       const eventConfig = ingested.item.eventConfiguration;
       if (eventConfig) {
@@ -4087,10 +4098,7 @@ async function processFactoryPoolFeedEvent(factoryPoolState, logEntry, source = 
           log(`[Flap Factory WSS] 底池开放：symbol=${current?.symbol || "未知"}｜address=${quoteToken}｜tx=${ingested.item.txHash}`);
         }
       }
-      const changes = ingested.changes.map(change => ({
-        ...change,
-        current: state.assets?.[change.current.quoteToken] || change.current,
-      }));
+      const changes = ingested.changes;
       return { ...ingested, changed: changes.length > 0, changes, implementationChange: null, state };
     },
   });
@@ -4101,7 +4109,8 @@ function createFactoryPoolEventQueue(factoryPoolState, processor = processFactor
   let tail = Promise.resolve();
   const queuedKeys = new Set();
   function enqueue(logEntry, source) {
-    const key = factoryPoolEventKey(logEntry);
+    const identity = factoryPoolEventKey(logEntry);
+    const key = identity && `${identity}:${Boolean(logEntry.removed)}`;
     if (!key || queuedKeys.has(key)) return Promise.resolve({ duplicate: true });
     queuedKeys.add(key);
     const job = tail.then(() => processor(factoryPoolState, logEntry, source));
@@ -6498,7 +6507,6 @@ async function runFlapContractIntegrityPass(state, {
   eventScanFn = scanContractIntegrityEvents,
 } = {}) {
   if (!CONFIG.contractIntegrityMonitor.enabled) return { changed: false, changes: [], state };
-  const existingPendingIds = new Set(state.pendingChanges.map(change => change.id));
   state.coreIntervalMs = CONFIG.contractIntegrityMonitor.coreIntervalMs;
   syncFlapContractIntegrityCatalog(state, snapshot, factoryPoolState);
   let stateResult = { changed: false, changes: [] }, stateError;
@@ -6545,7 +6553,7 @@ async function runFlapContractIntegrityPass(state, {
     suppressFactoryUpgrade: CONFIG.factoryPoolMonitor.enabled,
   });
   if (suppressNotifications && state.pendingChanges.length > 0) {
-    acknowledgeContractIntegrityChanges(state, state.pendingChanges.filter(change => !existingPendingIds.has(change.id)).map(change => change.id));
+    acknowledgeContractIntegrityChanges(state, [...stateResult.changes, ...eventResult.changes].map(change => change.id));
   }
   saveStateFn(CONFIG.contractIntegrityMonitor.stateFile, state);
   if (stateError) throw stateError;
@@ -6601,6 +6609,7 @@ async function deliverFlapContractIntegrityChanges(state, {
           log(`[Flap 审计关联] 查询失败：${error.message}`);
           return originals.map(change => ({ ...change, audit: { ...change.audit, lookupFailed: true } }));
         }).then(async enrichedChanges => {
+          if (originals.some(change => state.recentEvents?.[change.eventKey]?.removed)) return;
           const enriched = buildContractIntegrityContent(enrichedChanges, snapshot);
           const opts = alertMentionCardOptions();
           if (enriched !== content && !isTooLongForSingleCard(content, title, 'red', opts)
@@ -7125,7 +7134,7 @@ async function startMonitor() {
     if (Date.now() - lastMetricsAt < 10_000) return;
     const file = join(__dirname, "runtime-metrics.json");
     const jobs = Object.fromEntries([
-      ['earlyRealtime', earlyChainJob], ['earlyHistory', earlyHistoryJob], ['earlyFast', earlyFastJob],
+      ['earlyRealtime', earlyChainJob], ['earlyHistory', earlyHistoryJob], ['earlyFast', earlyFastJob], ['earlyFastAudit', earlyFastAuditJob],
       ...externalJobs, ['registry', registryJob], ['registryHistory', registryHistoryJob],
       ['registryDelivery', registryDeliveryJob], ['registryAudit', registryAuditJob],
     ].map(([name, job]) => [name, job.snapshot()]));
@@ -7140,6 +7149,7 @@ async function startMonitor() {
   }, 10_000);
   rpcMetricsTimer.unref();
   const receiptHints = new Map(), priorityTokens = new Set(), externalJobs = new Map();
+  const earlyFastRuntime = { deferAnchorAudit: true };
   let earlyDeliveryPromise = null;
   function deliverEarly() {
     if (!earlyDeliveryPromise) earlyDeliveryPromise = deliverFlapEarlySignals(earlySignalState)
@@ -7193,8 +7203,14 @@ async function startMonitor() {
     }, run: async () => {
       if (isShuttingDown || Date.now() < fastRetryAt) return;
       for (const [hash, hint] of receiptHints) if (Number(hint.blockNumber) <= (earlySignalState.realtimeCursor ?? earlySignalState.cursor ?? -1)) receiptHints.delete(hash);
-      if (!receiptHints.size && !Object.keys(earlySignalState.fastBlocks || {}).length) return;
-      const result = await processEarlyReceiptHints(earlySignalState, [...receiptHints.values()], earlySignalConfig(), bscRpcBatch);
+      if (!receiptHints.size) return;
+      const result = await processEarlyReceiptHints(earlySignalState, [...receiptHints.values()], { ...earlySignalConfig(), fastRuntime: earlyFastRuntime,
+        onReceiptCommitted: receipt => {
+          saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
+          receiptHints.delete(receipt.transactionHash);
+          prioritize(receipt.tokens);
+          void deliverEarly();
+        } }, bscRpcBatch);
       for (const hash of result.processed) receiptHints.delete(hash);
       fastFailures = 0;
       earlySignalState.health.fast = { lastError: "", lastSuccessAt: new Date().toISOString() };
@@ -7203,16 +7219,40 @@ async function startMonitor() {
       prioritize(result.tokens);
       void deliverEarly();
     } });
+  let fastAuditRetryAt = 0;
+  const earlyFastAuditJob = createWakeableJob({ intervalMs: CONFIG.earlySignalMonitor.intervalMs,
+    onError: error => {
+      fastAuditRetryAt = Date.now() + 10_000;
+      earlySignalState.health.fastAudit = { lastError: error.message, nextAttemptAtMs: fastAuditRetryAt };
+      log(`[Flap 快速回执复核] ${error.message}`);
+    }, run: async () => {
+      if (isShuttingDown || Date.now() < fastAuditRetryAt || !Object.keys(earlySignalState.fastBlocks || {}).length) return;
+      await validateFastBlocks(earlySignalState, Infinity, bscRpcBatch, Date.now());
+      earlySignalState.health.fastAudit = { lastError: "", lastSuccessAt: new Date().toISOString() };
+      saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
+      void deliverEarly();
+    } });
   const earlyFeeds = createSubscriptionSet(filter => createFactoryPoolWsFeed({
     urls: CONFIG.factoryPoolMonitor.wsUrls, proxy: filter.address, topicFilter: filter.topics,
     label: "Flap 提前信号 WSS",
     onEvent: event => {
       if (!shouldPrioritizeEarlyLog(event, earlySignalState)) return;
       if (/^0x[a-f0-9]{64}$/i.test(event.transactionHash || "") && receiptHints.size < 1000)
-        receiptHints.set(event.transactionHash.toLowerCase(), { transactionHash: event.transactionHash.toLowerCase(), blockNumber: event.blockNumber });
+        receiptHints.set(event.transactionHash.toLowerCase(), { transactionHash: event.transactionHash.toLowerCase(), blockNumber: event.blockNumber, blockHash: event.blockHash });
       void earlyFastJob.wake();
     },
-    onRemoved: () => { void earlyFastJob.wake(); void earlyChainJob.wake(); },
+    onRemoved: event => {
+      const block = hexToNumber(event.blockNumber);
+      if (block > 0 && /^0x[a-f0-9]{64}$/i.test(event.blockHash || "")
+        && (earlySignalState.fastBlocks?.[block] === event.blockHash.toLowerCase()
+          || Object.values(earlySignalState.events).some(item => item.blockHash === event.blockHash.toLowerCase()))) {
+        rewindEarlySignals(earlySignalState, Math.max(1, block - 128));
+        saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, earlySignalState);
+        void deliverEarly();
+      } else earlySignalState.reorgRevision = (earlySignalState.reorgRevision || 0) + 1;
+      receiptHints.delete(String(event.transactionHash || "").toLowerCase());
+      void earlyFastJob.wake(); void earlyChainJob.wake();
+    },
     onSubscribed: () => { void earlyChainJob.wake(); },
     onStatus: health => { earlySignalState.wssHealth = health; },
   }));
@@ -7232,7 +7272,7 @@ async function startMonitor() {
       } }));
   }
   if (CONFIG.earlySignalMonitor.enabled) {
-    earlyChainJob.start(); earlyFastJob.start(); earlyHistoryJob.start();
+    earlyChainJob.start(); earlyFastJob.start(); earlyFastAuditJob.start(); earlyHistoryJob.start();
     for (const job of externalJobs.values()) job.start();
     refreshEarlyFeeds();
   }
@@ -7299,6 +7339,7 @@ async function startMonitor() {
         const key = `${head.number}:${head.hash}`;
         if (lastHeadKey === key) return;
         lastHeadKey = key;
+        earlyFastRuntime.head = { number: hexToNumber(head.number), hash: head.hash, receivedAt: Date.now() };
         // Heads release confirmed fast hints; periodic HTTP scanning remains independent.
         if (CONFIG.earlySignalMonitor.enabled && CONFIG.earlySignalMonitor.wsEnabled) void earlyFastJob.wake();
         if (CONFIG.registryMonitor.enabled) void registryJob.wake();
@@ -7306,7 +7347,7 @@ async function startMonitor() {
   global.__earlySignalDrain = async () => {
     clearInterval(rpcMetricsTimer);
     earlyFeeds.stop(); registryFeed?.stop(); headFeed?.stop();
-    await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), registryJob.stop(), registryHistoryJob.stop(),
+    await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), earlyFastAuditJob.stop(), registryJob.stop(), registryHistoryJob.stop(),
       registryDeliveryJob.stop(), registryAuditJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
     saveRegistrySnapshot(snapshot);
     if (earlyDeliveryPromise) await earlyDeliveryPromise;
@@ -7315,6 +7356,7 @@ async function startMonitor() {
   };
   let contractIntegrityMutationQueue = Promise.resolve();
   let contractIntegrityDeliveryPromise = null;
+  let contractIntegrityPollPromise = null;
   let contractIntegrityWsFeed = null;
   let contractIntegrityWsFingerprint = "";
 
@@ -7331,14 +7373,16 @@ async function startMonitor() {
       if (pendingCount === 0) return { sent: false };
       if (!canAttemptFeishuDelivery()) return { sent: false, deliveryDeferred: true };
       try {
-        return await deliverFlapContractIntegrityChanges(contractIntegrityState, {
+        let delivered;
+        do { delivered = await deliverFlapContractIntegrityChanges(contractIntegrityState, {
           titlePrefix,
           acknowledgeFn: (_state, ids) => enqueueContractIntegrityMutation(() => {
             acknowledgeContractIntegrityChanges(contractIntegrityState, ids);
             saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
           }),
           saveStateFn: () => {},
-        });
+        }); } while (delivered.sent && contractIntegrityState.pendingChanges.length && canAttemptFeishuDelivery() && !isShuttingDown);
+        return delivered;
       } catch (error) {
         log(`[Flap 合约完整性] 待发送变更已保留：${error.message}`);
         return { sent: false, error };
@@ -7363,6 +7407,7 @@ async function startMonitor() {
       topics: [],
       label: "Flap 合约完整性 WSS",
       onEvent: event => processContractIntegrityEvent(event, "integrity-wss"),
+      onRemoved: event => processContractIntegrityEvent(event, "integrity-wss"),
       onStatus: health => enqueueContractIntegrityMutation(() => {
         contractIntegrityState.wssHealth = { ...(contractIntegrityState.wssHealth || {}), contracts: health };
         saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
@@ -7380,26 +7425,33 @@ async function startMonitor() {
       if (outcome.processed) saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
       return outcome;
     });
+    if (result.change) void scheduleContractIntegrityDelivery();
     if (contractIntegritySubscriptionAddresses(contractIntegrityState).join(",") !== subscriptionFingerprintBefore) {
       await refreshContractIntegrityWsFeed();
     }
-    if (result.change) void scheduleContractIntegrityDelivery();
     return result;
   }
 
   async function contractIntegrityPoll({ suppressNotifications = false, forceExtended = false, forceCodeAudit = false } = {}) {
     if (isShuttingDown || !CONFIG.contractIntegrityMonitor.enabled) return;
+    if (contractIntegrityPollPromise) return contractIntegrityPollPromise;
+    contractIntegrityPollPromise = runContractIntegrityPoll({ suppressNotifications, forceExtended, forceCodeAudit }).finally(() => { contractIntegrityPollPromise = null; });
+    return contractIntegrityPollPromise;
+  }
+
+  async function runContractIntegrityPoll({ suppressNotifications, forceExtended, forceCodeAudit }) {
     const now = Date.now();
     const extendedDue = forceExtended || now - (Date.parse(contractIntegrityState.lastExtendedScanAt || "") || 0) >= CONFIG.contractIntegrityMonitor.extendedIntervalMs;
     const codeAuditDue = forceCodeAudit || now - (Date.parse(contractIntegrityState.lastCodeAuditAt || "") || 0) >= CONFIG.contractIntegrityMonitor.codeAuditIntervalMs;
     try {
-      await enqueueContractIntegrityMutation(() => runFlapContractIntegrityPass(contractIntegrityState, {
+      // RPC scans mutate live state only in synchronous commit sections. Never hold the event queue across RPC awaits.
+      await runFlapContractIntegrityPass(contractIntegrityState, {
         snapshot,
         factoryPoolState,
         extended: extendedDue,
         forceCodeAudit: codeAuditDue,
         suppressNotifications,
-      }));
+      });
       await refreshContractIntegrityWsFeed();
     } catch (error) {
       await enqueueContractIntegrityMutation(() => {
@@ -7434,7 +7486,7 @@ async function startMonitor() {
       saveContractIntegrityState(CONFIG.contractIntegrityMonitor.stateFile, contractIntegrityState);
       void scheduleContractIntegrityDelivery();
     } });
-  global.__contractIntegrityMutationDrain = async () => { await integrityHistoryJob.stop(); await contractIntegrityMutationQueue; };
+  global.__contractIntegrityMutationDrain = async () => { await integrityHistoryJob.stop(); if (contractIntegrityPollPromise) await contractIntegrityPollPromise; await contractIntegrityMutationQueue; };
   global.__contractIntegrityDeliveryDrain = async () => {
     if (contractIntegrityDeliveryPromise) await contractIntegrityDeliveryPromise;
   };
@@ -7605,10 +7657,10 @@ async function startMonitor() {
     let resolveFirstFactoryWsSubscription;
     firstFactoryWsSubscription = new Promise(resolve => { resolveFirstFactoryWsSubscription = resolve; });
     const factoryPoolTopics = [...new Set([
-      ...FACTORY_POOL_STATE_EVENT_TOPICS,
+      ...FACTORY_POOL_STATE_EVENT_TOPICS, UPGRADED_EVENT_TOPIC,
       ...(CONFIG.contractIntegrityMonitor.enabled ? CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS : []),
     ])];
-    const factoryPoolTopicSet = new Set(FACTORY_POOL_STATE_EVENT_TOPICS);
+    const factoryPoolTopicSet = new Set([...FACTORY_POOL_STATE_EVENT_TOPICS, UPGRADED_EVENT_TOPIC]);
     const integrityFactoryTopicSet = new Set(CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS);
     const factoryPoolWsFeed = createFactoryPoolWsFeed({
       urls: CONFIG.factoryPoolMonitor.wsUrls,
@@ -7618,6 +7670,11 @@ async function startMonitor() {
         const topic0 = String(event?.topics?.[0] || "").toLowerCase();
         if (factoryPoolTopicSet.has(topic0)) void factoryPoolEventQueue.enqueue(event, "factory-wss");
         if (CONFIG.contractIntegrityMonitor.enabled && integrityFactoryTopicSet.has(topic0)) void processContractIntegrityEvent(event, "factory-wss");
+      },
+      onRemoved: event => {
+        const topic = String(event?.topics?.[0] || "").toLowerCase();
+        if (factoryPoolTopicSet.has(topic)) void factoryPoolEventQueue.enqueue(event, "factory-wss");
+        if (CONFIG.contractIntegrityMonitor.enabled && integrityFactoryTopicSet.has(topic)) void processContractIntegrityEvent(event, "factory-wss");
       },
       onStatus: health => recordFactoryPoolWsHealth(factoryPoolState, health),
       onSubscribed: async () => {

@@ -217,7 +217,7 @@ function migrateFactoryPoolAsset(asset = {}) {
     configured,
     configurationPresent,
     creationDisabled,
-    effectiveEnabled: configured && !creationDisabled,
+    effectiveEnabled: asset.stateVerified === false ? undefined : configured && !creationDisabled,
     configurationFingerprint,
     fingerprint: assetFingerprint(configurationFingerprint, creationDisabled, asset.swapRoute),
     enabled: Number(values[0] ?? asset.enabled ?? (configured ? 1 : 0)),
@@ -315,7 +315,7 @@ export function migrateFactoryPoolState(raw, proxy = FLAP_FACTORY_PROXY) {
     .sort(([, left], [, right]) => (right.lastSeenBlock || 0) - (left.lastSeenBlock || 0))
     .slice(0, MAX_FACTORY_POOL_CANDIDATES));
   state.recentEvents = Object.fromEntries(Object.entries(state.recentEvents)
-    .filter(([key, event]) => /^[a-f0-9x]+:\d+$/i.test(key) && event && typeof event === "object")
+    .filter(([key, event]) => /^[a-f0-9x]+:\d+(?::0x[a-f0-9]{64})?$/i.test(key) && event && typeof event === "object")
     .sort(([, left], [, right]) => (right.blockNumber || 0) - (left.blockNumber || 0))
     .slice(0, MAX_FACTORY_POOL_RECENT_EVENTS));
   for (const key of [
@@ -365,21 +365,25 @@ export function saveFactoryPoolState(path, state) {
 }
 
 function candidateKey(item) {
-  return `${item.source || "unknown"}:${item.txHash || ""}:${item.logIndex ?? ""}:${item.selector || item.topic0 || ""}:${item.quoteToken}`;
+  return `${item.source || "unknown"}:${item.txHash || ""}:${item.logIndex ?? ""}:${item.selector || item.topic0 || ""}:${item.quoteToken}:${item.blockHash || ""}`;
 }
 
 export function factoryPoolEventKey(logEntry) {
   const txHash = String(logEntry?.transactionHash || "").toLowerCase();
   const logIndex = hexToNumber(logEntry?.logIndex);
-  return /^0x[a-f0-9]{64}$/.test(txHash) ? `${txHash}:${logIndex}` : "";
+  const hash = String(logEntry?.blockHash || "").toLowerCase();
+  return /^0x[a-f0-9]{64}$/.test(txHash) ? `${txHash}:${logIndex}${hash ? `:${hash}` : ""}` : "";
 }
 
 function rememberFactoryPoolEvent(state, logEntry, source) {
   const key = factoryPoolEventKey(logEntry);
   if (!key || state.recentEvents?.[key]) return false;
+  const legacy = state.recentEvents?.[`${String(logEntry.transactionHash).toLowerCase()}:${hexToNumber(logEntry.logIndex)}`];
+  if (logEntry.blockHash && legacy && !legacy.removed && legacy.blockNumber === hexToNumber(logEntry.blockNumber)) return false;
   state.recentEvents ||= {};
   state.recentEvents[key] = {
     blockNumber: hexToNumber(logEntry?.blockNumber),
+    blockHash: String(logEntry?.blockHash || "").toLowerCase(),
     transactionHash: String(logEntry?.transactionHash || "").toLowerCase(),
     logIndex: hexToNumber(logEntry?.logIndex),
     source: source || "event",
@@ -431,7 +435,7 @@ function rememberCandidate(state, item) {
   if (item.eventRoute && (!current.routeEvidence || item.blockNumber > current.routeEvidence.blockNumber
     || (item.blockNumber === current.routeEvidence.blockNumber && item.logIndex >= current.routeEvidence.logIndex))) {
     current.eventRoute = item.eventRoute;
-    current.routeEvidence = { blockNumber: item.blockNumber, logIndex: item.logIndex, txHash: item.txHash };
+    current.routeEvidence = { blockNumber: item.blockNumber, logIndex: item.logIndex, txHash: item.txHash, ...(item.blockHash ? { blockHash: item.blockHash } : {}) };
   }
   current.lastTxHash = String(item.txHash || current.lastTxHash || "").toLowerCase();
   current.lastSourceBlock = item.blockNumber ?? current.lastSourceBlock ?? null;
@@ -523,12 +527,16 @@ async function readImplementation(rpcCall, proxy, blockTag) {
 }
 
 async function refreshImplementation({ state, rpcCall, log }) {
+  if (state.safeLatestBlock < (state.implementationEventBlock || 0)) return null;
   const implementation = await readImplementation(rpcCall, state.proxy, numberToHex(state.safeLatestBlock));
   if (!implementation) throw new Error("无法读取 Factory implementation");
-  if (implementation === state.currentImplementation) return null;
+  if (implementation === state.currentImplementation && !state.implementationNeedsCodeRefresh) return null;
   const previous = state.currentImplementation || "";
   const code = await rpcCall("eth_getCode", [implementation, numberToHex(state.safeLatestBlock)], { requireResult: true });
   const selectors = extractBytecodeSelectors(code);
+  state.implementationNeedsCodeRefresh = false;
+  state.implementationSelectors = selectors;
+  if (implementation === state.currentImplementation) return null;
   const change = {
     previous,
     current: implementation,
@@ -677,6 +685,8 @@ async function verifyCandidates({ state, rpcCall, items, blockTag = "latest", pe
 
     const next = {
       quoteToken,
+      stateVerified: true,
+      eventKey: previous?.eventKey,
       configured: decoded.configured,
       enabled: decoded.enabled,
       officialCandidate: decoded.officialCandidate,
@@ -735,12 +745,24 @@ export async function ingestFactoryPoolEvent({
   rpcCall,
   persistState,
   source = "factory-wss",
+  eventOnly = false,
   log,
 } = {}) {
   if (!state || typeof rpcCall !== "function") throw new Error("Factory WSS 事件处理缺少 state 或 rpcCall");
-  if (logEntry?.removed) return { processed: false, removed: true, changes: [], state };
+  if (eventOnly && (!/^0x[a-f0-9]{64}$/i.test(logEntry?.blockHash || "")
+    || !factoryPoolEventKey(logEntry) || !Number.isInteger(Number(logEntry.logIndex))
+    || !(hexToNumber(logEntry.blockNumber) > 0))) throw new Error("Factory 即时事件区块或交易标识无效");
+  if (eventOnly && String(logEntry?.topics?.[0]).toLowerCase() === UPGRADED_EVENT_TOPIC) return ingestFactoryUpgradeEvent(state, logEntry, source);
+  if (logEntry?.removed) return eventOnly ? revokeFactoryPoolEvent(state, logEntry) : { processed: false, removed: true, changes: [], state };
   const items = extractFactoryLogCandidates(logEntry, state.proxy);
   if (items.length === 0) throw new Error(`无法解析 Factory 事件：${String(logEntry?.topics?.[0] || "未知 topic")}`);
+  if (eventOnly && !items[0].eventConfiguration && !items[0].eventRoute && typeof items[0].eventDisabled !== "boolean") {
+    throw new Error("Factory 即时事件 ABI 不完整");
+  }
+  if (eventOnly && items[0].eventConfiguration && (!/^0x0{24}[a-f0-9]{40}(?:[a-f0-9]{64}){5}$/i.test(logEntry.data)
+    || ![0, 1].includes(items[0].eventConfiguration.enabled))) throw new Error("Factory 配置事件 ABI 无效");
+  if (eventOnly && typeof items[0].eventDisabled === "boolean" && (!/^0x0{63}[01]$/i.test(logEntry.data)
+    || !/^0x0{24}[a-f0-9]{40}$/i.test(logEntry.topics?.[1] || ""))) throw new Error("Factory 创建开关事件 ABI 无效");
   const key = factoryPoolEventKey(logEntry);
   if (!rememberFactoryPoolEvent(state, logEntry, source)) {
     return { processed: false, duplicate: true, eventKey: key, changes: [], item: items[0], state };
@@ -748,7 +770,27 @@ export async function ingestFactoryPoolEvent({
   const blockNumber = hexToNumber(logEntry?.blockNumber);
   state.latestBlock = Math.max(Number(state.latestBlock) || 0, blockNumber);
   state.safeLatestBlock = Math.max(Number(state.safeLatestBlock) || 0, blockNumber);
-  const enrichedItems = items.map(item => ({ ...item, source }));
+  const enrichedItems = items.map(item => ({ ...item, blockHash: logEntry.blockHash, source }));
+  if (eventOnly) {
+    const item = enrichedItems[0], previous = state.assets[item.quoteToken];
+    rememberCandidate(state, item);
+    Object.assign(state.candidates[item.quoteToken], { pendingVerification: true, lastVerifyBlock: blockNumber, lastVerifyAttemptAtMs: Date.now() });
+    state.eventRevision = (state.eventRevision || 0) + 1;
+    const current = { ...applyStateEventToAsset(previous || { quoteToken: item.quoteToken }, logEntry) };
+    // Never claim that an event alone verified all current getter values.
+    Object.assign(current, { stateVerified: false, eventKey: key, effectiveEnabled: undefined,
+      blockNumber, lastSeenBlock: blockNumber, transactionHash: item.txHash, logIndex: item.logIndex,
+      lastVerifiedBlock: blockNumber, lastVerifiedAtMs: Date.now(), source });
+    const stale = previous && (Number(previous.blockNumber) > blockNumber
+      || (Number(previous.blockNumber) === blockNumber && Number(previous.logIndex) > item.logIndex));
+    if (!stale) state.assets[item.quoteToken] = current;
+    refreshCandidateVerificationHealth(state);
+    state.lastRealtimeRunAt = state.lastRunAt = nowText();
+    return { processed: true, eventKey: key, item, state,
+      changes: !previous || previous.fingerprint !== current.fingerprint || state.recentEvents[previous.eventKey]?.removed
+        || (previous.eventKey !== key && previous.transactionHash === item.txHash && previous.logIndex === item.logIndex)
+        ? [{ type: classifyFactoryPoolChange(previous, current), previous: previous || null, current }] : [] };
+  }
   const changes = await verifyCandidates({
     state,
     rpcCall,
@@ -767,6 +809,68 @@ export async function ingestFactoryPoolEvent({
     item: enrichedItems[0],
     state,
   };
+}
+
+function ingestFactoryUpgradeEvent(state, entry, source) {
+  const key = factoryPoolEventKey(entry);
+  const word = String(entry.topics?.[1] || "").toLowerCase();
+  if (normalizeAddress(entry.address) !== state.proxy || !key || !/^0x0{24}[a-f0-9]{40}$/.test(word)) {
+    throw new Error("Factory 升级事件来源或 ABI 无效");
+  }
+  const implementation = `0x${word.slice(-40)}`, block = hexToNumber(entry.blockNumber);
+  const record = state.recentEvents?.[key];
+  if (entry.removed) {
+    if (record?.removed) return { processed: false, changes: [], state };
+    state.recentEvents ||= {};
+    state.recentEvents[key] = { ...record, removed: true, blockNumber: block };
+    state.eventRevision = (state.eventRevision || 0) + 1;
+    if (state.implementationEventKey === key && record?.previousImplementation) state.currentImplementation = record.previousImplementation;
+    state.implementationNeedsCodeRefresh = true;
+    return { processed: true, changes: [], state, implementationChange: record?.previousImplementation
+      ? { previous: implementation, current: record.previousImplementation, removed: true, eventKey: key } : null };
+  }
+  if (!rememberFactoryPoolEvent(state, entry, source)) return { processed: false, changes: [], state };
+  const previous = state.currentImplementation;
+  state.recentEvents[key].previousImplementation = previous;
+  state.eventRevision = (state.eventRevision || 0) + 1;
+  if (block < (state.implementationEventBlock || 0)) return { processed: true, changes: [], state };
+  state.currentImplementation = implementation;
+  state.implementationEventBlock = block;
+  state.implementationEventKey = key;
+  state.latestBlock = Math.max(state.latestBlock || 0, block);
+  state.implementationNeedsCodeRefresh = true;
+  const change = { previous, current: implementation, detectedBlock: block, eventKey: key, detectedAt: nowText() };
+  state.implementationHistory.push(change);
+  state.implementationHistory = state.implementationHistory.slice(-50);
+  return { processed: true, changes: [], state, implementationChange: previous !== implementation ? change : null };
+}
+
+function revokeFactoryPoolEvent(state, entry) {
+  if (normalizeAddress(entry.address) !== state.proxy) return { processed: false, changes: [], state };
+  const key = factoryPoolEventKey(entry);
+  if (!key || state.recentEvents?.[key]?.removed) return { processed: false, changes: [], state };
+  const item = extractFactoryLogCandidates({ ...entry, removed: false }, state.proxy)[0];
+  if (!item) return { processed: false, changes: [], state };
+  const seen = state.recentEvents?.[key] || state.recentEvents?.[`${item.txHash}:${item.logIndex}`];
+  state.recentEvents ||= {};
+  state.recentEvents[key] = { ...seen, blockNumber: item.blockNumber, blockHash: entry.blockHash, transactionHash: item.txHash, logIndex: item.logIndex, removed: true };
+  state.eventRevision = (state.eventRevision || 0) + 1;
+  const previous = state.assets[item.quoteToken];
+  if (previous?.eventKey === key || (!previous?.eventKey && previous?.transactionHash === item.txHash && previous?.logIndex === item.logIndex)) {
+    state.assets[item.quoteToken] = { ...previous, stateVerified: false, effectiveEnabled: undefined };
+  }
+  const candidate = state.candidates?.[item.quoteToken];
+  if (candidate) {
+    candidate.pendingVerification = true;
+    if (candidate.routeEvidence?.txHash === item.txHash && (!candidate.routeEvidence.blockHash || candidate.routeEvidence.blockHash === entry.blockHash)) { delete candidate.eventRoute; delete candidate.routeEvidence; }
+  }
+  if (previous?.routeEvidence?.txHash === item.txHash && (!previous.routeEvidence.blockHash || previous.routeEvidence.blockHash === entry.blockHash)) {
+    delete state.assets[item.quoteToken].swapRoute; delete state.assets[item.quoteToken].routeEvidence;
+  }
+  state.pendingChanges = (state.pendingChanges || []).filter(change => change.current?.eventKey !== key);
+  return { processed: true, reorg: true, state, item, changes: seen ? [{ type: "reorg", previous: previous || null,
+    current: { quoteToken: item.quoteToken, ...previous, eventKey: key, transactionHash: item.txHash, blockNumber: item.blockNumber,
+      stateVerified: false, fingerprint: `removed:${key}` } }] : [] };
 }
 
 async function refreshKnownAssets({ state, rpcCall, limit, blockTag, persistState, log }) {
@@ -810,11 +914,12 @@ function applyStateEventToAsset(asset, logEntry) {
   if (topic0 === QUOTE_ROUTE_EVENT_TOPIC) {
     if (asset.routeEvidence && (hexToNumber(logEntry.blockNumber) < asset.routeEvidence.blockNumber
       || (hexToNumber(logEntry.blockNumber) === asset.routeEvidence.blockNumber
-        && hexToNumber(logEntry.logIndex) <= asset.routeEvidence.logIndex))) return asset;
+        && hexToNumber(logEntry.logIndex) <= asset.routeEvidence.logIndex
+        && (!logEntry.blockHash || !asset.routeEvidence.blockHash || logEntry.blockHash === asset.routeEvidence.blockHash)))) return asset;
     const { hops: swapRoute } = decodeQuoteRoute(logEntry.data);
     return { ...asset, swapRoute,
       fingerprint: assetFingerprint(asset.configurationFingerprint, asset.creationDisabled, swapRoute),
-      routeEvidence: { blockNumber: hexToNumber(logEntry.blockNumber), logIndex: hexToNumber(logEntry.logIndex), txHash: logEntry.transactionHash } };
+      routeEvidence: { blockNumber: hexToNumber(logEntry.blockNumber), logIndex: hexToNumber(logEntry.logIndex), txHash: logEntry.transactionHash, ...(logEntry.blockHash ? { blockHash: logEntry.blockHash } : {}) } };
   }
   if (topic0 === QUOTE_TOKEN_CREATION_DISABLED_EVENT_TOPIC) {
     const creationDisabled = decodeBooleanResult(logEntry.data);
@@ -832,6 +937,12 @@ function applyStateEventToAsset(asset, logEntry) {
   return {
     ...asset,
     configured: decoded.configured,
+    enabled: decoded.enabled,
+    officialCandidate: decoded.officialCandidate,
+    defaultCurve: decoded.defaultCurve,
+    alternativeCurve: decoded.alternativeCurve,
+    nativeToQuoteSwapType: decoded.nativeToQuoteSwapType,
+    dexId: decoded.dexId,
     configurationPresent: decoded.configurationPresent,
     fields: decoded.fields,
     values: decoded.values,

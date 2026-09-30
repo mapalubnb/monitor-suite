@@ -534,7 +534,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   if (Number(chain) !== 56) throw new Error("RPC chainId 不是 BSC 56");
   const latest = Number(await strictRpc(rpcBatch, "eth_blockNumber", []));
   state.latestBlock = latest;
-  const confirmations = config.confirmations ?? 1;
+  const confirmations = config.confirmations ?? 0;
   if (config.realtime) recoverLiveCursor(state, {head: latest - confirmations, cursorKey, hashKey});
   else if (activateHistoryGap(state, state, 'cursor', 'historyEndBlock')) state.cursorHash = '';
   const head = Math.min(latest - confirmations, config.realtime ? Infinity : state.historyEndBlock ?? Infinity);
@@ -615,11 +615,12 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress });
 }
 
-async function validateFastBlocks(state, head, rpcBatch, nowMs) {
+export async function validateFastBlocks(state, head, rpcBatch, nowMs) {
   const anchors = Object.entries(state.fastBlocks || {}).filter(([block]) => Number(block) <= head);
   if (!anchors.length) return;
   const blocks = await rpcBatch(anchors.map(([block]) => ({ method: "eth_getBlockByNumber", params: [blockTag(Number(block)), false] })), { requireAllResults: true });
   for (let i = 0; i < anchors.length; i++) {
+    if (state.fastBlocks?.[anchors[i][0]] !== anchors[i][1]) continue;
     if (!blocks[i]?.hash) throw new Error("快速信号区块校验不可用");
     if (lower(blocks[i].hash) !== anchors[i][1]) {
       rewindEarlySignals(state, Math.max(1, Number(anchors[i][0]) - REORG_WINDOW), nowMs);
@@ -631,25 +632,37 @@ async function validateFastBlocks(state, head, rpcBatch, nowMs) {
 // Fast lane never advances the HTTP cursor. Both lanes use receipt log IDs for deduplication.
 export async function processEarlyReceiptHints(state, hints, config, rpcBatch, nowMs = Date.now()) {
   if (!state.chainBaselineAt) return { processed: [], tokens: [] };
-  const chain = await strictRpc(rpcBatch, "eth_chainId", []);
+  // This cache is process-local, never loaded from persisted monitoring state.
+  const runtime = config.fastRuntime;
+  const freshHead = runtime?.head && nowMs - runtime.head.receivedAt < 5000 && nowMs >= runtime.head.receivedAt;
+  const [chain, latest] = await Promise.all([
+    runtime?.chainVerifiedAt && nowMs - runtime.chainVerifiedAt < 60_000 ? 56 : strictRpc(rpcBatch, "eth_chainId", []),
+    freshHead ? Number(runtime.head.number) : strictRpc(rpcBatch, "eth_blockNumber", []).then(Number),
+  ]);
   if (Number(chain) !== 56) throw new Error("RPC chainId 不是 BSC 56");
-  const latest = Number(await strictRpc(rpcBatch, "eth_blockNumber", []));
-  const head = latest - (config.confirmations ?? 1);
-  await validateFastBlocks(state, head, rpcBatch, nowMs);
+  if (runtime && (!runtime.chainVerifiedAt || nowMs - runtime.chainVerifiedAt >= 60_000)) runtime.chainVerifiedAt = nowMs;
+  const confirmations = config.confirmations ?? 0;
+  const observedHead = runtime && confirmations === 0 ? Math.max(latest, ...hints.filter(h => /^0x[a-f0-9]{64}$/i.test(h.blockHash || "")).map(h => Number(h.blockNumber))) : latest;
+  const head = observedHead - confirmations;
+  if (!runtime?.deferAnchorAudit) await validateFastBlocks(state, head, rpcBatch, nowMs);
   const eligible = hints.filter(h => Number(h.blockNumber) <= head).slice(0, 20);
   const processed = [], tokens = new Set();
   for (const hint of eligible) {
     const reorgRevision = state.reorgRevision || 0;
     const receipt = await strictRpc(rpcBatch, "eth_getTransactionReceipt", [hint.transactionHash]);
     if (lower(receipt.transactionHash) !== lower(hint.transactionHash) || Number(receipt.blockNumber) > head) continue;
-    const block = await strictRpc(rpcBatch, "eth_getBlockByNumber", [receipt.blockNumber, false]);
-    if (lower(block.hash) !== lower(receipt.blockHash)) continue;
+    if (hint.blockHash && lower(hint.blockHash) !== lower(receipt.blockHash)) continue;
     if (!state.fastBlocks?.[Number(receipt.blockNumber)] && Object.keys(state.fastBlocks || {}).length >= 128) break;
     const resolved = { pools: structuredClone(state.pools) };
     await resolveReceiptPools(resolved, [receipt], rpcBatch, config);
     const check = await strictRpc(rpcBatch, "eth_getBlockByNumber", [receipt.blockNumber, false]);
     if (lower(check.hash) !== lower(receipt.blockHash)) continue;
     if ((state.reorgRevision || 0) !== reorgRevision) continue;
+    const oldAnchor = state.fastBlocks?.[Number(receipt.blockNumber)];
+    if (oldAnchor && oldAnchor !== lower(receipt.blockHash)) {
+      rewindEarlySignals(state, Math.max(1, Number(receipt.blockNumber) - REORG_WINDOW), nowMs);
+      continue; // Resolve pool evidence again after removing the old fork's cache.
+    }
     const draft = structuredClone(state);
     for (const [address, pool] of Object.entries(resolved.pools)) draft.pools[address] ||= pool;
     const events = decodeEarlyReceipt(receipt, draft, { config, nowMs });
@@ -659,6 +672,8 @@ export async function processEarlyReceiptHints(state, hints, config, rpcBatch, n
     Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress });
     for (const event of events) if (event.token) tokens.add(event.token);
     processed.push(hint.transactionHash);
+    // Persist and start delivery per receipt; later transactions must not hold up this one.
+    config.onReceiptCommitted?.({ transactionHash: hint.transactionHash, tokens: [...new Set(events.map(event => event.token).filter(Boolean))] });
   }
   return { processed, tokens: [...tokens] };
 }

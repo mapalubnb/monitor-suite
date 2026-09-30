@@ -1,4 +1,12 @@
-# Flap 底池提前监控（1.10.20）
+# Flap 底池提前监控（1.10.21）
+
+## 2026-09-30 WSS 全链路加速
+
+Monitor Suite 1.12.22 / Flap 1.10.21 将提前信号默认额外确认块数改为 0，复用新鲜 WSS 区块头，缓存进程内链身份，并把旧快速区块复核移到独立任务。仍获取整笔回执、解析流动性与 CoW 配套转账并校验当前区块 hash；每笔回执提交后即可持久化并启动发送，不再等待同批后续交易。
+
+Factory 配置、兑换路径、创建开关和升级事件先持久化、推送，再由原有后台任务查询 getter、代码及名称；事件推导的状态明确标为待复核。合约完整性 WSS 的接收和发送不再等待周期 RPC 扫描，持续排空成功投递后的待发队列。Factory 与完整性事件按区块 hash 去重，处理重组撤销、迟到旧分叉和重新入块；旧 HTTP 查询不能覆盖较新的 Factory 事件状态。
+
+保留所有 HTTP 补漏、重连回扫和原监控周期。Safe／CoW 链下 API、页面抓取以及没有对应事件的 getter 检查继续使用原通道；WSS 无法替代这些数据源。零额外确认表示出块后即时处理，不是未打包交易或最终确认；节点、回执可用性和飞书仍会影响实际时延。
 
 ## 2026-09-30 金库注册即时推送
 
@@ -159,7 +167,7 @@ CoW 按订单 UID 独立管理卡片：新订单、首次成交、完成、取�
 | `FLAP_REGISTRY_WS_ENABLED` | true | 金库注册／区块订阅；也受 Factory WSS 总开关约束 |
 | `FLAP_EARLY_DISCOVERY_INTERVAL_MS` | 86400000 | Safe 地址关系刷新 |
 | `FLAP_EARLY_MAX_BLOCKS` | 20 | 单次追赶窗口 |
-| `FLAP_EARLY_CONFIRMATIONS` | 1 | 提前信号确认块数；Factory 原实时设置不变 |
+| `FLAP_EARLY_CONFIRMATIONS` | 0 | 提前信号确认块数；Factory 原实时设置不变 |
 | `FLAP_EARLY_NATIVE_TX_SCAN` | true | 直接 BNB 交易扫描；完整区块读取会增加流量 |
 | `FLAP_EARLY_WS_ENABLED` | true | 动态钱包／池订阅、快速回执与新区块确认触发 |
 | `FLAP_EARLY_WALLETS` | 已核验执行钱包 | 额外执行钱包列表，逗号分隔 |

@@ -353,7 +353,7 @@ export function syncContractIntegrityCatalog(state, { vaultFactories = {}, contr
 }
 
 function changeId(change) {
-  return hashText(JSON.stringify([change.type, change.address, change.field, change.previous, change.current, change.txHash, change.logIndex]));
+  return hashText(JSON.stringify([change.type, change.address, change.field, change.previous, change.current, change.txHash, change.logIndex, change.blockHash]));
 }
 
 function appendChange(state, change) {
@@ -539,7 +539,8 @@ export async function runContractIntegrityStateScan({
 }
 
 function eventKey(logEntry) {
-  return `${String(logEntry?.transactionHash || "").toLowerCase()}:${hexToNumber(logEntry?.logIndex)}`;
+  const hash = String(logEntry?.blockHash || "").toLowerCase();
+  return `${String(logEntry?.transactionHash || "").toLowerCase()}:${hexToNumber(logEntry?.logIndex)}${hash ? `:${hash}` : ""}`;
 }
 
 function pruneRecentEvents(state) {
@@ -552,7 +553,19 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
   const address = normalizeAddress(logEntry?.address);
   if (!address || !state.catalog[address]) return { processed: false, change: null };
   const key = eventKey(logEntry);
+  if (logEntry.removed) {
+    const record = state.recentEvents[key];
+    if (record?.removed) return { processed: false, duplicate: true, change: null };
+    state.recentEvents[key] = { ...record, removed: true, blockNumber: hexToNumber(logEntry.blockNumber) };
+    state.pendingChanges = state.pendingChanges.filter(change => change.eventKey !== key);
+    pruneRecentEvents(state);
+    return { processed: true, change: record?.notified ? appendChange(state, { type: "reorg", address,
+      field: "链重组：原事件已撤销", eventKey: key, blockHash: logEntry.blockHash,
+      txHash: logEntry.transactionHash, logIndex: hexToNumber(logEntry.logIndex), blockNumber: hexToNumber(logEntry.blockNumber) }) : null };
+  }
   if (!key || state.recentEvents[key]) return { processed: false, duplicate: true, change: null };
+  const legacy = state.recentEvents[`${String(logEntry.transactionHash || "").toLowerCase()}:${hexToNumber(logEntry.logIndex)}`];
+  if (logEntry.blockHash && legacy && !legacy.removed && legacy.blockNumber === hexToNumber(logEntry.blockNumber)) return { processed: false, duplicate: true, change: null };
   const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
   const blockNumber = hexToNumber(logEntry?.blockNumber);
   state.recentEvents[key] = { address, topic0, blockNumber, source, seenAt: nowIso() };
@@ -577,12 +590,15 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
     current: topic0,
     topic0,
     blockNumber,
+    blockHash: logEntry.blockHash,
+    eventKey: key,
     txHash: String(logEntry?.transactionHash || "").toLowerCase(),
     logIndex: hexToNumber(logEntry?.logIndex),
     audit: decodeAuditSubject(logEntry),
     eventTime: logEntry?.blockTimestamp ? new Date(hexToNumber(logEntry.blockTimestamp) * 1000).toISOString() : '',
     source,
   });
+  state.recentEvents[key].notified = true;
   return { processed: true, change };
 }
 
@@ -673,6 +689,9 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
       else if (change.blockNumber) lines.push(`区块 ${change.blockNumber}`);
       if (change.eventTime) lines.push(`🕒 区块时间：${change.eventTime}`);
       else if (change.detectedAt) lines.push(`发现时间：${change.detectedAt}`);
+    } else if (change.type === "reorg") {
+      lines.push("🔴 链重组：原事件已撤销", `撤销区块：${change.blockNumber}`,
+        `[原交易](https://bscscan.com/tx/${change.txHash})`, "该分叉事件不再作为有效变更；重新入块后会另行提醒。");
     } else if (change.type === "selectors") {
       if (change.added?.length) lines.push(`新增函数选择器: ${change.added.join(", ")}`);
       if (change.removed?.length) lines.push(`移除函数选择器: ${change.removed.join(", ")}`);

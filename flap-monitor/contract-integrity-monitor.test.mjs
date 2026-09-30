@@ -547,3 +547,21 @@ test('older extended audit cannot overwrite a newer core code observation',async
  }});
  assert.equal(state.lastCoreScanAt,timestamp);assert.equal(state.latestBlock,200);assert.equal(state.contracts[address].codeHash,'newer-code');assert.equal(state.contracts[address].lastCodeBlock,200);
 });
+
+
+test('integrity removed event tombstones replay, persists correction and permits re-inclusion', () => {
+  const state = createContractIntegrityState();
+  const entry = { ...auditFixture.event, blockHash: '0x' + 'ab'.repeat(32) };
+  const first = ingestContractIntegrityEvent(state, entry).change;
+  acknowledgeContractIntegrityChanges(state, [first.id]);
+  const correction = ingestContractIntegrityEvent(state, { ...entry, removed: true }).change;
+  assert.equal(correction.type, 'reorg');
+  assert.match(buildContractIntegrityContent([correction], state), /原事件已撤销/);
+  assert.equal(ingestContractIntegrityEvent(state, entry).change, null);
+  assert.equal(ingestContractIntegrityEvent(state, { ...entry, removed: true }).change, null);
+  const restored = migrateContractIntegrityState(JSON.parse(JSON.stringify(state)));
+  assert.equal(ingestContractIntegrityEvent(restored, entry).change, null);
+  const next = ingestContractIntegrityEvent(restored, { ...entry, blockHash: '0x' + 'ef'.repeat(32) }).change;
+  assert.ok(next);
+  assert.notEqual(next.id, first.id);
+});
