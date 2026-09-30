@@ -76,6 +76,7 @@ export function selectEarlyNotification(state, nowMs = Date.now()) {
     .filter(group => earlyNotificationPriority(group, state, nowMs) === 'immediate').slice(0, 8);
   if (!selected.length) return null;
   const title = selected.every(group => group.some(e => e.kind === 'liquidityRemoved')) ? 'Flap 流动性撤出提醒'
+    : selected.every(group => group.every(e => ['transfer', 'nativeTransfer'].includes(e.kind))) ? '转账'
     : selected.every(group => group.every(e => ['nativeBalance', 'nativeTransfer'].includes(e.kind))) ? 'Flap 资金变动提醒'
     : 'Flap 底池提前信号';
   return { changes: selected.flat(), mode: 'immediate', title, template: 'orange' };
