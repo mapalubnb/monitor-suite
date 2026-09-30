@@ -7560,6 +7560,83 @@ async function startMonitor() {
   log("监控目标:");
   for (const url of CONFIG.urls) log(`  - ${url}`);
 
+  // Subscribe before any page, state or Safe baseline can wait on the network.
+  syncFlapContractIntegrityCatalog(contractIntegrityState, snapshot, factoryPoolState);
+  const factoryPoolEventQueue = createFactoryPoolEventQueue(factoryPoolState);
+  global.__factoryPoolEventQueueDrain = factoryPoolEventQueue.drain;
+  let firstFactoryWsSubscription = Promise.resolve();
+  let releaseFactoryStartup;
+  const factoryStartupReady = new Promise(resolve => { releaseFactoryStartup = resolve; });
+  if (CONFIG.factoryPoolMonitor.enabled && CONFIG.factoryPoolMonitor.wsEnabled && CONFIG.factoryPoolMonitor.wsUrls.length > 0) {
+    let backfillStarted = false;
+    let resolveFirstFactoryWsSubscription;
+    firstFactoryWsSubscription = new Promise(resolve => { resolveFirstFactoryWsSubscription = resolve; });
+    const factoryPoolTopics = [...new Set([
+      ...FACTORY_POOL_STATE_EVENT_TOPICS, UPGRADED_EVENT_TOPIC,
+      ...(CONFIG.contractIntegrityMonitor.enabled ? CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS : []),
+    ])];
+    const factoryPoolTopicSet = new Set([...FACTORY_POOL_STATE_EVENT_TOPICS, UPGRADED_EVENT_TOPIC]);
+    const integrityFactoryTopicSet = new Set(CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS);
+    const factoryPoolWsFeed = createFactoryPoolWsFeed({
+      urls: CONFIG.factoryPoolMonitor.wsUrls,
+      proxy: CONFIG.factoryPoolMonitor.proxy,
+      topics: factoryPoolTopics,
+      onEvent: event => {
+        const topic0 = String(event?.topics?.[0] || "").toLowerCase();
+        if (factoryPoolTopicSet.has(topic0)) void factoryPoolEventQueue.enqueue(event, "factory-wss");
+        if (CONFIG.contractIntegrityMonitor.enabled && integrityFactoryTopicSet.has(topic0)) void processContractIntegrityEvent(event, "factory-wss");
+      },
+      onRemoved: event => {
+        const topic = String(event?.topics?.[0] || "").toLowerCase();
+        if (factoryPoolTopicSet.has(topic)) void factoryPoolEventQueue.enqueue(event, "factory-wss");
+        if (CONFIG.contractIntegrityMonitor.enabled && integrityFactoryTopicSet.has(topic)) void processContractIntegrityEvent(event, "factory-wss");
+      },
+      onStatus: health => recordFactoryPoolWsHealth(factoryPoolState, health),
+      onSubscribed: async () => {
+        await recordFactoryPoolWsHealth(factoryPoolState, factoryPoolWsFeed.snapshot());
+        resolveFirstFactoryWsSubscription();
+        if (backfillStarted) return;
+        backfillStarted = true;
+        // Live logs flow immediately; retain first-run baseline suppression for historical replay.
+        await factoryStartupReady;
+        if (isShuttingDown) return;
+        await recordFactoryPoolWsBackfill(factoryPoolState, {
+          status: "running",
+          fromBlock: null,
+          toBlock: null,
+          eventCount: 0,
+          startedAt: new Date().toISOString(),
+          completedAt: "",
+          lastError: "",
+        });
+        try {
+          const backfill = await backfillFactoryPoolFeedEvents(factoryPoolEventQueue, undefined, undefined, undefined, undefined, factoryPoolState.latestBlock || 0);
+          await recordFactoryPoolWsBackfill(factoryPoolState, {
+            status: "completed",
+            fromBlock: backfill.fromBlock,
+            toBlock: backfill.latest,
+            eventCount: backfill.eventCount,
+            completedAt: new Date().toISOString(),
+            lastError: "",
+          });
+        } catch (error) {
+          backfillStarted = false;
+          await recordFactoryPoolWsBackfill(factoryPoolState, {
+            status: "failed",
+            completedAt: new Date().toISOString(),
+            lastError: error.message,
+          });
+          throw error;
+        }
+      },
+    });
+    global.__factoryPoolWsFeed = factoryPoolWsFeed.start();
+  } else {
+    await recordFactoryPoolWsHealth(factoryPoolState, createFactoryPoolWsHealth());
+    log("[Flap Factory WSS] 未启用或未配置节点，继续使用 1 秒 HTTP 扫描");
+  }
+  await refreshContractIntegrityWsFeed();
+
   // 初始化基线（并行抓取）
   let needsInit = false;
   for (const url of CONFIG.urls) {
@@ -7649,76 +7726,8 @@ async function startMonitor() {
 
   void startupNotifier.refresh();
 
-  const factoryPoolEventQueue = createFactoryPoolEventQueue(factoryPoolState);
-  global.__factoryPoolEventQueueDrain = factoryPoolEventQueue.drain;
-  let firstFactoryWsSubscription = Promise.resolve();
-  if (CONFIG.factoryPoolMonitor.enabled && CONFIG.factoryPoolMonitor.wsEnabled && CONFIG.factoryPoolMonitor.wsUrls.length > 0) {
-    let backfillStarted = false;
-    let resolveFirstFactoryWsSubscription;
-    firstFactoryWsSubscription = new Promise(resolve => { resolveFirstFactoryWsSubscription = resolve; });
-    const factoryPoolTopics = [...new Set([
-      ...FACTORY_POOL_STATE_EVENT_TOPICS, UPGRADED_EVENT_TOPIC,
-      ...(CONFIG.contractIntegrityMonitor.enabled ? CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS : []),
-    ])];
-    const factoryPoolTopicSet = new Set([...FACTORY_POOL_STATE_EVENT_TOPICS, UPGRADED_EVENT_TOPIC]);
-    const integrityFactoryTopicSet = new Set(CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS);
-    const factoryPoolWsFeed = createFactoryPoolWsFeed({
-      urls: CONFIG.factoryPoolMonitor.wsUrls,
-      proxy: CONFIG.factoryPoolMonitor.proxy,
-      topics: factoryPoolTopics,
-      onEvent: event => {
-        const topic0 = String(event?.topics?.[0] || "").toLowerCase();
-        if (factoryPoolTopicSet.has(topic0)) void factoryPoolEventQueue.enqueue(event, "factory-wss");
-        if (CONFIG.contractIntegrityMonitor.enabled && integrityFactoryTopicSet.has(topic0)) void processContractIntegrityEvent(event, "factory-wss");
-      },
-      onRemoved: event => {
-        const topic = String(event?.topics?.[0] || "").toLowerCase();
-        if (factoryPoolTopicSet.has(topic)) void factoryPoolEventQueue.enqueue(event, "factory-wss");
-        if (CONFIG.contractIntegrityMonitor.enabled && integrityFactoryTopicSet.has(topic)) void processContractIntegrityEvent(event, "factory-wss");
-      },
-      onStatus: health => recordFactoryPoolWsHealth(factoryPoolState, health),
-      onSubscribed: async () => {
-        await recordFactoryPoolWsHealth(factoryPoolState, factoryPoolWsFeed.snapshot());
-        resolveFirstFactoryWsSubscription();
-        if (backfillStarted) return;
-        backfillStarted = true;
-        await recordFactoryPoolWsBackfill(factoryPoolState, {
-          status: "running",
-          fromBlock: null,
-          toBlock: null,
-          eventCount: 0,
-          startedAt: new Date().toISOString(),
-          completedAt: "",
-          lastError: "",
-        });
-        try {
-          const backfill = await backfillFactoryPoolFeedEvents(factoryPoolEventQueue, undefined, undefined, undefined, undefined, factoryPoolState.latestBlock || 0);
-          await recordFactoryPoolWsBackfill(factoryPoolState, {
-            status: "completed",
-            fromBlock: backfill.fromBlock,
-            toBlock: backfill.latest,
-            eventCount: backfill.eventCount,
-            completedAt: new Date().toISOString(),
-            lastError: "",
-          });
-        } catch (error) {
-          backfillStarted = false;
-          await recordFactoryPoolWsBackfill(factoryPoolState, {
-            status: "failed",
-            completedAt: new Date().toISOString(),
-            lastError: error.message,
-          });
-          throw error;
-        }
-      },
-    });
-    global.__factoryPoolWsFeed = factoryPoolWsFeed.start();
-  } else {
-    await recordFactoryPoolWsHealth(factoryPoolState, createFactoryPoolWsHealth());
-    log("[Flap Factory WSS] 未启用或未配置节点，继续使用 1 秒 HTTP 扫描");
-  }
-  await refreshContractIntegrityWsFeed();
 
+  releaseFactoryStartup();
   await Promise.race([firstFactoryWsSubscription, sleep(2_500)]);
 
   let isFactoryRealtimeScanning = false;

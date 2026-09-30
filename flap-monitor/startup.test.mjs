@@ -50,5 +50,9 @@ test('real Flap entry starts with enabled feeds after lifecycle state initializa
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /=== Flap 监控 v2 启动 ===/);
   assert.match(result.stdout, /Flap 启动通知/);
+  assert.match(result.stdout, /Flap Factory WSS.*正在连接/);
+  assert.match(result.stdout, /Flap 合约完整性 WSS.*正在连接/);
+  assert.ok(result.stdout.indexOf('Flap Factory WSS') < result.stdout.indexOf('首次运行，正在并行建立基线'));
+
   assert.doesNotMatch(result.stdout + result.stderr, /before initialization|监控启动异常/);
 });
