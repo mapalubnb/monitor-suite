@@ -21,7 +21,7 @@ export function nativeBalanceDelta(event) {
 // Default to immediate delivery. Unknown/old state is never evidence that an
 // operation is routine. No raw event is dropped by the notification policy.
 export function earlyNotificationPriority(events, state, nowMs) {
-  if (cowGroupUid(events)) return 'cow';
+  if (cowGroupUid(events, state)) return 'cow';
   if (events.every(e => e.kind === 'nativeBalance')) {
     return events.every(e => {
       const delta = nativeBalanceDelta(e);

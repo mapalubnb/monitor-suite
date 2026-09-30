@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { decodeCowTrades, cowGroupUid, selectCowNotification, COW_TRADE_TOPIC } from './cow-notifications.mjs';
 import { createEarlySignalState, decodeEarlyReceipt, ingestCowOrders, acknowledgeEarlySignals, earlyAssetStage, rewindEarlySignals } from './early-signal-monitor.mjs';
 import { selectEarlyNotification } from './early-signal-notifications.mjs';
-import { COW_SETTLEMENT, EXECUTION_WALLETS } from './early-signal-catalog.mjs';
+import { COW_SETTLEMENT, COW_VAULT_RELAYER, EXECUTION_WALLETS } from './early-signal-catalog.mjs';
 import { TOPICS } from './early-signal-topics.mjs';
 
 const receipt = JSON.parse(readFileSync(new URL('./fixtures/cow-settlement.json', import.meta.url), 'utf8'));
@@ -13,6 +13,16 @@ const sell = '0x4902c5ebc598265ed2212b559b042de8a5eeec3f';
 const buy = '0x55d398326f99059ff775485246999027b3197955';
 const uid = '0xa47ffb36c363b5ca5ce4d315508277842154cb95357f6cbdf8cb082e8b83448f81459cd6b1bdf55d01a824350a79a0c2015309926ae31126';
 const now = Date.parse('2026-09-29T10:42:00Z');
+const allowanceFills = JSON.parse(readFileSync(new URL('./fixtures/cow-allowance-fills.json', import.meta.url), 'utf8'));
+function allowanceState() {
+  const state = createEarlySignalState();
+  const firstTx = allowanceFills.events[0].transactionHash;
+  state.pendingChanges = structuredClone(allowanceFills.events.filter(e => e.transactionHash === firstTx));
+  const baseline = structuredClone(allowanceFills.baselineApproval);
+  state.events = Object.fromEntries([baseline, ...state.pendingChanges].map(e => [e.id, e]));
+  state.tokens = structuredClone(allowanceFills.tokens);
+  return state;
+}
 const order = { uid, owner, receiver: owner, sellToken: sell, buyToken: buy, sellAmount: '100000000000000000000',
   executedSellAmount: '0', executedBuyAmount: '0', kind: 'sell', status: 'open', creationDate: new Date(now).toISOString(), validTo: now / 1000 + 3600 };
 function finish(state, selection) {
@@ -149,4 +159,81 @@ test('单订单卡片更新失败退避不阻挡其他订单与终态提醒', ()
   assert.equal(selectCowNotification(state, now + 3), null);
   ingestCowOrders(state, owner, [{ ...order, status: 'fulfilled', executedSellAmount: '100' }], { nowMs: now + 4 });
   assert.equal(selectCowNotification(state, now + 4).mode, 'cow-notice');
+});
+
+test('生产九笔分批成交的额度消耗均合并原订单卡，重启后仍保留原始事件', () => {
+  let state = allowanceState();
+  state.pendingChanges = [];
+  state.events = { [allowanceFills.baselineApproval.id]: structuredClone(allowanceFills.baselineApproval) };
+  const transactions = [...new Set(allowanceFills.events.map(e => e.transactionHash))];
+  assert.equal(transactions.length, 9);
+  for (const [index, tx] of transactions.entries()) {
+    state.pendingChanges = structuredClone(allowanceFills.events.filter(e => e.transactionHash === tx));
+    for (const e of state.pendingChanges) state.events[e.id] = e;
+    assert.equal(selectEarlyNotification(state, now), null);
+    const selection = selectCowNotification(state, now);
+    assert.equal(selection.cowUid, allowanceFills.uid);
+    assert.equal(selection.mode, index === 0 ? 'cow-notice' : 'cow-patch');
+    assert.equal(selection.changes.length, 4);
+    finish(state, selection);
+    state = JSON.parse(JSON.stringify(state));
+  }
+  assert.equal(Object.keys(state.events).length, 37);
+  assert.equal(state.pendingChanges.length, 0);
+});
+
+test('CoW 降噪不合并未知授权、额度增加、不匹配、缺失历史、未来或异分叉证据', () => {
+  for (const mutation of ['spender', 'increase', 'mismatch', 'missing', 'future', 'fork', 'duplicate', 'transferFork', 'standalone']) {
+    const state = allowanceState();
+    const approval = state.pendingChanges.find(e => e.kind === 'approval');
+    const previous = state.events[allowanceFills.baselineApproval.id];
+    if (mutation === 'spender') approval.to = buy;
+    if (mutation === 'increase') approval.amount = (BigInt(previous.amount) + 1n).toString();
+    if (mutation === 'mismatch') approval.amount = (BigInt(approval.amount) + 1n).toString();
+    if (mutation === 'missing') delete state.events[previous.id];
+    if (mutation === 'future') previous.blockNumber = approval.blockNumber + 1;
+    if (mutation === 'fork') { previous.blockNumber = approval.blockNumber; previous.logIndex = approval.logIndex - 1; }
+    if (mutation === 'duplicate') state.pendingChanges.push({ ...approval, id: 'duplicate' });
+    if (mutation === 'transferFork') state.pendingChanges.find(e => e.kind === 'transfer').blockHash = previous.blockHash;
+    if (mutation === 'standalone') state.pendingChanges = [approval];
+    assert.ok(selectEarlyNotification(state, now), mutation);
+    assert.equal(selectCowNotification(state, now), null, mutation);
+  }
+});
+
+test('额度消耗同笔存在加池、撤池或其他权限变更时仍立即通知', () => {
+  for (const kind of ['liquidityAdded', 'liquidityRemoved', 'authority', 'decodeError']) {
+    const state = allowanceState();
+    state.pendingChanges.push({ id: kind, kind, transactionHash: state.pendingChanges[0].transactionHash, detail: kind });
+    assert.equal(selectEarlyNotification(state, now).changes.length, 5);
+    assert.equal(selectCowNotification(state, now), null);
+  }
+});
+
+test('零额度授权不丢弃：撤销立即提醒，核验的最后一笔成交额度消耗可合并', () => {
+  const state = createEarlySignalState();
+  const copy = structuredClone(receipt);
+  copy.logs = [{ ...copy.logs[0], address: sell, logIndex: '0xffff',
+    topics: [TOPICS.Approval, '0x' + owner.slice(2).padStart(64, '0'), '0x' + COW_VAULT_RELAYER.slice(2).padStart(64, '0')],
+    data: '0x' + '0'.repeat(64) }];
+  decodeEarlyReceipt(copy, state, { nowMs: now });
+  assert.equal(state.pendingChanges.length, 1);
+  assert.equal(state.pendingChanges[0].kind, 'approval');
+  assert.equal(state.pendingChanges[0].amount, '0');
+  assert.ok(selectEarlyNotification(state, now));
+  const fill = allowanceState();
+  fill.pendingChanges.find(e => e.kind === 'approval').amount = '0';
+  fill.events[allowanceFills.baselineApproval.id].amount = fill.pendingChanges.find(e => e.kind === 'cowTrade').sellAmount;
+  assert.equal(selectEarlyNotification(fill, now), null);
+  assert.ok(selectCowNotification(fill, now));
+});
+
+test('重组移除额度历史后不沿用旧消耗证据', () => {
+  const state = allowanceState();
+  const changes = structuredClone(state.pendingChanges);
+  rewindEarlySignals(state, allowanceFills.baselineApproval.blockNumber, now);
+  state.pendingChanges = changes;
+  for (const e of changes) state.events[e.id] = e;
+  assert.ok(selectEarlyNotification(state, now));
+  assert.equal(selectCowNotification(state, now), null);
 });

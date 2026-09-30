@@ -224,7 +224,8 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         if (t === TOPICS.Transfer && to === feeSafe && !wallets.has(from)) continue;
         const nft = l.topics.length === 4;
         const amount = nft ? abiUint(l.topics[3].slice(2)) : abiUint(w[0]);
-        if (amount === "0") continue;
+        // Zero allowance is a revocation (or the last settlement's consumption), not a zero transfer.
+        if (amount === "0" && t !== TOPICS.Approval) continue;
         const kind = t === TOPICS.Approval ? "approval" : nft ? (POSITION_MANAGERS.includes(a) ? "positionTransfer" : "nftTransfer") : "transfer";
         if (!nft && (wallets.has(from) || executors.has(to))) trackToken(state, a, "关联钱包资产流", nowMs);
         // Incoming dust never expands the monitored address set or implies stocking.

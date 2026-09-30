@@ -24,6 +24,9 @@ export const CORE_OWNERS = [
 ];
 export const ALLOWANCE_MODULE = "0xcfbfac74c26f8647cbdb8c5caf80bb5b32e43134";
 export const COW_SETTLEMENT = "0x9008d19f58aabd9ed0d60971565aa8510560ab41";
+// CoW Protocol core deployments: GPv2VaultRelayer on BNB.
+// https://github.com/cowprotocol/docs/blob/main/docs/cow-protocol/reference/contracts/core/README.mdx
+export const COW_VAULT_RELAYER = "0xc92e8bdf79f0507f65a392b0ab4667716bfe0110";
 export const PROXY_ADMINS = ["0xb2480c2d17bf4510701c4def374de6d22e039bd4", "0xc8215c1f9c8aaeac02dbeb7fb5d14e5bb77d607f"];
 // Sources: developer.pancakeswap.finance/contracts/{v2,v3,infinity}/... and
 // developers.uniswap.org/docs/protocols/v4/deployments (BNB, chainId 56).

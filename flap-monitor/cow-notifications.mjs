@@ -1,4 +1,4 @@
-import { BASE_ASSETS, COW_SETTLEMENT } from './early-signal-catalog.mjs';
+import { BASE_ASSETS, COW_SETTLEMENT, COW_VAULT_RELAYER } from './early-signal-catalog.mjs';
 
 // GPv2Settlement.Trade: owner indexed; sellToken, buyToken, amounts, fee, UID.
 // https://github.com/cowprotocol/contracts/blob/main/src/contracts/GPv2Settlement.sol
@@ -55,8 +55,45 @@ export function matchCowTransfers(logs, trades, transferTopic) {
   return matches;
 }
 
-export function cowGroupUid(events) {
-  const uids = events.map(e => e.kind === 'transfer' ? e.cowOrderUid
+function chainPosition(event) {
+  return event?.source === 'chain' && event.chainId === 56
+    && Number.isSafeInteger(event.blockNumber) && event.blockNumber > 0
+    && Number.isSafeInteger(event.logIndex) && event.logIndex >= 0
+    && /^0x[0-9a-f]{64}$/.test(event.blockHash || '')
+    && /^0x[0-9a-f]{64}$/.test(event.transactionHash || '');
+}
+
+// An Approval emitted during transferFrom can report the remaining allowance.
+// A known spender alone is never sufficient to silence a permission change.
+function cowAllowanceSpendUid(approval, events, state) {
+  if (!chainPosition(approval) || approval.to !== COW_VAULT_RELAYER || !/^\d+$/.test(approval.amount || '')) return null;
+  const sameAllowance = e => e.kind === 'approval' && e.token === approval.token && e.from === approval.from && e.to === approval.to;
+  if (events.filter(sameAllowance).length !== 1) return null;
+  const trades = events.filter(e => e.kind === 'cowTrade' && e.owner === approval.from && e.sellToken === approval.token);
+  if (trades.length !== 1) return null;
+  const trade = trades[0];
+  if (!chainPosition(trade) || !validUid(trade.orderUid) || trade.blockHash !== approval.blockHash
+    || trade.transactionHash !== approval.transactionHash) return null;
+  const transfers = events.filter(e => e.kind === 'transfer' && e.cowOrderUid === trade.orderUid);
+  if (transfers.some(e => !chainPosition(e) || e.blockHash !== approval.blockHash
+    || e.transactionHash !== approval.transactionHash)) return null;
+  const sells = transfers.filter(e => e.token === trade.sellToken && e.from === trade.owner && e.to === COW_SETTLEMENT);
+  const buys = transfers.filter(e => e.token === trade.buyToken && e.from === COW_SETTLEMENT && e.to === trade.receiver);
+  const sum = rows => rows.reduce((total, e) => total + uint(e.amount), 0n);
+  if (!sells.length || !buys.length || uint(trade.sellAmount) === 0n
+    || sum(sells) !== uint(trade.sellAmount) || sum(buys) !== uint(trade.buyAmount)) return null;
+  const previous = Object.values(state?.events || {}).filter(e => sameAllowance(e) && chainPosition(e)
+    && (e.blockNumber < approval.blockNumber || e.blockNumber === approval.blockNumber
+      && e.blockHash === approval.blockHash && e.logIndex < approval.logIndex))
+    .sort((a, b) => b.blockNumber - a.blockNumber || b.logIndex - a.logIndex)[0];
+  // No inference from order size, token type, or a future/out-of-order observation.
+  if (!previous || !/^\d+$/.test(previous.amount || '')
+    || BigInt(previous.amount) - BigInt(approval.amount) !== BigInt(trade.sellAmount)) return null;
+  return trade.orderUid;
+}
+
+export function cowGroupUid(events, state) {
+  const uids = events.map(e => e.kind === 'approval' ? cowAllowanceSpendUid(e, events, state) : e.kind === 'transfer' ? e.cowOrderUid
     : ['order', 'cowTrade'].includes(e.kind) && e.sellToken && e.buyToken && e.owner ? e.orderUid : null);
   return uids.length && uids.every(uid => validUid(uid) && uid === uids[0]) ? uids[0] : null;
 }
@@ -83,7 +120,7 @@ export function selectCowNotification(state, nowMs) {
   }
   const byUid = new Map();
   for (const events of byTx.values()) {
-    const uid = cowGroupUid(events);
+    const uid = cowGroupUid(events, state);
     if (!uid) continue;
     if (!byUid.has(uid)) byUid.set(uid, []);
     byUid.get(uid).push(events);
