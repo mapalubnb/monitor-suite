@@ -9,6 +9,7 @@ import { abiAddress, abiUint, hexWords } from "./operational-call-codec.mjs";
 import { normalizeAddress, extractFlapProposalActions, createSafeApiPoolFetch, normalizeSafeApiKeys } from "./safe-proposal-monitor.mjs";
 import { FLAP_FACTORY_PROXY, QUOTE_CONFIG_SELECTOR, QUOTE_TOKEN_CREATION_DISABLED_SELECTOR } from "./factory-pool-monitor.mjs";
 import { decodeCowTrades, matchCowTransfers, cowDirection } from './cow-notifications.mjs';
+import { poolOperationRelevance, migratePoolEvidence } from './pool-relevance.mjs';
 
 export const EARLY_SIGNAL_SCHEMA_VERSION = 2;
 const ZERO = "0x" + "0".repeat(40);
@@ -33,7 +34,7 @@ export const stageLabel = stage => STAGES[stage] || stage;
 export function createEarlySignalState() {
   return { schemaVersion: EARLY_SIGNAL_SCHEMA_VERSION, chainId: 56, cursor: null, cursorHash: "", events: {},
     pendingChanges: [], tokens: {}, pools: {}, positions: {}, orders: {}, candidates: {}, safeInfo: {},
-    balances: {}, stages: {}, proposalVersions: {}, fastBlocks: {}, cowNotifications: {}, health: {}, discoveryCursor: 0, lastDiscoveryAt: 0, lastRunAt: "" };
+    balances: {}, stages: {}, proposalVersions: {}, fastBlocks: {}, cowNotifications: {}, publicPoolNotifications: {}, health: {}, discoveryCursor: 0, lastDiscoveryAt: 0, lastRunAt: "" };
 }
 export function loadEarlySignalState(path) {
   if (!existsSync(path)) return createEarlySignalState();
@@ -41,7 +42,7 @@ export function loadEarlySignalState(path) {
   const raw = JSON.parse(readFileSync(path, "utf8"));
   if (raw.chainId !== 56) throw new Error("提前监控状态不是 BSC");
   const state = { ...createEarlySignalState(), ...raw, schemaVersion: EARLY_SIGNAL_SCHEMA_VERSION };
-  for (const name of ["events", "tokens", "pools", "positions", "orders", "candidates", "safeInfo", "balances", "stages", "proposalVersions", "fastBlocks", "cowNotifications", "health"]) {
+  for (const name of ["events", "tokens", "pools", "positions", "orders", "candidates", "safeInfo", "balances", "stages", "proposalVersions", "fastBlocks", "cowNotifications", "publicPoolNotifications", "health"]) {
     if (!state[name] || typeof state[name] !== "object" || Array.isArray(state[name])) throw new Error(`提前监控状态 ${name} 无效`);
   }
   if (!Array.isArray(state.pendingChanges)) throw new Error("提前监控队列无效");
@@ -67,6 +68,7 @@ export function loadEarlySignalState(path) {
       health.nextAttemptAtMs = Math.min(health.nextAttemptAtMs || 0, Date.now() + 10_000);
     }
   }
+  migratePoolEvidence(state, new Set(watchedWallets()));
   pruneDiscoveryPools(state);
   return state;
 }
@@ -74,7 +76,7 @@ function isRelevantPool(pool, state) {
   return pool.officialOperation || pool.tokens?.some(token => state.tokens[token] && state.tokens[token].effectiveEnabled !== true);
 }
 function pruneDiscoveryPools(state) {
-  const unrelated = Object.values(state.pools).filter(pool => !isRelevantPool(pool, state));
+  const unrelated = Object.values(state.pools).filter(pool => !pool.officialOperation);
   unrelated.sort((a, b) => (b.blockNumber || 0) - (a.blockNumber || 0));
   for (const pool of unrelated.slice(512)) delete state.pools[pool.address];
 }
@@ -121,10 +123,13 @@ export function watchedWallets(config = {}) {
 }
 export function earlyLogFilters(state, config = {}) {
   const wallets = watchedWallets(config).map(pad);
+  const active = p => config.subscriptionMode ? p.officialOperation : isRelevantPool(p, state);
+  const positionIds = Object.values(state.positions).filter(p => p.manager === DEX.v3Positions && watchedWallets(config).includes(p.owner))
+    .map(p => '0x' + BigInt(p.tokenId).toString(16).padStart(64, '0')).sort();
   const operationAddresses = uniq([...watchedWallets(config), ALLOWANCE_MODULE, ...PROXY_ADMINS,
     config.factoryAddress || FLAP_FACTORY_PROXY, "0x90497450f2a706f1951b5bdda52b4e5d16f34c06",
     DEX.v2Factory, DEX.v3Factory,
-    ...Object.values(state.pools).filter(p => /^0x[a-f0-9]{40}$/.test(p.address) && isRelevantPool(p, state)).map(p => p.address)]);
+    ...Object.values(state.pools).filter(p => /^0x[a-f0-9]{40}$/.test(p.address) && active(p)).map(p => p.address)]).sort();
   return [
     { topics: [[TOPICS.Transfer, TOPICS.Approval], wallets] },
     { topics: [TOPICS.Transfer, null, wallets.filter(a => a !== pad(FEE_SAFE))] },
@@ -132,10 +137,11 @@ export function earlyLogFilters(state, config = {}) {
     { address: watchedWallets(config).filter(a => a !== FEE_SAFE), topics: [TOPICS.SafeReceived] },
     // Module ABI versions may differ. Its low-volume logs are retained and scoped by Safe address.
     { address: ALLOWANCE_MODULE },
+    ...(positionIds.length ? [{ address: DEX.v3Positions, topics: [[TOPICS.IncreaseLiquidity, TOPICS.DecreaseLiquidity], positionIds] }] : []),
     { address: [DEX.v4Manager, DEX.clManager, DEX.binManager], topics: [[TOPICS.V4Initialize, TOPICS.CLInitialize, TOPICS.BinInitialize]] },
-    ...(Object.values(state.pools).some(p => p.poolId && isRelevantPool(p, state)) ? [{
+    ...(Object.values(state.pools).some(p => p.poolId && active(p)) ? [{
       address: [DEX.v4Manager, DEX.clManager, DEX.binManager],
-      topics: [[TOPICS.ModifyLiquidity, TOPICS.BinMint, TOPICS.BinBurn], uniq(Object.values(state.pools).filter(p => p.poolId && isRelevantPool(p, state)).map(p => p.poolId))],
+      topics: [[TOPICS.ModifyLiquidity, TOPICS.BinMint, TOPICS.BinBurn], uniq(Object.values(state.pools).filter(p => p.poolId && active(p)).map(p => p.poolId)).sort()],
     }] : []),
   ];
 }
@@ -167,8 +173,8 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
   const related = wallets.has(txFrom) || logs.some(l => lower(l.topics?.[0]) === TOPICS.Transfer
     && wallets.has(addressTopic(l.topics[1])));
   // A public pair with a known quote asset must never promote its other token.
-  const poolSignalTokens = pool => pool.tokens.filter(token => !BASE_ASSETS.has(token)
-    && (related || state.tokens[token] && state.tokens[token].effectiveEnabled !== true));
+  const poolSignalTokens = (pool, relevance) => pool.tokens.filter(token => !BASE_ASSETS.has(token)
+    && (relevance === 'related' || state.tokens[token] && (relevance === 'unknown' || state.tokens[token].effectiveEnabled !== true)));
   const emitted = [];
   const add = (log, event) => {
     const e = { ...event, enabledAtObservation: state.tokens[event.token]?.effectiveEnabled,
@@ -198,8 +204,9 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
       const offset = pool.poolId ? 2 : 1;
       pool.tokens = [addressTopic(l.topics[offset]), addressTopic(l.topics[offset + 1])];
       pool.blockNumber = Number(l.blockNumber || receipt.blockNumber);
-      pool = { ...state.pools[pool.address], ...pool, officialOperation: Boolean(related || state.pools[pool.address]?.officialOperation) };
-      if (!poolSignalTokens(pool).length) {
+      const relevance = poolOperationRelevance(pool, l, logs, txFrom, state, wallets);
+      pool = { ...state.pools[pool.address], ...pool, officialOperation: Boolean(relevance === 'related' || state.pools[pool.address]?.officialOperation) };
+      if (!poolSignalTokens(pool, relevance).length) {
         // A bounded discovery cache is useful when a token is observed shortly afterwards.
         // Cached unrelated pools must never enter active liquidity subscriptions.
         state.pools[pool.address] = pool;
@@ -207,10 +214,11 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         continue;
       }
       state.pools[pool.address] = pool;
-      for (const token of poolSignalTokens(pool)) {
+      for (const token of poolSignalTokens(pool, relevance)) {
         trackToken(state, token, "已核验 DEX 建池", nowMs);
-        add(l, { kind: "poolCreated", token, stage: "observation", detail: `${pool.protocol} 建池/初始化｜${pool.address}` });
+        add(l, { kind: "poolCreated", token, stage: "observation", poolRelevance: relevance, poolAddress: pool.address, detail: `${pool.protocol} 建池/初始化｜${pool.address}` });
       }
+      pruneDiscoveryPools(state);
     } catch (error) { if (error.earlyOutboxFull) throw error; if (related) add(l, { kind: "decodeError", detail: `${a} ${t}：${error.message}（保留原始日志）`, raw: l }); }
   }
   for (const l of logs) {
@@ -276,11 +284,13 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
       }
       if (t === TOPICS.BinMint && pool.protocol === "Infinity Bin") direction = 1;
       if (t === TOPICS.BinBurn && pool.protocol === "Infinity Bin") direction = -1;
-      if (direction && related) pool.officialOperation = true;
-      if (direction) for (const token of poolSignalTokens(pool)) {
+      const relevance = direction ? poolOperationRelevance(pool, l, logs, txFrom, state, wallets) : null;
+      if (relevance === 'related') pool.officialOperation = true;
+      if (direction) for (const token of poolSignalTokens(pool, relevance)) {
         trackToken(state, token, "已核验池子的流动性变化", nowMs);
         add(l, {
         kind: direction > 0 ? "liquidityAdded" : "liquidityRemoved", token, stage: direction > 0 ? "prepared" : "observation",
+        poolRelevance: relevance, poolAddress: pool.address,
         detail: `${pool.protocol} ${direction > 0 ? "增加" : "减少"}流动性｜${pool.address}`, raw: l,
         });
       }
@@ -461,7 +471,7 @@ async function resolveReceiptPools(state, receipts, rpcBatch, config) {
     const data = (protocol === "V3" ? "0x1698ee82" : "0xe6a43905") + pad(token0).slice(2) + pad(token1).slice(2) + (protocol === "V3" ? values[3].slice(2) : "");
     const [registered] = await rpcBatch([{ method: "eth_call", params: [{ to: factory, data }, "latest"] }]);
     if (addressTopic(registered) !== pool) continue;
-    state.pools[pool] = { address: pool, protocol, tokens: [token0, token1], verified: true, blockNumber: 0 };
+    state.pools[pool] = { address: pool, protocol, tokens: [token0, token1], ...(protocol === 'V3' ? { fee: Number(BigInt(values[3])) } : {}), verified: true, blockNumber: 0 };
   }
 }
 export async function refreshEarlyPositions(state, rpcBatch) {
@@ -720,7 +730,7 @@ export function earlyAssetStage(state, token) {
   const proposals = new Map(signals.filter(e => e.kind === "proposal").map(e => [e.safeTxHash, e]));
   for (const stage of ["executable", "signed", "proposed"]) if ([...proposals.values()].some(e => e.stage === stage)) return stage;
   if (meta.effectiveEnabled === false && meta.everEnabled) return "disabled";
-  const liquidity = signals.filter(e => ["liquidityAdded", "liquidityRemoved"].includes(e.kind)).sort(chainOrder).at(-1);
+  const liquidity = signals.filter(e => ["liquidityAdded", "liquidityRemoved"].includes(e.kind) && e.poolRelevance === 'related').sort(chainOrder).at(-1);
   if (liquidity?.kind === "liquidityAdded") return "prepared";
   const order = signals.filter(e => ['order', 'cowTrade'].includes(e.kind)).at(-1);
   const wrapping = signals.filter(e => ["wrap", "redeem"].includes(e.kind)).sort(chainOrder).at(-1);
@@ -751,7 +761,7 @@ function readableBnb(raw) {
 function earlyOperationDetail(event) {
   if (['liquidityAdded', 'liquidityRemoved', 'poolCreated'].includes(event.kind) && event.detail?.includes('｜')) {
     const [action, pool] = event.detail.split('｜');
-    return `${action.match(/^(V[234]|Infinity CL|Infinity Bin)/)?.[0] || 'DEX'} 池：${addressLink(pool.trim())}`;
+    return `${event.poolRelevance === 'public' ? '公共池活动 · ' : event.poolRelevance === 'unknown' ? '归属待核验 · ' : ''}${action.match(/^(V[234]|Infinity CL|Infinity Bin)/)?.[0] || 'DEX'} 池：${addressLink(pool.trim())}`;
   }
   if (event.kind === 'transfer' && event.from && event.to) return `${addressLink(event.from)} → ${addressLink(event.to)}`;
   if (event.kind === 'approval' && event.to) return `授权对象：${addressLink(event.to)}`;

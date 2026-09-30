@@ -32,6 +32,7 @@ import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.m
 import { processEarlyReceiptHints, shouldPrioritizeEarlyLog, rewindEarlySignals, validateFastBlocks } from "./early-signal-monitor.mjs";
 import { selectEarlyNotification, archiveRoutineEarlySignals } from './early-signal-notifications.mjs';
 import { selectCowNotification } from './cow-notifications.mjs';
+import { selectPublicPoolNotification } from './public-pool-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { hasTokenDecimals, operationalAmountToken } from "./operational-call-codec.mjs";
 import { decodeRegistryLog, ingestRegistryLog, drainRegistryNotifications, auditRegistryNotifications } from './registry-notifications.mjs';
@@ -6732,12 +6733,12 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
   if (state.notificationDelivery?.ids.some(id => !pendingIds.has(id))) delete state.notificationDelivery;
   let delivery = state.notificationDelivery;
   if (!delivery) {
-    const selection = selectEarlyNotification(state, now()) || selectCowNotification(state, now());
+    const selection = selectEarlyNotification(state, now()) || selectCowNotification(state, now()) || selectPublicPoolNotification(state, now());
     if (!selection) return { sent: false };
     const { changes, title, template, mode } = selection;
     const content = selection.content || buildEarlySignalContent(changes, state);
     delivery = { ids: changes.map(e => e.id), title, template, mode, content, sentParts: [],
-      cowUid: selection.cowUid, cowRecord: selection.cowRecord, patchMessageId: selection.patchMessageId,
+      cowUid: selection.cowUid, cowRecord: selection.cowRecord, publicToken: selection.publicToken, patchMessageId: selection.patchMessageId,
       deliveryId: createHash('sha256').update(JSON.stringify(changes.map(e => e.id))).digest('hex'),
       cardParts: planCardParts(title, content, template) };
     state.notificationDelivery = delivery;
@@ -6760,8 +6761,8 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
     } catch (error) {
       // Keep the evidence; back off only this order. A terminal transition and
       // unrelated urgent alerts can still bypass a failed progress edit.
-      state.cowNotifications ||= {};
-      const record = state.cowNotifications[delivery.cowUid] ||= {};
+      const records = delivery.publicToken ? (state.publicPoolNotifications ||= {}) : (state.cowNotifications ||= {});
+      const record = records[delivery.publicToken || delivery.cowUid] ||= {};
       record.failures = (record.failures || 0) + 1;
       record.lastError = error.message;
       record.nextAttemptAtMs = now() + Math.min(60000, 5000 * 2 ** Math.min(record.failures, 4));
@@ -6774,6 +6775,14 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
       { sentParts, cardParts, deliveryId: delivery.deliveryId, onPartSent: persistPart });
   }
   if (!id) return { sent: false };
+  if (delivery.publicToken) {
+    state.publicPoolNotifications ||= {};
+    state.publicPoolNotifications[delivery.publicToken] = { messageId: id, lastUpdatedAt: new Date(now()).toISOString(),
+      failures: 0, lastError: '', nextAttemptAtMs: now() + 10_000 };
+    for (const event of changes) if (state.events[event.id]) Object.assign(state.events[event.id], {
+      notificationDisposition: delivery.mode, notificationMessageId: id, notificationHandledAt: new Date(now()).toISOString() });
+    log(`[Flap 公共池通知] ${delivery.patchMessageId ? '更新原卡' : '首次观察'}｜${delivery.publicToken}｜合并 ${changes.length} 条记录`);
+  }
   if (delivery.cowUid) {
     state.cowNotifications ||= {};
     state.cowNotifications[delivery.cowUid] = { ...delivery.cowRecord, messageId: id,
@@ -6787,13 +6796,14 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
   state.notificationStats = { ...state.notificationStats, lastMode: delivery.mode, lastSentAt: new Date(now()).toISOString(),
     lastEventCount: changes.length,
     sentEvents: (state.notificationStats?.sentEvents || 0) + changes.length,
-    cowPatchedCards: (state.notificationStats?.cowPatchedCards || 0) + (delivery.patchMessageId ? 1 : 0) };
+    cowPatchedCards: (state.notificationStats?.cowPatchedCards || 0) + (delivery.cowUid && delivery.patchMessageId ? 1 : 0),
+    publicPoolPatchedCards: (state.notificationStats?.publicPoolPatchedCards || 0) + (delivery.publicToken && delivery.patchMessageId ? 1 : 0) };
   saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
   const addresses = [...new Set(changes.flatMap(change => [change.token, ...(delivery.cowUid ? [change.sellToken, change.buyToken] : [])]).map(normalizeAddress).filter(address => address
     && state.tokens[address] && ((!state.tokens[address].name && !state.tokens[address].symbol) || delivery.cowUid && !Number.isInteger(state.tokens[address].decimals))
     && !(Date.parse(state.tokens[address].nameNextRetryAt || "") > now())))];
   let metadataPromise;
-  if (resolveMetadataFn && addresses.length) {
+  if (resolveMetadataFn && addresses.length && !delivery.publicToken) {
     const retryAt = new Date(now() + CONFIG.factoryPoolMonitor.tokenMetadataRetryMs).toISOString();
     for (const address of addresses) state.tokens[address].nameNextRetryAt = retryAt;
     saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
@@ -7158,7 +7168,7 @@ async function startMonitor() {
   }
   function refreshEarlyFeeds() {
     if (CONFIG.earlySignalMonitor.enabled && CONFIG.earlySignalMonitor.wsEnabled && !isShuttingDown)
-      earlyFeeds.update(earlyLogFilters(earlySignalState, earlySignalConfig()));
+      earlyFeeds.update(earlyLogFilters(earlySignalState, { ...earlySignalConfig(), subscriptionMode: true }));
   }
   function prioritize(tokens) {
     for (const token of tokens) if (earlySignalState.tokens[token]) priorityTokens.add(token);

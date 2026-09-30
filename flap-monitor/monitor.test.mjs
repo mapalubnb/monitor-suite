@@ -3885,6 +3885,49 @@ test('failed CoW initial send persists exact delivery and retries once across re
   assert.equal(Object.values(state.cowNotifications)[0].messageId, 'sent-card');
 });
 
+test('公共池通知重启后更新原卡，编辑失败保留事件且不阻挡真实撤池', async () => {
+  const { createEarlySignalState } = await import('./early-signal-monitor.mjs');
+  let state=createEarlySignalState(), time=Date.now(), sends=0, patches=0, disk;
+  const token='0x'+'31'.repeat(20);
+  const add=(id,relevance='public')=>{
+    const event={id,kind:'liquidityRemoved',poolRelevance:relevance,token,transactionHash:'0x'+id.padStart(64,'0'),
+      blockNumber:100+Number(id),logIndex:1,observedAt:new Date(time).toISOString(),detail:'V3 减少流动性｜'+token};
+    state.events[id]=event;state.pendingChanges.push(event);
+  };
+  const opts={now:()=>time,saveStateFn:(_p,s)=>{disk=JSON.stringify(s);},
+    sendCardFn:async()=>{sends++;return 'pool-card';},patchCardFn:async id=>{assert.equal(id,'pool-card');patches++;}};
+  add('1');await __testables.deliverFlapEarlySignals(state,opts);
+  state=JSON.parse(disk); add('2');
+  assert.equal((await __testables.deliverFlapEarlySignals(state,opts)).sent,false);
+  time+=11000;
+  await assert.rejects(__testables.deliverFlapEarlySignals(state,{...opts,patchCardFn:async()=>{throw Error('edit offline');}}),/edit offline/);
+  assert.equal(state.pendingChanges.length,1);
+  add('3','related');await __testables.deliverFlapEarlySignals(state,opts);
+  assert.equal(state.pendingChanges.length,1);assert.equal(sends,2);
+  time+=60000;await __testables.deliverFlapEarlySignals(state,opts);
+  assert.equal(patches,1);assert.equal(sends,2);assert.equal(state.pendingChanges.length,0);
+  assert.equal(state.events['2'].notificationDisposition,'public-patch');
+  assert.equal(state.notificationStats.cowPatchedCards,0);
+});
+
+test('公共池首次发送失败后按原计划恢复，发送中到达的新事件留待下次处理', async () => {
+  const { createEarlySignalState } = await import('./early-signal-monitor.mjs');
+  let state=createEarlySignalState(),disk;
+  const token='0x'+'32'.repeat(20);
+  const e={id:'public1',kind:'poolCreated',poolRelevance:'public',token,transactionHash:'tx',blockNumber:100,logIndex:1};
+  state.events[e.id]=e;state.pendingChanges.push(e);
+  const opts={saveStateFn:(_p,s)=>{disk=JSON.stringify(s);}};
+  await assert.rejects(__testables.deliverFlapEarlySignals(state,{...opts,sendCardFn:async()=>{throw Error('offline');}}),/offline/);
+  state=JSON.parse(disk);const deliveryId=state.notificationDelivery.deliveryId;
+  await __testables.deliverFlapEarlySignals(state,{...opts,sendCardFn:async(_t,_c,_color,_file,plan)=>{
+    assert.equal(plan.deliveryId,deliveryId);
+    const next={...e,id:'public2',transactionHash:'next',blockNumber:101};state.events[next.id]=next;state.pendingChanges.push(next);
+    Object.assign(state,structuredClone(state));return 'public-card';
+  }});
+  assert.equal(state.pendingChanges.length,1);assert.equal(state.pendingChanges[0].id,'public2');
+  assert.equal(state.publicPoolNotifications[token].messageId,'public-card');
+});
+
 test('history denial leaves same-provider live logs working',async()=>{
  const original=globalThis.fetch;__testables.resetBscRpcHealth();let denied=true;
  globalThis.fetch=async(_url,options)=>{const req=JSON.parse(options.body);if(denied)return {ok:false,status:403,body:{cancel:async()=>{}}};return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x100':[]})};};

@@ -1,5 +1,6 @@
 import { BASE_ASSETS } from './early-signal-catalog.mjs';
 import { cowGroupUid } from './cow-notifications.mjs';
+import { isPublicPoolEvent } from './public-pool-notifications.mjs';
 
 const SMALL_DEBIT_WEI = 100_000_000_000_000n; // 0.0001 BNB; record silently; retain raw evidence.
 
@@ -21,6 +22,7 @@ export function nativeBalanceDelta(event) {
 // Default to immediate delivery. Unknown/old state is never evidence that an
 // operation is routine. No raw event is dropped by the notification policy.
 export function earlyNotificationPriority(events, state, nowMs) {
+  if (events.every(isPublicPoolEvent)) return 'public';
   if (cowGroupUid(events, state)) return 'cow';
   if (events.every(e => e.kind === 'nativeBalance')) {
     return events.every(e => {

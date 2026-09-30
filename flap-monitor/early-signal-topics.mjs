@@ -1,5 +1,7 @@
 // Event signatures verified against Safe, ERC4626, Pancake and Uniswap interfaces.
 export const EVENT_SIGNATURES = {
+  "IncreaseLiquidity": "IncreaseLiquidity(uint256,uint128,uint256,uint256)",
+  "DecreaseLiquidity": "DecreaseLiquidity(uint256,uint128,uint256,uint256)",
   "Transfer": "Transfer(address,address,uint256)",
   "Approval": "Approval(address,address,uint256)",
   "Deposit": "Deposit(address,address,uint256,uint256)",
@@ -28,6 +30,8 @@ export const EVENT_SIGNATURES = {
   "ChangedThreshold": "ChangedThreshold(uint256)"
 };
 export const TOPICS = {
+  "IncreaseLiquidity": "0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f",
+  "DecreaseLiquidity": "0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4",
   "Transfer": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",
   "Approval": "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925",
   "Deposit": "0xdcbc1c05240f31ff3ad067ef1ee35ce4997762752e3a095284754544f4c709d7",

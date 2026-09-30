@@ -381,7 +381,7 @@ test("public Flap pair cannot promote its new token or alert for an opened quote
   const meme = '0x418257fbbc9832793d1a043c4311cd4afe407777';
   state.tokens[quote] = { reason: 'Safe 配置提案', effectiveEnabled: true };
   const logs = [log(DEX.v2Factory, [TOPICS.PairCreated, topic(quote), topic(meme)], '0x' + word(POOL) + word(1)),
-    log(POOL, [TOPICS.V2Mint, topic(OWNER)], '0x' + word(10) + word(10), 1)];
+    log(POOL, [TOPICS.V2Mint, topic(meme)], '0x' + word(10) + word(10), 1)];
   const publicReceipt = { ...receipt(logs), from: meme };
   decodeEarlyReceipt(publicReceipt, state, { nowMs });
   assert.equal(state.tokens[meme], undefined);
