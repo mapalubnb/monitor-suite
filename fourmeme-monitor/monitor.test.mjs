@@ -1130,6 +1130,57 @@ test("classifyFetchFailure distinguishes backoff and rate limits", () => {
   assert.equal(__testables.classifyFetchFailure(new Error("HTTP 429 (风控)")), "rate_limited");
 });
 
+test('前端冷却跳过不累计请求失败，同次故障持久化合并，持续成功才恢复', () => {
+  const t = __testables, url = 'https://four.meme/en/create-token', key = t.urlToKey(url);
+  let s = {};
+  const failed = [{ url, reason: 'backoff', message: '[退避中] pages' }];
+  t.updateFrontendFetchHealth(s, failed, {}, 1000);
+  t.updateFrontendFetchHealth(s, failed, {}, 31000);
+  assert.equal(s._frontendFailCounts[key].count, 0);
+  assert.equal(s._frontendFailCounts[key].skipped, 2);
+  assert.equal(t.buildFrontendFailureNotifications([url], s, 31000).length, 1);
+  s = JSON.parse(JSON.stringify(s));
+  t.updateFrontendFetchHealth(s, [{ url, reason: 'rate_limited', message: 'HTTP 403' }], {}, 35000);
+  assert.equal(s._frontendFailCounts[key].count, 1);
+  assert.deepEqual(t.buildFrontendFailureNotifications([url], s, 35000), []);
+  const pages = { [key]: { originalUrl: url } };
+  t.updateFrontendFetchHealth(s, [], pages, 40000);
+  assert.deepEqual(t.buildFrontendFailureNotifications([], s, 99999), []);
+  t.updateFrontendFetchHealth(s, failed, {}, 99999);
+  t.updateFrontendFetchHealth(s, [], pages, 100000);
+  assert.deepEqual(t.buildFrontendFailureNotifications([], s, 100001), []);
+  t.updateFrontendFetchHealth(s, [], pages, 160000);
+  assert.match(t.buildFrontendFailureNotifications([], s, 160000)[0].title, /恢复/);
+  assert.deepEqual(t.buildFrontendFailureNotifications([], s, 160001), []);
+});
+
+test('host limiter bounds active requests while preserving queued work', async () => {
+  const limiter = __testables.createHostLimiter({ maxConcurrent: 2 });
+  let active = 0, peak = 0, calls = 0;
+  await Promise.all(Array.from({ length: 12 }, () => limiter.schedule('https://four.meme/test', async () => {
+    active++; peak = Math.max(peak, active); calls++;
+    await new Promise(resolve => setTimeout(resolve, 2)); active--;
+  })));
+  assert.equal(peak, 2); assert.equal(calls, 12);
+});
+
+test('HTTP wrapper preserves 304 and separates denied API from page requests', async () => {
+  const originalFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async url => {
+    seen.push(url);
+    return url.includes('/meme-api/') ? new Response('Forbidden', { status: 403 }) : new Response(null, { status: 304 });
+  };
+  try {
+    const api = 'https://wrapper-test.four.meme/meme-api/config';
+    await assert.rejects(__testables.fetchWithTimeout(api, {}, 1000), /HTTP 403/);
+    await assert.rejects(__testables.fetchWithTimeout(api, {}, 1000), /退避中/);
+    const page = await __testables.fetchWithTimeout('https://wrapper-test.four.meme/en', {}, 1000);
+    assert.equal(page.status, 304);
+    assert.equal(seen.length, 2);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
 test("transient fetch failures expose their network cause", () => {
   const err = new TypeError("fetch failed", {
     cause: Object.assign(new Error("Connect Timeout Error"), {

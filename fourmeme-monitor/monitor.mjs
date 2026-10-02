@@ -2,6 +2,7 @@ import { formatBeijingTime, formatDisplayText } from "../shared/display-format.c
 import { createRpcControl, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
+import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
  *
@@ -346,6 +347,11 @@ function nextUA() {
   return PROCESS_BROWSER_UA;
 }
 
+function apiRequestHeaders() {
+  return { Accept: 'application/json, text/plain, */*', Origin: CONFIG.siteUrl,
+    Referer: `${CONFIG.siteUrl}/`, 'User-Agent': nextUA() };
+}
+
 function browserHeaders(userAgent = PROCESS_BROWSER_UA) {
   return {
     "User-Agent": userAgent,
@@ -380,6 +386,14 @@ function staticAssetHeaders(assetUrl, referer = "", userAgent = PROCESS_BROWSER_
 
 // --- Per-domain 自适应退避 ---
 const domainBackoff = new Map(); // domain -> { delayMs, lastFail }
+let previousHttpState = {};
+if (!IS_TEST_MODE) {
+  try { previousHttpState = JSON.parse(readFileSync(CONFIG.runtimeMetricsFile, 'utf8')).http || {}; } catch {}
+}
+const fourmemeHttp = createHttpRecovery({ initial: previousHttpState, onRestriction: state => {
+  log(`[HTTP 受限] ${state.scope} ${state.path}｜HTTP ${state.status}｜恢复探测 ${formatBeijingTime(state.until)}｜${JSON.stringify(state.headers)}｜${state.preview}`);
+  scheduleRuntimeMetricsWrite();
+} });
 const frontendAssetWarningState = new Map();
 const frontendAssetRetryState = new Map();
 const FRONTEND_ASSET_WARNING_COOLDOWN_MS = 10 * 60_000;
@@ -508,9 +522,11 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
-function createHostLimiter({ minDelayMs = 0, now = () => Date.now(), sleepFn = sleep } = {}) {
+function createHostLimiter({ minDelayMs = 0, maxConcurrent = 6, now = () => Date.now(), sleepFn = sleep } = {}) {
   const startChains = new Map();
   const lastStartedAt = new Map();
+  const active = new Map();
+  const waiters = new Map();
   const delayMs = Math.max(0, Number(minDelayMs) || 0);
 
   function hostKey(url) {
@@ -519,18 +535,30 @@ function createHostLimiter({ minDelayMs = 0, now = () => Date.now(), sleepFn = s
 
   async function schedule(url, task) {
     const host = hostKey(url);
-    const previousStart = startChains.get(host) || Promise.resolve();
-    const start = previousStart.catch(() => {}).then(async () => {
-      if (delayMs > 0 && lastStartedAt.has(host)) {
-        const waitMs = delayMs - (now() - lastStartedAt.get(host));
-        if (waitMs > 0) await sleepFn(waitMs);
-      }
-      lastStartedAt.set(host, now());
-    });
-    startChains.set(host, start);
-    await start;
-    if (startChains.get(host) === start) startChains.delete(host);
-    return task();
+    if ((active.get(host) || 0) >= maxConcurrent) {
+      await new Promise(resolve => {
+        if (!waiters.has(host)) waiters.set(host, []);
+        waiters.get(host).push(resolve);
+      });
+    } else active.set(host, (active.get(host) || 0) + 1);
+    try {
+      const previousStart = startChains.get(host) || Promise.resolve();
+      const start = previousStart.catch(() => {}).then(async () => {
+        if (delayMs > 0 && lastStartedAt.has(host)) {
+          const waitMs = delayMs - (now() - lastStartedAt.get(host));
+          if (waitMs > 0) await sleepFn(waitMs);
+        }
+        lastStartedAt.set(host, now());
+      });
+      startChains.set(host, start);
+      await start;
+      if (startChains.get(host) === start) startChains.delete(host);
+      return await task();
+    } finally {
+      const next = waiters.get(host)?.shift();
+      if (next) next();
+      else { active.set(host, (active.get(host) || 1) - 1); waiters.delete(host); }
+    }
   }
 
   return { schedule };
@@ -612,6 +640,7 @@ function scheduleRuntimeMetricsWrite() {
       memory: { rss: memory.rss, heapUsed: memory.heapUsed, heapTotal: memory.heapTotal },
       modules: modulesSummary,
       rpc: rpcControl.summary(),
+      http: fourmemeHttp.snapshot(),
       snapshotWrites: {
         ...snapshotWriteMetrics,
         averageDurationMs: snapshotWriteMetrics.writes
@@ -627,6 +656,11 @@ function scheduleRuntimeMetricsWrite() {
       frontend: {
         pages: Object.keys(snapshot?.frontendPages || {}).length,
         resources: Object.keys(snapshot?._frontendAssetStore || {}).length,
+        lastRunAt: frontendMetrics.lastRunAt,
+        successfulPages: frontendMetrics.success,
+        failedPages: frontendMetrics.failed,
+        skippedPages: frontendMetrics.skipped || 0,
+        pageHealth: frontendMetrics.pages,
       },
     };
     runtimeMetricsWriteQueue = runtimeMetricsWriteQueue.then(() => {
@@ -1230,7 +1264,7 @@ function appendHistory(module, title, summary, diffSnippet = "") {
 
 /* ── HTTP 请求工具（含反风控 + 5xx/超时/瞬时网络错误重试）── */
 async function fetchWithTimeout(url, opts, timeoutMs) {
-  return scheduleHostRequest(url, async () => {
+  const dispatch = async () => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs);
     try {
@@ -1241,7 +1275,11 @@ async function fetchWithTimeout(url, opts, timeoutMs) {
     } finally {
       clearTimeout(timer);
     }
-  });
+  };
+  const schedule = task => scheduleHostRequest(url, task);
+  return isFourmemeHttp(url)
+    ? fourmemeHttp.request(url, opts, schedule, dispatch, timeoutMs)
+    : schedule(dispatch);
 }
 
 const TRANSIENT_NETWORK_ERROR_CODES = new Set([
@@ -1297,7 +1335,7 @@ function formatNetworkError(err) {
 
 async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, requestFn = fetchWithTimeout, delayFn = sleep) {
   const domain = getDomain(url);
-  const backoffState = currentBackoffState(domain);
+  const backoffState = isFourmemeHttp(url) ? null : currentBackoffState(domain);
   if (backoffState) {
     const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
     throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
@@ -1313,12 +1351,14 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, re
         throw new Error(`HTTP ${res.status} (风控)`);
       }
       if (res.status >= 500) {
-        try { await res.text(); } catch {}
+        let errorBody = '';
+        try { errorBody = await res.text(); } catch {}
         lastStatus = res.status;
         if (attempt < maxRetries) {
           await delayFn(1_000 * (attempt + 1));
           continue;
         }
+        if (isFourmemeHttp(url)) fourmemeHttp.recordFailure(url, res, errorBody);
         recordFail(domain, res.status);
         throw new Error(`HTTP ${res.status} (服务端错误，重试${maxRetries}次仍失败)`);
       }
@@ -1326,7 +1366,7 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, re
         try { await res.text(); } catch {}
         return res;
       }
-      if (res.ok) recordSuccess(domain);
+      if (res.ok && !isFourmemeHttp(url)) recordSuccess(domain);
       return res;
     } catch (err) {
       if (err.name === "AbortError") {
@@ -1359,7 +1399,7 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, re
  */
 async function fetchProbe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
   const domain = getDomain(url);
-  const backoffState = currentBackoffState(domain);
+  const backoffState = isFourmemeHttp(url) ? null : currentBackoffState(domain);
   if (backoffState) {
     const statusText = backoffState.lastStatusCode ? `，上次状态: ${backoffState.lastStatusCode}` : "";
     throw new Error(`[退避中] ${domain}，剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${statusText}`);
@@ -1372,7 +1412,7 @@ async function fetchProbe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs) {
       throw new Error(`HTTP ${res.status} (风控)`);
     }
     // 对非风控错误码：直接返回响应，不触发退避，让调用方决定如何处理
-    if (res.ok || res.status < 500) recordSuccess(domain);
+    if (!isFourmemeHttp(url) && (res.ok || res.status < 500)) recordSuccess(domain);
     return res;
   } catch (err) {
     if (err.name === "AbortError") {
@@ -1694,7 +1734,7 @@ const SEL = {
 
 async function fetchPoolConfig() {
   const res = await fetchSafe(`${CONFIG.apiBase}/v1/public/config`, {
-    headers: { "User-Agent": nextUA(), "Accept": "application/json" },
+    headers: apiRequestHeaders(),
   }, 15_000);
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const json = await res.json();
@@ -4793,7 +4833,7 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
     features.fetchMeta = { status: res.status, durationMs: Date.now() - startedAt };
     validateFrontendPageFeatures(url, html, features);
   } catch (err) {
-    log(`  [${urlLabel(url)}] HTML 抓取失败：${err.message}`);
+    if (classifyFetchFailure(err) !== 'backoff') log(`  [${urlLabel(url)}] HTML 抓取失败：${err.message}`);
     return { data: null, error: { url, reason: classifyFetchFailure(err), message: err.message || String(err), durationMs: Date.now() - startedAt } };
   }
 
@@ -5655,7 +5695,7 @@ function filterFrontendDedupe(notifications, state, windowMs = readPositiveIntEn
   return out;
 }
 
-function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
+function buildFrontendFailureNotifications(failedUrls = [], state = snapshot, now = Date.now()) {
   const groups = new Map();
   const FAIL_THRESHOLD = 3;
   for (const url of failedUrls) {
@@ -5665,10 +5705,10 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
     const reason = typeof failState === "object" ? failState.reason : "error";
     const isBackoffLike = ["backoff", "rate_limited", "restricted"].includes(reason);
     const threshold = isBackoffLike ? FAIL_THRESHOLD * 2 : FAIL_THRESHOLD;
-    if (!(count > 0 && count % threshold === 0)) continue;
+    if (!(count >= threshold || (failState.firstUnavailableAt && now - failState.firstUnavailableAt >= 30_000))) continue;
 
     const domain = getDomain(url);
-    const groupKey = isBackoffLike ? `${domain}:${reason}` : `${domain}:${reason}:${count}`;
+    const groupKey = domain;
     if (!groups.has(groupKey)) {
       groups.set(groupKey, {
         domain,
@@ -5685,11 +5725,16 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
     group.urls.push(url);
   }
 
-  return [...groups.values()].map(group => {
+  const incidents = state._frontendFetchIncidents ||= {};
+  const notifications = [...groups.values()].flatMap(group => {
+    const incident = incidents[group.domain] ||= { firstSeenAt: now };
+    if (incident.notifiedAt) return [];
+    incident.notifiedAt = now;
     const backoffState = currentBackoffState(group.domain);
     const lines = [
-      `站点 ${group.domain} 前端抓取已连续失败 ${group.count} 轮，影响 ${group.urls.length} 个页面。`,
-      `原因: ${group.reason}`,
+      `站点 ${group.domain} 前端检查未完成，影响 ${group.urls.length} 个页面。`,
+      `原因：${group.reason === 'backoff' ? '请求冷却中，暂未发送请求' : group.reason}`,
+      `实际请求连续失败：最多 ${group.count} 次；冷却跳过不计入失败。`,
     ];
     if (backoffState) {
       lines.push(`当前退避: 剩余 ${Math.ceil(backoffState.remainingMs / 1000)}s${backoffState.lastStatusCode ? `，上次状态 ${backoffState.lastStatusCode}` : ""}`);
@@ -5709,9 +5754,42 @@ function buildFrontendFailureNotifications(failedUrls = [], state = snapshot) {
       template: "red",
       url: CONFIG.siteUrl,
       skipAi: true,
-      dedupeKey: `frontend:failure:${group.domain}:${group.reason}:${group.count}`,
+      dedupeKey: `frontend:failure:${group.domain}:${incident.firstSeenAt}`,
     };
   });
+  for (const [domain, incident] of Object.entries(incidents)) {
+    if (!incident.healthySince || now - incident.healthySince < 60_000) continue;
+    if (incident.notifiedAt) notifications.push({ title: `前端抓取恢复：${domain}`, template: 'green', skipAi: true,
+      url: CONFIG.siteUrl, content: '监控页面已连续正常检查至少 60 秒。受限期间保留原快照，恢复后继续比对；期间短暂出现又消失的变化无法保证补获。',
+      dedupeKey: `frontend:recovery:${domain}:${incident.firstSeenAt}` });
+    delete incidents[domain];
+  }
+  return notifications;
+}
+
+function updateFrontendFetchHealth(state, failedDetails, pages, now = Date.now()) {
+  state._frontendFailCounts ||= {};
+  state._frontendFetchIncidents ||= {};
+  for (const detail of failedDetails) {
+    const key = urlToKey(detail.url), previous = state._frontendFailCounts[key];
+    const old = typeof previous === 'object' ? previous : { count: previous || 0 };
+    const oldCount = old?.reason === 'backoff' && !old.firstUnavailableAt ? 0 : old?.count || 0;
+    state._frontendFailCounts[key] = { ...old,
+      count: oldCount + (detail.reason === 'backoff' ? 0 : 1),
+      skipped: (old?.skipped || 0) + (detail.reason === 'backoff' ? 1 : 0),
+      firstUnavailableAt: old?.firstUnavailableAt || now,
+      reason: detail.reason, message: detail.message, lastFailAt: now };
+    const domain = getDomain(detail.url);
+    const incident = state._frontendFetchIncidents[domain] ||= { firstSeenAt: now };
+    incident.healthySince = 0;
+  }
+  for (const key of Object.keys(pages)) delete state._frontendFailCounts[key];
+  const failedDomains = new Set(failedDetails.map(d => getDomain(d.url)));
+  for (const [domain, incident] of Object.entries(state._frontendFetchIncidents)) {
+    if (!incident.lastObservedAt || now - incident.lastObservedAt > 60_000) incident.healthySince = 0;
+    incident.lastObservedAt = now;
+    if (!failedDomains.has(domain) && Object.values(pages).some(p => getDomain(p.originalUrl) === domain)) incident.healthySince ||= now;
+  }
 }
 
 /**
@@ -6014,25 +6092,20 @@ async function fetchApiData() {
       try {
         const opts = {
           method: ep.method || "GET",
-          headers: {
-            "Accept": "application/json, text/plain, */*",
-            "Content-Type": "application/json",
-            "Origin": CONFIG.siteUrl,
-            "Referer": `${CONFIG.siteUrl}/`,
-            "User-Agent": nextUA(),
-            ...(ep.headers || {}),
-          },
+          headers: { ...apiRequestHeaders(), ...(ep.method === 'POST' ? { 'Content-Type': 'application/json' } : {}), ...(ep.headers || {}) },
         };
         if (ep.method === "POST" && ep.body) opts.body = JSON.stringify(ep.body);
         res = await fetchProbe(ep.url, opts, 15_000);
         const text = await res.text();
         const json = tryParseJson(text);
         payload = json === null ? buildNonJsonApiPayload(res, text) : normalizeApiPayload(json, 0, ep.sampleArrayItems || 0);
-        if (payload?._http?.errorCode === "1015") recordFail(getDomain(ep.url), 429);
+        if (payload?._http?.errorCode === "1015" && !isFourmemeHttp(ep.url)) recordFail(getDomain(ep.url), 429);
         const hasCode = payload && typeof payload === "object" && !Array.isArray(payload) && Object.prototype.hasOwnProperty.call(payload, "code");
         isSuccess = !!payload && (hasCode ? (payload.code === 0 || payload.code === "0") : res.ok);
       } catch (err) {
         payload = buildApiProbeErrorPayload(err);
+        const sample = moduleMetricContext.getStore();
+        if (sample) sample[classifyFetchFailure(err) === 'backoff' ? 'backoffCount' : 'errorCount']++;
       }
       // 公共 API 只用成功响应更新结构/值，避免短暂超时、风控页、非 JSON 响应污染快照。
       // 私有探针只记录稳定的业务错误 envelope；Cloudflare/5xx/429/网络异常不污染 API 快照。
@@ -9240,6 +9313,8 @@ function recordModuleError(name, errMsg) {
   e.total++;
   e.lastMsg = errMsg;
   e.lastFailTime = Date.now();
+  e.healthySince = 0;
+  e.httpRestricted = /HTTP (?:403|429)/.test(errMsg);
   // 记录最近 2 小时内的错误时间戳（用于状态汇总）
   const now = Date.now();
   e.hourlyErrors.push(now);
@@ -9257,6 +9332,10 @@ function recordModuleError(name, errMsg) {
 function clearModuleError(name) {
   if (!moduleErrors[name]) return;
   const e = moduleErrors[name];
+  if (e.httpRestricted && e.consecutive > 0) {
+    e.healthySince ||= Date.now();
+    if (Date.now() - e.healthySince < 60_000) return;
+  }
   if (e.alerted && e.consecutive >= ERROR_ALERT_THRESHOLD) {
     log(`[恢复] 模块 ${name} 已恢复正常（曾连续失败 ${e.consecutive} 次）`);
     sendFeishu(`模块恢复：${name}`,
@@ -9301,7 +9380,7 @@ function createModuleRunner(name, fn, intervalMs) {
             backoffSkips = 0;
             log(`[${name}] 退避恢复：此前因风控跳过 ${skipped} 次检测，本轮已完成全量比对`);
             // 仅连续跳过 3 次以上才推送通知，避免短暂退避（如 5s）产生噪音
-            if (skipped >= 3) {
+            if (skipped >= 3 && !['pool', 'api', 'openfourTemplates'].includes(name)) {
               sendFeishu(
                 `模块恢复：${name}`,
                 `**模块** ${name} 退避结束，已恢复检测\n**跳过次数：** ${skipped}\n**注意：** 退避期间的中间状态变更可能未被捕获`,
@@ -9318,6 +9397,7 @@ function createModuleRunner(name, fn, intervalMs) {
           if (name === "github") githubReposETag = "";
           metricSample.durationMs = Date.now() - startedAt;
           if (err.message?.includes("[退避中]")) {
+            if (moduleErrors[name]) moduleErrors[name].healthySince = 0;
             metricSample.backoffCount = 1;
             recordModuleMetric(moduleMetrics, name, metricSample);
             backoffSkips++;
@@ -9395,30 +9475,25 @@ async function runFrontendCheck() {
   const oldPages = snapshot.frontendPages || {};
   const { pages: newPages, failedUrls, failedDetails = [], discoveryHistoryChanged = false, pendingRoutePages = [] } = await fetchFrontendDataWithDiscovery(oldPages);
   frontendMetrics.success = Object.keys(newPages).length;
-  frontendMetrics.failed = failedUrls.length;
+  frontendMetrics.skipped = failedDetails.filter(d => d.reason === 'backoff').length;
+  frontendMetrics.failed = failedUrls.length - frontendMetrics.skipped;
+  const metricSample = moduleMetricContext.getStore();
+  if (metricSample) {
+    metricSample.backoffCount += frontendMetrics.skipped;
+    metricSample.errorCount += frontendMetrics.failed;
+  }
 
-  // 页面抓取失败告警：连续失败计数
-  let failCountChanged = false;
-  const failedByUrl = new Map(failedDetails.map(item => [item.url, item]));
-  for (const url of failedUrls) {
-    const detail = failedByUrl.get(url) || { reason: "error", message: "" };
-    const key = urlToKey(url);
-    const prev = snapshot._frontendFailCounts[key];
-    const count = typeof prev === "object" ? (prev.count || 0) : (prev || 0);
-    snapshot._frontendFailCounts[key] = {
-      count: count + 1,
-      reason: detail.reason,
-      message: detail.message,
-      lastFailAt: Date.now(),
-    };
-    failCountChanged = true;
+  // Cooldown skips are visible, but are not counted as failed network requests.
+  const failCountChanged = failedUrls.length > 0 || Object.keys(snapshot._frontendFailCounts).length > 0
+    || Object.keys(snapshot._frontendFetchIncidents || {}).length > 0;
+  updateFrontendFetchHealth(snapshot, failedDetails, newPages);
+  for (const detail of failedDetails) {
+    const key = urlToKey(detail.url);
+    frontendMetrics.pages[key] = { ...frontendMetrics.pages[key], lastFailureAt: Date.now(),
+      status: detail.reason, message: detail.message };
   }
   // 重置成功页面的失败计数
   for (const key of Object.keys(newPages)) {
-    if (snapshot._frontendFailCounts[key]) {
-      delete snapshot._frontendFailCounts[key];
-      failCountChanged = true;
-    }
     frontendMetrics.pages[key] = {
       lastSuccessAt: Date.now(),
       durationMs: newPages[key]?.fetchMeta?.durationMs || 0,
@@ -10214,6 +10289,7 @@ export const __testables = {
   shouldUseAiForNotification,
   isTooLongForSingleCard,
   buildFrontendFailureNotifications,
+  updateFrontendFetchHealth,
   buildFrontendNewPageNotification,
   buildFrontendNewPageAiInput,
   formatPoolChanges,
