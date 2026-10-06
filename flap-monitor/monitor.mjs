@@ -6587,7 +6587,7 @@ async function deliverFlapContractIntegrityChanges(state, {
   const auditIndex = pending.slice(0, 8).findIndex(change => change.audit);
   const changes = pending.slice(0, auditIndex === 0 ? 1 : auditIndex > 0 ? auditIndex : 8);
   if (changes.length === 0) return { sent: false, changes: [] };
-  const title = `${titlePrefix}Flap 合约与配置完整性变更`;
+  const title = `${titlePrefix}${changes.every(change => change.audit) ? "审计报告提交" : "Flap 合约与配置完整性变更"}`;
   const content = buildContractIntegrityContent(changes, state);
   const messageId = await sendAlertCard(
     sendCardFn,
