@@ -6591,7 +6591,6 @@ async function deliverFlapContractIntegrityChanges(state, {
   const kinds = changes.map(change => change.permission?.kind);
   const title = `${titlePrefix}${changes.every(change => change.audit) ? "审计报告提交"
     : kinds.every(kind => kind === 'roleAdmin') ? 'Flap 角色管理权限变更'
-    : kinds.every(kind => kind === 'grantRevoked') ? 'Flap 审计授权已撤销'
     : kinds.every(kind => kind === 'grantUsed') ? 'Flap 审计授权使用待核验'
     : 'Flap 合约与配置完整性变更'}`;
   const content = buildContractIntegrityContent(changes, state);

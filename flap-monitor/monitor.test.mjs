@@ -11,7 +11,7 @@ import { ingestRegistryLog, REGISTRY_TOPIC } from './registry-notifications.mjs'
 process.env.FLAP_MONITOR_TEST = "1";
 const { __testables } = await import("./monitor.mjs");
 
-test('新版权限卡片正确分类，孤立授权等待期间不阻塞撤销通知', async () => {
+test('审计撤销仅留档，孤立授权等待期间不阻塞角色变更通知', async () => {
   const { createContractIntegrityState, ingestContractIntegrityEvent } = await import('./contract-integrity-monitor.mjs');
   const { VAULT_PORTAL_ADDRESS, GRANT_REVOKER_ROLE, AUDITOR_ROLE, ROLE_ADMIN_CHANGED, GRANT_REVOKED, GRANT_USED } = await import('./vault-portal-v116.mjs');
   const state = createContractIntegrityState();
@@ -23,7 +23,7 @@ test('新版权限卡片正确分类，孤立授权等待期间不阻塞撤销�
   const titles = [];
   const sendCardFn = async (title, content) => { titles.push(title); assert.doesNotMatch(content, /\*\*/); return 'message'; };
   await __testables.deliverFlapContractIntegrityChanges(state, { sendCardFn, saveStateFn: () => {} });
-  assert.deepEqual(titles, ['Flap 审计授权已撤销']);
+  assert.deepEqual(titles, []);
   const deferred = await __testables.deliverFlapContractIntegrityChanges(state, { sendCardFn, saveStateFn: () => {} });
   assert.equal(deferred.grantDeferred, true);
   assert.equal(state.pendingChanges.length, 1);

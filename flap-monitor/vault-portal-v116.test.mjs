@@ -76,14 +76,28 @@ test('报告已投递后迟到授权不再单发；不同交易或分叉不得�
   assert.equal(other.pendingChanges.length, 2);
 });
 
-test('孤立授权使用超时保留提醒，撤销及权限事件不被合并窗口阻塞', () => {
+test('孤立授权使用超时保留提醒，静默撤销不阻塞角色事件且重启不补发', () => {
   const state = createContractIntegrityState();
   const grant = ingestContractIntegrityEvent(state, grantLog).change;
-  const revoked = ingestContractIntegrityEvent(state, log([GRANT_REVOKED, role, word(addr('1'))], 190)).change;
-  assert.deepEqual(readyContractIntegrityChanges(state, Date.parse(grant.detectedAt)).map(c => c.id), [revoked.id]);
+  const revokedLog = log([GRANT_REVOKED, role, word(addr('1'))], 190);
+  assert.equal(ingestContractIntegrityEvent(state, revokedLog).suppressed, true);
+  const record = Object.values(state.recentEvents).find(r => r.permission?.kind === 'grantRevoked');
+  assert.equal(record.permission.digest, role);
+  assert.equal(record.notified, false);
+  const changedRole = ingestContractIntegrityEvent(state, roleLog).change;
+  assert.deepEqual(readyContractIntegrityChanges(state, Date.parse(grant.detectedAt)).map(c => c.id), [changedRole.id]);
   assert.equal(readyContractIntegrityChanges(state, Date.parse(grant.detectedAt) + 1501).length, 2);
   assert.match(buildContractIntegrityContent([grant], state), /尚未关联/);
-  assert.match(buildContractIntegrityContent([revoked], state), /不删除已上链/);
+  // Simulate a persisted notification queued by the previous release.
+  const eventKey = Object.keys(state.recentEvents).find(k => state.recentEvents[k] === record);
+  record.notified = true;
+  state.pendingChanges.push({ id: 'legacy-revocation', type: 'event', address: portal,
+    topic0: GRANT_REVOKED, eventKey, permission: record.permission });
+  const restored = migrateContractIntegrityState(JSON.parse(JSON.stringify(state)));
+  assert.equal(restored.pendingChanges.length, 2);
+  assert.equal(restored.recentEvents[eventKey].notified, false);
+  assert.equal(ingestContractIntegrityEvent(restored, revokedLog, 'http').duplicate, true);
+  assert.equal(ingestContractIntegrityEvent(restored, { ...revokedLog, removed: true }).change, null);
 });
 
 test('同笔批量审计的第二个授权不被前一个报告吞掉', () => {

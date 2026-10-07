@@ -291,6 +291,15 @@ export function migrateContractIntegrityState(raw) {
       change?.type !== "event" || Boolean(EVENT_LABELS[String(change?.topic0 || "").toLowerCase()])
     ))
     : [];
+  // Drop only queued Portal revocation notifications from the previous version.
+  // Keep the decoded event and deduplication record for local inspection.
+  state.pendingChanges = state.pendingChanges.filter(change => {
+    if (change.type !== 'event' || change.address !== VAULT_PORTAL_ADDRESS
+      || change.permission?.kind !== 'grantRevoked') return true;
+    const record = state.recentEvents[change.eventKey];
+    if (record) { record.notified = false; record.suppressed = 'grant-revoked-notification-disabled'; }
+    return false;
+  });
   return state;
 }
 
@@ -597,6 +606,12 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
   }
   const label = EVENT_LABELS[topic0];
   if (!label) return { processed: true, suppressed: true, unknown: true, change: null };
+  const permission = decodePortalPermissionEvent(logEntry);
+  if (permission?.kind === 'grantRevoked') {
+    Object.assign(state.recentEvents[key], { permission, notified: false,
+      suppressed: 'grant-revoked-notification-disabled' });
+    return { processed: true, suppressed: true, change: null };
+  }
   const change = appendChange(state, {
     type: "event",
     address,
@@ -609,7 +624,7 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
     txHash: String(logEntry?.transactionHash || "").toLowerCase(),
     logIndex: hexToNumber(logEntry?.logIndex),
     audit: decodeAuditSubject(logEntry),
-    permission: decodePortalPermissionEvent(logEntry),
+    permission,
     eventTime: logEntry?.blockTimestamp ? new Date(hexToNumber(logEntry.blockTimestamp) * 1000).toISOString() : '',
     source,
   });
