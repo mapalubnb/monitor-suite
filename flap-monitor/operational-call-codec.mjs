@@ -1,4 +1,5 @@
 import { ALLOWANCE_MODULE, COW_SETTLEMENT, POSITION_MANAGERS } from "./early-signal-catalog.mjs";
+import { VAULT_PORTAL_ADDRESS, GRANT_REVOKER_ROLE, AUDITOR_ROLE, portalRoleName } from './vault-portal-v116.mjs';
 
 export const hexWords = data => {
   const h = String(data || "").replace(/^0x/, "").toLowerCase();
@@ -34,6 +35,28 @@ export function decodeOperationalCall(transaction, path = "0") {
     if (base.operation !== 0) return unknown("非 CALL，保留原始调用");
     if (data === "0x") return { ...base, kind: "funding", recipient: to, amount: BigInt(transaction.value || 0).toString(), asset: "BNB" };
     const w = hexWords(data.slice(10));
+    if (to === VAULT_PORTAL_ADDRESS) {
+      if (selector === '0x211be400' && w.length === 0) return { ...base, kind: 'grantRoleAdmin', role: GRANT_REVOKER_ROLE, newAdmin: AUDITOR_ROLE };
+      if (selector === '0x6e500b55' && w.length === 1) return { ...base, kind: 'grantRevoke', digest: '0x' + w[0] };
+      if (selector === '0x15f9e17a' && w.length === 1) return { ...base, kind: 'grantQuery', digest: '0x' + w[0] };
+      if (selector === '0xf2277e85') {
+        const token = abiAddress(w[0]);
+        const offset = Number(BigInt('0x' + w[1]));
+        if (!Number.isSafeInteger(offset) || offset < 96 || offset % 32 || offset / 32 + 8 > w.length) throw Error('审计授权 tuple 偏移无效');
+        const tuple = data.slice(10 + offset * 2), tw = hexWords(tuple);
+        const riskLevel = Number(abiUint(tw[3]));
+        if (riskLevel > 4) throw Error('审计风险等级无效');
+        const string = slot => {
+          if (BigInt('0x' + tw[slot]) < 256n) throw Error('审计授权字符串覆盖 tuple 头部');
+          return Buffer.from(abiBytes(tuple, slot).slice(2), 'hex').toString('utf8');
+        };
+        if (BigInt('0x' + w[2]) < BigInt(offset + 256)) throw Error('审计授权签名覆盖 tuple 头部');
+        const signature = abiBytes(data.slice(10), 2);
+        if (signature.length !== 132) throw Error('审计授权签名长度无效');
+        return { ...base, kind: 'auditGrantSubmit', token, grantToken: abiAddress(tw[0]), factory: abiAddress(tw[1]),
+          deployer: abiAddress(tw[2]), riskLevel, ipfsCid: string(4), artifactId: string(5), manifestHash: '0x' + tw[6], nonce: abiUint(tw[7]) };
+      }
+    }
     if (selector === "0xa9059cbb" && w.length === 2) return { ...base, kind: "transfer", asset: to, recipient: abiAddress(w[0]), amount: abiUint(w[1]) };
     if (selector === "0x095ea7b3" && w.length === 2) return { ...base, kind: "approval", asset: to, spender: abiAddress(w[0]), amount: abiUint(w[1]) };
     if (["0x42842e0e", "0xb88d4fde", "0x23b872dd"].includes(selector) && POSITION_MANAGERS.includes(to)) {
@@ -104,7 +127,11 @@ export function describeOperationalAction(a, metadata = {}) {
     positionTransfer: `LP NFT ${a.asset} #${a.tokenId} → ${a.recipient}`,
     cowPresign: `CoW 订单${a.signed ? "预签名" : "撤销预签名"}：${a.orderUid}`,
     upgrade: `合约升级 ${a.proxy} → ${a.implementation}`,
-    role: `${a.granted ? "授予" : "撤销"}角色 ${a.role} → ${a.account}`,
+    role: `${a.granted ? "授予" : "撤销"}角色：${portalRoleName(a.role, a.to)}\n角色标识：${a.role}\n账户：${addressLink(a.account)}`,
+    grantRoleAdmin: `🔑 角色管理权限迁移\n角色：${portalRoleName(a.role, a.to)}\n新管理角色：${portalRoleName(a.newAdmin, a.to)}\n仅改变管理关系，不直接授予账户权限。`,
+    grantRevoke: `🚫 撤销未使用的审计授权\n授权摘要：${a.digest}\n不删除已上链的审计报告。`,
+    grantQuery: `🔎 查询审计授权使用状态\n授权摘要：${a.digest}\n只读查询，不改变链上权限。`,
+    auditGrantSubmit: `📝 通过签名授权提交审计报告\n代币：${addressLink(a.token)}\n授权绑定代币：${addressLink(a.grantToken)}\n工厂：${addressLink(a.factory)}\n指定提交者：${addressLink(a.deployer)}\n风险等级：${a.riskLevel}\n报告 CID：${plainLabel(a.ipfsCid)}\nUI 标识：${plainLabel(a.artifactId)}\n授权 nonce：${a.nonce}\n授权有效性仍需链上核验。`,
     ownership: `管理员变更 → ${a.account}`,
     module: `${a.enabled ? "启用" : "停用"} Safe 模块 ${a.module}`,
     allowance: `${a.reason} ${a.selector}${a.delegate ? `\n委托：${addressLink(a.delegate)}` : ""}${a.asset ? `\n资产：${token === "BNB" ? "BNB" : addressLink(a.asset)}\n额度：${quantity}\n重置间隔：${a.resetMinutes} 分钟` : ""}`,

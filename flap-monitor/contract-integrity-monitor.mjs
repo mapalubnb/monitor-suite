@@ -4,6 +4,8 @@ import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 
 import { PROXY_ADMINS } from "./early-signal-catalog.mjs";
+import { VAULT_PORTAL_ADDRESS, GRANT_REVOKER_ROLE, ROLE_ADMIN_CHANGED, GRANT_REVOKED, GRANT_USED,
+  PORTAL_MODULE_GETTERS, decodePortalPermissionEvent, permissionEventLines, portalRoleName } from './vault-portal-v116.mjs';
 
 export const CONTRACT_INTEGRITY_SCHEMA_VERSION = 2;
 export const BSC_CHAIN_ID = 56;
@@ -25,6 +27,7 @@ export const CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS = Object.freeze([
   "0x2f8788117e7eff1d82e926ec794901d17c78024a50270940304540a733656f0d", // RoleGranted
   "0xf6391f5c32d9c69d2a47ea670b442974b53935d1edc7fd64eb21e047a839171b", // RoleRevoked
   "0x31a3b20984650bce20de2cc7e24a3b22a069ab56c0b52456b8ceefc2a7169377", // BitFlagsChanged
+  ROLE_ADMIN_CHANGED,
 ]);
 
 const ROLE_GRANTED_TOPIC = CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS[3];
@@ -35,6 +38,9 @@ const BEACON_UPGRADED_TOPIC = CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS[2];
 const BIT_FLAGS_CHANGED_TOPIC = CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS[5];
 
 const EVENT_LABELS = Object.freeze({
+  [ROLE_ADMIN_CHANGED]: '角色管理权限变更',
+  [GRANT_REVOKED]: '审计授权已撤销',
+  [GRANT_USED]: '审计授权已使用',
   [UPGRADED_TOPIC]: "代理实现升级",
   [ADMIN_CHANGED_TOPIC]: "代理管理员变更",
   [BEACON_UPGRADED_TOPIC]: "Beacon 升级",
@@ -149,6 +155,8 @@ const GETTERS = Object.freeze({
     ["registryAdminRole", "0xbf584c4b", "bytes32"],
   ],
   vaultPortal: [
+    ...PORTAL_MODULE_GETTERS,
+    ['审计撤销角色的管理权限', '0x248a9ca3' + GRANT_REVOKER_ROLE.slice(2), 'bytes32'],
     ["version", "0x54fd4d50", "string"],
     ["portal", "0x0ff754ea", "address"],
     ["tokenImplV3", "0x2f567533", "address", "token-implementation"],
@@ -450,6 +458,7 @@ export async function runContractIntegrityStateScan({
       contract.slots[item.field] = current;
       if (current) newDerived.push({ address: current, kind: item.field === "admin" ? "proxy-admin" : item.field, label: `${state.catalog[item.address]?.label || item.address} ${item.field}` });
     } else {
+      if ((contract.getters[item.field]?.observedBlock || 0) > scanBlock) continue;
       const decoded = decodeContractValue(raw, item.valueType);
       const comparable = Array.isArray(decoded) ? decoded.join(",") : decoded;
       compareField(state, changes, item.address, item.field, contract.getters[item.field]?.value, comparable, "getter");
@@ -558,6 +567,7 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
     if (record?.removed) return { processed: false, duplicate: true, change: null };
     state.recentEvents[key] = { ...record, removed: true, blockNumber: hexToNumber(logEntry.blockNumber) };
     state.pendingChanges = state.pendingChanges.filter(change => change.eventKey !== key);
+    for (const change of state.pendingChanges) if (change.grants) change.grants = change.grants.filter(grant => grant.eventKey !== key);
     pruneRecentEvents(state);
     return { processed: true, change: record?.notified ? appendChange(state, { type: "reorg", address,
       field: "链重组：原事件已撤销", eventKey: key, blockHash: logEntry.blockHash,
@@ -568,7 +578,8 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
   if (logEntry.blockHash && legacy && !legacy.removed && legacy.blockNumber === hexToNumber(logEntry.blockNumber)) return { processed: false, duplicate: true, change: null };
   const topic0 = String(logEntry?.topics?.[0] || "").toLowerCase();
   const blockNumber = hexToNumber(logEntry?.blockNumber);
-  state.recentEvents[key] = { address, topic0, blockNumber, source, seenAt: nowIso() };
+  state.recentEvents[key] = { address, topic0, blockNumber, blockHash: logEntry.blockHash,
+    txHash: String(logEntry.transactionHash || '').toLowerCase(), logIndex: hexToNumber(logEntry.logIndex), source, seenAt: nowIso() };
   pruneRecentEvents(state);
 
   // Factory implementation changes are already delivered by the dedicated 1s pool monitor.
@@ -581,6 +592,9 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
     return { processed: true, suppressed: true, change: null };
   }
   if (IGNORED_OPERATIONAL_TOPICS.has(topic0)) return { processed: true, suppressed: true, change: null };
+  if ([GRANT_REVOKED, GRANT_USED].includes(topic0) && address !== VAULT_PORTAL_ADDRESS) {
+    return { processed: true, suppressed: true, change: null };
+  }
   const label = EVENT_LABELS[topic0];
   if (!label) return { processed: true, suppressed: true, unknown: true, change: null };
   const change = appendChange(state, {
@@ -595,11 +609,57 @@ export function ingestContractIntegrityEvent(state, logEntry, source = "wss", { 
     txHash: String(logEntry?.transactionHash || "").toLowerCase(),
     logIndex: hexToNumber(logEntry?.logIndex),
     audit: decodeAuditSubject(logEntry),
+    permission: decodePortalPermissionEvent(logEntry),
     eventTime: logEntry?.blockTimestamp ? new Date(hexToNumber(logEntry.blockTimestamp) * 1000).toISOString() : '',
     source,
   });
   state.recentEvents[key].notified = true;
+  state.recentEvents[key].permission = change.permission;
+  if (address === VAULT_PORTAL_ADDRESS && change.permission?.kind === 'roleAdmin'
+    && change.permission.role === GRANT_REVOKER_ROLE) {
+    const contract = state.contracts[address] ||= { address, getters: {}, slots: {} };
+    const field = '审计撤销角色的管理权限';
+    if ((contract.getters[field]?.observedBlock || 0) <= blockNumber && (contract.lastStateBlock || 0) <= blockNumber) {
+      contract.getters[field] = { value: change.permission.newAdmin, observedBlock: blockNumber, updatedAt: nowIso() };
+    }
+  }
+  // EVM usually emits GrantUsed before AuditReportSubmitted. Also tolerate reverse
+  // arrival from concurrent HTTP/WSS feeds, without correlating across forks.
+  coalesceAuditGrantChanges(state);
   return { processed: true, change };
+}
+
+export function coalesceAuditGrantChanges(state) {
+  const pending = state.pendingChanges || [];
+  const covered = new Set();
+  for (const grant of pending.filter(c => c.permission?.kind === 'grantUsed')) {
+    const sameTransaction = c => c.address === grant.address && c.txHash === grant.txHash
+      && c.blockHash && c.blockHash === grant.blockHash;
+    const nextGrant = Object.values(state.recentEvents || {}).filter(c => sameTransaction(c)
+      && c.topic0 === GRANT_USED && !c.removed && c.logIndex > grant.logIndex)
+      .reduce((min, c) => Math.min(min, c.logIndex), Infinity);
+    const followsGrant = c => sameTransaction(c) && c.logIndex > grant.logIndex && c.logIndex < nextGrant;
+    const audit = pending.filter(c => c.audit?.token && followsGrant(c)).sort((a, b) => a.logIndex - b.logIndex)[0];
+    const deliveredAudit = !audit && Object.entries(state.recentEvents || {}).find(([, record]) =>
+      record.topic0 === VAULT_AUDIT_TOPIC && followsGrant(record) && record.notified && !record.removed);
+    if (!audit && !deliveredAudit) continue;
+    if (audit) {
+      audit.grants ||= [];
+      if (!audit.grants.some(g => g.eventKey === grant.eventKey)) audit.grants.push({ ...grant.permission, eventKey: grant.eventKey });
+    }
+    covered.add(grant.id);
+    const record = state.recentEvents?.[grant.eventKey];
+    if (record) { record.notified = false; record.coveredBy = audit?.eventKey || deliveredAudit[0]; }
+  }
+  state.pendingChanges = pending.filter(c => !covered.has(c.id));
+}
+
+// Only the informational GrantUsed waits briefly for its companion log. Other
+// events, including reports and revocations, are never delayed by this window.
+export function readyContractIntegrityChanges(state, now = Date.now()) {
+  coalesceAuditGrantChanges(state);
+  return state.pendingChanges.filter(c => c.permission?.kind !== 'grantUsed'
+    || now - Date.parse(c.detectedAt || '') >= 1500 || !Number.isFinite(Date.parse(c.detectedAt || '')));
 }
 
 export async function scanContractIntegrityEvents({ state, rpcCall, latestBlock = 0, maxBlocks = 2_000, realtime = false, suppressFactoryUpgrade = false, commit = operation => operation() } = {}) {
@@ -669,6 +729,9 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
     if (launchUrl) lines.push(`🏦 金库链接：[打开金库](${launchUrl})`);
     if (change.type === "event") {
       lines.push(`### 🟠 ${change.field}`);
+      lines.push(...permissionEventLines(change.permission, change.address));
+      if (change.permission?.kind === 'grantUsed') lines.push('⚠️ 尚未关联到同笔审计报告事件，请结合交易核验。');
+      for (const grant of change.grants || []) lines.push('🔏 同笔交易的签名授权', ...permissionEventLines(grant, change.address));
       const audit = change.audit;
       if (audit) {
         const link = (address, name, baseUrl = 'https://bscscan.com/address/') => `[${shortValue(name || `${address.slice(0, 6)}…${address.slice(-4)}`).replace(/[\[\]\\`*_]/g, '\\$&')}](${baseUrl}${address})`;
@@ -696,7 +759,8 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
       if (change.added?.length) lines.push(`新增函数选择器: ${change.added.join(", ")}`);
       if (change.removed?.length) lines.push(`移除函数选择器: ${change.removed.join(", ")}`);
     } else {
-      lines.push(`### ⚙️ ${change.field}`, `<font color='red'>− ${shortValue(change.previous)}</font>`, `<font color='green'>+ ${shortValue(change.current)}</font>`);
+      const display = value => change.field === '审计撤销角色的管理权限' ? portalRoleName(value, change.address) : value;
+      lines.push(`### ⚙️ ${change.field}`, `<font color='red'>− ${shortValue(display(change.previous))}</font>`, `<font color='green'>+ ${shortValue(display(change.current))}</font>`);
     }
   }
   return lines.join("\n\n");

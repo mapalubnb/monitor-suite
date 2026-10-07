@@ -57,6 +57,7 @@ import {
   CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS,
   acknowledgeContractIntegrityChanges,
   buildContractIntegrityContent,
+  readyContractIntegrityChanges,
   resolveVaultAuditDetails,
   contractIntegritySubscriptionAddresses,
   ingestContractIntegrityEvent,
@@ -6581,13 +6582,18 @@ async function deliverFlapContractIntegrityChanges(state, {
   patchCardFn = patchCard,
   enrichmentTimeoutMs = 20_000,
 } = {}) {
-  const pending = state.pendingChanges || [];
+  const pending = readyContractIntegrityChanges(state);
   // Keep an audit in a single compact card so a later edit never replaces one
   // fragment of a mixed/multipart notification and hides other changes.
   const auditIndex = pending.slice(0, 8).findIndex(change => change.audit);
   const changes = pending.slice(0, auditIndex === 0 ? 1 : auditIndex > 0 ? auditIndex : 8);
-  if (changes.length === 0) return { sent: false, changes: [] };
-  const title = `${titlePrefix}${changes.every(change => change.audit) ? "审计报告提交" : "Flap 合约与配置完整性变更"}`;
+  if (changes.length === 0) return { sent: false, changes: [], grantDeferred: (state.pendingChanges || []).length > 0 };
+  const kinds = changes.map(change => change.permission?.kind);
+  const title = `${titlePrefix}${changes.every(change => change.audit) ? "审计报告提交"
+    : kinds.every(kind => kind === 'roleAdmin') ? 'Flap 角色管理权限变更'
+    : kinds.every(kind => kind === 'grantRevoked') ? 'Flap 审计授权已撤销'
+    : kinds.every(kind => kind === 'grantUsed') ? 'Flap 审计授权使用待核验'
+    : 'Flap 合约与配置完整性变更'}`;
   const content = buildContractIntegrityContent(changes, state);
   const messageId = await sendAlertCard(
     sendCardFn,
@@ -7367,6 +7373,7 @@ async function startMonitor() {
   let contractIntegrityMutationQueue = Promise.resolve();
   let contractIntegrityDeliveryPromise = null;
   let contractIntegrityPollPromise = null;
+  let contractGrantDeliveryTimer = null;
   let contractIntegrityWsFeed = null;
   let contractIntegrityWsFingerprint = "";
 
@@ -7392,6 +7399,13 @@ async function startMonitor() {
           }),
           saveStateFn: () => {},
         }); } while (delivered.sent && contractIntegrityState.pendingChanges.length && canAttemptFeishuDelivery() && !isShuttingDown);
+        if (delivered.grantDeferred && !contractGrantDeliveryTimer && !isShuttingDown) {
+          contractGrantDeliveryTimer = setTimeout(() => {
+            contractGrantDeliveryTimer = null;
+            if (!isShuttingDown) void scheduleContractIntegrityDelivery(titlePrefix);
+          }, 1500);
+          contractGrantDeliveryTimer.unref?.();
+        }
         return delivered;
       } catch (error) {
         log(`[Flap 合约完整性] 待发送变更已保留：${error.message}`);

@@ -9,8 +9,28 @@ import { QUOTE_ROUTE_EVENT_TOPIC, decodeQuoteRoute, formatQuoteRoute } from "./q
 import { ingestRegistryLog, REGISTRY_TOPIC } from './registry-notifications.mjs';
 
 process.env.FLAP_MONITOR_TEST = "1";
-
 const { __testables } = await import("./monitor.mjs");
+
+test('新版权限卡片正确分类，孤立授权等待期间不阻塞撤销通知', async () => {
+  const { createContractIntegrityState, ingestContractIntegrityEvent } = await import('./contract-integrity-monitor.mjs');
+  const { VAULT_PORTAL_ADDRESS, GRANT_REVOKER_ROLE, AUDITOR_ROLE, ROLE_ADMIN_CHANGED, GRANT_REVOKED, GRANT_USED } = await import('./vault-portal-v116.mjs');
+  const state = createContractIntegrityState();
+  const event = (topic, index, args) => ({ address: VAULT_PORTAL_ADDRESS, topics: [topic, ...args], data: '0x',
+    transactionHash: '0x' + String(index).repeat(64).slice(0, 64), blockHash: '0x' + 'a'.repeat(64), blockNumber: '0x10', logIndex: '0x' + index });
+  const account = '0x' + '0'.repeat(24) + '1'.repeat(40);
+  ingestContractIntegrityEvent(state, event(GRANT_USED, 1, [GRANT_REVOKER_ROLE, account, account]));
+  ingestContractIntegrityEvent(state, event(GRANT_REVOKED, 2, [GRANT_REVOKER_ROLE, account]));
+  const titles = [];
+  const sendCardFn = async (title, content) => { titles.push(title); assert.doesNotMatch(content, /\*\*/); return 'message'; };
+  await __testables.deliverFlapContractIntegrityChanges(state, { sendCardFn, saveStateFn: () => {} });
+  assert.deepEqual(titles, ['Flap 审计授权已撤销']);
+  const deferred = await __testables.deliverFlapContractIntegrityChanges(state, { sendCardFn, saveStateFn: () => {} });
+  assert.equal(deferred.grantDeferred, true);
+  assert.equal(state.pendingChanges.length, 1);
+  ingestContractIntegrityEvent(state, event(ROLE_ADMIN_CHANGED, 3, [GRANT_REVOKER_ROLE, '0x' + '0'.repeat(64), AUDITOR_ROLE]));
+  await __testables.deliverFlapContractIntegrityChanges(state, { sendCardFn, saveStateFn: () => {} });
+  assert.equal(titles.at(-1), 'Flap 角色管理权限变更');
+});
 
 test("conditional page fetch reuses a 304 body and never caches a region error", async () => {
   const cache = new Map(), url = "https://flap.sh/launch";
