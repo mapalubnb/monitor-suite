@@ -69,6 +69,11 @@ export function ingestRegistryLog(state, log, { portal, persist = () => {}, now 
   const previous = state.notifications[known?.eventKey];
   if (known && (!previous || previous.settled || previous.blockHash === event.blockHash)) return null;
   record = state.notifications[event.key] = { ...event, source, firstSeenAt: new Date(now).toISOString(), nextAttemptAt: 0 };
+  const observation = state.pendingObservations?.[`${record.txHash}:${record.vault}`];
+  if (observation) {
+    observation.logSeenAt = record.firstSeenAt;
+    observation.pendingLeadMs = now - Date.parse(observation.workerSeenAt);
+  }
   const preview = previewFor(state, record);
   if (preview) {
     preview.status = 'registered'; preview.logSeenAt = record.firstSeenAt;
@@ -91,8 +96,8 @@ export function drainRegistryNotifications(state, { persist = () => {}, send, pa
   if (!Object.values(state.notifications || {}).some(r => (r.nextAttemptAt || 0) <= now()
     && (!r.messageId && !r.revoked && !r.candidate || r.messageId && patchVersion(r) && r.patchedVersion !== patchVersion(r)))
     && !Object.values(state.pendingRegistrations || {}).some(r => r.mode === 'live' && (r.nextAttemptAt || 0) <= now()
-      && (sendPending && !r.messageId && r.status === 'pending'
-        || patchPending && r.messageId && !['checking', 'registered'].includes(r.status) && r.patchedStatus !== r.status))) {
+      && (sendPending && !r.messageId && ['checking', 'pending', 'unverified'].includes(r.status)
+        || patchPending && r.messageId && r.status !== 'registered' && (r.patchedStatus !== r.status || r.patchedSimulationStatus !== r.simulationStatus)))) {
     return Promise.resolve({ sent: false, errors: [] });
   }
   const run = (async () => {
@@ -138,19 +143,25 @@ export function drainRegistryNotifications(state, { persist = () => {}, send, pa
     // Share the same delivery flight with mined logs. A log arriving while the
     // preview send is in flight adopts its message ID on the next drain.
     for (const r of Object.values(state.pendingRegistrations || {})) {
-      if (r.mode !== 'live' || (r.nextAttemptAt || 0) > now() || ['checking', 'registered'].includes(r.status)) continue;
+      if (r.mode !== 'live' || (r.nextAttemptAt || 0) > now() || r.status === 'registered') continue;
       try {
-        if (!r.messageId && r.status === 'pending' && sendPending) {
+        if (!r.messageId && ['checking', 'pending', 'unverified'].includes(r.status) && sendPending) {
           persist();
-          const version = r.status;
+          const version = r.status, simulationVersion = r.simulationStatus;
+          r.sendStartedAt = new Date(now()).toISOString();
+          const observation = state.pendingObservations?.[r.key];
+          if (observation) observation.sendStartedAt = r.sendStartedAt;
+          persist();
           const id = await sendPending({ ...r }, `registry-pending:${r.key}`);
           if (!id) throw Error('pending 注册预警未送达');
-          r.messageId = id; r.sentAt = new Date(now()).toISOString(); r.patchedStatus = version;
-          r.deliveryMs = now() - Date.parse(r.firstSeenAt); persist(); sent++;
+          r.messageId = id; r.sentAt = new Date(now()).toISOString(); r.patchedStatus = version; r.patchedSimulationStatus = simulationVersion;
+          r.deliveryMs = now() - Date.parse(r.firstSeenAt);
+          if (observation) Object.assign(observation, { sentAt: r.sentAt, messageId: id, deliveryMs: r.deliveryMs });
+          persist(); sent++;
         }
-        if (r.messageId && r.status !== 'registered' && r.patchedStatus !== r.status && patchPending) {
-          persist(); const version = r.status;
-          await patchPending({ ...r }); r.patchedStatus = version; persist();
+        if (r.messageId && r.status !== 'registered' && (r.patchedStatus !== r.status || r.patchedSimulationStatus !== r.simulationStatus) && patchPending) {
+          persist(); const version = r.status, simulationVersion = r.simulationStatus;
+          await patchPending({ ...r }); r.patchedStatus = version; r.patchedSimulationStatus = simulationVersion; persist();
         }
         r.failures = 0; r.nextAttemptAt = 0; r.lastDeliveryError = '';
       } catch (error) {

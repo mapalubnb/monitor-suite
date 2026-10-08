@@ -28,21 +28,34 @@ export function decodePendingRegistration(tx, safes = DEFAULT_FLAP_ADMIN_SAFES) 
   } catch { return []; }
 }
 
-export function ingestPendingRegistration(state, candidates, { now = Date.now(), persist = () => {}, mode = 'live' } = {}) {
+export function ingestPendingRegistration(state, candidates, { now = Date.now(), persist = () => {}, mode = 'live', onObservation = () => {} } = {}) {
   state.pendingRegistrations ||= {};
+  state.pendingObservations ||= {};
   let added = 0;
   for (const candidate of candidates) {
     const key = pendingRegistryKey(candidate.txHash, candidate.vault);
-    if (state.pendingRegistrations[key] || state.knownVaults?.[candidate.vault]
-      || Object.values(state.notifications || {}).some(r => r.txHash === candidate.txHash && r.vault === candidate.vault)) continue;
-    if (Object.keys(state.pendingRegistrations).length >= 256) {
-      state.pendingCapacityReachedAt = new Date(now).toISOString(); break;
-    }
-    state.pendingRegistrations[key] = { ...candidate, key, mode, firstSeenAt: new Date(now).toISOString(),
+    const workerMs = Date.parse(candidate.workerSeenAt);
+    const firstSeenAt = new Date(Number.isFinite(workerMs) && workerMs <= now ? workerMs : now).toISOString();
+    const event = Object.values(state.notifications || {}).find(r => r.txHash === candidate.txHash && r.vault === candidate.vault && !r.revoked);
+    const reason = state.pendingRegistrations[key] ? 'duplicate'
+      : event ? 'chain-observed-before-main'
+      : state.knownVaults?.[candidate.vault] ? 'known-factory'
+      : Object.keys(state.pendingRegistrations).length >= 256 ? 'capacity-limit' : 'accepted';
+    const observation = state.pendingObservations[key] ||= { txHash: candidate.txHash, vault: candidate.vault,
+      workerSeenAt: firstSeenAt, mainSeenAt: new Date(now).toISOString(), source: candidate.pendingSource || 'unknown',
+      workerToMainMs: now - Date.parse(firstSeenAt), reason, observations: 0 };
+    observation.observations++; observation.lastSeenAt = new Date(now).toISOString(); observation.lastReason = reason;
+    if (event) { observation.logSeenAt = event.firstSeenAt; observation.pendingLeadMs = Date.parse(event.firstSeenAt) - Date.parse(observation.workerSeenAt); }
+    if (reason === 'capacity-limit') state.pendingCapacityReachedAt = new Date(now).toISOString();
+    onObservation({ ...observation, lastReason: reason });
+    if (reason !== 'accepted') continue;
+    state.pendingRegistrations[key] = { ...candidate, key, mode, firstSeenAt, mainSeenAt: new Date(now).toISOString(),
       status: 'checking', nextCheckAt: 0, nextAttemptAt: 0 };
     added++;
   }
-  if (added) persist();
+  const observations = Object.entries(state.pendingObservations).sort(([, a], [, b]) => Date.parse(b.lastSeenAt) - Date.parse(a.lastSeenAt));
+  state.pendingObservations = Object.fromEntries(observations.slice(0, 1000));
+  if (candidates.length) persist();
   return added;
 }
 
@@ -59,7 +72,7 @@ export function observePendingReplacement(state, tx, persist = () => {}) {
 }
 
 export function pendingRegistryContent(r) {
-  const status = { pending: '🟡 发现注册交易，等待链上执行', failed: '🔴 交易执行失败',
+  const status = { checking: '🟡 发现待执行注册调用，尚未核验', pending: '🟡 模拟通过，等待链上执行', failed: '🔴 交易执行失败',
     replaced: '🟠 已核实同发送账户、同 nonce 的其他交易上链', noRegistration: '🟠 交易已上链，未发现对应的有效注册事件',
     configuration: '🟢 已有工厂的登记／配置操作已执行',
     withdrawn: '🔴 注册日志被区块重组撤回，暂不视为注册成功',
@@ -68,7 +81,9 @@ export function pendingRegistryContent(r) {
     `[创建入口](${buildVaultFactoryLaunchUrl(r.vault)})`,
     `调用方式：${r.viaSafe ? 'Safe 执行交易' : 'Portal 直接调用'}`,
     '仅为待执行注册／配置线索，不代表新工厂已注册；首次注册以链上核验为准。',
-    r.simulatedAt ? `只读模拟通过：${formatBeijingTime(r.simulatedAt)}（不保证最终执行成功）` : '',
+    r.simulatedAt ? `只读模拟通过：${formatBeijingTime(r.simulatedAt)}（不保证最终执行成功）`
+      : r.simulationStatus === 'rejected' ? '只读模拟未通过；不等于交易已经上链失败。'
+      : r.simulationStatus === 'unavailable' ? '只读模拟暂不可用，等待链上结果。' : '只读模拟：等待核验；尚未验证签名和执行权限。',
     `首次观测：${formatBeijingTime(r.firstSeenAt)}`,
     `[交易](https://bscscan.com/tx/${r.txHash})`,
     r.status === 'replaced' ? `[上链替代交易](https://bscscan.com/tx/${r.replacementHash})` : '',
@@ -84,20 +99,23 @@ export async function checkPendingRegistrations(state, { rpc, ingestLog, persist
     if (event) { r.status = 'registered'; r.logSeenAt = event.firstSeenAt;
       r.pendingLeadMs = Date.parse(event.firstSeenAt) - Date.parse(r.firstSeenAt); delete r.data; }
     if (now() - Date.parse(r.firstSeenAt) > 86_400_000 && r.status !== 'pending'
-      && (!r.messageId || r.patchedStatus === r.status || r.status === 'registered')) delete state.pendingRegistrations[r.key];
+      && (!r.messageId || r.patchedStatus === r.status && r.patchedSimulationStatus === r.simulationStatus || r.status === 'registered')) delete state.pendingRegistrations[r.key];
   }
   const r = records.filter(r => ['checking', 'pending', 'unverified'].includes(r.status)
     && (r.nextCheckAt || 0) <= now() && now() - Date.parse(r.firstSeenAt) < 1_800_000)
     .sort((a, b) => (a.nextCheckAt || 0) - (b.nextCheckAt || 0))[0];
   if (!r) { persist(); return; }
   const group = records.filter(x => x.txHash === r.txHash);
-  const update = patch => { for (const x of group) if (!linked(x)) Object.assign(x, patch); };
+  const active = x => ['checking', 'pending', 'unverified'].includes(x.status) && !linked(x);
+  const update = patch => { for (const x of group) if (active(x)) Object.assign(x, patch); };
   update({ nextCheckAt: now() + (r.simulatedAt ? 10_000 : 5_000) });
   try {
-    if (!r.simulatedAt && r.status === 'checking') {
+    if (!r.simulationAttemptedAt && !r.simulatedAt && r.status === 'checking') {
+      update({ simulationAttemptedAt: new Date(now()).toISOString() });
+      persist();
       const result = await rpc('eth_call', [{ to: r.to, from: r.from, value: '0x' + BigInt(r.value).toString(16), data: r.data }, 'latest']);
       if (r.viaSafe ? !/^0x0{63}1$/.test(result || '') : !/^0x(?:[a-f0-9]{2})*$/i.test(result || '')) throw Error('只读模拟未返回成功结果');
-      update({ simulatedAt: new Date(now()).toISOString(), status: 'pending', nextCheckAt: now() + 2000, lastError: '' });
+      update({ simulatedAt: new Date(now()).toISOString(), simulationStatus: 'passed', status: 'pending', nextCheckAt: now() + 2000, lastError: '' });
     } else {
       const receipt = await rpc('eth_getTransactionReceipt', [r.txHash]);
       if (receipt) {
@@ -111,7 +129,7 @@ export async function checkPendingRegistrations(state, { rpc, ingestLog, persist
           for (const log of logs) ingestLog(log);
           const registrations = logs.map(log => decodeRegistryLog(log, VAULT_PORTAL))
             .filter(log => log?.topic0 === REGISTRY_TOPIC && log.enabled && !log.removed);
-          for (const x of group) if (!linked(x)) {
+          for (const x of group) if (active(x)) {
             if (!registrations.some(log => log.vault === x.vault)) x.status = 'noRegistration';
             else if (state.knownVaults?.[x.vault]) x.status = 'configuration';
             // Positive confirmation-block settings may intentionally postpone ingestion.
@@ -126,11 +144,13 @@ export async function checkPendingRegistrations(state, { rpc, ingestLog, persist
         }
       }
       if (now() - Date.parse(r.firstSeenAt) > 60_000) {
-        for (const x of group) if (x.status === 'pending' && !linked(x)) x.status = 'unverified';
+        for (const x of group) if (active(x)) x.status = 'unverified';
       }
     }
   } catch (error) {
     update({ lastError: error.message });
+    if (!r.simulatedAt && r.status === 'checking') update({ status: 'unverified',
+      simulationStatus: /revert|未返回成功|signature/i.test(error.message) ? 'rejected' : 'unavailable' });
     if (now() - Date.parse(r.firstSeenAt) > 60_000) update({ status: 'unverified' });
   }
   persist();

@@ -1,13 +1,14 @@
-# Flap 底池提前监控（1.10.30）
+# Flap 底池提前监控（1.10.31）
 
 ## 2026-10-08 注册 pending 预警
 
 - 默认开启 `FLAP_REGISTRY_PENDING_ENABLED=true`，`FLAP_REGISTRY_PENDING_MODE=live`；`observe` 只留存观测，不发 pending 卡。`FLAP_REGISTRY_PENDING_WS_URLS` 留空复用 Factory WSS，单连接断线轮换；当前默认的两个 PublicNode 域名不是两个独立供应商。
 - 完整 pending 交易在独立 Worker 内过滤，只接受 BSC Portal 直接注册、配置的管理 Safe `execTransaction` 及受支持的 MultiSend 调用。复用已有 ABI 解码，禁用配置、已知工厂、畸形和非目标调用不发新注册预警；未知历史情况下文案明确为注册／配置线索。未知 Safe／模块入口和私有交易不保证提前覆盖，仍由链上事件监控兜底。
-- 候选先通过低优先级 RPC 做只读模拟，Safe 必须返回执行成功。模拟不保证打包后成功，模拟失败或不可用时仅记录错误，原链上通知不会等待模拟。默认每秒检查一笔命中交易，同笔多工厂复用结果；回执复核通常每十秒，首轮模拟后两秒复核。以上为新增预警核验周期，原监控频率不变。
+- 1.10.31 起候选持久化后立即唤醒投递，先发“尚未核验”预警；低优先级 RPC 异步模拟并编辑原卡，不阻塞首次发送。Safe 模拟必须返回执行成功，模拟仍不保证打包后成功。模拟只尝试一次，失败／不可用标为待核验并继续查回执，避免反复模拟阻塞确认。每秒检查一笔命中交易，同笔多工厂复用结果；模拟成功后两秒首次复核、之后通常十秒，未通过模拟的回执复核间隔五秒。原监控频率不变。
 - 飞书状态：待执行预警 → 同卡更新链上已注册；失败／无有效注册事件／已核实同发送账户同 nonce 替换分别更新。仅看到替代 pending 不判替换；一分钟未确认标记待核验，最多主动查询三十分钟，后续链上日志仍可确认。私有交易及断线漏掉的 pending 无法补回，HTTP 仅补链上事件。
-- 预警、确认共用持久投递队列，发送途中链上日志到达不另发确认卡。HTTP/WSS 去重、原重组撤回机制保留。记录 pending 首见、日志首见、发送时间及 `pendingLeadMs`，运行连接与消息计数写入 `runtime-metrics.json.registryPending`。
-- Worker 老生代 64MB／新生代 16MB 上限，单消息 256KB、解码 calldata 32KB、候选记录最多 256 条、每秒最多转发 10 条候选／替换消息。上限丢弃会计数，链上路径仍正常工作。只返回哈希的节点不触发全链 RPC 查询。记录按二十四小时保留，未完成的消息纠正不提前清理。
+- 预警、确认共用持久投递队列，发送途中链上日志到达不另发确认卡。HTTP/WSS 去重、原重组撤回机制保留，迟到的模拟结果不能覆盖确认或撤回。`snapshot.registryMonitor.pendingObservations` 保留最近 1000 条候选观测：`workerSeenAt`、`mainSeenAt`、`workerToMainMs`、来源、首次／最近过滤原因、日志与发送时间。理由区分 accepted、duplicate、chain-observed-before-main、known-factory、capacity-limit；日志先到而候选后到也记录，不静默丢失证据。`pendingLeadMs` 为日志首见减 Worker 首见，负数表示 pending 晚到；不把区块秒级时间当准确的毫秒打包时间。ISO 时间用于内部存储，飞书显示北京时间。
+- Worker 老生代 64MB／新生代 16MB 上限，单消息 256KB、解码 calldata 32KB、候选记录最多 256 条、每秒最多转发 10 条候选／替换消息。上限丢弃计数，并在 `runtime-metrics.json.registryPending.recentDrops` 保留最近 32 条哈希／时间／原因摘要，新增丢弃时写日志；被丢弃的候选不标记为已转发，重复到达可再尝试。链上路径仍正常工作。只返回哈希的节点不触发全链 RPC 查询。待执行记录按二十四小时保留，未完成的消息纠正不提前清理。
+- 独立来源核验：dRPC 公共 `wss://bsc.drpc.org` 实测拒绝订阅（Public endpoint rate limit，要求付费）；[bloXroute BSC Streams](https://docs.bloxroute.com/bsc/streams/working-with-streams/requirements) 需要付费账户和专用订阅适配，不能直接把其 URL 填入现有通用配置。本次保持现有来源，不宣称双供应商覆盖或保证提前量。
 - 验证覆盖真实注册交易 `0x88f91d1c8fa49072f0b14e4cbac9c6b6a4fc25faa432f586afea2d7306b8cc88` 回放、Safe/MultiSend、乱序、重启、失败、替换、重组和只观察模式。通用 pending 接收测试不能证明每笔金库注册的提前量；实际覆盖率需积累生产样本。
 
 ## 2026-10-07 VaultPortal 1.16.0

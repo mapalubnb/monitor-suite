@@ -92,16 +92,102 @@ test('预警失败持久重试，重启后成功上链不会重复新建卡片',
   await drainRegistryNotifications(restored, { now: () => 5000, patch: async r => assert.equal(r.messageId, 'retry'), send: () => assert.fail('duplicate') });
 });
 
-test('模拟失败不发预警，查不到回执只记待核验，observe 模式不发预警', async () => {
+test('模拟失败仍明确标为待核验，查不到回执不判链上失败，observe 模式不发预警', async () => {
   const { state, record } = setup();
   await checkPendingRegistrations(state, { now: () => 1100, rpc: async () => { throw Error('bad signature'); } });
-  assert.equal(record.status, 'checking');
-  await drainRegistryNotifications(state, { sendPending: () => assert.fail('unverified') });
+  assert.equal(record.status, 'unverified');
+  assert.equal(record.simulationStatus, 'rejected');
+  await drainRegistryNotifications(state, { sendPending: async r => {
+    assert.match(pendingRegistryContent(r), /只读模拟未通过/); return 'unverified';
+  } });
   record.status = 'pending'; record.simulatedAt = 'date'; record.nextCheckAt = 0;
   await checkPendingRegistrations(state, { now: () => 62000, rpc: async () => null });
   assert.equal(record.status, 'unverified'); assert.doesNotMatch(pendingRegistryContent(record), /执行失败|已取消/);
   const observe = setup('observe'); observe.record.status = 'pending';
   await drainRegistryNotifications(observe.state, { sendPending: () => assert.fail('observe') });
+});
+
+test('模拟 RPC 阻塞期间先发送待核验预警，结果更新同一卡且发送时序留档', async () => {
+  const { state, record } = setup();
+  let release;
+  const checking = checkPendingRegistrations(state, { now: () => 1100, rpc: () => new Promise(resolve => { release = resolve; }) });
+  let sends = 0;
+  await drainRegistryNotifications(state, { now: () => 1150, sendPending: async r => {
+    assert.equal(r.status, 'checking'); assert.match(pendingRegistryContent(r), /尚未核验/);
+    sends++; return 'early';
+  } });
+  assert.equal(sends, 1);
+  assert.equal(state.pendingObservations[record.key].sentAt, new Date(1150).toISOString());
+  release('0x'); await checking;
+  const patches = [];
+  await drainRegistryNotifications(state, { patchPending: async r => patches.push([r.messageId, r.status, r.simulationStatus]) });
+  assert.deepEqual(patches, [['early', 'pending', 'passed']]);
+  const restored = JSON.parse(JSON.stringify(state));
+  ingest(restored)(event);
+  await drainRegistryNotifications(restored, { send: () => assert.fail('duplicate'), patch: async (r, version) => {
+    assert.equal(r.messageId, 'early'); assert.equal(version, 'registered');
+  } });
+});
+
+test('迟到模拟结果不能覆盖链上确认或重组撤回，模拟失败后仍能回执确认', async () => {
+  for (const removed of [false, true]) {
+    const { state, record } = setup(); let release;
+    const checking = checkPendingRegistrations(state, { now: () => 1100, rpc: () => new Promise(resolve => { release = resolve; }) });
+    ingest(state)(event);
+    if (removed) ingest(state)({ ...event, removed: true });
+    release('0x'); await checking;
+    assert.equal(record.status, removed ? 'withdrawn' : 'registered');
+  }
+  const { state, record } = setup();
+  await drainRegistryNotifications(state, { sendPending: async () => 'early' });
+  await checkPendingRegistrations(state, { now: () => 1100, rpc: async () => { throw Error('execution reverted'); } });
+  await drainRegistryNotifications(state, { patchPending: async r => assert.equal(r.status, 'unverified') });
+  const calls = [];
+  await checkPendingRegistrations(state, { now: () => 7000, ingestLog: ingest(state), rpc: async method => {
+    calls.push(method);
+    return method === 'eth_getTransactionReceipt' ? { transactionHash: tx.hash, blockHash: h('b'), blockNumber: '0x10', status: 1, logs: [event] } : { hash: h('b') };
+  } });
+  assert.deepEqual(calls, ['eth_getTransactionReceipt', 'eth_getBlockByNumber']);
+  assert.equal(record.status, 'registered');
+});
+
+test('模拟中断后重启不会反复模拟，无法确认时退出 checking 状态', async () => {
+  const { state, record } = setup(); record.simulationAttemptedAt = new Date(1100).toISOString();
+  await checkPendingRegistrations(state, { now: () => 62000, rpc: async method => {
+    assert.equal(method, 'eth_getTransactionReceipt'); return null;
+  } });
+  assert.equal(record.status, 'unverified');
+});
+
+test('日志早于主线程收到候选时仍记录 Worker 时间、来源及正负提前量', () => {
+  for (const workerMs of [1000, 1300]) {
+    const state = {}; ingest(state)(event); let persisted = 0;
+    const candidates = decodePendingRegistration(tx).map(r => ({ ...r, workerSeenAt: new Date(workerMs).toISOString(), pendingSource: 'node.example' }));
+    assert.equal(ingestPendingRegistration(state, candidates, { now: 1400, persist: () => persisted++ }), 0);
+    const observation = Object.values(state.pendingObservations)[0];
+    assert.equal(observation.reason, 'chain-observed-before-main');
+    assert.equal(observation.pendingLeadMs, 1200 - workerMs);
+    assert.equal(observation.workerToMainMs, 1400 - workerMs);
+    assert.equal(observation.source, 'node.example'); assert.equal(persisted, 1);
+    assert.equal(Object.keys(state.pendingRegistrations).length, 0);
+  }
+});
+
+test('重复、已知工厂、容量限制均留痕，观测记录有界且重启保留', () => {
+  const { state } = setup();
+  ingestPendingRegistration(state, decodePendingRegistration(tx), { now: 2000 });
+  const observation = Object.values(state.pendingObservations)[0];
+  assert.equal(observation.reason, 'accepted'); assert.equal(observation.lastReason, 'duplicate');
+  assert.equal(observation.workerSeenAt, new Date(1000).toISOString());
+  for (const [seed, reason] of [[{ knownVaults: { [a('1')]: {} } }, 'known-factory'],
+    [{ pendingRegistrations: Object.fromEntries(Array.from({ length: 256 }, (_, i) => [i, {}])) }, 'capacity-limit']]) {
+    ingestPendingRegistration(seed, decodePendingRegistration(tx), { now: 2000 });
+    assert.equal(Object.values(seed.pendingObservations)[0].reason, reason);
+  }
+  state.pendingObservations = Object.fromEntries(Array.from({ length: 1000 }, (_, i) => [i, { lastSeenAt: new Date(i).toISOString() }]));
+  ingestPendingRegistration(state, decodePendingRegistration(tx), { now: 2000 });
+  assert.equal(Object.keys(state.pendingObservations).length, 1000);
+  assert.equal(JSON.parse(JSON.stringify(state)).pendingObservations[`${tx.hash}:${a('1')}`].lastReason, 'duplicate');
 });
 
 test('失败、无注册与替换以当前链回执为据，匹配 nonce 的 pending 本身不判替换', async () => {

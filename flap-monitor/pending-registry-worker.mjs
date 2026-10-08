@@ -14,7 +14,15 @@ for (const r of workerData.tracked || []) {
 let socket, endpoint = 0, lastMessage = Date.now(), retry, started = Date.now(), windowStart = 0, forwarded = 0, outstanding = 0;
 parentPort.on('message', message => { if (message.type === 'ack') outstanding = Math.max(0, outstanding - 1); });
 function forward(message) {
-  if (forwarded++ >= 10 || outstanding >= 16) { health.dropped++; return false; }
+  if (forwarded++ >= 10 || outstanding >= 16) {
+    health.dropped++;
+    health.recentDrops ||= [];
+    health.recentDrops.push({ txHash: message.candidates?.[0]?.txHash || message.tx?.hash,
+      workerSeenAt: message.candidates?.[0]?.workerSeenAt || new Date().toISOString(), source: health.endpoint,
+      reason: outstanding >= 16 ? 'ipc-backpressure' : 'forward-rate-limit' });
+    health.recentDrops = health.recentDrops.slice(-32);
+    return false;
+  }
   outstanding++; parentPort.postMessage(message); return true;
 }
 const publish = () => parentPort.postMessage({ type: 'health', health: { ...health, updatedAt: new Date().toISOString() } });
@@ -26,6 +34,7 @@ function connect() {
   ws.on('open', () => ws.send(JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'eth_subscribe', params: ['newPendingTransactions', true] })));
   ws.on('pong', () => { lastMessage = Date.now(); });
   ws.on('message', raw => {
+    const workerSeenMs = Date.now();
     if (socket !== ws) return;
     lastMessage = Date.now();
     let message; try { message = JSON.parse(String(raw)); } catch { return; }
@@ -48,18 +57,18 @@ function connect() {
     const key = `${from}:${nonce}`;
     if (Date.now() - windowStart > 1000) { windowStart = Date.now(); forwarded = 0; }
     if (tracked.has(key) && tracked.get(key).hash !== tx.hash && !seen.has(tx.hash)) {
-      forward({ type: 'replacement', tx: { hash: tx.hash, from, nonce } });
-      seen.set(tx.hash, Date.now());
+      if (forward({ type: 'replacement', tx: { hash: tx.hash, from, nonce } })) seen.set(tx.hash, Date.now());
       if (seen.size > 2048) seen.delete(seen.keys().next().value);
     }
     const candidates = decodePendingRegistration(tx, workerData.safes);
     if (!candidates.length || seen.has('candidate:' + tx.hash)) return;
+    for (const candidate of candidates) { candidate.workerSeenAt = new Date(workerSeenMs).toISOString(); candidate.pendingSource = health.endpoint; }
+    health.matches += candidates.length;
+    if (!forward({ type: 'candidates', candidates })) return;
     seen.set('candidate:' + tx.hash, Date.now());
     if (seen.size > 2048) seen.delete(seen.keys().next().value);
-    if (!forward({ type: 'candidates', candidates })) return;
     tracked.set(key, { hash: tx.hash, at: Date.now() });
     if (tracked.size > 256) tracked.delete(tracked.keys().next().value);
-    health.matches += candidates.length;
   });
   ws.on('error', error => { health.lastError = error.message; ws.terminate(); });
   ws.on('close', () => {

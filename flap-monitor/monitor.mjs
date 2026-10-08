@@ -7365,14 +7365,16 @@ async function startMonitor() {
         .map(({ from, nonce, txHash }) => ({ from, nonce, txHash })),
       onCandidates: candidates => {
         if (ingestPendingRegistration(snapshot.registryMonitor, candidates, { mode: CONFIG.registryMonitor.pendingMode,
-          persist: () => saveRegistrySnapshot(snapshot) })) {
-          log(`[Flap pending 注册] 收到 ${candidates.length} 个候选注册调用，开始只读核验`);
+          persist: () => saveRegistrySnapshot(snapshot),
+          onObservation: observation => log(`[Flap pending 观测] ${JSON.stringify(observation)}`) })) {
+          void registryDeliveryJob.wake();
           void registryPendingJob.wake();
         }
       },
       onReplacement: tx => observePendingReplacement(snapshot.registryMonitor, tx, () => saveRegistrySnapshot(snapshot)),
       onHealth: health => {
         if (registryPendingHealth.status !== health.status) log(`[Flap pending 注册] ${health.status}｜${health.endpoint || ''}｜模式 ${CONFIG.registryMonitor.pendingMode}`);
+        if (health.dropped > (registryPendingHealth.dropped || 0)) log(`[Flap pending 丢弃] ${JSON.stringify({ dropped: health.dropped, recentDrops: health.recentDrops })}`);
         registryPendingHealth = health;
       },
       onError: error => log(`[Flap pending 注册] ${error.message}`),
