@@ -1,4 +1,14 @@
-# Flap 底池提前监控（1.10.29）
+# Flap 底池提前监控（1.10.30）
+
+## 2026-10-08 注册 pending 预警
+
+- 默认开启 `FLAP_REGISTRY_PENDING_ENABLED=true`，`FLAP_REGISTRY_PENDING_MODE=live`；`observe` 只留存观测，不发 pending 卡。`FLAP_REGISTRY_PENDING_WS_URLS` 留空复用 Factory WSS，单连接断线轮换；当前默认的两个 PublicNode 域名不是两个独立供应商。
+- 完整 pending 交易在独立 Worker 内过滤，只接受 BSC Portal 直接注册、配置的管理 Safe `execTransaction` 及受支持的 MultiSend 调用。复用已有 ABI 解码，禁用配置、已知工厂、畸形和非目标调用不发新注册预警；未知历史情况下文案明确为注册／配置线索。未知 Safe／模块入口和私有交易不保证提前覆盖，仍由链上事件监控兜底。
+- 候选先通过低优先级 RPC 做只读模拟，Safe 必须返回执行成功。模拟不保证打包后成功，模拟失败或不可用时仅记录错误，原链上通知不会等待模拟。默认每秒检查一笔命中交易，同笔多工厂复用结果；回执复核通常每十秒，首轮模拟后两秒复核。以上为新增预警核验周期，原监控频率不变。
+- 飞书状态：待执行预警 → 同卡更新链上已注册；失败／无有效注册事件／已核实同发送账户同 nonce 替换分别更新。仅看到替代 pending 不判替换；一分钟未确认标记待核验，最多主动查询三十分钟，后续链上日志仍可确认。私有交易及断线漏掉的 pending 无法补回，HTTP 仅补链上事件。
+- 预警、确认共用持久投递队列，发送途中链上日志到达不另发确认卡。HTTP/WSS 去重、原重组撤回机制保留。记录 pending 首见、日志首见、发送时间及 `pendingLeadMs`，运行连接与消息计数写入 `runtime-metrics.json.registryPending`。
+- Worker 老生代 64MB／新生代 16MB 上限，单消息 256KB、解码 calldata 32KB、候选记录最多 256 条、每秒最多转发 10 条候选／替换消息。上限丢弃会计数，链上路径仍正常工作。只返回哈希的节点不触发全链 RPC 查询。记录按二十四小时保留，未完成的消息纠正不提前清理。
+- 验证覆盖真实注册交易 `0x88f91d1c8fa49072f0b14e4cbac9c6b6a4fc25faa432f586afea2d7306b8cc88` 回放、Safe/MultiSend、乱序、重启、失败、替换、重组和只观察模式。通用 pending 接收测试不能证明每笔金库注册的提前量；实际覆盖率需积累生产样本。
 
 ## 2026-10-07 VaultPortal 1.16.0
 

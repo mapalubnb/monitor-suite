@@ -36,6 +36,8 @@ import { selectPublicPoolNotification } from './public-pool-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { hasTokenDecimals, operationalAmountToken } from "./operational-call-codec.mjs";
 import { decodeRegistryLog, ingestRegistryLog, drainRegistryNotifications, auditRegistryNotifications } from './registry-notifications.mjs';
+import { startPendingRegistryFeed, ingestPendingRegistration, observePendingReplacement,
+  checkPendingRegistrations, pendingRegistryContent } from './pending-registry.mjs';
 import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
 import {
   BNB_QUOTE_TOKEN,
@@ -133,6 +135,9 @@ const CONFIG = {
     .split(",").map(s => s.trim()).filter(Boolean)
     .concat(process.env.FLAP_FACTORY_ARCHIVE_RPC_URL || []).filter(Boolean))],
   registryMonitor: {
+    pendingEnabled: process.env.FLAP_REGISTRY_PENDING_ENABLED !== 'false',
+    pendingMode: process.env.FLAP_REGISTRY_PENDING_MODE === 'observe' ? 'observe' : 'live',
+    pendingWsUrls: (process.env.FLAP_REGISTRY_PENDING_WS_URLS || '').split(/[\s,]+/).filter(Boolean),
     intervalMs: readPositiveIntEnv("FLAP_REGISTRY_INTERVAL_MS", 1_000, 500),
     wsEnabled: process.env.FLAP_REGISTRY_WS_ENABLED !== "false" && process.env.FLAP_FACTORY_WS_ENABLED !== "false",
     enabled: process.env.FLAP_REGISTRY_MONITOR !== "false",
@@ -3197,6 +3202,7 @@ function buildRegistryMonitorContent(events, { fromBlock, toBlock } = {}) {
       : event.codeStatus === 'missing' ? '🟠 已发现注册事件，当前未检测到合约代码'
       : '🟢 链上已注册（即时信号）');
     if (event.firstSeenAt) primaryLines.push(`首次观测：${formatBeijingTime(event.firstSeenAt)}`);
+    if (event.pendingFirstSeenAt) primaryLines.push(`pending 首次观测：${formatBeijingTime(event.pendingFirstSeenAt)}｜比注册日志早 ${Math.max(0, event.pendingLeadMs || 0)}ms`);
     primaryLines.push('');
   }
   const content = buildFlapCardContent({
@@ -3241,7 +3247,11 @@ function deliverRegistryChanges(snapshot, { sendCardFn = sendCardViaApi, patchCa
       return id;
     },
     patch: (record, version) => patchCardFn(record.messageId, `${titlePrefix}Flap 链上金库注册变更`,
-      buildRegistryMonitorContent([{ ...record, revoked: version === 'revoked' }]), version === 'revoked' ? 'red' : 'orange'),
+      buildRegistryMonitorContent([{ ...record, revoked: version === 'revoked' }]), version === 'registered' ? 'green' : version === 'revoked' ? 'red' : 'orange'),
+    sendPending: (record, deliveryId) => sendCardFn('Flap 金库注册预警：待执行', pendingRegistryContent(record),
+      'orange', undefined, { ...alertMentionCardOptions(), deliveryId }),
+    patchPending: record => patchCardFn(record.messageId, 'Flap 金库注册预警：结果更新',
+      pendingRegistryContent(record), record.status === 'failed' ? 'red' : 'orange'),
   });
 }
 function checkFlapRegistryLogs(snapshot, options = {}) {
@@ -7151,9 +7161,10 @@ async function startMonitor() {
     const jobs = Object.fromEntries([
       ['earlyRealtime', earlyChainJob], ['earlyHistory', earlyHistoryJob], ['earlyFast', earlyFastJob], ['earlyFastAudit', earlyFastAuditJob],
       ...externalJobs, ['registry', registryJob], ['registryHistory', registryHistoryJob],
-      ['registryDelivery', registryDeliveryJob], ['registryAudit', registryAuditJob],
+      ['registryDelivery', registryDeliveryJob], ['registryAudit', registryAuditJob], ['registryPending', registryPendingJob],
     ].map(([name, job]) => [name, job.snapshot()]));
-    writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs }));
+    writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs,
+      registryPending: registryPendingHealth }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
   }
   const rpcMetricsTimer = setInterval(() => {
@@ -7338,6 +7349,35 @@ async function startMonitor() {
       portal: CONFIG.registryMonitor.address, persist: () => saveRegistrySnapshot(snapshot) });
     if (record) void registryDeliveryJob.wake();
   };
+  let registryPendingHealth = { status: CONFIG.registryMonitor.pendingEnabled ? 'connecting' : 'disabled' };
+  const registryPendingJob = createWakeableJob({ intervalMs: 1000,
+    onError: error => log(`[Flap pending 注册] ${error.message}`), run: async () => {
+      if (isShuttingDown || !CONFIG.registryMonitor.enabled) return;
+      await checkPendingRegistrations(snapshot.registryMonitor, {
+        rpc: (method, params) => bscRpcCall(method, params, { history: true }),
+        ingestLog: receiveRegistryLog, persist: () => saveRegistrySnapshot(snapshot) });
+      void registryDeliveryJob.wake();
+    } });
+  const registryPendingFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.pendingEnabled
+    ? startPendingRegistryFeed({ urls: CONFIG.registryMonitor.pendingWsUrls.length ? CONFIG.registryMonitor.pendingWsUrls : CONFIG.factoryPoolMonitor.wsUrls,
+      safes: CONFIG.safeProposalMonitor.safes,
+      tracked: () => Object.values(snapshot.registryMonitor.pendingRegistrations || {}).filter(r => ['checking', 'pending', 'unverified'].includes(r.status))
+        .map(({ from, nonce, txHash }) => ({ from, nonce, txHash })),
+      onCandidates: candidates => {
+        if (ingestPendingRegistration(snapshot.registryMonitor, candidates, { mode: CONFIG.registryMonitor.pendingMode,
+          persist: () => saveRegistrySnapshot(snapshot) })) {
+          log(`[Flap pending 注册] 收到 ${candidates.length} 个候选注册调用，开始只读核验`);
+          void registryPendingJob.wake();
+        }
+      },
+      onReplacement: tx => observePendingReplacement(snapshot.registryMonitor, tx, () => saveRegistrySnapshot(snapshot)),
+      onHealth: health => {
+        if (registryPendingHealth.status !== health.status) log(`[Flap pending 注册] ${health.status}｜${health.endpoint || ''}｜模式 ${CONFIG.registryMonitor.pendingMode}`);
+        registryPendingHealth = health;
+      },
+      onError: error => log(`[Flap pending 注册] ${error.message}`),
+    }) : null;
+  if (CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.pendingEnabled) registryPendingJob.start();
   if (CONFIG.registryMonitor.enabled) {
     registryJob.start(); registryHistoryJob.start(); registryDeliveryJob.start(); registryAuditJob.start();
     log(`[Flap 金库注册] WSS 直接推送=${CONFIG.registryMonitor.wsEnabled && CONFIG.registryMonitor.confirmations === 0}｜额外确认块=${CONFIG.registryMonitor.confirmations}｜HTTP 补漏=${CONFIG.registryMonitor.intervalMs}ms`);
@@ -7362,8 +7402,9 @@ async function startMonitor() {
   global.__earlySignalDrain = async () => {
     clearInterval(rpcMetricsTimer);
     earlyFeeds.stop(); registryFeed?.stop(); headFeed?.stop();
+    await registryPendingFeed?.stop();
     await Promise.all([earlyChainJob.stop(), earlyHistoryJob.stop(), earlyFastJob.stop(), earlyFastAuditJob.stop(), registryJob.stop(), registryHistoryJob.stop(),
-      registryDeliveryJob.stop(), registryAuditJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
+      registryDeliveryJob.stop(), registryAuditJob.stop(), registryPendingJob.stop(), ...[...externalJobs.values()].map(job => job.stop())]);
     saveRegistrySnapshot(snapshot);
     if (earlyDeliveryPromise) await earlyDeliveryPromise;
     await Promise.allSettled([...earlySignalNameFlights]);

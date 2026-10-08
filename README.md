@@ -29,6 +29,12 @@
 
 提前信号用于发现准备动作。**采购、包装或加池不代表底池已经开放，Safe 提案也不保证执行。** 监控只读，不签名或发送链上交易；未公开的 Safe 提案无法提前获取。详细范围见 [Flap 监控说明](flap-monitor/MONITORING.md)。
 
+## 2026-10-08 金库注册 pending 预警
+
+Monitor Suite 1.12.32 / Flap 1.10.30 增加公开 pending 交易预警：独立线程接收完整交易，只解析 Portal、已配置管理 Safe 和 MultiSend 内的注册操作；只读模拟通过后发出待执行预警，收到注册事件后更新同一卡片。交易失败、经核实的替换、未确认结果分别显示，不把 pending 当成注册成功。已有 WSS、HTTP、Safe 检测频率不变。
+
+使用单个 pending 连接并在断线后轮换，候选队列和线程内存设上限；不逐笔查询全链交易哈希。新增 `FLAP_REGISTRY_PENDING_ENABLED`、`FLAP_REGISTRY_PENDING_MODE=live|observe`、`FLAP_REGISTRY_PENDING_WS_URLS`，详见 [Flap 监控说明](flap-monitor/MONITORING.md)。公开池覆盖不完整，不能保证每笔注册提前预警或固定提前时间。
+
 ## 2026-10-07 VaultPortal 1.16.0 适配
 
 Monitor Suite 1.12.31 / Flap 1.10.29 按需关闭已解析的 Portal `GrantRevoked`（审计授权已撤销）事件推送，继续保留本地事件记录与去重。旧待发队列中的此类通知不再补发；其他角色、授权使用、审计报告和 Safe 提案提醒及检测频率保持不变。

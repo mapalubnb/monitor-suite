@@ -5,6 +5,7 @@ export const CATEGORY_TOPIC = '0x566b7414cab715cde3c8bcc93daec35325367d6c648327d
 const hash = x => /^0x[a-f0-9]{64}$/.test(x || '');
 const lower = x => String(x || '').toLowerCase();
 const flights = new WeakMap();
+const previewFor = (state, record) => state.pendingRegistrations?.[`${record.txHash}:${record.vault}`];
 function claimVault(state, record) {
   record.candidate = false;
   state.knownVaults[record.vault] = { eventKey: record.key, firstSeenAt: record.firstSeenAt, txHash: record.txHash,
@@ -34,6 +35,10 @@ export function revokeRegistryEvent(state, record, persist, now = Date.now()) {
   record.revoked = true;
   record.revokedAt = new Date(now).toISOString();
   record.nextAttemptAt = 0;
+  const preview = previewFor(state, record);
+  if (preview && !preview.confirmedEventKey) {
+    preview.status = 'withdrawn'; preview.nextAttemptAt = 0;
+  }
   if (state.knownVaults?.[record.vault]?.eventKey === record.key) {
     delete state.knownVaults[record.vault];
     // A replacement fork may arrive before the old endpoint reports removed.
@@ -64,6 +69,13 @@ export function ingestRegistryLog(state, log, { portal, persist = () => {}, now 
   const previous = state.notifications[known?.eventKey];
   if (known && (!previous || previous.settled || previous.blockHash === event.blockHash)) return null;
   record = state.notifications[event.key] = { ...event, source, firstSeenAt: new Date(now).toISOString(), nextAttemptAt: 0 };
+  const preview = previewFor(state, record);
+  if (preview) {
+    preview.status = 'registered'; preview.logSeenAt = record.firstSeenAt;
+    preview.pendingLeadMs = now - Date.parse(preview.firstSeenAt);
+    record.pendingFirstSeenAt = preview.firstSeenAt;
+    record.pendingLeadMs = preview.pendingLeadMs;
+  }
   if (known) record.candidate = true;
   else claimVault(state, record);
   persist();
@@ -74,10 +86,13 @@ function patchVersion(record) {
   return record.revoked ? 'revoked' : record.codeStatus === 'missing' ? 'missing-code' : '';
 }
 
-export function drainRegistryNotifications(state, { persist = () => {}, send, patch, now = Date.now } = {}) {
+export function drainRegistryNotifications(state, { persist = () => {}, send, patch, sendPending, patchPending, now = Date.now } = {}) {
   if (flights.has(state)) return flights.get(state);
   if (!Object.values(state.notifications || {}).some(r => (r.nextAttemptAt || 0) <= now()
-    && (!r.messageId && !r.revoked && !r.candidate || r.messageId && patchVersion(r) && r.patchedVersion !== patchVersion(r)))) {
+    && (!r.messageId && !r.revoked && !r.candidate || r.messageId && patchVersion(r) && r.patchedVersion !== patchVersion(r)))
+    && !Object.values(state.pendingRegistrations || {}).some(r => r.mode === 'live' && (r.nextAttemptAt || 0) <= now()
+      && (sendPending && !r.messageId && r.status === 'pending'
+        || patchPending && r.messageId && !['checking', 'registered'].includes(r.status) && r.patchedStatus !== r.status))) {
     return Promise.resolve({ sent: false, errors: [] });
   }
   const run = (async () => {
@@ -89,7 +104,12 @@ export function drainRegistryNotifications(state, { persist = () => {}, send, pa
         // Persist again before each network operation, including after a failed disk write.
         if (!record.messageId && !record.revoked && !record.candidate) {
           persist();
-          const id = await send(record, `registry:${record.key}`);
+          const preview = previewFor(state, record);
+          let id;
+          if (preview?.messageId && !preview.confirmedEventKey) {
+            await patch({ ...record, messageId: preview.messageId }, 'registered');
+            id = preview.messageId; preview.confirmedEventKey = record.key; preview.patchedStatus = 'registered';
+          } else id = await send(record, `registry:${record.key}`);
           if (!id) throw new Error('金库注册消息未送达，保留待发送事件');
           record.messageId = id;
           record.sentAt = new Date(now()).toISOString();
@@ -113,6 +133,30 @@ export function drainRegistryNotifications(state, { persist = () => {}, send, pa
         record.nextAttemptAt = now() + Math.min(60_000, 1000 * 2 ** Math.min(6, record.failures - 1));
         record.lastError = error.message;
         errors.push(error.message);
+      }
+    }
+    // Share the same delivery flight with mined logs. A log arriving while the
+    // preview send is in flight adopts its message ID on the next drain.
+    for (const r of Object.values(state.pendingRegistrations || {})) {
+      if (r.mode !== 'live' || (r.nextAttemptAt || 0) > now() || ['checking', 'registered'].includes(r.status)) continue;
+      try {
+        if (!r.messageId && r.status === 'pending' && sendPending) {
+          persist();
+          const version = r.status;
+          const id = await sendPending({ ...r }, `registry-pending:${r.key}`);
+          if (!id) throw Error('pending 注册预警未送达');
+          r.messageId = id; r.sentAt = new Date(now()).toISOString(); r.patchedStatus = version;
+          r.deliveryMs = now() - Date.parse(r.firstSeenAt); persist(); sent++;
+        }
+        if (r.messageId && r.status !== 'registered' && r.patchedStatus !== r.status && patchPending) {
+          persist(); const version = r.status;
+          await patchPending({ ...r }); r.patchedStatus = version; persist();
+        }
+        r.failures = 0; r.nextAttemptAt = 0; r.lastDeliveryError = '';
+      } catch (error) {
+        r.failures = (r.failures || 0) + 1;
+        r.nextAttemptAt = now() + Math.min(60000, 1000 * 2 ** Math.min(r.failures, 6));
+        r.lastDeliveryError = error.message; errors.push(error.message);
       }
     }
     state.deliveryError = errors.join('；');
