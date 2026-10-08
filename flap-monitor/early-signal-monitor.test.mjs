@@ -11,6 +11,8 @@ import { extractFlapProposalActions, DEFAULT_FLAP_ADMIN_SAFES } from "./safe-pro
 import { DEX, EXECUTION_WALLETS, CORE_SAFES, ALLOWANCE_MODULE } from "./early-signal-catalog.mjs";
 import { TOPICS } from "./early-signal-topics.mjs";
 import { decodeOperationalCall } from "./operational-call-codec.mjs";
+import { planCardParts } from '../shared/feishu-client.mjs';
+import { safeReceiptPayment, summarizeEarlyOperations } from './early-operation-summary.mjs';
 
 const history = JSON.parse(readFileSync(new URL("./fixtures/early-signal-history.json", import.meta.url)));
 const TOKEN = "0x4ebf5fd25b02022afad96e2fa25da54a246fded0";
@@ -23,6 +25,82 @@ const BH = "0x" + "ab".repeat(32);
 const TX = "0x" + "cd".repeat(32);
 const log = (address, topics, data, index = 0) => ({ address, topics, data, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logIndex: `0x${index.toString(16)}` });
 const receipt = logs => ({ status: "0x1", from: OWNER, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logs });
+
+const batchFixture = JSON.parse(readFileSync(new URL('./fixtures/early-batch-fxion.json', import.meta.url)));
+test('真实 FXIon 批量操作回放：三笔交易各一张卡，全部原始事件保持不变', () => {
+  const groups = Map.groupBy(batchFixture.events, e => e.transactionHash);
+  assert.deepEqual([...groups.values()].map(v => v.length), [40, 92, 88]);
+  for (const events of groups.values()) {
+    const state = { ...createEarlySignalState(), tokens: batchFixture.tokens, pendingChanges: events };
+    const before = JSON.stringify(state);
+    const body = buildEarlySignalContent(events, state);
+    assert.match(body, /批量临时授权与转账/);
+    assert.match(body, /授权后额度归零/);
+    assert.doesNotMatch(body, /SafeReceived|｜参数|授权对象：/);
+    assert.ok(body.includes(events[0].transactionHash));
+    assert.equal(planCardParts('Flap 底池提前信号', body, 'orange').length, 1);
+    assert.equal(JSON.stringify(state), before);
+    if (events.length === 88) {
+      assert.match(body, /22 个对象/);
+      assert.match(body, /0\.0000000000000202/);
+      assert.match(body, /0\.000000000000000928 BNB/);
+    }
+  }
+});
+
+test('混合权限、未知操作和持续授权不被批量摘要吞掉', () => {
+  const base = batchFixture.events.filter(e => e.transactionHash === batchFixture.events.at(-1).transactionHash);
+  const extras = [
+    { ...base[0], id: 'permission', kind: 'authority', detail: '管理员角色变更，必须保留' },
+    { ...base[0], id: 'unknown', kind: 'unknown', detail: '未解析 Portal 调用，必须保留' },
+    { ...base[0], id: 'new-grant', logIndex: 9999, amount: '99999' },
+  ];
+  const state = { ...createEarlySignalState(), tokens: batchFixture.tokens };
+  const body = buildEarlySignalContent([...base, ...extras], state);
+  assert.match(body, /管理员角色变更，必须保留/);
+  assert.match(body, /未解析 Portal 调用，必须保留/);
+  assert.match(body, /授权对象：/);
+  const result = summarizeEarlyOperations([...base, ...extras], state, x => x);
+  assert.ok(extras.every(e => result.remaining.includes(e)));
+});
+
+test('缺少回款、精度、金额不匹配和日志乱序保留逐项明细，不跨交易合并', () => {
+  const base = batchFixture.events.filter(e => e.transactionHash === batchFixture.events[0].transactionHash);
+  for (const mode of ['no-return', 'bad-raw', 'no-decimals', 'amount', 'order', 'other-tx']) {
+    const rows = structuredClone(base), state = { tokens: structuredClone(batchFixture.tokens) };
+    for (const e of rows) {
+      if (mode === 'no-return' && e.kind === 'safeOperation') e.kind = 'unknown';
+      if (mode === 'bad-raw' && e.raw) e.raw.topics[0] = TOPICS.ChangedThreshold;
+      if (mode === 'no-decimals' && e.token) delete state.tokens[e.token].decimals;
+      if (mode === 'amount' && e.kind === 'transfer') e.amount = '2000';
+      if (mode === 'order' && e.kind === 'transfer') e.logIndex = -1;
+      if (mode === 'other-tx' && e.kind === 'transfer') e.transactionHash = TX;
+    }
+    const result = summarizeEarlyOperations(rows, state, x => x);
+    assert.equal(result.summaries.length, 0, mode);
+    assert.equal(result.remaining.length, rows.length, mode);
+  }
+});
+
+test('单独 Safe 收款显示精确 BNB 数量，畸形事件保持待核验原文', () => {
+  const event = batchFixture.events.find(e => e.kind === 'safeOperation');
+  assert.equal(safeReceiptPayment(event).amount, 46n);
+  const body = buildEarlySignalContent([event], createEarlySignalState());
+  assert.match(body, /Safe 收款/); assert.match(body, /0\.000000000000000046 BNB/);
+  assert.doesNotMatch(body, /SafeReceived|｜参数/);
+  assert.equal(safeReceiptPayment({ ...event, raw: { ...event.raw, data: '0x01' } }), null);
+});
+
+test('同一对象收到多个资产时不重复归入一笔 BNB 回款', () => {
+  const rows = batchFixture.events.filter(e => e.transactionHash === batchFixture.events[0].transactionHash);
+  const receiver = rows[0].to;
+  const extra = rows.filter(e => e.to === receiver).map(e => ({ ...e, token: TOKEN, id: 'other-' + e.id }));
+  const result = summarizeEarlyOperations([...rows, ...extra], { tokens: { ...batchFixture.tokens, [TOKEN]: { decimals: 18 } } }, x => x);
+  assert.ok(extra.every(e => result.remaining.includes(e)));
+  const payment = rows.find(e => safeReceiptPayment(e)?.from === receiver);
+  assert.ok(result.remaining.includes(payment));
+  assert.ok(rows.filter(e => e.to === receiver).every(e => result.remaining.includes(e)));
+});
 
 test('discovery resumes after a failed address without repeating completed requests', async () => {
   const state = createEarlySignalState(), seen = []; let fail = true;

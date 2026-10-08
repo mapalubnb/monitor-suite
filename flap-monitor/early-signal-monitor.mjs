@@ -10,6 +10,7 @@ import { normalizeAddress, extractFlapProposalActions, createSafeApiPoolFetch, n
 import { FLAP_FACTORY_PROXY, QUOTE_CONFIG_SELECTOR, QUOTE_TOKEN_CREATION_DISABLED_SELECTOR } from "./factory-pool-monitor.mjs";
 import { decodeCowTrades, matchCowTransfers, cowDirection } from './cow-notifications.mjs';
 import { poolOperationRelevance, migratePoolEvidence } from './pool-relevance.mjs';
+import { safeReceiptPayment, summarizeEarlyOperations } from './early-operation-summary.mjs';
 
 export const EARLY_SIGNAL_SCHEMA_VERSION = 2;
 const ZERO = "0x" + "0".repeat(40);
@@ -764,7 +765,9 @@ function earlyOperationDetail(event) {
     return `${event.poolRelevance === 'public' ? '公共池活动 · ' : event.poolRelevance === 'unknown' ? '归属待核验 · ' : ''}${action.match(/^(V[234]|Infinity CL|Infinity Bin)/)?.[0] || 'DEX'} 池：${addressLink(pool.trim())}`;
   }
   if (event.kind === 'transfer' && event.from && event.to) return `${addressLink(event.from)} → ${addressLink(event.to)}`;
-  if (event.kind === 'approval' && event.to) return `授权对象：${addressLink(event.to)}`;
+  if (event.kind === 'approval' && event.to) return `${String(event.amount) === '0' ? '授权额度归零' : '授权对象'}：${addressLink(event.to)}`;
+  const received = safeReceiptPayment(event);
+  if (received) return `Safe 收款：${addressLink(received.from)} → ${addressLink(received.safe)}｜${readableBnb(received.amount)}`;
   if (['positionTransfer', 'nftTransfer'].includes(event.kind) && event.from && event.to)
     return `${addressLink(event.from)} → ${addressLink(event.to)}｜NFT #${escapeLabel(event.tokenId || event.amount || '待核验')}`;
   if (event.kind === 'nativeBalance') {
@@ -816,7 +819,9 @@ export function buildEarlySignalContent(changes, state) {
       if (state.tokens[token]?.underlying) lines.push(`底层资产：${addressLink(state.tokens[token].underlying)}`);
     }
     if (state.health?.assets?.lastError) lines.push("当前配置复核异常，上述状态为缓存快照。");
-    for (const e of events) {
+    const compact = summarizeEarlyOperations(events, state, addressLink);
+    lines.push(...compact.summaries);
+    for (const e of compact.remaining) {
       const mixedLiquidity = kinds.has('liquidityAdded') && kinds.has('liquidityRemoved');
       const direction = mixedLiquidity && e.kind === 'liquidityAdded' ? '加池 · '
         : mixedLiquidity && e.kind === 'liquidityRemoved' ? '撤池 · ' : '';
