@@ -1783,6 +1783,9 @@ function diffPoolConfigs(oldList, newList) {
     if (!oldItem) continue;
     const fc = [];
     for (const f of WATCH_FIELDS) {
+      // The API now adjusts the quote-token fundraising amount dynamically.
+      // Retain the latest value in snapshots/cards, but do not alert on its drift.
+      if (f === "totalBAmount") continue;
       const ov = JSON.stringify(oldItem[f] ?? "");
       const nv = JSON.stringify(newItem[f] ?? "");
       if (ov !== nv) fc.push(`${f}: ${ov} → ${nv}`);
@@ -10236,6 +10239,7 @@ function setSnapshotForTests(value) {
 
 export const __testables = {
   CONFIG,
+  diffPoolConfigs,
   buildFourmemeRestartCard,
   createModuleRunner,
   sendNotificationMaybeAi,

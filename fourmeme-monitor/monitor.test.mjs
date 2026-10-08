@@ -9,6 +9,20 @@ process.env.FOURMEME_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
 
+test('动态满池金额不触发底池告警，其他参数及新增移除保持检测', () => {
+  const previous = { networkCode: 'BSC', symbol: 'USD1', symbolAddress: '0x' + '1'.repeat(40),
+    status: 'PUBLISH', totalBAmount: '10013.3', b0Amount: '4000', buyFee: '0.01' };
+  const current = { ...previous, totalBAmount: '10013.4' };
+  assert.deepEqual(__testables.diffPoolConfigs([previous], [current]), []);
+  const mixed = __testables.diffPoolConfigs([previous], [{ ...current, buyFee: '0.02', b0Amount: '5000', status: 'HIDE' }]);
+  assert.equal(mixed.length, 1);
+  assert.equal(mixed[0].fieldChanges.length, 3);
+  assert.ok(mixed[0].fieldChanges.every(line => !line.startsWith('totalBAmount:')));
+  assert.equal(__testables.diffPoolConfigs([], [current])[0].type, '新增底池');
+  assert.equal(__testables.diffPoolConfigs([previous], [])[0].type, '移除底池');
+  assert.equal(current.totalBAmount, '10013.4');
+});
+
 test('API 混合名称样本与排序变化不会生成新增删除告警', () => {
   const { extractStructure, stabilizeApiListTypes, diffApiStructures } = __testables;
   const extract = rows => ({ token_search_new: extractStructure({data: rows}, '', 'token_search_new') });
