@@ -13,6 +13,7 @@ import { TOPICS } from "./early-signal-topics.mjs";
 import { decodeOperationalCall } from "./operational-call-codec.mjs";
 import { planCardParts } from '../shared/feishu-client.mjs';
 import { safeReceiptPayment, summarizeEarlyOperations } from './early-operation-summary.mjs';
+import { earlyNotificationPriority } from './early-signal-notifications.mjs';
 
 const history = JSON.parse(readFileSync(new URL("./fixtures/early-signal-history.json", import.meta.url)));
 const TOKEN = "0x4ebf5fd25b02022afad96e2fa25da54a246fded0";
@@ -25,6 +26,53 @@ const BH = "0x" + "ab".repeat(32);
 const TX = "0x" + "cd".repeat(32);
 const log = (address, topics, data, index = 0) => ({ address, topics, data, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logIndex: `0x${index.toString(16)}` });
 const receipt = logs => ({ status: "0x1", from: OWNER, blockNumber: "0x64", blockHash: BH, transactionHash: TX, logs });
+
+const ewyb = JSON.parse(readFileSync(new URL('./fixtures/ewyb-executor.json', import.meta.url)));
+test('EWYB 真实业务链路：收币与授权准备、加池及 LP NFT 纳入即时监控', () => {
+  const state = createEarlySignalState(); state.tokens[ewyb.token] = { effectiveEnabled: false };
+  for (const [i, r] of ewyb.receipts.entries()) {
+    const changes = decodeEarlyReceipt(r, state, { nowMs });
+    assert.equal(earlyNotificationPriority(changes, state, nowMs), 'immediate');
+    if (i < 2) {
+      assert.ok(changes.some(e => e.liquidityPreparation === (i === 0 ? 'funding' : 'approval')));
+      assert.match(buildEarlySignalContent(changes, state), /准备.*｜/);
+      assert.match(buildEarlySignalContent(changes, state), /不代表已加池或已开放/);
+    } else {
+      assert.ok(changes.some(e => e.kind === 'liquidityAdded' && e.poolRelevance === 'related'));
+      assert.equal(state.positions[`${DEX.v3Positions}:7668265`].owner, ewyb.wallet);
+      assert.equal(state.pools['0xc60ed5b770e8a3abd60ee9ed10faa0aee577a66b'].officialOperation, true);
+      assert.match(buildEarlySignalContent(changes, state), /增加流动性/);
+    }
+  }
+  const filters = JSON.stringify(earlyLogFilters(state, { subscriptionMode: true }));
+  assert.ok(filters.includes(ewyb.wallet.slice(2)));
+  assert.ok(filters.includes(word(7668265)));
+});
+
+test('未加入执行钱包时仍归公共池，未知收币与已开放资产不误标准备', () => {
+  const state = createEarlySignalState(); state.tokens[ewyb.token] = { effectiveEnabled: false };
+  const oldConfig = { wallets: [EXECUTION_WALLETS[0]] };
+  const changes = decodeEarlyReceipt(ewyb.receipts[2], state, { config: oldConfig, nowMs });
+  assert.equal(earlyNotificationPriority(changes, state, nowMs), 'public');
+  const funding = decodeEarlyReceipt(ewyb.receipts[0], state, { config: oldConfig, nowMs });
+  assert.ok(funding.every(e => !e.liquidityPreparation));
+  const opened = createEarlySignalState(); opened.tokens[ewyb.token] = { effectiveEnabled: true };
+  for (const r of ewyb.receipts.slice(0, 2)) assert.ok(decodeEarlyReceipt(r, opened, { nowMs }).every(e => !e.liquidityPreparation));
+  const revoked = structuredClone(ewyb.receipts[1]);
+  for (const l of revoked.logs) if (l.topics[0] === TOPICS.Approval) l.data = topic(0);
+  const fresh = createEarlySignalState();
+  assert.ok(decodeEarlyReceipt(revoked, fresh, { nowMs }).every(e => !e.liquidityPreparation));
+});
+
+test('已核验回执可静默补齐持有仓位与池订阅，不重新推送历史加池', () => {
+  const state = createEarlySignalState(); state.tokens[ewyb.token] = { effectiveEnabled: false };
+  decodeEarlyReceipt(ewyb.receipts[2], state, { config: { wallets: [EXECUTION_WALLETS[0]] }, nowMs });
+  acknowledgeEarlySignals(state, state.pendingChanges.map(e => e.id));
+  decodeEarlyReceipt(ewyb.receipts[2], state, { nowMs, silent: true });
+  assert.equal(state.pendingChanges.length, 0);
+  assert.equal(state.positions[`${DEX.v3Positions}:7668265`].owner, ewyb.wallet);
+  assert.equal(state.pools['0xc60ed5b770e8a3abd60ee9ed10faa0aee577a66b'].officialOperation, true);
+});
 
 const batchFixture = JSON.parse(readFileSync(new URL('./fixtures/early-batch-fxion.json', import.meta.url)));
 test('真实 FXIon 批量操作回放：三笔交易各一张卡，全部原始事件保持不变', () => {

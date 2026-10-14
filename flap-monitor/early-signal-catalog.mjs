@@ -15,7 +15,12 @@ export const AUXILIARY_SAFES = Object.freeze([
   "0xf82dC45E843693D9ffd42D6922a5d534c4AbC3C8",
   "0xE1c8bCbd9784E2Efc78C1310Ac3E0c6c568322F0",
 ]);
-export const EXECUTION_WALLETS = ["0x81459cD6b1bdf55D01A824350A79a0c201530992"];
+export const EXECUTION_WALLETS = [
+  "0x81459cD6b1bdf55D01A824350A79a0c201530992",
+  // 2026-10-14: received EWYB from the operating Safe, funded V3 pool
+  // 0xc60e...a66b and received LP NFT #7668265. Business association, not identity proof.
+  "0x57d5656b4212af89f0afcc9680a7fb1d08b5c5c9",
+];
 export const CORE_OWNERS = [
   "0x25D1BE80daaE074D3FAF7987fb21bdfe791E2BBc",
   "0x29a64981d327c2B4893F1bB84aa9A6266EFBb491",

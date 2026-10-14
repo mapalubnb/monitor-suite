@@ -239,7 +239,12 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         if (!nft && (wallets.has(from) || executors.has(to))) trackToken(state, a, "关联钱包资产流", nowMs);
         // Incoming dust never expands the monitored address set or implies stocking.
         if (t === TOPICS.Transfer && wallets.has(from)) candidate(state, to, `资金/仓位接收 ${receipt.transactionHash}`, nowMs);
+        const liquidityPreparation = !nft && !BASE_ASSETS.has(a) && state.tokens[a]?.effectiveEnabled !== true
+          ? kind === 'transfer' && wallets.has(from) && executors.has(to) && from !== to ? 'funding'
+            : kind === 'approval' && executors.has(from) && POSITION_MANAGERS.includes(to) && amount !== '0' ? 'approval' : ''
+          : '';
         add(l, { kind, token: nft ? "" : a, stage: "observation", from, to, amount, tokenId: nft ? amount : undefined,
+          ...(liquidityPreparation ? { liquidityPreparation } : {}),
           ...(kind === 'transfer' && cowTransfers.has(l) ? { cowOrderUid: cowTransfers.get(l) } : {}),
           passiveIncoming: kind === 'transfer' && !related && !wallets.has(from) && wallets.has(to),
           knownLiquiditySpender: kind === 'approval' && POSITION_MANAGERS.includes(to),
@@ -806,6 +811,8 @@ export function buildEarlySignalContent(changes, state) {
       : kinds.has('configuration') ? '⚙️ 创建状态变化'
       : kinds.has('order') ? '🛒 订单状态／成交进度更新'
       : kinds.has('proposal') ? '📝 提案进展'
+      : events.some(e => e.liquidityPreparation === 'approval') ? '🔑 加池准备｜已向仓位管理器授权'
+      : events.some(e => e.liquidityPreparation === 'funding') ? '👀 疑似流动性准备｜关联执行钱包收币'
       : kinds.has('transfer') || kinds.has('nativeTransfer') || kinds.has('nativeBalance') ? '💸 资金变动'
       : kinds.has('approval') ? '🔑 代币授权' : '🔎 关联操作';
     if (lines.length) lines.push('---');
@@ -819,6 +826,7 @@ export function buildEarlySignalContent(changes, state) {
       if (state.tokens[token]?.underlying) lines.push(`底层资产：${addressLink(state.tokens[token].underlying)}`);
     }
     if (state.health?.assets?.lastError) lines.push("当前配置复核异常，上述状态为缓存快照。");
+    if (events.some(e => e.liquidityPreparation)) lines.push('观测时尚未确认该资产支持创建；收币／授权仅为准备线索，不代表已加池或已开放。');
     const compact = summarizeEarlyOperations(events, state, addressLink);
     lines.push(...compact.summaries);
     for (const e of compact.remaining) {
