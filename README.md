@@ -2,6 +2,10 @@
 
 监控 **Four.meme** 与 **Flap.sh** 的页面、接口、合约和链上变化，通过飞书群发送通知。项目包含两个独立监控进程和一个飞书交互机器人。
 
+## 多对话协作入口（Suite 1.12.39）
+
+当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。本次仅更新文档，不改变业务版本、频率或运行状态，不需重启监控。
+
 ## 监控功能
 
 ### Four.meme
