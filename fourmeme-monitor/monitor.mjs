@@ -6208,6 +6208,12 @@ function isVolatileApiStructureField(endpoint, field) {
   return patterns.some(re => re.test(name));
 }
 
+function isOptionalApiStructureField(endpoint, field) {
+  // 实测同一批代币仅部分携带 filterId；进入/离开前十条样本不代表接口变更。
+  // 仅忽略出现与消失，仍保留最近类型基线和连续三轮类型变化检测。
+  return API_TOKEN_LIST_ENDPOINTS.has(endpoint) && normalizeStructureFieldName(field) === 'data[0].filterId';
+}
+
 function mergeOldArrayItemFieldsForEmptySamples(oldFields, newFields) {
   const merged = { ...newFields };
   const newKeys = Object.keys(newFields || {});
@@ -6288,7 +6294,9 @@ function diffApiStructures(oldStruct, newStruct) {
       if (key.endsWith("[]") && key.slice(0, -2) in newFields) continue;
       if (isVolatileApiStructureField(endpoint, key)) continue;
       const normalizedNewType = normalizeApiStructureFieldType(endpoint, key, type);
-      if (!(key in oldFields)) added.push(`${key} (${type})`);
+      if (!(key in oldFields)) {
+        if (!isOptionalApiStructureField(endpoint, key)) added.push(`${key} (${type})`);
+      }
       else {
         const normalizedOldType = normalizeApiStructureFieldType(endpoint, key, oldFields[key]);
         if (normalizedOldType !== normalizedNewType) changed.push(`${key}: ${oldFields[key]} → ${type}`);
@@ -6297,6 +6305,7 @@ function diffApiStructures(oldStruct, newStruct) {
     for (const key of Object.keys(oldFields)) {
       if (key.endsWith("[]") && key.slice(0, -2) in oldFields) continue;
       if (isVolatileApiStructureField(endpoint, key)) continue;
+      if (isOptionalApiStructureField(endpoint, key)) continue;
       if (!(key in newFields)) removed.push(key);
     }
     if (added.length || removed.length || changed.length) {
@@ -6329,6 +6338,9 @@ function stabilizeApiListTypes(oldStruct, newStruct, pending = apiTypeConfirmati
       const count = last?.type === type ? last.count + 1 : 1;
       if (count >= 3) pending.delete(key);
       else { pending.set(key, { type, count }); fields[field] = previous; }
+    }
+    for (const [field, previous] of Object.entries(oldStruct?.[endpoint] || {})) {
+      if (!(field in fields) && isOptionalApiStructureField(endpoint, field)) fields[field] = previous;
     }
   }
   // 失败/缺失的样本中断连续确认，不能跨失败轮次累计。
@@ -9901,7 +9913,7 @@ async function runApiCheck() {
   }
   const notifications = [];
 
-  // 新增/删除字段即时检测，列表字段类型变化经过连续确认。
+  // 除已核验的可选字段外，新增/删除字段即时检测；列表类型变化经过连续确认。
   const apiChanges = diffApiStructures(snapshot.apiStructure, newStruct);
   if (apiChanges.length > 0) {
     log(`[API] 检测到结构变化！`);
@@ -10359,6 +10371,7 @@ export const __testables = {
   fetchActorBlockActions,
   diffApiStructures,
   extractStructure,
+  normalizeApiPayload,
   stabilizeApiListTypes,
   buildMergedFrontendAssetNotification,
   formatFrontendTextChanges,

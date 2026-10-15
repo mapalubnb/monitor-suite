@@ -23,6 +23,60 @@ test('动态满池金额不触发底池告警，其他参数及新增移除保�
   assert.equal(current.totalBAmount, '10013.4');
 });
 
+test('API 可选 filterId 进出前十条样本不会误报，保留最近类型基线', () => {
+  const { normalizeApiPayload, extractStructure, stabilizeApiListTypes, diffApiStructures } = __testables;
+  for (const endpoint of ['token_search_new', 'token_search_cap', 'token_ranking_cap', 'token_ranking_binance']) {
+    const rows = Array.from({ length: 20 }, (_, i) => ({ tokenId: i, name: 'token' }));
+    rows[10].filterId = '1778027615733';
+    const extract = data => ({ [endpoint]: extractStructure(normalizeApiPayload({ data }, 0, 10), '', endpoint) });
+    const absent = extract(rows);
+    const present = extract([rows[10], ...rows.slice(0, 10)]);
+    assert.equal(absent[endpoint]['data[0].filterId'], undefined);
+    assert.equal(present[endpoint]['data[0].filterId'], 'number');
+    assert.deepEqual(diffApiStructures(absent, present), []);
+    assert.deepEqual(diffApiStructures(present, absent), []);
+    const pending = new Map();
+    let baseline = absent;
+    for (const sample of [present, absent, present, absent]) {
+      const next = stabilizeApiListTypes(baseline, sample, pending);
+      assert.deepEqual(diffApiStructures(baseline, next), []);
+      assert.equal(next[endpoint]['data[0].filterId'], 'number');
+      baseline = next;
+    }
+  }
+});
+
+test('API 可选 filterId 类型变化仍需三轮确认，缺失中断确认且不清除基线', () => {
+  const { extractStructure, stabilizeApiListTypes, diffApiStructures } = __testables;
+  const extract = row => ({ token_search_new: extractStructure({ data: [row] }, '', 'token_search_new') });
+  let baseline = extract({ tokenId: 1, filterId: 123 });
+  const pending = new Map();
+  const changed = extract({ tokenId: 1, filterId: 'unexpected' });
+  for (let i = 0; i < 2; i++) baseline = stabilizeApiListTypes(baseline, changed, pending);
+  baseline = stabilizeApiListTypes(baseline, extract({ tokenId: 2 }), pending);
+  assert.equal(pending.size, 0);
+  assert.equal(baseline.token_search_new['data[0].filterId'], 'number');
+  for (let i = 0; i < 2; i++) {
+    const next = stabilizeApiListTypes(baseline, changed, pending);
+    assert.deepEqual(diffApiStructures(baseline, next), []);
+    baseline = next;
+  }
+  const confirmed = stabilizeApiListTypes(baseline, changed, pending);
+  assert.deepEqual(diffApiStructures(baseline, confirmed)[0].changed, ['data[0].filterId: number → string']);
+});
+
+test('API filterId 降噪不屏蔽其他字段及非代币列表同名字段', () => {
+  const { diffApiStructures } = __testables;
+  const before = { token_search_new: { 'data[0].tokenId': 'number', 'data[0].filterId': 'number' } };
+  const after = { token_search_new: { 'data[0].newFeature': 'boolean' } };
+  const changes = diffApiStructures(before, after);
+  assert.deepEqual(changes[0].removed, ['data[0].tokenId']);
+  assert.deepEqual(changes[0].added, ['data[0].newFeature (boolean)']);
+  const config = { public_config: { 'data[0].filterId': 'number' } };
+  assert.deepEqual(diffApiStructures(config, { public_config: {} })[0].removed, ['data[0].filterId']);
+  assert.deepEqual(diffApiStructures({ public_config: {} }, config)[0].added, ['data[0].filterId (number)']);
+});
+
 test('API 混合名称样本与排序变化不会生成新增删除告警', () => {
   const { extractStructure, stabilizeApiListTypes, diffApiStructures } = __testables;
   const extract = rows => ({ token_search_new: extractStructure({data: rows}, '', 'token_search_new') });
