@@ -8507,27 +8507,27 @@ function decodeSafeExecTransaction(input) {
 function classifyActorTx(tx, context) {
   const from = normalizeAddress(tx.from);
   const to = normalizeAddress(tx.to);
-  const selector = txSelector(tx.input);
+  const isDeployment = !to;
+  const selector = isDeployment ? "" : txSelector(tx.input);
   const fromActor = context.actors.get(from);
   const toContract = context.contracts.get(to);
   if (!isCreatorActionActor(fromActor)) return null;
 
   const selectorInfo = ACTOR_SELECTOR_INFO[selector] || (selector ? { name: KNOWN_SELECTORS[selector] || selector, risk: "medium" } : null);
-  const isDeployment = !to;
-  const safeExec = decodeSafeExecTransaction(tx.input || "");
+  const safeExec = isDeployment ? null : decodeSafeExecTransaction(tx.input || "");
   const safeTarget = safeExec?.to ? context.contracts.get(safeExec.to) : null;
   const safeSelectorInfo = safeExec?.selector ? (ACTOR_SELECTOR_INFO[safeExec.selector] || { name: KNOWN_SELECTORS[safeExec.selector] || safeExec.selector, risk: "medium" }) : null;
 
   let risk = "low";
   let reason = "";
   if (isDeployment) {
-    risk = "high";
+    risk = "info";
     reason = "已监听创建者部署新合约";
   } else if (safeExec && (safeTarget || safeSelectorInfo?.risk === "high")) {
     risk = "high";
     reason = `已监听控制合约执行 execTransaction → ${safeTarget?.labels.join("/") || safeExec.to}`;
   } else if (toContract && fromActor) {
-    risk = selectorInfo?.risk === "high" ? "high" : "high";
+    risk = "high";
     reason = `已监听创建者调用受监控合约 ${toContract.labels.join("/")}`;
   } else if (selectorInfo?.risk === "high") {
     risk = "high";
@@ -8540,6 +8540,7 @@ function classifyActorTx(tx, context) {
   }
 
   return {
+    isDeployment,
     risk,
     reason,
     hash: String(tx.hash || "").toLowerCase(),
@@ -8549,7 +8550,7 @@ function classifyActorTx(tx, context) {
     fromActor,
     toContract,
     selector,
-    method: selectorInfo?.name || (isDeployment ? "合约创建" : ""),
+    method: isDeployment ? "部署新合约" : selectorInfo?.name || "",
     safeTarget: safeExec?.to || "",
     safeTargetLabel: safeTarget?.labels.join("/") || "",
     safeSelector: safeExec?.selector || "",
@@ -8635,6 +8636,8 @@ async function fetchActorBlockActions(fromBlock, toBlock, context, state, rpcBat
       if (!hash || seen.has(hash) || seen.has(seenKey)) continue;
       const action = classifyActorTx(tx, context);
       if (!action) continue;
+      action.blockNumber = hexToNumber(block.number);
+      action.blockTimestamp = hexToNumber(block.timestamp);
       action.blockHash = block.hash;
       actions.push(action);
       seen.add(seenKey);
@@ -8645,7 +8648,9 @@ async function fetchActorBlockActions(fromBlock, toBlock, context, state, rpcBat
     const receiptResults = await rpcBatchFn(actions.map(a => ({ method: "eth_getTransactionReceipt", params: [a.hash] })));
     for (let i = 0; i < actions.length; i++) {
       const receipt = receiptResults[i];
-      if (!receipt || !["0x0", "0x1"].includes(receipt.status) || receipt.transactionHash?.toLowerCase() !== actions[i].hash || !blocks.some(block => block.hash === receipt.blockHash)) throw new Error("创建者交易回执缺失或分叉，保留游标");
+      if (!receipt || !["0x0", "0x1"].includes(receipt.status) || receipt.transactionHash?.toLowerCase() !== actions[i].hash || receipt.blockHash !== actions[i].blockHash || hexToNumber(receipt.blockNumber) !== actions[i].blockNumber) {
+        throw new Error(`创建者交易回执${receipt ? '与目标交易/区块不一致' : '缺失'}：${actions[i].hash}，预期区块 ${actions[i].blockNumber}，保留游标`);
+      }
       actions[i].status = receipt.status;
       actions[i].contractAddress = normalizeAddress(receipt?.contractAddress);
       actions[i].logsCount = Array.isArray(receipt?.logs) ? receipt.logs.length : 0;
@@ -8660,6 +8665,37 @@ function rememberActorTxs(state, actions) {
   state.seenTxs = [...new Set(merged)].slice(-500);
 }
 
+// 独立顶层字段由事务快照与 outbox 一起提交；并发通道冲突时整轮回滚重试。
+// 不从 history.jsonl 迁移：它可能包含提交前日志，不能作为已经入队的凭证。
+function ensureActorNotificationLedger(target) {
+  if (!target.actorNotificationLedger) {
+    const entries = {};
+    for (const lane of [target.chainActorMonitor, target.chainActorMonitor?.realtime, target.chainActorHistory]) {
+      for (const key of lane?.seenTxs || []) {
+        if (/^0x[0-9a-f]{64}(?::0x[0-9a-f]{64})?$/i.test(key)) entries[key.toLowerCase()] = 0;
+      }
+    }
+    target.actorNotificationLedger = { entries };
+  }
+  return target.actorNotificationLedger;
+}
+
+function rememberActorNotifications(target, actions) {
+  const ledger = ensureActorNotificationLedger(target);
+  for (const a of actions) ledger.entries[`${a.hash}:${a.blockHash}`] = a.blockNumber;
+  const live = target.chainActorMonitor?.realtime;
+  const history = target.chainActorHistory;
+  const cursors = [live?.lastBlock, history?.lastBlock,
+    ...(live?.realtimeGaps || []).map(r => r.from - 1)];
+  // 缺少任一通道时不推断已经完成；保留所有待补扫区间之前的去重凭证。
+  if (!Number.isSafeInteger(live?.lastBlock) || !Number.isSafeInteger(history?.lastBlock)) return;
+  const floor = Math.min(...cursors.filter(Number.isSafeInteger)) - 64;
+  const recent = new Set(Object.keys(ledger.entries).slice(-500));
+  for (const [key, block] of Object.entries(ledger.entries)) {
+    if (block > 0 && block < floor && !recent.has(key)) delete ledger.entries[key];
+  }
+}
+
 function formatActorWatchList(context) {
   return [...context.actors.values()].map(actor => ({
     address: actor.address,
@@ -8670,28 +8706,30 @@ function formatActorWatchList(context) {
   }));
 }
 
-function formatActorActions(actions) {
-  const riskIcon = { high: "🚨", medium: "⚠️", low: "ℹ️" };
-  const riskLabel = { high: "高风险", medium: "中风险", low: "低风险" };
-  const lines = [];
+function formatActorActions(actions, { historical = false } = {}) {
+  const riskIcon = { high: "🚨", medium: "⚠️", low: "ℹ️", info: "🆕" };
+  const riskLabel = { high: "高风险", medium: "中风险", low: "低风险", info: "动作提醒" };
+  const lines = [historical ? "📚 历史补扫｜以下交易发生于过去，本次补充发现。" : "⚡ 实时监测"];
   for (const a of actions) {
-    lines.push(`**${riskIcon[a.risk] || "⚠️"} ${riskLabel[a.risk] || "未知风险"}：${a.method || "已监听地址交易"}**`);
+    lines.push(`${riskIcon[a.risk] || "⚠️"} ${riskLabel[a.risk] || "未知风险"}：${a.method || "已监听地址交易"}`);
+    lines.push(`🕒 链上时间：${a.blockTimestamp ? formatBeijingTime(a.blockTimestamp * 1000) : '未知'}`);
     lines.push(`- 区块: ${bscBlockLink(a.blockNumber)}`);
     lines.push(formatLinkedLine("发起地址", addressWithMeta(a.from)));
     if (a.fromActor) lines.push(`- 角色: ${diffSnippet(`${a.fromActor.roles.join(",")} (${a.fromActor.labels.join("/")})`)}`);
     if (a.to) lines.push(formatLinkedLine("目标地址", addressWithMeta(a.to, a.toContract ? `(${a.toContract.labels.join("/")})` : "")));
-    if (a.selector) lines.push(`- 函数选择器: ${diffSnippet(a.selector)}`);
+    if (a.selector && !a.isDeployment) lines.push(`- 函数选择器: ${diffSnippet(a.selector)}`);
     if (a.safeTarget) lines.push(formatLinkedLine("内部目标", addressWithMeta(a.safeTarget, a.safeTargetLabel ? `(${a.safeTargetLabel})` : "")));
     if (a.safeSelector) lines.push(`- 内部选择器: ${diffSnippet(`${a.safeSelector}${a.safeMethod ? ` ${a.safeMethod}` : ""}`)}`);
     if (a.contractAddress) lines.push(isEvmAddress(a.contractAddress)
       ? formatLinkedAddedLine("新合约", bscAddressLink(a.contractAddress))
       : formatAddedLine("新合约", a.contractAddress));
-    if (a.status) lines.push(`- 状态: ${diffSnippet(a.status === "0x1" ? "成功" : a.status)}`);
+    if (a.status) lines.push(`- 状态: ${diffSnippet(a.status === "0x1" ? "成功" : a.status === "0x0" ? "执行失败" : a.status)}`);
     lines.push(`- 原因: ${diffSnippet(a.reason)}`);
+    if (a.isDeployment) lines.push("说明：创建者地址关联不代表新合约已经纳入 Four.meme，也不单凭部署判断风险。");
     lines.push(`- 交易: ${bscTxLink(a.hash)}`);
     lines.push("---");
   }
-  lines.push(`监控时间：${ts()}`);
+  lines.push(`本次发现时间：${ts()}`);
   return lines.join("\n");
 }
 
@@ -8985,6 +9023,7 @@ async function runActorLane(realtime) {
   let scannedBlocks = 0;
   let scannedBatches = 0;
   let anyActions = false;
+  const notificationLedger = ensureActorNotificationLedger(snapshot);
 
   while (state.lastBlock < safeLatest && remainingBlocks > 0) {
     const fromBlock = state.lastBlock + 1;
@@ -8994,7 +9033,9 @@ async function runActorLane(realtime) {
       safeLatest - state.lastBlock
     );
     const toBlock = fromBlock + batchSize - 1;
-    const actions = await fetchActorBlockActions(fromBlock, toBlock, context, state);
+    const actions = await fetchActorBlockActions(fromBlock, toBlock, context, {
+      ...state, seenTxs: [...(state.seenTxs || []), ...Object.keys(notificationLedger.entries)],
+    });
 
     const [anchor] = await bscRpcBatch([{ method: "eth_getBlockByNumber", params: [blockTag(toBlock), false] }]);
     if (!anchor?.hash) throw new Error("创建者扫描结束区块缺失");
@@ -9013,6 +9054,7 @@ async function runActorLane(realtime) {
     state.lastRunBatches = scannedBatches + 1;
     state.lastRunAt = ts();
     rememberActorTxs(state, actions);
+    rememberActorNotifications(snapshot, actions);
 
     scannedBlocks += batchSize;
     scannedBatches++;
@@ -9021,11 +9063,12 @@ async function runActorLane(realtime) {
     if (actions.length > 0) {
       anyActions = true;
       const highCount = actions.filter(a => a.risk === "high").length;
-      log(`[创建者] 捕获 ${actions.length} 条创建者动作（高风险 ${highCount} 条），区块 ${fromBlock}-${toBlock}`);
-      const content = formatActorActions(actions);
-      appendHistory("actor", `链上创建者动作（${actions.length}项）`, content.slice(0, 300), content);
-      const color = highCount > 0 ? "red" : "yellow";
-      await sendNotificationMaybeAi({ title: `链上创建者动作（${actions.length}项）`, content, template: color, moduleContext: "Four.meme 合约创建者动作", url: `https://bscscan.com/block/${toBlock}` });
+      log(`[创建者${realtime ? '实时' : '补扫'}] 捕获 ${actions.length} 条创建者动作（高风险 ${highCount} 条），区块 ${fromBlock}-${toBlock}`);
+      const content = formatActorActions(actions, { historical: !realtime });
+      const title = `链上创建者动作${realtime ? '' : ' · 历史补扫'}（${actions.length}项）`;
+      appendHistory("actor", title, content.slice(0, 300), content);
+      const color = highCount > 0 ? "red" : actions.some(a => a.risk === 'medium') ? "yellow" : "blue";
+      await sendNotificationMaybeAi({ title, content, template: color, moduleContext: "Four.meme 合约创建者动作", url: `https://bscscan.com/block/${toBlock}` });
       await saveSnapshot(snapshot);
     }
 
@@ -10325,6 +10368,9 @@ export const __testables = {
   fetchContractFingerprintsForTargets,
   formatOnchainChanges,
   formatActorActions,
+  classifyActorTx,
+  ensureActorNotificationLedger,
+  rememberActorNotifications,
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,
   diffRoutes,

@@ -4,10 +4,118 @@ import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
 
 process.env.FOURMEME_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
+
+const actorHash = n => `0x${n.toString(16).padStart(64, '0')}`;
+function actorFixture() {
+  const from = `0x${'1'.repeat(40)}`;
+  const actor = { address: from, roles: ['creator'], labels: ['OpenFourRegistry'] };
+  const context = { actors: new Map([[from, actor]]), contracts: new Map() };
+  const tx = { hash: actorHash(1), from, to: null, input: '0x6080806040523461', blockNumber: '0xa', value: '0x0' };
+  const block = { hash: actorHash(10), parentHash: actorHash(9), number: '0xa', timestamp: '0x6ac41944', transactions: [tx] };
+  const receipt = { transactionHash: tx.hash, blockHash: block.hash, blockNumber: block.number, status: '0x1', contractAddress: `0x${'2'.repeat(40)}`, logs: [] };
+  return { context, tx, block, receipt };
+}
+
+test('创建者部署使用动作提醒，字节码不作为函数选择器，权限调用仍告警', () => {
+  const { context, tx } = actorFixture();
+  const deployed = __testables.classifyActorTx(tx, context);
+  assert.equal(deployed.risk, 'info');
+  assert.equal(deployed.method, '部署新合约');
+  assert.equal(deployed.selector, '');
+  assert.equal(deployed.safeTarget, '');
+  const upgrade = __testables.classifyActorTx({ ...tx, to: `0x${'3'.repeat(40)}`, input: '0x3659cfe6' }, context);
+  assert.equal(upgrade.risk, 'high');
+  assert.equal(upgrade.isDeployment, false);
+  assert.equal(__testables.classifyActorTx({ ...tx, from: `0x${'4'.repeat(40)}` }, context), null);
+});
+
+test('创建者卡片明确标注历史与链上北京时间，不把失败交易显示为成功', () => {
+  const { context, tx } = actorFixture();
+  const action = { ...__testables.classifyActorTx(tx, context), blockTimestamp: Date.parse('2026-10-13T16:03:32Z') / 1000, status: '0x1' };
+  const card = __testables.formatActorActions([action], { historical: true });
+  assert.match(card, /历史补扫/);
+  assert.match(card, /链上时间：2026\/10\/14 00:03:32\.000/);
+  assert.match(card, /本次发现时间/);
+  assert.doesNotMatch(card, /高风险|函数选择器|0x60808060|\*\*/);
+  assert.match(card, /不代表新合约已经纳入 Four.meme/);
+  const live = __testables.formatActorActions([{ ...action, status: '0x0' }]);
+  assert.match(live, /实时监测/);
+  assert.match(live, /执行失败/);
+  assert.doesNotMatch(live, /历史补扫/);
+});
+
+test('创建者回执必须对应本笔区块，时间直接取已读取区块', async () => {
+  const { context, block, receipt } = actorFixture();
+  const rpc = async calls => calls[0].method === 'eth_getBlockByNumber' ? [block] : [receipt];
+  const actions = await __testables.fetchActorBlockActions(10, 10, context, {}, rpc);
+  assert.equal(actions[0].blockTimestamp, Number(block.timestamp));
+  assert.equal(actions[0].blockNumber, 10);
+  receipt.blockNumber = '0xb';
+  await assert.rejects(__testables.fetchActorBlockActions(10, 10, context, {}, rpc), /不一致.*预期区块 10/);
+  receipt.blockNumber = '0xa'; receipt.blockHash = actorHash(11);
+  await assert.rejects(__testables.fetchActorBlockActions(10, 10, context, {}, rpc), /不一致/);
+});
+
+test('创建者两通道迁移及重启共用去重记录，重组新块仍保留提醒', async () => {
+  const { context, block, receipt } = actorFixture();
+  const target = { chainActorMonitor: { seenTxs: [actorHash(2)], realtime: { seenTxs: [`${actorHash(1)}:${block.hash}`] } }, chainActorHistory: { seenTxs: [actorHash(3)] } };
+  let ledger = __testables.ensureActorNotificationLedger(target);
+  assert.equal(Object.keys(ledger.entries).length, 3);
+  ledger = __testables.ensureActorNotificationLedger(JSON.parse(JSON.stringify(target)));
+  let receiptCalls = 0;
+  const rpc = async calls => {
+    if (calls[0].method === 'eth_getBlockByNumber') return [block];
+    receiptCalls++; return [receipt];
+  };
+  assert.equal((await __testables.fetchActorBlockActions(10, 10, context, { seenTxs: Object.keys(ledger.entries) }, rpc)).length, 0);
+  assert.equal(receiptCalls, 0);
+  block.hash = actorHash(12); receipt.blockHash = block.hash;
+  assert.equal((await __testables.fetchActorBlockActions(10, 10, context, { seenTxs: Object.keys(ledger.entries) }, rpc)).length, 1);
+});
+
+test('创建者去重保留尚未补扫的交易，越过两个游标后才清理旧记录', () => {
+  const actions = Array.from({ length: 700 }, (_, i) => ({ hash: actorHash(i + 1), blockHash: actorHash(800 + i), blockNumber: i + 1 }));
+  const target = { chainActorMonitor: { realtime: { lastBlock: 2000, realtimeGaps: [{ from: 1, to: 1000 }] } }, chainActorHistory: { lastBlock: 2000 } };
+  __testables.rememberActorNotifications(target, actions);
+  assert.equal(Object.keys(target.actorNotificationLedger.entries).length, 700);
+  target.chainActorMonitor.realtime.realtimeGaps = [];
+  target.chainActorHistory.lastBlock = 0;
+  __testables.rememberActorNotifications(target, []);
+  assert.equal(Object.keys(target.actorNotificationLedger.entries).length, 700);
+  target.chainActorHistory.lastBlock = 2000;
+  __testables.rememberActorNotifications(target, []);
+  assert.equal(Object.keys(target.actorNotificationLedger.entries).length, 500);
+});
+
+test('创建者并发通道只提交一份通知，失败回滚及重启不会误吞或重发', async () => {
+  let disk = { actorNotificationLedger: { entries: {} } };
+  const store = createTransactionalOutbox({ initial: disk, persist: state => { disk = structuredClone(state); }, deliver: async () => 'test' });
+  const action = { hash: actorHash(1), blockHash: actorHash(10), blockNumber: 10 };
+  const key = `${action.hash}:${action.blockHash}`;
+  let arrivals = 0, release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const scan = async (wait = false) => {
+    const ledger = __testables.ensureActorNotificationLedger(store.state);
+    if (key in ledger.entries) return;
+    if (wait) { if (++arrivals === 2) release(); await gate; }
+    __testables.rememberActorNotifications(store.state, [action]);
+    await store.enqueue({ title: 'actor', content: key });
+  };
+  await assert.rejects(store.transaction(async () => { await scan(); throw new Error('rollback'); }), /rollback/);
+  assert.equal(Object.keys(disk.actorNotificationLedger.entries).length, 0);
+  const results = await Promise.allSettled([store.transaction(() => scan(true)), store.transaction(() => scan(true))]);
+  assert.equal(results.filter(r => r.status === 'fulfilled').length, 1);
+  assert.match(results.find(r => r.status === 'rejected').reason.message, /并发快照字段冲突/);
+  await store.transaction(() => scan());
+  assert.equal(disk._notificationOutbox.length, 1);
+  const restarted = createTransactionalOutbox({ initial: disk, persist: () => {}, deliver: async () => 'test' });
+  assert.ok(key in __testables.ensureActorNotificationLedger(restarted.state).entries);
+});
 
 test('动态满池金额不触发底池告警，其他参数及新增移除保持检测', () => {
   const previous = { networkCode: 'BSC', symbol: 'USD1', symbolAddress: '0x' + '1'.repeat(40),
