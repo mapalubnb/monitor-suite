@@ -65,13 +65,17 @@
 
 专项使用 `npm run test:flap`，语法使用 `npm run check`；按变更选择真实回执 fixtures 验证分类、重组、失败重试及分片投递。回放不向真实群发送消息、不推进生产游标。
 
-### 发布交接：1.10.34 关联地址覆盖（2026/10/17）
+### 已发布：1.10.34 关联地址覆盖（2026/10/17）
 
 用户已确认实施并授权验证后交总控发布。实现基于本地 `main` 的 `026159cc9cb984a635769529203b6bcbaec63bda`；本模块未提交、推送、修改服务器或重启服务。根版本及 README 由总控整合。
 
 总控已接手并整合 Suite `1.12.40`、根 README 及新增模块语法检查。复核补充修正了 Safe 外层回执成功但内部失败时的观察归并：必须有有效 Safe 执行结果，缺失结果保持待核验，失败不能被覆盖为成功。该场景先通过失败测试复现，修复后相关 80 项及全量 575 项测试通过，`npm run check` 通过。实际部署结果以总控发布回执及三方提交核对为准。
 
 发布前基线（2026/10/17 13:06，北京时间）：服务器仍为 1.10.33，提前信号实时游标与最新高度一致，pending 订阅正常。EWYB 执行钱包已有 `CoW 订单 owner 不匹配`（132 次）的既存来源错误；本次不删除校验或清空错误掩盖它，该项需后续单独核验。
+
+总控发布验收（2026/10/17 13:09:54，北京时间）：业务提交 `d1aba563e5437a58ad7d141adcd0431d442f2f95` 已先推 GitHub 再快进部署；服务器语法检查及 Flap 361 项测试通过。仅重启 Flap，版本 1.10.34、PID 3521060；Four.meme 与飞书机器人 PID 不变，`.env` 哈希和全部任务调度周期不变。新 Safe 于 13:09:18.702 完成公开提案轮询，nonce 2、错误为空；18 个观察地址从 128111708 起覆盖。实时游标推进至 128111911，与当时最新高度一致；Factory／注册已追平，pending 已收 17743 条消息、丢弃 0。观察窗口约 94 秒，尚无新增重要 pending 自然命中，不能视为长期稳定或提前捕获率证明。
+
+回滚备份：`/root/monitor-suite-backups/flap-1.10.34-20261017-130754`，含前一提交代码、配置、停机后完整 Flap 状态及快照分片、验证日志和前后指标。另有既存公共池卡片编辑失败：升级前备份已记录 2391 次 HTTP 400，升级后错误 230031 明确为超过 14 天编辑期限，仍有两条旧公共池事件等待更新。该项和上述 CoW 来源错误需后续单独修复，不删除队列或更改降噪规则来掩盖。本轮无待发布业务改动。
 
 - 问题与证据：资金关联 Safe `0x65eA398b9EB6b7A75FD5A1018463039374A0b908` 原仅候选，现补提案／签名监控；16 个签名关联地址和资金收款人 `0x24160Dfca52F12017338932DEcE5c85c4F971aeB` 补独立观察。新 Safe 仍为 2/3，四个真实样本的区块 hash 于 2026/10/17 13:02:57 只读复核通过。证据、完整名单与业务边界见 [MONITORING](MONITORING.md) 最新章节及 fixture。
 - 修改文件：`early-signal-catalog.mjs`、新增 `address-observation.mjs`、`early-signal-monitor.mjs`、`early-signal-notifications.mjs`、`operational-call-codec.mjs`、`safe-proposal-monitor.mjs`、新增 `pending-operations.mjs`、`pending-registry.mjs`、`pending-registry-worker.mjs`、`registry-notifications.mjs`、`monitor.mjs`；测试 `early-signal-monitor.test.mjs`、`pending-registry.test.mjs`；新增 `fixtures/address-coverage-20261017.json`；模块 `package.json`、`MONITORING.md` 和本交接。

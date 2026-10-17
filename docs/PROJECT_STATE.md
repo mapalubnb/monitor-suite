@@ -27,9 +27,9 @@
 ## 项目与发布基线
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
-- 上次已核验业务提交：`281261e551e85ca213faed93b51f9f3f12c671b9`（创建者动作去重与历史提醒修复）。这是历史业务基线，不是对未来 HEAD 的固定要求。
-- 当前发布版本：Suite `1.12.40`、Four.meme `1.5.16`、Flap `1.10.34`。本次补齐关联 Safe、签名者与资金地址观察及重要操作 pending；详细范围与验证见 Flap HANDOFF。上次协作文档发布基线为 `026159cc9cb984a635769529203b6bcbaec63bda`。
-- 本次仅需重启 `flap-monitor`；保留 `.env`、监控频率、历史策略及原有过滤规则。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
+- 最新已核验业务提交：`d1aba563e5437a58ad7d141adcd0431d442f2f95`（Flap 关联地址覆盖）；Four.meme 业务基线仍为 `281261e551e85ca213faed93b51f9f3f12c671b9`。这些不是对未来 HEAD 的固定要求。
+- 当前版本：Suite `1.12.41`（发布验收文档）、Four.meme `1.5.16`、Flap `1.10.34`。业务发布为 Suite 1.12.40，已补齐关联 Safe、签名者与资金地址观察及重要操作 pending；详细证据见 Flap HANDOFF。
+- 业务发布仅重启 `flap-monitor`，`.env`、监控频率、历史策略及原有过滤规则保留；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
 - 日志：`/root/.pm2/logs/<服务名>-out.log` 与 `-error.log`；备份根目录：`/root/monitor-suite-backups/`。
@@ -77,4 +77,5 @@
 - 公共页面可能返回 403/429；看现有 HTTP 分范围恢复状态。AI 曾返回 403，核验其当前状态需另查日志/配置，不应由这次文档初始化修改凭证。
 - Flap pending 不能覆盖私有交易池；Safe 仅覆盖公开服务可见的提案。历史放弃记录必须保留；旧文档中早期方案与新实现不同，以代码、当前配置和较新变更说明核实。
 - 2026/10/17 发布前发现 EWYB 执行钱包 `0x57d5656b4212af89f0afcc9680a7fb1d08b5c5c9` 已有 `CoW 订单 owner 不匹配` 来源错误；保留身份校验，后续单独核验，不视为本次新增观察层导致。
+- 2026/10/17 发布验收确认既存公共池卡片超过飞书 14 天编辑期限（230031），两条旧公共池事件仍待更新；升级前已有 2391 次失败，需单独修复卡片更新生命周期，不能简单清空队列或恢复普通公共池活动推送。
 - 初始化只创建交接入口，不创建定时任务或额外后台监控实例。
