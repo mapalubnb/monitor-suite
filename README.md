@@ -4,7 +4,13 @@
 
 ## 多对话协作入口（Suite 1.12.39）
 
-当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。本次仅更新文档，不改变业务版本、频率或运行状态，不需重启监控。
+当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。协作入口在 Suite 1.12.39 建立，该次仅为文档更新。
+
+## 2026-10-17 Flap 关联地址与重要操作覆盖
+
+Monitor Suite 1.12.40 / Flap 1.10.34 补入资金关联 Safe `0x65ea398b9eb6b7a75fd5a1018463039374a0b908` 的公开提案及签名监控，并为 16 个签名关联地址及 `0x24160dfca52f12017338932dece5c85c4f971aeb` 建立独立观察层。观察身份不赋予官方加池归属，也不推进资产准备阶段；新增地址从首次实时高度开始覆盖，不回放历史活动。
+
+复用现有 pending Worker 和预算，扩展重要权限、Factory 配置、资金与 V3 仓位调用预警，核对回执并处理替代、重组及同卡结果更新。Safe 外层交易成功不代表内部操作成功；执行失败或缺少结果事件时，不将观察结果归并为成功。原监控频率、Safe Key 策略、历史放弃记录及降噪边界保持不变。增加 Safe 会延长固定预算下的轮转覆盖周期，公开 pending 不保证每笔提前捕获。部署仅需重启 `flap-monitor`，无需追加 `FLAP_EARLY_WALLETS`；详见 [Flap 最新说明](flap-monitor/MONITORING.md)。
 
 ## 监控功能
 

@@ -5,6 +5,127 @@ import { decodePendingRegistration, ingestPendingRegistration, checkPendingRegis
   observePendingReplacement, pendingRegistryContent } from './pending-registry.mjs';
 import { ingestRegistryLog, drainRegistryNotifications, REGISTRY_TOPIC } from './registry-notifications.mjs';
 import { DEFAULT_FLAP_ADMIN_SAFES, VAULT_PORTAL as portal } from './safe-proposal-monitor.mjs';
+import { decodePendingOperation, checkPendingOperation, reconcileOperationObservations, pendingOperationContent } from './pending-operations.mjs';
+import { OBSERVATION_WALLETS, DEX } from './early-signal-catalog.mjs';
+import { selectEarlyNotification } from './early-signal-notifications.mjs';
+import { establishObservationCoverage, observeAddressTransaction } from './address-observation.mjs';
+const coverage = JSON.parse(readFileSync(new URL('./fixtures/address-coverage-20261017.json', import.meta.url)));
+
+test('重要 pending 真实 Safe 调拨、owner 新增与 v=1 直接执行严格区分', () => {
+  const pending = s => ({ ...s.transaction, blockHash: null, blockNumber: null });
+  const funding = decodePendingOperation(pending(coverage.samples[0]));
+  assert.deepEqual(funding[0].actions.map(a => a.kind), ['funding', 'transfer']);
+  assert.equal(funding[0].actions[0].amount, '3100000000000000000');
+  assert.equal(decodePendingOperation(pending(coverage.samples[1]))[0].actions[0].kind, 'safeOwner');
+  assert.deepEqual(decodePendingOperation(coverage.samples[0].transaction), []);
+  // Registry/UI calls are not promoted merely because v=1 is present.
+  assert.deepEqual(decodePendingOperation(pending(coverage.samples[2])), []);
+  for (const patch of [{ to: '0x' + '99'.repeat(20) }, { chainId: '0x1' }, { input: '0x6a761202' }])
+    assert.deepEqual(decodePendingOperation({ ...pending(coverage.samples[0]), ...patch }), []);
+});
+test('直接签名者的 V3 调用严格绑定管理器，未知调用不生成重要 pending', () => {
+  const base = { hash: '0x' + 'a1'.repeat(32), from: OBSERVATION_WALLETS[4], to: DEX.v3Positions,
+    nonce: '0x1', value: '0x0', input: '0x0c49ccbe' + '0'.repeat(64 * 5) };
+  assert.equal(decodePendingOperation(base)[0].actions[0].kind, 'liquidityCall');
+  assert.deepEqual(decodePendingOperation({ ...base, to: '0x' + '99'.repeat(20) }), []);
+  assert.deepEqual(decodePendingOperation({ ...base, input: '0xdeadbeef' }), []);
+  assert.deepEqual(decodePendingOperation({ ...base, input: base.input + '00' }), []);
+  const w = n => BigInt(n).toString(16).padStart(64, '0');
+  const child = base.input.slice(2), packed = w(child.length / 2) + child.padEnd(Math.ceil(child.length / 64) * 64, '0');
+  const multi = '0xac9650d8' + w(32) + w(1) + w(32) + packed;
+  assert.equal(decodePendingOperation({ ...base, input: multi })[0].actions[0].kind, 'liquidityCall');
+  assert.deepEqual(decodePendingOperation({ ...base, input: '0xac9650d8' + w(32) + w(1) + w(0) + packed }), []);
+});
+test('重要预警模拟、真实回执、重组与重新上链更新同一记录', async () => {
+  const sample = coverage.samples[0], state = {};
+  ingestPendingRegistration(state, decodePendingOperation({ ...sample.transaction, blockHash: null, blockNumber: null }), { now: 1000 });
+  const r = Object.values(state.pendingRegistrations)[0];
+  let block = sample.block, receipt = sample.receipt;
+  const rpc = async method => method === 'eth_call' ? '0x' + '0'.repeat(63) + '1'
+    : method === 'eth_getTransactionReceipt' ? receipt : block;
+  const opts = { rpc, now: () => 2000, persist: () => {} };
+  await checkPendingOperation(r, state, opts); assert.equal(r.status, 'pending');
+  await checkPendingOperation(r, state, opts); assert.equal(r.status, 'executed');
+  assert.equal(r.confirmedBlockHash, sample.receipt.blockHash);
+  assert.doesNotMatch(pendingOperationContent(r), /\*\*/);
+  block = { ...block, hash: '0x' + '66'.repeat(32) };
+  await checkPendingOperation(r, state, opts); assert.equal(r.status, 'withdrawn');
+  const stale = { pendingChanges: [{ id: 'old', kind: 'addressObservation', observationOnly: true,
+    transactionHash: r.txHash, blockHash: sample.receipt.blockHash, blockNumber: Number(sample.receipt.blockNumber), detail: 'old' }] };
+  assert.equal(reconcileOperationObservations(stale, state).heldIds.size, 1);
+  assert.equal(r.status, 'withdrawn');
+  receipt = { ...receipt, blockHash: block.hash };
+  await checkPendingOperation(r, state, opts); assert.equal(r.status, 'executed');
+  assert.equal(r.confirmedBlockHash, block.hash);
+});
+test('缺少 Safe 成功事件不得确认；失败回执与同 nonce 替代必须验证身份', async () => {
+  const sample = coverage.samples[0];
+  const [r] = decodePendingOperation({ ...sample.transaction, blockHash: null, blockNumber: null });
+  Object.assign(r, { status: 'pending', firstSeenAt: new Date(1000).toISOString(), simulatedAt: 'done' });
+  let receipt = { ...sample.receipt, logs: [] };
+  const opts = { now: () => 2000, persist: () => {}, rpc: async m => m === 'eth_getTransactionReceipt' ? receipt : sample.block };
+  await checkPendingOperation(r, {}, opts);
+  assert.equal(r.status, 'pending'); assert.match(r.lastError, /缺少 Safe/);
+  receipt = { ...receipt, status: '0x0' };
+  await checkPendingOperation(r, {}, opts); assert.equal(r.status, 'failed');
+  delete r.confirmedBlockHash; r.status = 'pending'; r.replacementHash = '0x' + '88'.repeat(32);
+  opts.rpc = async m => m === 'eth_getTransactionReceipt' ? null : { hash: r.replacementHash, from: r.from, nonce: '0xffff' };
+  await checkPendingOperation(r, {}, opts);
+  assert.equal(r.status, 'pending'); assert.match(r.lastError, /替代交易身份/);
+});
+test('观察确认归并原预警：发送失败不丢事件，重启重试且其他关键事件继续发送', async () => {
+  const sample = coverage.samples[0], state = {};
+  ingestPendingRegistration(state, decodePendingOperation({ ...sample.transaction, blockHash: null, blockNumber: null }), { now: 1000 });
+  const r = Object.values(state.pendingRegistrations)[0]; r.messageId = 'same-card';
+  const event = { id: 'observation', kind: 'addressObservation', observationOnly: true, transactionHash: r.txHash,
+    blockHash: sample.receipt.blockHash, blockNumber: Number(sample.receipt.blockNumber), safeExecutionStatus: 'executed', detail: '真实调拨' };
+  const early = { pendingChanges: [event, { id: 'authority', kind: 'authority', transactionHash: 'other' }] };
+  let link = reconcileOperationObservations(early, state);
+  assert.equal(link.acknowledgedIds.length, 0);
+  assert.deepEqual(selectEarlyNotification(early, 2000, link.heldIds).changes.map(e => e.id), ['authority']);
+  await drainRegistryNotifications(state, { now: () => 2000, patchPending: async () => { throw Error('offline'); } });
+  assert.equal(reconcileOperationObservations(early, state).acknowledgedIds.length, 0);
+  const restored = JSON.parse(JSON.stringify(state)); let patches = 0;
+  await drainRegistryNotifications(restored, { now: () => 9000, patchPending: async r => { assert.equal(r.messageId, 'same-card'); patches++; } });
+  assert.equal(patches, 1);
+  assert.deepEqual(reconcileOperationObservations(early, restored).acknowledgedIds, ['observation']);
+});
+test('迟到模拟不能覆盖已确认的观察结果', async () => {
+  const sample = coverage.samples[0], state = {};
+  ingestPendingRegistration(state, decodePendingOperation({ ...sample.transaction, blockHash: null, blockNumber: null }), { now: 1000 });
+  const r = Object.values(state.pendingRegistrations)[0]; let resolve;
+  const checking = checkPendingOperation(r, state, { now: () => 2000, persist: () => {}, rpc: () => new Promise(done => { resolve = done; }) });
+  reconcileOperationObservations({ pendingChanges: [{ id: 'e', kind: 'addressObservation', observationOnly: true,
+    transactionHash: r.txHash, blockHash: sample.receipt.blockHash, blockNumber: Number(sample.receipt.blockNumber), safeExecutionStatus: 'executed', detail: 'mined' }] }, state);
+  resolve('0x' + '0'.repeat(63) + '1'); await checking;
+  assert.equal(r.status, 'executed'); assert.equal(r.confirmedDetail, 'mined');
+});
+
+test('Safe 外层成功但内部失败或结果缺失时，观察归并不能改成执行成功', async () => {
+  const sample = coverage.samples[0];
+  const transaction = { ...sample.transaction, from: OBSERVATION_WALLETS[0].toLowerCase() };
+  for (const failed of [true, false]) {
+    const pendingState = {}, early = { pendingChanges: [] };
+    ingestPendingRegistration(pendingState, decodePendingOperation({ ...transaction, blockHash: null, blockNumber: null }), { now: 1000 });
+    const r = Object.values(pendingState.pendingRegistrations)[0];
+    Object.assign(r, { status: 'pending', messageId: 'existing-preview' });
+    establishObservationCoverage(early, {}, 0);
+    const receipt = { ...sample.receipt, from: transaction.from, logs: failed ? [{ address: transaction.to,
+      topics: ['0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23'] }] : [] };
+    const [observed] = observeAddressTransaction(receipt, transaction, early, {}, new Set());
+    assert.ok(observed);
+    assert.equal(observed.safeExecutionStatus, failed ? 'failed' : 'unverified');
+    assert.match(observed.detail, failed ? /内部执行失败/ : /执行结果待核验/);
+    early.pendingChanges = [{ ...observed, id: 'observed-failure', transactionHash: r.txHash,
+      blockHash: receipt.blockHash, blockNumber: Number(receipt.blockNumber) }];
+    reconcileOperationObservations(early, pendingState);
+    assert.equal(r.status, failed ? 'failed' : 'pending');
+    if (failed) {
+      await drainRegistryNotifications(pendingState, { now: () => 2000, patchPending: async record => assert.equal(record.status, 'failed') });
+      assert.deepEqual(reconcileOperationObservations(early, pendingState).acknowledgedIds, ['observed-failure']);
+    }
+  }
+});
 const a = digit => '0x' + digit.repeat(40), h = digit => '0x' + digit.repeat(64);
 const word = value => BigInt(value).toString(16).padStart(64, '0');
 const data = '0x4809625b' + word(a('1')) + word(1) + word(0) + word(1);

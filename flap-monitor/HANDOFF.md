@@ -65,4 +65,18 @@
 
 专项使用 `npm run test:flap`，语法使用 `npm run check`；按变更选择真实回执 fixtures 验证分类、重组、失败重试及分片投递。回放不向真实群发送消息、不推进生产游标。
 
-当前无待发布业务改动；本次为交接初始化。下次替换本段填写：问题及证据、改动文件、重要事件保留/降噪边界、测试结果、性能和请求增量、配置/状态迁移、需重启服务、残留问题。提交与部署由总控完成。
+### 发布交接：1.10.34 关联地址覆盖（2026/10/17）
+
+用户已确认实施并授权验证后交总控发布。实现基于本地 `main` 的 `026159cc9cb984a635769529203b6bcbaec63bda`；本模块未提交、推送、修改服务器或重启服务。根版本及 README 由总控整合。
+
+总控已接手并整合 Suite `1.12.40`、根 README 及新增模块语法检查。复核补充修正了 Safe 外层回执成功但内部失败时的观察归并：必须有有效 Safe 执行结果，缺失结果保持待核验，失败不能被覆盖为成功。该场景先通过失败测试复现，修复后相关 80 项及全量 575 项测试通过，`npm run check` 通过。实际部署结果以总控发布回执及三方提交核对为准。
+
+发布前基线（2026/10/17 13:06，北京时间）：服务器仍为 1.10.33，提前信号实时游标与最新高度一致，pending 订阅正常。EWYB 执行钱包已有 `CoW 订单 owner 不匹配`（132 次）的既存来源错误；本次不删除校验或清空错误掩盖它，该项需后续单独核验。
+
+- 问题与证据：资金关联 Safe `0x65eA398b9EB6b7A75FD5A1018463039374A0b908` 原仅候选，现补提案／签名监控；16 个签名关联地址和资金收款人 `0x24160Dfca52F12017338932DEcE5c85c4F971aeB` 补独立观察。新 Safe 仍为 2/3，四个真实样本的区块 hash 于 2026/10/17 13:02:57 只读复核通过。证据、完整名单与业务边界见 [MONITORING](MONITORING.md) 最新章节及 fixture。
+- 修改文件：`early-signal-catalog.mjs`、新增 `address-observation.mjs`、`early-signal-monitor.mjs`、`early-signal-notifications.mjs`、`operational-call-codec.mjs`、`safe-proposal-monitor.mjs`、新增 `pending-operations.mjs`、`pending-registry.mjs`、`pending-registry-worker.mjs`、`registry-notifications.mjs`、`monitor.mjs`；测试 `early-signal-monitor.test.mjs`、`pending-registry.test.mjs`；新增 `fixtures/address-coverage-20261017.json`；模块 `package.json`、`MONITORING.md` 和本交接。
+- 行为：新增地址不授予官方／执行钱包身份，不提升准备阶段；被动收币静默、投毒日志不认定主动参与。新增 owner 进入待核验候选。重要 pending 有只读模拟、回执身份／Safe 结果核验、替代及重组纠正；新观察结果归并原预警，投递成功才出队。原关键权限／LP／CoW 事件继续独立提醒。
+- 验证：`npm run check` 通过，两个新增模块分别 `node --check` 通过；`npm run test:flap` 360/360 通过（原 350 项 + 10 项新测试）。新增测试覆盖真实资金调拨／新增 owner／v=1／投毒回放、历史起点、畸形／错误目标调用、V3 multicall、重组、失败回执、替代身份、发送失败重启及迟到模拟。未向真实群发测试卡片，未推进生产状态。
+- 保持：所有周期、Safe Key／预算、旧降噪、已关闭推送、历史放弃记录和历史读取策略不变。新 Safe 进入固定轮转会拉长整体覆盖周期；17 个观察地址只增加命中交易查询，不增加余额／CoW 轮询。pending 沿用单笔核验和 Worker 既有预算，注册优先；高负载可能使新增操作等待或被容量限制，健康计数可见。
+- 配置／迁移：正常生产配置无需新增环境变量，保留 `FLAP_EARLY_WALLETS`；不把 24160 或签名者加入其中。可选 `FLAP_OBSERVATION_WALLETS` 仅追加观察。若关闭 `FLAP_SAFE_INCLUDE_CORE`，总控需核对显式 Safe 列表。新 `observationCoverage` 自首次实时高度起生效，状态其余字段保持；不做历史补发和旧游标变更。
+- 发布：请总控复核 diff、更新根版本／README，再验证、中文提交、推送并核验确切提交后部署；仅需重启 `flap-monitor`，保留并备份现有状态。发布后核对新 Safe 配置／轮转、观察起点、扫描推进、pending 队列和错误。该结果为本地验证，不代表已上线；私有 pending／未公开 Safe 提案、未覆盖的 V4／Infinity pending 仍有覆盖限制。

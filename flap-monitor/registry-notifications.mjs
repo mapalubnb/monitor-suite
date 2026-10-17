@@ -91,13 +91,18 @@ function patchVersion(record) {
   return record.revoked ? 'revoked' : record.codeStatus === 'missing' ? 'missing-code' : '';
 }
 
+const pendingNeedsPatch = r => r.patchedStatus !== r.status || r.patchedSimulationStatus !== r.simulationStatus
+  || r.operationPreview && r.patchedDetail !== r.confirmedDetail;
+const pendingCanSend = r => ['checking', 'pending', 'unverified'].includes(r.status)
+  || r.operationPreview && ['executed', 'failed', 'replaced', 'withdrawn'].includes(r.status);
+
 export function drainRegistryNotifications(state, { persist = () => {}, send, patch, sendPending, patchPending, now = Date.now } = {}) {
   if (flights.has(state)) return flights.get(state);
   if (!Object.values(state.notifications || {}).some(r => (r.nextAttemptAt || 0) <= now()
     && (!r.messageId && !r.revoked && !r.candidate || r.messageId && patchVersion(r) && r.patchedVersion !== patchVersion(r)))
     && !Object.values(state.pendingRegistrations || {}).some(r => r.mode === 'live' && (r.nextAttemptAt || 0) <= now()
-      && (sendPending && !r.messageId && ['checking', 'pending', 'unverified'].includes(r.status)
-        || patchPending && r.messageId && r.status !== 'registered' && (r.patchedStatus !== r.status || r.patchedSimulationStatus !== r.simulationStatus)))) {
+      && (sendPending && !r.messageId && pendingCanSend(r)
+        || patchPending && r.messageId && r.status !== 'registered' && pendingNeedsPatch(r)))) {
     return Promise.resolve({ sent: false, errors: [] });
   }
   const run = (async () => {
@@ -145,9 +150,9 @@ export function drainRegistryNotifications(state, { persist = () => {}, send, pa
     for (const r of Object.values(state.pendingRegistrations || {})) {
       if (r.mode !== 'live' || (r.nextAttemptAt || 0) > now() || r.status === 'registered') continue;
       try {
-        if (!r.messageId && ['checking', 'pending', 'unverified'].includes(r.status) && sendPending) {
+        if (!r.messageId && pendingCanSend(r) && sendPending) {
           persist();
-          const version = r.status, simulationVersion = r.simulationStatus;
+          const version = r.status, simulationVersion = r.simulationStatus, detailVersion = r.confirmedDetail;
           r.sendStartedAt = new Date(now()).toISOString();
           const observation = state.pendingObservations?.[r.key];
           if (observation) observation.sendStartedAt = r.sendStartedAt;
@@ -155,13 +160,15 @@ export function drainRegistryNotifications(state, { persist = () => {}, send, pa
           const id = await sendPending({ ...r }, `registry-pending:${r.key}`);
           if (!id) throw Error('pending 注册预警未送达');
           r.messageId = id; r.sentAt = new Date(now()).toISOString(); r.patchedStatus = version; r.patchedSimulationStatus = simulationVersion;
+          r.patchedDetail = detailVersion;
           r.deliveryMs = now() - Date.parse(r.firstSeenAt);
           if (observation) Object.assign(observation, { sentAt: r.sentAt, messageId: id, deliveryMs: r.deliveryMs });
           persist(); sent++;
         }
-        if (r.messageId && r.status !== 'registered' && (r.patchedStatus !== r.status || r.patchedSimulationStatus !== r.simulationStatus) && patchPending) {
-          persist(); const version = r.status, simulationVersion = r.simulationStatus;
-          await patchPending({ ...r }); r.patchedStatus = version; r.patchedSimulationStatus = simulationVersion; persist();
+        if (r.messageId && r.status !== 'registered' && pendingNeedsPatch(r) && patchPending) {
+          persist(); const version = r.status, simulationVersion = r.simulationStatus, detailVersion = r.confirmedDetail;
+          await patchPending({ ...r }); r.patchedStatus = version; r.patchedSimulationStatus = simulationVersion;
+          r.patchedDetail = detailVersion; persist();
         }
         r.failures = 0; r.nextAttemptAt = 0; r.lastDeliveryError = '';
       } catch (error) {

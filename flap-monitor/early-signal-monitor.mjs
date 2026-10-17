@@ -3,7 +3,7 @@ import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.m
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { CORE_SAFES, AUXILIARY_SAFES, EXECUTION_WALLETS, CORE_OWNERS, ALLOWANCE_MODULE, PROXY_ADMINS,
-  DEX, POSITION_MANAGERS, BASE_ASSETS } from "./early-signal-catalog.mjs";
+  DEX, POSITION_MANAGERS, BASE_ASSETS, RELATED_SAFES, observationAddresses } from "./early-signal-catalog.mjs";
 import { TOPICS } from "./early-signal-topics.mjs";
 import { abiAddress, abiUint, hexWords } from "./operational-call-codec.mjs";
 import { normalizeAddress, extractFlapProposalActions, createSafeApiPoolFetch, normalizeSafeApiKeys } from "./safe-proposal-monitor.mjs";
@@ -11,6 +11,8 @@ import { FLAP_FACTORY_PROXY, QUOTE_CONFIG_SELECTOR, QUOTE_TOKEN_CREATION_DISABLE
 import { decodeCowTrades, matchCowTransfers, cowDirection } from './cow-notifications.mjs';
 import { poolOperationRelevance, migratePoolEvidence } from './pool-relevance.mjs';
 import { safeReceiptPayment, summarizeEarlyOperations } from './early-operation-summary.mjs';
+
+import { establishObservationCoverage, observeAddressTransaction } from './address-observation.mjs';
 
 export const EARLY_SIGNAL_SCHEMA_VERSION = 2;
 const ZERO = "0x" + "0".repeat(40);
@@ -119,15 +121,15 @@ function candidate(state, address, evidence, nowMs) {
     lastSeenAt: iso(nowMs), evidence: uniq([...(previous?.evidence || []), evidence]).slice(-8) };
 }
 export function watchedWallets(config = {}) {
-  return uniq([...(config.safes || CORE_SAFES.map(([a]) => a)), ...AUXILIARY_SAFES,
+  return uniq([...(config.safes || CORE_SAFES.map(([a]) => a)).filter(a => !(config.relatedSafes ?? RELATED_SAFES).some(r => lower(r) === lower(a))), ...AUXILIARY_SAFES,
     ...(config.wallets || EXECUTION_WALLETS)].map(normalizeAddress));
 }
 export function earlyLogFilters(state, config = {}) {
-  const wallets = watchedWallets(config).map(pad);
+  const wallets = uniq([...watchedWallets(config), ...observationAddresses(config)]).map(pad);
   const active = p => config.subscriptionMode ? p.officialOperation : isRelevantPool(p, state);
   const positionIds = Object.values(state.positions).filter(p => p.manager === DEX.v3Positions && watchedWallets(config).includes(p.owner))
     .map(p => '0x' + BigInt(p.tokenId).toString(16).padStart(64, '0')).sort();
-  const operationAddresses = uniq([...watchedWallets(config), ALLOWANCE_MODULE, ...PROXY_ADMINS,
+  const operationAddresses = uniq([...watchedWallets(config), ...observationAddresses(config), ALLOWANCE_MODULE, ...PROXY_ADMINS,
     config.factoryAddress || FLAP_FACTORY_PROXY, "0x90497450f2a706f1951b5bdda52b4e5d16f34c06",
     DEX.v2Factory, DEX.v3Factory,
     ...Object.values(state.pools).filter(p => /^0x[a-f0-9]{40}$/.test(p.address) && active(p)).map(p => p.address)]).sort();
@@ -167,6 +169,8 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
   if (!receipt || Number(receipt.status) !== 1) return [];
   const options = { nowMs, silent };
   const wallets = new Set(watchedWallets(config));
+  const observedSafes = new Set((config.relatedSafes ?? RELATED_SAFES).map(lower)
+    .filter(a => Number(receipt.blockNumber) >= (state.observationCoverage?.[a] ?? Infinity)));
   const executors = new Set((config.wallets || EXECUTION_WALLETS).map(lower));
   const feeSafe = FEE_SAFE;
   const txFrom = lower(transaction?.from || receipt.from);
@@ -185,6 +189,9 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
       source: "chain", chainId: 56, provisional: true };
     if (emit(state, e, options)) emitted.push(e);
   };
+  for (const event of observeAddressTransaction(receipt, transaction, state, config, wallets)) {
+    add({ blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, transactionHash: receipt.transactionHash, logIndex: event.observationLogIndex ?? -1 }, event);
+  }
   const cowTrades = decodeCowTrades(logs, wallets, state.orders);
   const cowTransfers = matchCowTransfers(logs, cowTrades, TOPICS.Transfer);
   for (const { log, ...trade } of cowTrades) {
@@ -259,9 +266,13 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         trackToken(state, a, "ERC4626 事件，待 asset() 复核", nowMs);
         add(l, { kind: t === TOPICS.Deposit ? "wrap" : "redeem", token: a, stage: "observation", detail: `${t === TOPICS.Deposit ? "存入并铸造包装份额" : "赎回包装份额"} ${a}｜原始参数 ${w.map(abiUint).join(" / ")}；asset() 映射待复核` });
       } else if ([TOPICS.ModuleSuccess, TOPICS.ModuleFailure, TOPICS.EnabledModule, TOPICS.DisabledModule,
-        TOPICS.AddedOwner, TOPICS.RemovedOwner, TOPICS.ChangedThreshold, TOPICS.SafeReceived].includes(t) && wallets.has(a)) {
+        TOPICS.AddedOwner, TOPICS.RemovedOwner, TOPICS.ChangedThreshold, TOPICS.SafeReceived].includes(t) && (wallets.has(a) || observedSafes.has(a))) {
         if (t === TOPICS.SafeReceived && a === feeSafe && !wallets.has(addressTopic(l.topics[1]))) continue;
         add(l, { kind: "safeOperation", detail: `Safe ${a}｜${Object.keys(TOPICS).find(k => TOPICS[k] === t)}｜参数 ${JSON.stringify(l.topics.slice(1))} ${l.data}`, raw: l });
+        if ([TOPICS.AddedOwner, TOPICS.RemovedOwner].includes(t)) {
+          const owner = addressTopic(l.topics[1] || '0x' + (w[0] || ''));
+          candidate(state, owner, `Safe ${t === TOPICS.AddedOwner ? '新增' : '移除'}所有者 ${a} ${receipt.transactionHash}`, nowMs);
+        }
       } else if (a === ALLOWANCE_MODULE) {
         const known = new Set([...wallets].map(x => x.slice(2)));
         if (![...(l.topics || []), ...w].some(x => known.has(x.replace(/^0x/, "").slice(-40)))) continue;
@@ -362,7 +373,8 @@ export function ingestCowOrders(state, owner, orders, { nowMs = Date.now(), boot
   }
 }
 export async function scanCowOrders(state, config, fetchFn, nowMs) {
-  const owners = uniq([...(config.wallets || EXECUTION_WALLETS), ...(config.safes || CORE_SAFES.map(([a]) => a))]);
+  const owners = uniq([...(config.wallets || EXECUTION_WALLETS), ...(config.safes || CORE_SAFES.map(([a]) => a))])
+    .filter(a => !RELATED_SAFES.some(s => lower(s) === lower(a)));
   for (const owner of owners) await sourcePass(state, `cow:${lower(owner)}`, async () => {
     const bootstrap = !state.health[`cow:${lower(owner)}`]?.lastSuccessAt;
     const all = [];
@@ -388,6 +400,7 @@ export function syncEarlyProposals(state, safeState, nowMs = Date.now()) {
       if (a.quoteToken) trackToken(state, a.quoteToken, "Safe 配置提案", nowMs);
       if (a.kind === "transfer" || a.kind === "positionTransfer" || a.kind === "funding") candidate(state, a.recipient, `Safe 计划调拨 ${record.safeTxHash}`, nowMs);
     }
+    if (RELATED_SAFES.some(s => lower(s) === lower(record.safe))) continue;
     // A route alone is preparation, not a proposal to enable creating tokens.
     const lastConfig = record.actions?.filter(a => a.kind === "configuration").at(-1);
     const lastCreation = record.actions?.filter(a => a.kind === "creation").at(-1);
@@ -551,6 +564,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   if (Number(chain) !== 56) throw new Error("RPC chainId 不是 BSC 56");
   const latest = Number(await strictRpc(rpcBatch, "eth_blockNumber", []));
   state.latestBlock = latest;
+  establishObservationCoverage(state, config, latest);
   const confirmations = config.confirmations ?? 0;
   if (config.realtime) recoverLiveCursor(state, {head: latest - confirmations, cursorKey, hashKey});
   else if (activateHistoryGap(state, state, 'cursor', 'historyEndBlock')) state.cursorHash = '';
@@ -584,11 +598,13 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   }
   const transactionMap = new Map();
   if (config.nativeTransactions !== false) {
-    const wallets = new Set(watchedWallets(config));
+    const wallets = new Set([...watchedWallets(config), ...observationAddresses(config)]);
+    const observerLogHashes = new Set(logs.filter(l => [l.topics?.[1], l.topics?.[2]]
+      .some(t => observationAddresses(config).includes(addressTopic(t)))).map(l => lower(l.transactionHash)));
     const blocks = await readEarlyFullBlocks(state, Array.from({ length: to - from + 1 }, (_, i) => from + i), rpcBatch);
     for (const block of blocks) {
       if (!Array.isArray(block.transactions)) throw new Error("完整区块交易不可用");
-      for (const tx of block.transactions) if (wallets.has(lower(tx.from)) || wallets.has(lower(tx.to))) transactionMap.set(lower(tx.hash), tx);
+      for (const tx of block.transactions) if (wallets.has(lower(tx.from)) || wallets.has(lower(tx.to)) || observerLogHashes.has(lower(tx.hash))) transactionMap.set(lower(tx.hash), tx);
     }
   }
   const hashes = uniq([...logs.filter(l => shouldPrioritizeEarlyLog(l, state)).map(l => lower(l.transactionHash)), ...transactionMap.keys()]);
@@ -616,7 +632,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   for (const receipt of receipts.sort((a, b) => Number(a.blockNumber) - Number(b.blockNumber) || Number(a.transactionIndex) - Number(b.transactionIndex))) {
     const tx = transactionMap.get(lower(receipt.transactionHash));
     decodeEarlyReceipt(receipt, draft, { config, nowMs, silent: bootstrap, transaction: tx });
-    if (tx && Number(receipt.status) === 1 && BigInt(tx.value || "0") > 0n) {
+    if (tx && (watchedWallets(config).includes(lower(tx.from)) || watchedWallets(config).includes(lower(tx.to))) && Number(receipt.status) === 1 && BigInt(tx.value || "0") > 0n) {
       emit(draft, { id: `native:${receipt.blockHash}:${tx.hash}`, kind: "nativeTransfer", source: "chain", blockNumber: Number(receipt.blockNumber), blockHash: lower(receipt.blockHash),
         transactionHash: lower(tx.hash), detail: `BNB 直接转账 ${tx.from} → ${tx.to}｜wei ${BigInt(tx.value).toString()}（不含内部调用）` }, { nowMs, silent: bootstrap });
     }
@@ -680,9 +696,18 @@ export async function processEarlyReceiptHints(state, hints, config, rpcBatch, n
       rewindEarlySignals(state, Math.max(1, Number(receipt.blockNumber) - REORG_WINDOW), nowMs);
       continue; // Resolve pool evidence again after removing the old fork's cache.
     }
+    const observed = new Set(observationAddresses(config));
+    const trusted = new Set(watchedWallets(config));
+    const observerReceipt = !trusted.has(lower(receipt.from)) && !trusted.has(lower(receipt.to))
+      && (observed.has(lower(receipt.from)) || observed.has(lower(receipt.to))
+      || receipt.logs?.some(l => [l.topics?.[1], l.topics?.[2]].some(t => observed.has(addressTopic(t)))));
+    const transaction = observerReceipt ? await strictRpc(rpcBatch, "eth_getTransactionByHash", [receipt.transactionHash]) : null;
+    if (observerReceipt && !transaction) continue;
+    if ((state.reorgRevision || 0) !== reorgRevision) continue;
     const draft = structuredClone(state);
     for (const [address, pool] of Object.entries(resolved.pools)) draft.pools[address] ||= pool;
-    const events = decodeEarlyReceipt(receipt, draft, { config, nowMs });
+    establishObservationCoverage(draft, config, observedHead);
+    const events = decodeEarlyReceipt(receipt, draft, { config, nowMs, transaction });
     draft.fastBlocks ||= {};
     if (Number(receipt.blockNumber) > (state.realtimeCursor ?? state.cursor ?? 0)) draft.fastBlocks[Number(receipt.blockNumber)] = lower(receipt.blockHash);
     // Preserve live API progress across the synchronous chain commit.
@@ -765,6 +790,7 @@ function readableBnb(raw) {
   } catch { return '金额待核验'; }
 }
 function earlyOperationDetail(event) {
+  if (event.observationOnly) return String(event.detail || '');
   if (['liquidityAdded', 'liquidityRemoved', 'poolCreated'].includes(event.kind) && event.detail?.includes('｜')) {
     const [action, pool] = event.detail.split('｜');
     return `${event.poolRelevance === 'public' ? '公共池活动 · ' : event.poolRelevance === 'unknown' ? '归属待核验 · ' : ''}${action.match(/^(V[234]|Infinity CL|Infinity Bin)/)?.[0] || 'DEX'} 池：${addressLink(pool.trim())}`;

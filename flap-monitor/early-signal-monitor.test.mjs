@@ -14,6 +14,53 @@ import { decodeOperationalCall } from "./operational-call-codec.mjs";
 import { planCardParts } from '../shared/feishu-client.mjs';
 import { safeReceiptPayment, summarizeEarlyOperations } from './early-operation-summary.mjs';
 import { earlyNotificationPriority } from './early-signal-notifications.mjs';
+import { observationAddresses, OBSERVATION_WALLETS, RELATED_SAFES } from './early-signal-catalog.mjs';
+import { establishObservationCoverage, observeAddressTransaction } from './address-observation.mjs';
+
+const coverageFixture = JSON.parse(readFileSync(new URL('./fixtures/address-coverage-20261017.json', import.meta.url)));
+test('关联覆盖：16 个所有者与资金观察地址有效，真实 Safe 调拨不提升官方准备状态', () => {
+  assert.equal(new Set(OBSERVATION_WALLETS.map(x => x.toLowerCase())).size, 17);
+  assert.equal(observationAddresses().length, 18);
+  const sample = coverageFixture.samples[0], state = createEarlySignalState();
+  const originalCursor = state.cursor;
+  establishObservationCoverage(state, {}, Number(sample.receipt.blockNumber));
+  const events = decodeEarlyReceipt(sample.receipt, state, { transaction: sample.transaction });
+  assert.equal(events.filter(e => e.kind === 'addressObservation').length, 1);
+  assert.match(events[0].detail, /3.1 BNB/);
+  assert.match(events[0].detail, /24160dfca52f12017338932dece5c85c4f971aeb/);
+  assert.doesNotMatch(buildEarlySignalContent(events, state), /\[\[0x/);
+  assert.equal(Object.keys(state.stages).length, 0);
+  assert.equal(Object.keys(state.positions).length, 0);
+  assert.equal(state.cursor, originalCursor);
+  assert.equal(decodeEarlyReceipt(sample.receipt, state, { transaction: sample.transaction }).length, 0);
+  assert.ok(JSON.stringify(earlyLogFilters(state, {})).includes(RELATED_SAFES[0].toLowerCase()));
+});
+test('观察层新增起点持久化，不回放旧交易，不改历史放弃记录', () => {
+  const sample = coverageFixture.samples[0], state = createEarlySignalState();
+  state.abandonedHistory = [{ from: 1, to: 100 }];
+  const head = Number(sample.receipt.blockNumber) + 1;
+  establishObservationCoverage(state, {}, head);
+  const restored = JSON.parse(JSON.stringify(state));
+  establishObservationCoverage(restored, {}, head + 100);
+  assert.equal(restored.observationCoverage[RELATED_SAFES[0].toLowerCase()], head);
+  assert.deepEqual(observeAddressTransaction(sample.receipt, sample.transaction, restored, {}, new Set()), []);
+  assert.deepEqual(restored.abandonedHistory, state.abandonedHistory);
+});
+test('真实投毒日志不能冒充签名者主动交易，回执身份不匹配不采纳', () => {
+  const sample = coverageFixture.samples[3], state = createEarlySignalState();
+  establishObservationCoverage(state, {}, 0);
+  assert.deepEqual(observeAddressTransaction(sample.receipt, sample.transaction, state, {}, new Set()), []);
+  const valid = coverageFixture.samples[0];
+  assert.deepEqual(observeAddressTransaction(valid.receipt, { ...valid.transaction, blockHash: '0x' + 'ab'.repeat(32) }, state, {}, new Set()), []);
+});
+test('真实新增 Safe owner 进入待核验候选，不自动成为执行钱包', () => {
+  const sample = coverageFixture.samples[1], state = createEarlySignalState();
+  const events = decodeEarlyReceipt(sample.receipt, state, { transaction: sample.transaction,
+    config: { safes: CORE_SAFES.map(([a]) => a) } });
+  assert.ok(events.some(e => e.kind === 'safeOperation'));
+  assert.ok(state.candidates['0x01be21a32c281e98ef239b89ce9e7b1baba2abcd']);
+  assert.equal(Object.keys(state.positions).length, 0);
+});
 
 const history = JSON.parse(readFileSync(new URL("./fixtures/early-signal-history.json", import.meta.url)));
 const TOKEN = "0x4ebf5fd25b02022afad96e2fa25da54a246fded0";

@@ -1,4 +1,4 @@
-import { ALLOWANCE_MODULE, COW_SETTLEMENT, POSITION_MANAGERS } from "./early-signal-catalog.mjs";
+import { ALLOWANCE_MODULE, COW_SETTLEMENT, POSITION_MANAGERS, DEX } from "./early-signal-catalog.mjs";
 import { VAULT_PORTAL_ADDRESS, GRANT_REVOKER_ROLE, AUDITOR_ROLE, portalRoleName } from './vault-portal-v116.mjs';
 
 export const hexWords = data => {
@@ -72,6 +72,16 @@ export function decodeOperationalCall(transaction, path = "0") {
     if (selector === "0xf2fde38b" && w.length === 1) return { ...base, kind: "ownership", account: abiAddress(w[0]) };
     if (selector === "0x610b5925" && w.length === 1) return { ...base, kind: "module", enabled: true, module: abiAddress(w[0]) };
     if (selector === "0xe009cfde" && w.length === 2) return { ...base, kind: "module", enabled: false, module: abiAddress(w[1]) };
+    if (selector === '0x0d582f13' && w.length === 2) return { ...base, kind: 'safeOwner', action: '新增', account: abiAddress(w[0]), threshold: abiUint(w[1]) };
+    if (selector === '0xf8dc5dd9' && w.length === 3) return { ...base, kind: 'safeOwner', action: '移除', account: abiAddress(w[1]), threshold: abiUint(w[2]) };
+    if (selector === '0xe318b52b' && w.length === 3) return { ...base, kind: 'safeOwner', action: '替换', account: abiAddress(w[1]), newOwner: abiAddress(w[2]) };
+    if (selector === '0x694e80c3' && w.length === 1) return { ...base, kind: 'safeThreshold', threshold: abiUint(w[0]) };
+    if (to === DEX.v3Positions) {
+      // V3 position manager ABI: keep unsupported/malformed calls unknown.
+      const sizes = { '0x88316456': 11, '0x219f5d17': 6, '0x0c49ccbe': 5, '0xfc6f7865': 4 };
+      if (sizes[selector] === w.length) return { ...base, kind: 'liquidityCall',
+        reason: ({ '0x88316456': '创建仓位', '0x219f5d17': '增加流动性', '0x0c49ccbe': '减少流动性', '0xfc6f7865': '领取仓位资产' })[selector] };
+    }
     if (to === ALLOWANCE_MODULE) {
       if (selector === "0xbeaeb388" && w.length === 5) return { ...base, kind: "allowance", delegate: abiAddress(w[0]), asset: abiAddress(w[1]), amount: abiUint(w[2]), resetMinutes: abiUint(w[3]), reason: "设置额度" };
       if (selector === "0xe71bdf41" && w.length === 1) return { ...base, kind: "allowance", delegate: abiAddress(w[0]), reason: "添加委托人" };
@@ -134,6 +144,9 @@ export function describeOperationalAction(a, metadata = {}) {
     auditGrantSubmit: `📝 通过签名授权提交审计报告\n代币：${addressLink(a.token)}\n授权绑定代币：${addressLink(a.grantToken)}\n工厂：${addressLink(a.factory)}\n指定提交者：${addressLink(a.deployer)}\n风险等级：${a.riskLevel}\n报告 CID：${plainLabel(a.ipfsCid)}\nUI 标识：${plainLabel(a.artifactId)}\n授权 nonce：${a.nonce}\n授权有效性仍需链上核验。`,
     ownership: `管理员变更 → ${a.account}`,
     module: `${a.enabled ? "启用" : "停用"} Safe 模块 ${a.module}`,
+    safeOwner: `Safe 所有者${a.action}：${a.account}${a.newOwner ? ` → ${a.newOwner}` : ''}${a.threshold ? `\n签名阈值：${a.threshold}` : ''}`,
+    safeThreshold: `Safe 签名阈值拟变更为 ${a.threshold}`,
+    liquidityCall: `仓位管理器调用：${a.reason}\n合约：${addressLink(a.to)}\n实际数量和执行结果以回执为准。`,
     allowance: `${a.reason} ${a.selector}${a.delegate ? `\n委托：${addressLink(a.delegate)}` : ""}${a.asset ? `\n资产：${token === "BNB" ? "BNB" : addressLink(a.asset)}\n额度：${quantity}\n重置间隔：${a.resetMinutes} 分钟` : ""}`,
     wrapping: `${wrapLabel}\n包装合约：${addressLink(a.asset)}\n${token ? `数量：${quantity}\n计量资产：${addressLink(token)}` : "金额待确认（底层资产映射未核验）"}`,
   };

@@ -1,5 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import WebSocket from 'ws';
+import { decodePendingOperation } from './pending-operations.mjs';
 import { decodePendingRegistration } from './pending-registry.mjs';
 
 // Keep the full-chain stream off the monitor's event loop. Use one connection,
@@ -60,7 +61,8 @@ function connect() {
       if (forward({ type: 'replacement', tx: { hash: tx.hash, from, nonce } })) seen.set(tx.hash, Date.now());
       if (seen.size > 2048) seen.delete(seen.keys().next().value);
     }
-    const candidates = decodePendingRegistration(tx, workerData.safes);
+    const registrations = decodePendingRegistration(tx, workerData.safes);
+    const candidates = registrations.length ? registrations : decodePendingOperation(tx, workerData.operationConfig);
     if (!candidates.length || seen.has('candidate:' + tx.hash)) return;
     for (const candidate of candidates) { candidate.workerSeenAt = new Date(workerSeenMs).toISOString(); candidate.pendingSource = health.endpoint; }
     health.matches += candidates.length;

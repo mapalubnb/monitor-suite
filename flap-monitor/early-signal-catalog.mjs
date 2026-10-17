@@ -27,6 +27,30 @@ export const CORE_OWNERS = [
   "0xA85c06f58B6A2F1BF577B15F20F4AA66D8a334Ec",
   "0x705163Cf642a975d2F0570463BE93AAb7993D1c2",
 ];
+// Read-only BSC verification at block 128109250 (2026-10-17).
+// A funded/actively signed Safe is a financial relation, not Portal authority.
+export const RELATED_SAFES = ["0x65eA398b9EB6b7A75FD5A1018463039374A0b908"];
+export const OBSERVATION_WALLETS = [...CORE_OWNERS,
+  "0x01bE21A32c281E98Ef239b89CE9e7b1babA2ABcd",
+  "0x0806D3920dAFd50e8cEb189c82D2d3a217e2A045",
+  "0x5d9D048471df8961B8E1d2f8bf4332090F1C361a",
+  "0x7cec45a85BCdA408b83A7107Bad5bA54F0b0128b",
+  "0x3737721dCb6B8737cB8b9223380C59334cbDf4BF",
+  "0xde1ffc96E701707299612c9c51CB398460675661",
+  "0x0754Ae4F8F9090A95Fd28B473ba1e66dDcfACEFd",
+  "0x01db37579E55cE13f4504019025e36047bDaD845",
+  "0x1d60bBBEF79Fb9540D271Dbb01925380323A8f66",
+  "0xd8B61d3c1fe630d1a827256231c14bd61B0d4Ad5",
+  "0x4c08e9166F2cc66dAF63eF9254017a74fe4d9a2f",
+  "0x90deF8Dedf8F3218900454aC1Ff736549e8090Fb",
+  // Received funds from the operating Safe and RELATED_SAFES; no LP attribution.
+  "0x24160Dfca52F12017338932DEcE5c85c4F971aeB",
+];
+export function observationAddresses(config = {}) {
+  return [...new Set([...(config.observationWallets ?? OBSERVATION_WALLETS),
+    ...(config.relatedSafes ?? RELATED_SAFES)].map(a => String(a).toLowerCase()))]
+    .filter(a => /^0x[a-f0-9]{40}$/.test(a));
+}
 export const ALLOWANCE_MODULE = "0xcfbfac74c26f8647cbdb8c5caf80bb5b32e43134";
 export const COW_SETTLEMENT = "0x9008d19f58aabd9ed0d60971565aa8510560ab41";
 // CoW Protocol core deployments: GPv2VaultRelayer on BNB.

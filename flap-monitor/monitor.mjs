@@ -79,7 +79,8 @@ import {
   saveSafeProposalState,
 } from "./safe-proposal-monitor.mjs";
 
-import { EXECUTION_WALLETS } from "./early-signal-catalog.mjs";
+import { EXECUTION_WALLETS, RELATED_SAFES, OBSERVATION_WALLETS } from "./early-signal-catalog.mjs";
+import { reconcileOperationObservations } from './pending-operations.mjs';
 import { createEarlySignalState, loadEarlySignalState, saveEarlySignalState, runEarlySignalScan,
   earlyLogFilters, acknowledgeEarlySignals, formatEarlySignalAsset, buildEarlySignalContent } from "./early-signal-monitor.mjs";
 
@@ -195,7 +196,7 @@ const CONFIG = {
     apiBaseUrl: process.env.FLAP_SAFE_API_BASE_URL || "https://api.safe.global/tx-service/bnb/api/v1",
     apiKey: String(process.env.FLAP_SAFE_API_KEY || "").trim(),
     apiKeys: String(process.env.FLAP_SAFE_API_KEYS || "").split(/[\s,]+/).filter(Boolean),
-    safes: [...new Set(([process.env.FLAP_ADMIN_SAFE_ADDRESSES || "", process.env.FLAP_SAFE_INCLUDE_CORE === "false" ? "" : DEFAULT_FLAP_ADMIN_SAFES.join(",")].filter(Boolean).join(","))
+    safes: [...new Set(([process.env.FLAP_ADMIN_SAFE_ADDRESSES || "", process.env.FLAP_SAFE_INCLUDE_CORE === "false" ? "" : [...DEFAULT_FLAP_ADMIN_SAFES, ...RELATED_SAFES].join(",")].filter(Boolean).join(","))
       .split(",").map(value => value.trim()).filter(value => /^0x[a-fA-F0-9]{40}$/.test(value)))],
   },
 
@@ -209,6 +210,9 @@ const CONFIG = {
     nativeTransactions: process.env.FLAP_EARLY_NATIVE_TX_SCAN !== "false",
     confirmations: Math.max(0, Number.parseInt(process.env.FLAP_EARLY_CONFIRMATIONS || "0", 10) || 0),
     wallets: (process.env.FLAP_EARLY_WALLETS || EXECUTION_WALLETS.join(",")).split(",").map(s => s.trim()).filter(s => /^0x[a-f0-9]{40}$/i.test(s)),
+    observationWallets: [...new Set([...OBSERVATION_WALLETS, ...(process.env.FLAP_OBSERVATION_WALLETS || '').split(',')]
+      .map(s => s.trim().toLowerCase()).filter(s => /^0x[a-f0-9]{40}$/.test(s)))],
+    relatedSafes: RELATED_SAFES,
     cowApiBaseUrl: process.env.FLAP_COW_API_BASE_URL || "https://api.cow.fi/bnb/api/v1",
     wsEnabled: process.env.FLAP_EARLY_WS_ENABLED !== "false", timeoutMs: 5_000,
   },
@@ -3248,9 +3252,9 @@ function deliverRegistryChanges(snapshot, { sendCardFn = sendCardViaApi, patchCa
     },
     patch: (record, version) => patchCardFn(record.messageId, `${titlePrefix}Flap 链上金库注册变更`,
       buildRegistryMonitorContent([{ ...record, revoked: version === 'revoked' }]), version === 'registered' ? 'green' : version === 'revoked' ? 'red' : 'orange'),
-    sendPending: (record, deliveryId) => sendCardFn('Flap 金库注册预警：待执行', pendingRegistryContent(record),
+    sendPending: (record, deliveryId) => sendCardFn(record.operationPreview ? 'Flap 重要操作观察' : 'Flap 金库注册预警：待执行', pendingRegistryContent(record),
       'orange', undefined, { ...alertMentionCardOptions(), deliveryId }),
-    patchPending: record => patchCardFn(record.messageId, 'Flap 金库注册预警：结果更新',
+    patchPending: record => patchCardFn(record.messageId, record.operationPreview ? 'Flap 重要操作预警：结果更新' : 'Flap 金库注册预警：结果更新',
       pendingRegistryContent(record), record.status === 'failed' ? 'red' : 'orange'),
   });
 }
@@ -6739,16 +6743,22 @@ function earlySignalConfig() {
 const earlySignalNameFlights = new Set();
 async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState,
   resolveMetadataFn = sendCardFn === sendCardViaApi ? resolveFactoryPoolTokenMetadata : null,
-  patchCardFn = patchCard, now = Date.now } = {}) {
+  patchCardFn = patchCard, now = Date.now, pendingOperationState = null, persistPendingOperations = () => {} } = {}) {
   // Persist the exact selection and each delivered part. Restart/retry must not
   // recut a transaction or acknowledge evidence arriving while a send is pending.
   if (archiveRoutineEarlySignals(state, now()).changed) saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+  const linked = reconcileOperationObservations(state, pendingOperationState);
+  if (linked.changed || linked.acknowledgedIds.length) persistPendingOperations();
+  if (linked.acknowledgedIds.length) {
+    acknowledgeEarlySignals(state, linked.acknowledgedIds);
+    saveStateFn(CONFIG.earlySignalMonitor.stateFile, state);
+  }
   if (sendCardFn === sendCardViaApi && !canAttemptFeishuDelivery()) return { sent: false };
   const pendingIds = new Set(state.pendingChanges.map(e => e.id));
   if (state.notificationDelivery?.ids.some(id => !pendingIds.has(id))) delete state.notificationDelivery;
   let delivery = state.notificationDelivery;
   if (!delivery) {
-    const selection = selectEarlyNotification(state, now()) || selectCowNotification(state, now()) || selectPublicPoolNotification(state, now());
+    const selection = selectEarlyNotification(state, now(), linked.heldIds) || selectCowNotification(state, now()) || selectPublicPoolNotification(state, now());
     if (!selection) return { sent: false };
     const { changes, title, template, mode } = selection;
     const content = selection.content || buildEarlySignalContent(changes, state);
@@ -7034,7 +7044,8 @@ async function runCheck() {
     const result = await runEarlySignalScan({ state: early, config: earlySignalConfig(), rpcBatch: bscRpcBatch, safeState: safe });
     saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, early);
     if (result.changed) hasDetectedChange = true;
-    const earlyDelivery = await deliverFlapEarlySignals(early);
+    const earlyDelivery = await deliverFlapEarlySignals(early, { pendingOperationState: snapshot.registryMonitor,
+      persistPendingOperations: () => saveRegistrySnapshot(snapshot) });
     if (earlyDelivery.sent) hasNotifiedChange = true;
     await earlyDelivery.metadataPromise;
     for (const error of result.errors) log("[Flap 提前信号] " + error);
@@ -7178,7 +7189,8 @@ async function startMonitor() {
   const earlyFastRuntime = { deferAnchorAudit: true };
   let earlyDeliveryPromise = null;
   function deliverEarly() {
-    if (!earlyDeliveryPromise) earlyDeliveryPromise = deliverFlapEarlySignals(earlySignalState)
+    if (!earlyDeliveryPromise) earlyDeliveryPromise = deliverFlapEarlySignals(earlySignalState, {
+      pendingOperationState: snapshot.registryMonitor, persistPendingOperations: () => saveRegistrySnapshot(snapshot) })
       .catch(error => log(`[Flap 提前信号发送] ${error.message}`)).finally(() => { earlyDeliveryPromise = null; });
     return earlyDeliveryPromise;
   }
@@ -7360,7 +7372,10 @@ async function startMonitor() {
     } });
   const registryPendingFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.pendingEnabled
     ? startPendingRegistryFeed({ urls: CONFIG.registryMonitor.pendingWsUrls.length ? CONFIG.registryMonitor.pendingWsUrls : CONFIG.factoryPoolMonitor.wsUrls,
-      safes: CONFIG.safeProposalMonitor.safes,
+      safes: CONFIG.safeProposalMonitor.safes.filter(a => !RELATED_SAFES.some(r => r.toLowerCase() === a.toLowerCase())),
+      operationConfig: { safes: CONFIG.safeProposalMonitor.safes, relatedSafes: RELATED_SAFES,
+        observationWallets: CONFIG.earlySignalMonitor.observationWallets, wallets: CONFIG.earlySignalMonitor.wallets,
+        factoryAddress: CONFIG.factoryPoolMonitor.proxy },
       tracked: () => Object.values(snapshot.registryMonitor.pendingRegistrations || {}).filter(r => ['checking', 'pending', 'unverified'].includes(r.status))
         .map(({ from, nonce, txHash }) => ({ from, nonce, txHash })),
       onCandidates: candidates => {

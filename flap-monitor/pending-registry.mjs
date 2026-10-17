@@ -1,3 +1,4 @@
+import { checkPendingOperation, pendingOperationContent } from './pending-operations.mjs';
 import { Worker } from 'node:worker_threads';
 import { extractFlapProposalActions, VAULT_PORTAL, DEFAULT_FLAP_ADMIN_SAFES } from './safe-proposal-monitor.mjs';
 import { formatBeijingTime } from '../shared/display-format.cjs';
@@ -39,8 +40,8 @@ export function ingestPendingRegistration(state, candidates, { now = Date.now(),
     const event = Object.values(state.notifications || {}).find(r => r.txHash === candidate.txHash && r.vault === candidate.vault && !r.revoked);
     const reason = state.pendingRegistrations[key] ? 'duplicate'
       : event ? 'chain-observed-before-main'
-      : state.knownVaults?.[candidate.vault] ? 'known-factory'
-      : Object.keys(state.pendingRegistrations).length >= 256 ? 'capacity-limit' : 'accepted';
+      : !candidate.operationPreview && state.knownVaults?.[candidate.vault] ? 'known-factory'
+      : Object.values(state.pendingRegistrations).filter(r => Boolean(r.operationPreview) === Boolean(candidate.operationPreview)).length >= (candidate.operationPreview ? 64 : 256) ? 'capacity-limit' : 'accepted';
     const observation = state.pendingObservations[key] ||= { txHash: candidate.txHash, vault: candidate.vault,
       workerSeenAt: firstSeenAt, mainSeenAt: new Date(now).toISOString(), source: candidate.pendingSource || 'unknown',
       workerToMainMs: now - Date.parse(firstSeenAt), reason, observations: 0 };
@@ -72,6 +73,7 @@ export function observePendingReplacement(state, tx, persist = () => {}) {
 }
 
 export function pendingRegistryContent(r) {
+  if (r.operationPreview) return pendingOperationContent(r);
   const status = { checking: '🟡 发现待执行注册调用，尚未核验', pending: '🟡 模拟通过，等待链上执行', failed: '🔴 交易执行失败',
     replaced: '🟠 已核实同发送账户、同 nonce 的其他交易上链', noRegistration: '🟠 交易已上链，未发现对应的有效注册事件',
     configuration: '🟢 已有工厂的登记／配置操作已执行',
@@ -98,13 +100,17 @@ export async function checkPendingRegistrations(state, { rpc, ingestLog, persist
     const event = linked(r);
     if (event) { r.status = 'registered'; r.logSeenAt = event.firstSeenAt;
       r.pendingLeadMs = Date.parse(event.firstSeenAt) - Date.parse(r.firstSeenAt); delete r.data; }
-    if (now() - Date.parse(r.firstSeenAt) > 86_400_000 && r.status !== 'pending'
-      && (!r.messageId || r.patchedStatus === r.status && r.patchedSimulationStatus === r.simulationStatus || r.status === 'registered')) delete state.pendingRegistrations[r.key];
+    if (now() - Date.parse(r.firstSeenAt) > 86_400_000 && r.status !== 'pending' && (!r.operationPreview || r.settled || !r.confirmedBlockHash)
+      && (!r.messageId || r.patchedStatus === r.status && r.patchedSimulationStatus === r.simulationStatus
+        && (!r.operationPreview || r.patchedDetail === r.confirmedDetail) || r.status === 'registered')) delete state.pendingRegistrations[r.key];
   }
-  const r = records.filter(r => ['checking', 'pending', 'unverified'].includes(r.status)
-    && (r.nextCheckAt || 0) <= now() && now() - Date.parse(r.firstSeenAt) < 1_800_000)
-    .sort((a, b) => (a.nextCheckAt || 0) - (b.nextCheckAt || 0))[0];
+  const r = records.filter(r => (['checking', 'pending', 'unverified'].includes(r.status)
+      || r.operationPreview && (r.confirmedBlockHash && !r.settled || r.status === 'withdrawn'))
+    && (r.nextCheckAt || 0) <= now() && (r.confirmedBlockHash || now() - Date.parse(r.firstSeenAt) < 1_800_000))
+    .sort((a, b) => Number(Boolean(a.operationPreview)) - Number(Boolean(b.operationPreview))
+      || (a.nextCheckAt || 0) - (b.nextCheckAt || 0))[0];
   if (!r) { persist(); return; }
+  if (r.operationPreview) return checkPendingOperation(r, state, { rpc, now, persist });
   const group = records.filter(x => x.txHash === r.txHash);
   const active = x => ['checking', 'pending', 'unverified'].includes(x.status) && !linked(x);
   const update = patch => { for (const x of group) if (active(x)) Object.assign(x, patch); };
@@ -156,12 +162,12 @@ export async function checkPendingRegistrations(state, { rpc, ingestLog, persist
   persist();
 }
 
-export function startPendingRegistryFeed({ urls, safes, tracked = [], onCandidates, onReplacement, onHealth, onError }) {
+export function startPendingRegistryFeed({ urls, safes, operationConfig = {}, tracked = [], onCandidates, onReplacement, onHealth, onError }) {
   let worker, stopped = false, timer, failures = 0;
   const start = () => {
     if (stopped) return;
     worker = new Worker(new URL('./pending-registry-worker.mjs', import.meta.url), {
-      workerData: { urls, safes, tracked: typeof tracked === 'function' ? tracked() : tracked },
+      workerData: { urls, safes, operationConfig, tracked: typeof tracked === 'function' ? tracked() : tracked },
       execArgv: process.execArgv.filter(arg => !arg.startsWith('--input-type')),
       resourceLimits: { maxOldGenerationSizeMb: 64, maxYoungGenerationSizeMb: 16 } });
     worker.on('message', message => {

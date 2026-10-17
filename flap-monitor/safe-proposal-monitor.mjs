@@ -12,7 +12,7 @@ import {
 } from "./factory-pool-monitor.mjs";
 import { SET_QUOTE_CONFIG_SELECTOR, SET_QUOTE_ROUTE_SELECTOR, decodeQuoteConfigurationCall, decodeQuoteRoute, formatQuoteRoute } from "./quote-token-codec.mjs";
 
-import { CORE_SAFES } from "./early-signal-catalog.mjs";
+import { CORE_SAFES, DEX } from "./early-signal-catalog.mjs";
 import { abiBytes, abiAddress, hexWords, decodeOperationalCall, describeOperationalAction } from "./operational-call-codec.mjs";
 
 export const SAFE_PROPOSAL_SCHEMA_VERSION = 4;
@@ -169,7 +169,26 @@ export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_
     { factoryAddress, depth: depth + 1, path: path + ".safe", includeOperations, safeAddresses });
   }
   if (selector !== SAFE_MULTISEND_SELECTOR || operation !== 1 || !MULTISEND_ADDRESSES.has(to)) {
-    return includeOperations ? [decodeOperationalCall(transaction, path)] : [];
+    if (includeOperations && operation === 0 && to === DEX.v3Positions && ['0xac9650d8', '0x5ae401dc'].includes(selector)) {
+      if (depth >= MAX_MULTISEND_DEPTH) throw Error('仓位 multicall 嵌套超过上限');
+      const body = data.slice(10), w = hexWords(body), slot = selector === '0xac9650d8' ? 0 : 1;
+      const offset = Number(BigInt('0x' + w[slot]));
+      if (!Number.isSafeInteger(offset) || offset % 32 || offset < (slot + 1) * 32 || offset * 2 + 64 > body.length) throw Error('multicall 数组偏移无效');
+      const count = Number(BigInt('0x' + body.slice(offset * 2, offset * 2 + 64)));
+      if (!Number.isSafeInteger(count) || count > 16) throw Error('multicall 数量越界');
+      const array = body.slice(offset * 2 + 64);
+      return Array.from({ length: count }, (_, i) => {
+        const aw = hexWords(array), start = Number(BigInt('0x' + aw[i]));
+        if (start < count * 32) throw Error('multicall 数据覆盖数组头');
+        return extractFlapProposalActions({ to, data: abiBytes(array, i), value: '0', operation: 0 },
+          { factoryAddress, depth: depth + 1, path: `${path}.lp.${i}`, includeOperations, safeAddresses });
+      }).flat();
+    }
+    if (!includeOperations) return [];
+    const action = decodeOperationalCall(transaction, path);
+    if (['safeOwner', 'safeThreshold'].includes(action.kind) && (!safeAddresses.some(a => normalizeAddress(a) === to)
+      || action.threshold === '0')) return [{ ...action, kind: 'unknown', reason: 'Safe 目标或阈值未核验' }];
+    return [action];
   }
   if (depth >= MAX_MULTISEND_DEPTH) throw new Error("MultiSend 嵌套超过解析上限");
   return decodeMultiSendTransactions(data).flatMap((nested, index) => extractFlapProposalActions(nested, {
