@@ -27,8 +27,8 @@
 ## 项目与发布基线
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
-- 最新已核验业务提交：`d1aba563e5437a58ad7d141adcd0431d442f2f95`（Flap 关联地址覆盖）；Four.meme 业务基线仍为 `281261e551e85ca213faed93b51f9f3f12c671b9`。这些不是对未来 HEAD 的固定要求。
-- 当前版本：Suite `1.12.41`（发布验收文档）、Four.meme `1.5.16`、Flap `1.10.34`。业务发布为 Suite 1.12.40，已补齐关联 Safe、签名者与资金地址观察及重要操作 pending；详细证据见 Flap HANDOFF。
+- 最新已核验业务提交：`847db12793528b5b389b5d2fb0b02888e9e8ddbd`（Flap 关联 Safe 与 ERC-4337）；Four.meme 业务基线仍为 `281261e551e85ca213faed93b51f9f3f12c671b9`。这些不是对未来 HEAD 的固定要求。
+- 当前版本：Suite `1.12.43`（发布验收文档）、Four.meme `1.5.16`、Flap `1.10.35`。业务发布为 Suite 1.12.42，已补齐关联 Safe 即时发现及 ERC-4337 观察；详细证据见 Flap HANDOFF。
 - 业务发布仅重启 `flap-monitor`，`.env`、监控频率、历史策略及原有过滤规则保留；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
@@ -84,4 +84,4 @@
 
 用户在链上核验对话明确确认实施已讨论计划，授权该对话修改 Flap 模块、验证并交总控发布。仅本次覆盖关联 Safe 持续观察、创建发现和 ERC-4337 提醒；不自动标记官方。未授权本对话提交、推送、改服务器或重启。模块待发布版本 1.10.35，具体文件、验证及限制见 Flap HANDOFF 最新待发布交接。该版本不代表已经上线；总控接手后负责根版本整合及完整发布验收。
 
-总控已按用户最新发布授权接手，根待发布版本 1.12.42、Flap 1.10.35；补齐执行确认与 API 并发保护，全量 592 项测试通过。服务器仍以已核验 1.10.34 为基线，待先推 GitHub 后部署，验收后更新本节。
+总控已完成先推 GitHub 后部署，业务提交 847db12793528b5b389b5d2fb0b02888e9e8ddbd，Suite 1.12.42 / Flap 1.10.35；本地全量 592 项、服务器 Flap 378 项测试通过。2026/10/21 17:15:41 验收确认环境配置与调度周期不变，新 Safe API 基线已建立，19 个观察地址生效，扫描持续推进。Suite 1.12.43 仅同步验收文档，无需重启；旧公共池卡片、CoW 来源错误和公共 RPC 波动仍有明确记录，详见 Flap HANDOFF。
