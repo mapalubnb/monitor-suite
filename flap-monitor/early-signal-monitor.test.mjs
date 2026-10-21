@@ -1,3 +1,4 @@
+import './safe-4337.test.mjs';
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, mkdtempSync, rmSync } from "node:fs";
@@ -20,7 +21,7 @@ import { establishObservationCoverage, observeAddressTransaction } from './addre
 const coverageFixture = JSON.parse(readFileSync(new URL('./fixtures/address-coverage-20261017.json', import.meta.url)));
 test('关联覆盖：16 个所有者与资金观察地址有效，真实 Safe 调拨不提升官方准备状态', () => {
   assert.equal(new Set(OBSERVATION_WALLETS.map(x => x.toLowerCase())).size, 17);
-  assert.equal(observationAddresses().length, 18);
+  assert.equal(observationAddresses().length, 19);
   const sample = coverageFixture.samples[0], state = createEarlySignalState();
   const originalCursor = state.cursor;
   establishObservationCoverage(state, {}, Number(sample.receipt.blockNumber));

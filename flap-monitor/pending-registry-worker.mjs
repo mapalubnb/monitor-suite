@@ -13,7 +13,10 @@ for (const r of workerData.tracked || []) {
   tracked.set(`${r.from}:${r.nonce}`, { hash: r.txHash, at: Date.now() });
 }
 let socket, endpoint = 0, lastMessage = Date.now(), retry, started = Date.now(), windowStart = 0, forwarded = 0, outstanding = 0;
-parentPort.on('message', message => { if (message.type === 'ack') outstanding = Math.max(0, outstanding - 1); });
+parentPort.on('message', message => {
+  if (message.type === 'ack') outstanding = Math.max(0, outstanding - 1);
+  if (message.type === 'operationConfig') workerData.operationConfig = message.config;
+});
 function forward(message) {
   if (forwarded++ >= 10 || outstanding >= 16) {
     health.dropped++;

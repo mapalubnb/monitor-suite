@@ -1,3 +1,4 @@
+import { ENTRY_POINT_V07, decodeHandleOps, decodeSafeUserOperation, userOperationResult, operationKey4337 } from './erc4337-codec.mjs';
 import { observationAddresses, RELATED_SAFES, EXECUTION_WALLETS, POSITION_MANAGERS, DEX } from './early-signal-catalog.mjs';
 import { extractFlapProposalActions, DEFAULT_FLAP_ADMIN_SAFES } from './safe-proposal-monitor.mjs';
 import { FLAP_FACTORY_PROXY } from './factory-pool-monitor.mjs';
@@ -16,6 +17,17 @@ export function decodePendingOperation(tx, config = {}) {
   const from = lower(tx.from), to = lower(tx.to), data = lower(tx.input), txHash = lower(tx.hash);
   const safes = [...(config.safes || DEFAULT_FLAP_ADMIN_SAFES), ...(config.relatedSafes ?? RELATED_SAFES)].map(lower);
   const sources = new Set([...observationAddresses(config), ...(config.wallets || EXECUTION_WALLETS).map(lower)]);
+  if (to === ENTRY_POINT_V07 && hash(txHash) && address(from)) {
+    try {
+      if (tx.chainId != null && BigInt(tx.chainId) !== 56n) return [];
+      return decodeHandleOps(tx).filter(op => sources.has(op.sender) || safes.includes(op.sender)).map(op => ({
+        operationPreview: true, via4337: true, observationOnly: true, txHash, from, to,
+        nonce: BigInt(tx.nonce).toString(), value: BigInt(tx.value || 0).toString(),
+        sender: op.sender, userOpNonce: op.userOpNonce, userOpIndex: op.userOpIndex,
+        vault: operationKey4337(op), actions: decodeSafeUserOperation(op, config),
+      }));
+    } catch { return []; }
+  }
   const viaSafe = safes.includes(to) && data.startsWith('0x6a761202');
   if (!address(from) || !address(to) || !hash(txHash) || !/^0x(?:[a-f0-9]{2})*$/.test(data)
     || data.length > 65538 || (!viaSafe && !sources.has(from))) return [];
@@ -50,7 +62,7 @@ export function pendingOperationContent(r) {
     ? `Factory ${a.kind === 'creation' ? `创建开关：${a.disabled ? '停用' : '启用'}` : a.kind === 'route' ? '兑换路径变更' : '计价配置变更'}｜资产 ${a.quoteToken || '待核验'}`
     : describeOperationalAction(a, r.tokenMetadata || {}));
   return [`${status}；不代表平台已开放。`, `发送地址：${r.from}`, `目标地址：${r.to}`,
-    r.viaSafe ? '调用方式：Safe 执行（可能为所有者直接执行，不代表存在公开离线签名）' : '调用方式：关联地址直接调用',
+    r.via4337 ? `调用方式：ERC-4337｜智能账户 ${r.sender}｜UserOperation nonce ${r.userOpNonce}；仅关联观察，不代表官方。` : r.viaSafe ? '调用方式：Safe 执行（可能为所有者直接执行，不代表存在公开离线签名）' : '调用方式：关联地址直接调用',
     ...summary, `首次观测：${formatBeijingTime(r.firstSeenAt)}`, `来源：${r.pendingSource || 'unknown'}`,
     r.simulationStatus ? `模拟：${r.simulationStatus}（不保证打包后成功）` : '',
     r.confirmedAt ? `链上时间：${formatBeijingTime(r.confirmedAt)}` : '',
@@ -64,13 +76,13 @@ export function reconcileOperationObservations(early, pendingState) {
   for (const event of early.pendingChanges || []) {
     if (event.kind !== 'addressObservation' || !event.observationOnly) continue;
     if (early.notificationDelivery?.ids?.includes(event.id)) continue;
-    const r = pendingState?.pendingRegistrations?.[`${event.transactionHash}:${OPERATION_KEY}`];
+    const r = pendingState?.pendingRegistrations?.[`${event.transactionHash}:${event.operationKey || OPERATION_KEY}`];
     if (!r?.operationPreview || r.mode !== 'live' || !hash(event.blockHash)) continue;
     if (r.withdrawnBlockHash === event.blockHash) { heldIds.add(event.id); continue; }
     if (r.confirmedBlockHash && r.confirmedBlockHash !== event.blockHash) continue;
     // A successful outer Safe receipt does not establish inner execution success.
-    if (r.viaSafe && !['executed', 'failed'].includes(event.safeExecutionStatus)) continue;
-    const status = r.viaSafe ? event.safeExecutionStatus : 'executed';
+    if ((r.viaSafe || r.via4337) && !['executed', 'failed'].includes(event.safeExecutionStatus)) continue;
+    const status = r.viaSafe || r.via4337 ? event.safeExecutionStatus : 'executed';
     if (r.confirmedDetail !== event.detail || r.status !== status) {
       Object.assign(r, { confirmedDetail: event.detail, status,
         confirmedBlockHash: event.blockHash, confirmedBlockNumber: event.blockNumber, settled: false });
@@ -100,12 +112,19 @@ export async function checkPendingOperation(r, state, { rpc, now, persist }) {
     }
     if (!r.simulationAttemptedAt && r.status === 'checking') {
       r.simulationAttemptedAt = new Date(now()).toISOString(); persist();
-      const result = await rpc('eth_call', [{ to: r.to, from: r.from, value: '0x' + BigInt(r.value).toString(16), data: r.data }, 'latest']);
+      let data = r.data;
+      if (r.via4337) {
+        const tx = await rpc('eth_getTransactionByHash', [r.txHash]);
+        if (lower(tx?.hash) !== r.txHash || lower(tx.from) !== r.from || lower(tx.to) !== r.to
+          || !decodeHandleOps(tx).some(op => op.sender === r.sender && op.userOpNonce === r.userOpNonce)) throw Error('UserOperation 模拟身份不符');
+        data = tx.input; // signatures are used transiently, never persisted in AA records
+      }
+      const result = await rpc('eth_call', [{ to: r.to, from: r.from, value: '0x' + BigInt(r.value).toString(16), data }, 'latest']);
       if (version() !== initial) return;
       // Do not infer ERC20 execution success from empty/true return data.
       if (r.viaSafe && !/^0x0{63}1$/i.test(result || '')) throw Error('Safe 模拟未返回成功');
       if (!/^0x(?:[a-f0-9]{2})*$/i.test(result || '')) throw Error('模拟响应无效');
-      r.simulationStatus = 'passed'; r.simulatedAt = new Date(now()).toISOString(); r.status = 'pending'; r.nextCheckAt = now() + 2000;
+      r.simulationStatus = r.via4337 ? '外层模拟完成，单笔操作结果待链上核验' : 'passed'; r.simulatedAt = new Date(now()).toISOString(); r.status = r.via4337 ? 'unverified' : 'pending'; r.nextCheckAt = now() + 2000;
     } else {
       const receipt = await rpc('eth_getTransactionReceipt', [r.txHash]);
       if (version() !== initial) return;
@@ -119,9 +138,20 @@ export async function checkPendingOperation(r, state, { rpc, now, persist }) {
         const safeSuccess = !r.viaSafe || receipt.logs?.some(l => lower(l.address) === r.to && lower(l.topics?.[0]) === SUCCESS);
         const safeFailure = r.viaSafe && receipt.logs?.some(l => lower(l.address) === r.to && lower(l.topics?.[0]) === FAILURE);
         if (Number(receipt.status) === 1 && !safeSuccess && !safeFailure) throw Error('缺少 Safe 执行结果');
-        r.status = Number(receipt.status) === 1 && safeSuccess && !safeFailure ? 'executed' : 'failed';
+        let status = Number(receipt.status) === 1 && safeSuccess && !safeFailure ? 'executed' : 'failed';
+        let userOpHash;
+        if (r.via4337) {
+          const result = userOperationResult(receipt, { sender: r.sender, userOpNonce: r.userOpNonce });
+          if (result.status === 'unverified') throw Error(result.reason);
+          status = result.status; userOpHash = result.userOpHash;
+        }
+        // Validate everything before mutating the version guarded above. Otherwise
+        // an incomplete AA receipt can leave a false success and bypass retry errors.
+        const confirmedAt = new Date(Number(block.timestamp) * 1000).toISOString();
+        r.status = status;
+        if (r.via4337) r.userOpHash = userOpHash;
         r.confirmedBlockHash = lower(receipt.blockHash); r.confirmedBlockNumber = Number(receipt.blockNumber);
-        r.confirmedAt = new Date(Number(block.timestamp) * 1000).toISOString();
+        r.confirmedAt = confirmedAt;
       } else if (r.replacementHash) {
         const tx = await rpc('eth_getTransactionByHash', [r.replacementHash]);
         if (lower(tx?.hash) !== r.replacementHash || lower(tx?.from) !== r.from || BigInt(tx.nonce).toString() !== r.nonce) throw Error('替代交易身份不符');

@@ -1,4 +1,16 @@
-# Flap 底池提前监控（1.10.34）
+# Flap 底池提前监控（1.10.35）
+
+
+## 2026-10-21 关联 Safe 即时发现与 ERC-4337（待总控发布）
+
+- 将 `0xdfee42acb3fce076033edcf2084687340b8f2fab` 加入静态关联 Safe：覆盖普通提案与后续链上操作，但不加入可信执行钱包，不自动认定官方、备货或底池开放。升级从观察激活块开始，不补发之前全部历史。
+- 发现延迟原因：旧关联发现受 24 小时 API 刷新间隔约束；真实 Safe 创建于北京时间 2026/10/21 00:51:27，机器人于 16:47:58.920 发现，相差 15 小时 56 分 31.920 秒。创建交易 `0x7ff81775492dbc6a7f77cb0d9194efa68df938a2825c426c48ef1bd77c9f8542` 同时通过 EntryPoint v0.7 执行 USDT 对 Permit2 的无限额度授权，普通 Safe nonce=0 不能排除这类执行。
+- 复用 WSS 和现有实时 HTTP 扫描监听已核验 Safe 工厂 `0x4e1dcf7ad4e460cfd30791ccc4f9c8a4f820ec67` 的 ProxyCreation。初始化 owner 与根关联名单交集后，按创建块核验 owners、threshold、singleton；通过才持久加入 `observedSafes`。新 Safe owners 不递归扩充根名单。API 仍按原 24 小时作为补漏，新候选还需精确 Safe runtime 验证。
+- 动态名单扩充后刷新日志订阅与 pending Worker；保存独立 `replayFrom`，按现有块窗口补扫激活后的交易，防止创建和后续操作位于同一窗口时漏扫；补扫不倒退主游标。重启恢复名单／补扫起点，重组撤回相关发现。
+- 解码 EntryPoint v0.7 `handleOps` 和 Safe4337Module v0.3 的两种 executeUserOp 入口。身份用 sender + UserOperation nonce，结果同时核对 UserOperationEvent 与本操作范围内的模块成功日志，排除预付 gas 日志。批量一笔失败不会借用另一笔成功；外层 eth_call 成功仅称“外层模拟完成”。未知调用、超限 bundle、路由器间接调用保留事件级待解析提醒；其他 EntryPoint 版本仍依已有 Safe 模块事件提醒，未宣称完整解码。
+- 解析限制：每批最多 64 个操作、calldata 128 KiB；动态观察最多 128 个地址，满额创建候选明确提醒尚未启用。沿用现有 RPC 预算、300 笔窗口上限、Worker 背压与私有 pending 不可见边界；新增两个日志过滤器、有关创建额外 3 次 getter 查询及 canonical 复核，API 候选另验证 runtime。全局 Safe 创建数量增大可能增加扫描负担，发布需观察 source health、游标延迟和 Worker dropped。
+- 正常新建 Safe 不再依赖每日 API 才发现；实际时延仍取决于 RPC、扫描积压、确认设置与通知队列，不作固定秒数承诺。未识别工厂／singleton 不自动纳入；无事件内部原生币变动仍受既有 trace 覆盖限制。未改频率、Safe Key 策略、被动收款静默、撤销授权降噪或历史放弃记录。
+- 回放 fixture 已清零 UserOperation signature，不保存可执行签名。实现依据：[Safe4337Module 源码](https://github.com/safe-fndn/safe-modules/blob/main/modules/4337/contracts/Safe4337Module.sol)、[Safe 官方 ERC-4337 文档](https://docs.safe.global/advanced/erc-4337/4337-safe)。
 
 ## 2026-10-17 关联 Safe、签名者与资金地址覆盖
 

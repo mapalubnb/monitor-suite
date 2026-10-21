@@ -186,5 +186,6 @@ export function startPendingRegistryFeed({ urls, safes, operationConfig = {}, tr
     });
   };
   start();
-  return { stop: async () => { stopped = true; clearTimeout(timer); await worker?.terminate(); } };
+  return { updateOperationConfig: config => { operationConfig = config; worker?.postMessage({ type: 'operationConfig', config }); },
+    stop: async () => { stopped = true; clearTimeout(timer); await worker?.terminate(); } };
 }

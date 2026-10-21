@@ -1,3 +1,4 @@
+import { observedSafeConfig } from './safe-observation.mjs';
 import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.mjs';
 import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
@@ -7194,7 +7195,17 @@ async function startMonitor() {
       .catch(error => log(`[Flap 提前信号发送] ${error.message}`)).finally(() => { earlyDeliveryPromise = null; });
     return earlyDeliveryPromise;
   }
+  let registryPendingFeed = null, pendingConfigFingerprint = '';
+  function pendingOperationConfig() {
+    return observedSafeConfig(earlySignalState, { safes: CONFIG.safeProposalMonitor.safes, relatedSafes: RELATED_SAFES,
+      observationWallets: CONFIG.earlySignalMonitor.observationWallets, wallets: CONFIG.earlySignalMonitor.wallets,
+      factoryAddress: CONFIG.factoryPoolMonitor.proxy });
+  }
   function refreshEarlyFeeds() {
+    const config = pendingOperationConfig(), fingerprint = JSON.stringify(config);
+    if (registryPendingFeed && fingerprint !== pendingConfigFingerprint) {
+      registryPendingFeed.updateOperationConfig(config); pendingConfigFingerprint = fingerprint;
+    }
     if (CONFIG.earlySignalMonitor.enabled && CONFIG.earlySignalMonitor.wsEnabled && !isShuttingDown)
       earlyFeeds.update(earlyLogFilters(earlySignalState, { ...earlySignalConfig(), subscriptionMode: true }));
   }
@@ -7370,12 +7381,10 @@ async function startMonitor() {
         ingestLog: receiveRegistryLog, persist: () => saveRegistrySnapshot(snapshot) });
       void registryDeliveryJob.wake();
     } });
-  const registryPendingFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.pendingEnabled
+  registryPendingFeed = CONFIG.registryMonitor.enabled && CONFIG.registryMonitor.pendingEnabled
     ? startPendingRegistryFeed({ urls: CONFIG.registryMonitor.pendingWsUrls.length ? CONFIG.registryMonitor.pendingWsUrls : CONFIG.factoryPoolMonitor.wsUrls,
       safes: CONFIG.safeProposalMonitor.safes.filter(a => !RELATED_SAFES.some(r => r.toLowerCase() === a.toLowerCase())),
-      operationConfig: { safes: CONFIG.safeProposalMonitor.safes, relatedSafes: RELATED_SAFES,
-        observationWallets: CONFIG.earlySignalMonitor.observationWallets, wallets: CONFIG.earlySignalMonitor.wallets,
-        factoryAddress: CONFIG.factoryPoolMonitor.proxy },
+      operationConfig: pendingOperationConfig(),
       tracked: () => Object.values(snapshot.registryMonitor.pendingRegistrations || {}).filter(r => ['checking', 'pending', 'unverified'].includes(r.status))
         .map(({ from, nonce, txHash }) => ({ from, nonce, txHash })),
       onCandidates: candidates => {

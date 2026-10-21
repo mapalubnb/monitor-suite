@@ -6,6 +6,12 @@
 
 当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。协作入口在 Suite 1.12.39 建立，该次仅为文档更新。
 
+## 2026-10-21 关联 Safe 发现与 ERC-4337
+
+Monitor Suite 1.12.42 / Flap 1.10.35 增加关联 Safe `0xdfee42acb3fce076033edcf2084687340b8f2fab` 的持续观察，复用现有 WSS、HTTP 和 pending 通道识别 Safe 创建及 ERC-4337 操作。创建事件经 owners、threshold、singleton 核验后进入关联名单，API 补漏另核验代理 runtime；仅关联观察，不自动标记官方或加池准备。动态地址及其独立补扫起点持久化，保留重启、重组和去重处理。
+
+ERC-4337 按智能账户与 UserOperation nonce 区分批量操作；外层模拟成功不代表单笔执行成功，缺失或歧义结果保留待核验。总控复核补齐确认状态原子写入及 API／快速发现并发保护，避免提前确认或覆盖更早观察起点。保留现有监控频率、Safe Key／预算、已关闭推送与历史策略；仅需重启 Flap，无需修改环境配置。动态观察不自动扩大 Safe API 提案轮询集合；公开 pending 仍不覆盖私有交易，额外日志查询的负载以部署后指标核验。详见 [交接记录](flap-monitor/HANDOFF.md)。
+
 ## 2026-10-17 Flap 关联地址与重要操作覆盖
 
 Suite 1.12.41 补充发布验收记录：业务提交 `d1aba563e5437a58ad7d141adcd0431d442f2f95` 已上线，服务器 Flap 361 项测试通过，新 Safe 轮询及 18 个地址观察起点已核验；现有 CoW 身份不匹配与过期公共池卡片错误单列后续处理。此次验收文档不改变业务行为、不需重启。

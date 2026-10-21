@@ -63,6 +63,20 @@
 
 ## 验证与待发布交接
 
+### 2026/10/21 待发布：1.10.35 关联 Safe 与 ERC-4337
+
+- 授权：用户明确确认按计划实施并交总控发布；本次由链上核验对话执行 Flap 模块修复，例外范围已登记 PROJECT_STATE。基于 `2a01ee94b7edca375b86c3a2dca778f8961df2b5`，未提交／推送／部署，未改服务器或发送测试卡片。
+- 问题与证据：新 Safe `0xdfee42acb3fce076033edcf2084687340b8f2fab` 于 2026/10/21 00:51:27 创建并执行 ERC-4337 授权；16:47:58.920 才被每日 API 关联发现，生产仅候选、无持续观察覆盖。脱敏真实回执见 `fixtures/safe-4337-20261021.json`，交易 `0x7ff81775492dbc6a7f77cb0d9194efa68df938a2825c426c48ef1bd77c9f8542`。
+- 文件：新增 `erc4337-codec.mjs`、`safe-observation.mjs`、`safe-4337.test.mjs`、上述 fixture；修改 `address-observation.mjs`、`early-signal-catalog.mjs`、`early-signal-monitor.mjs`、`early-signal-monitor.test.mjs`、`pending-operations.mjs`、`pending-registry-worker.mjs`、`pending-registry.mjs`、`monitor.mjs`、模块 `package.json`、`MONITORING.md`、本文件与 `docs/PROJECT_STATE.md`。共 16 个文件；根版本及根脚本留总控整合。
+- 行为：静态新 Safe 仅关联观察；可信工厂创建事件＋owners/threshold/singleton 核验后动态持续观察，API 新候选额外核验 runtime；名单与补扫起点持久化、订阅与 pending 配置热更新。不扩充官方执行钱包，不将关联自动当官方。普通提案轮询覆盖静态新 Safe；动态新 Safe 的链上操作／公开 pending 持续观察，不自动扩张 Safe API 提案轮询集合。
+- ERC-4337：按 sender/nonce 独立核验 UserOperation 结果、模块调用与预付 gas 边界；保留未知/超限/路由器调用的待解析提醒；不把外层模拟通过当作单笔成功。动态发现同窗口后续操作通过持久补扫捕获，不倒退实时主游标；并发状态合并、重组、重启和通知去重有回归测试。
+- 验证：`npm run check` 通过，新增模块及最终改动单独 `node --check` 通过；全仓 `npm test` 589/589 通过，随后补充路由器回归后最终 `npm run test:flap` 376/376 通过（新增专项共 15 项）；`git diff --check` 通过。测试隔离了真实通知凭证，没有发群测试。不是线上时延/长期稳定证明。
+- 总控复核：修正 pending 回执在 UserOperation 结果完整核验前提前写入 executed 的问题，新增失败回归后改为原子确认；API 核验跨 await 不覆盖快速发现的更早补扫起点，重组后不提交旧结果，API 发现事件带区块身份以支持撤回。根版本整合为 1.12.42，新增模块纳入语法检查。最终本地 `npm run check`、`git diff --check` 通过，全量 `npm test` 592/592 通过（专项 17 项）；服务器验收待发布后补记。
+- 配置／状态：无需改 `.env` 或手工修改生产状态，保持全部调度周期、Safe Key、历史放弃和降噪设置。模块版本 1.10.35。新增可选 `observedSafes`（含 replayFrom）、`ownerRelations`，复用 observationCoverage；新静态地址从升级激活高度开始，旧历史不批量补推。回滚需保留/备份状态，旧版不会使用动态名单扩展，应明确回滚后覆盖缩减。
+- 总控上线：更新根 Suite 版本和必要说明，建议在根 check 脚本显式列入新增两个模块（专项已由 early-signal-monitor.test.mjs 引入，不要再重复枚举同一专项）；按先验证、提交、推 GitHub、确切提交校验、服务器快进顺序，只重启 Flap。备份完整状态与配置，不重置游标。验收本地/GitHub/服务器一致、dfee 静态观察与普通 Safe API 轮询、WSS 新过滤器、pending Worker 健康、实时游标推进及 source health。
+- 限制／资源：已核验工厂和 singleton 集合之外不自动纳入，其他 EntryPoint 版本只保留既有模块事件提醒；私有 pending 不可见，解析 64 操作/128 KiB，动态观察最多 128 个（满额创建提醒尚未启用），沿用 300 笔/窗口与 Worker 背压。全局工厂日志和有关创建 getter 增加 RPC 压力，需上线观察延迟/错误/丢弃指标；不承诺固定秒数。原公共池超 14 天卡片编辑失败与 CoW owner 不匹配属于既存问题，本次未处理或清空。
+
+
 专项使用 `npm run test:flap`，语法使用 `npm run check`；按变更选择真实回执 fixtures 验证分类、重组、失败重试及分片投递。回放不向真实群发送消息、不推进生产游标。
 
 ### 已发布：1.10.34 关联地址覆盖（2026/10/17）

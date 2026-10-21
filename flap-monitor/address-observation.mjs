@@ -2,6 +2,7 @@ import { observationAddresses, RELATED_SAFES, POSITION_MANAGERS } from './early-
 import { extractFlapProposalActions } from './safe-proposal-monitor.mjs';
 import { describeOperationalAction } from './operational-call-codec.mjs';
 import { TOPICS } from './early-signal-topics.mjs';
+import { ENTRY_POINT_V07, decodeHandleOps, decodeSafeUserOperation, userOperationResult, operationKey4337, receiptUserOperations } from './erc4337-codec.mjs';
 
 const lower = a => String(a || '').toLowerCase();
 const link = a => `[${a}](https://bscscan.com/address/${a})`;
@@ -22,6 +23,32 @@ export function observeAddressTransaction(receipt, transaction, state, config, t
   const observers = new Set(observationAddresses(config).filter(a =>
     Number(receipt.blockNumber) >= (state.observationCoverage?.[a] ?? Infinity)));
   const relatedSafes = new Set((config.relatedSafes ?? RELATED_SAFES).map(lower));
+  const receiptOperations = receiptUserOperations(receipt);
+  if (to === ENTRY_POINT_V07 || receiptOperations.length) {
+    let operations;
+    try { operations = decodeHandleOps(transaction); } catch { operations = []; }
+    if (!operations.length) operations = receiptOperations;
+    try {
+      return operations.filter(op => observers.has(op.sender)).map(op => {
+        const result = userOperationResult(receipt, op);
+        const actions = decodeSafeUserOperation(op, config);
+        return { kind: 'addressObservation', observationOnly: true, actor: op.sender,
+          operationKey: operationKey4337(op), userOpNonce: op.userOpNonce, userOpHash: result.userOpHash,
+          observationLogIndex: result.logIndex ?? -100 - op.userOpIndex,
+          safeExecutionStatus: result.status, via4337: true,
+          detail: [`关联 Safe ERC-4337 操作：${link(op.sender)}`,
+            `UserOperation nonce：${op.userOpNonce}｜${({ executed: '执行成功', failed: '执行失败', unverified: '结果待核验' })[result.status]}`,
+            '仅为关联观察，不代表官方动作、加池准备或底池开放。',
+            result.status === 'executed' ? '执行调用（具体资产变化以业务回执为准）：' : '拟执行调用（不作为已完成操作）：',
+            ...actions.slice(0, 16).map(a => describeOperationalAction(a, state.tokens)),
+            actions.length > 16 ? `另有 ${actions.length - 16} 项调用，见交易详情。` : '',
+          ].filter(Boolean).join('\n') };
+      });
+    } catch {
+      // ModuleSuccess/Failure events remain a separate fallback in decodeEarlyReceipt.
+      return [];
+    }
+  }
   // Existing trusted-wallet paths retain their own classification and noise policy.
   if (trustedWallets.has(from) || trustedWallets.has(to)) return [];
   const safeCall = relatedSafes.has(to) && observers.has(to)
