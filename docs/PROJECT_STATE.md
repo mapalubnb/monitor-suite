@@ -27,9 +27,9 @@
 ## 项目与发布基线
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
-- 最新已核验业务提交：`b38a4de5f2a9cfe2dfca12b6ded6da086fb13a8e`（关闭 Four.meme 自动 AI 分析）；Flap 业务基线为 `847db12793528b5b389b5d2fb0b02888e9e8ddbd`。这些不是对未来 HEAD 的固定要求。
-- 当前版本：Suite `1.12.49`（发布验收文档）、Four.meme `1.5.19`、Flap `1.10.35`。最新业务发布为 Suite 1.12.48，Four.meme 自动 AI 已关闭；详细证据见 Four.meme HANDOFF。
-- 最新业务发布仅重启 `fourmeme-monitor`，配置及全部周期逐项不变，保留独立 30 秒创建者补全和历史策略；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
+- 最新已核验业务提交：`3d4191f8f0f519f0b436a8ebc528aa6dc3bfb65a`（关闭 Flap 全部 AI 分析）；Four.meme 业务基线为 `b38a4de5f2a9cfe2dfca12b6ded6da086fb13a8e`。这些不是对未来 HEAD 的固定要求。
+- 当前版本：Suite `1.12.51`（发布验收文档）、Four.meme `1.5.19`、Flap `1.10.36`。最新业务发布为 Suite 1.12.50，两套监控自动 AI 均已关闭；详细证据见各模块 HANDOFF。
+- 最新业务发布仅重启 `flap-monitor`，配置及全部周期逐项不变，保留独立 30 秒创建者补全和历史策略；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
 - 日志：`/root/.pm2/logs/<服务名>-out.log` 与 `-error.log`；备份根目录：`/root/monitor-suite-backups/`。
@@ -104,6 +104,8 @@
 
 关闭自动 AI 已于 18:55 部署业务提交 b38a4de，总控串行全量 634/634、服务器专项154/154。18:57 连续指标 ai.enabled=false、队列0、关闭启动日志确认；所有配置与周期不变，Flap/机器人未重启。历史补扫 RPC 数据不完整仍待处理，未跳游标或清队列；业务自然告警端到端未在此窗口发生。备份及证据见 Four.meme HANDOFF，Suite 1.12.49 仅同步验收文档。
 
-## 2026/10/22 待发布：关闭 Flap AI
+## 2026/10/22 已部署：关闭 Flap AI
 
 用户明确授权关闭 Flap 全部 AI 并交总控部署。Suite 1.12.50 / Flap 1.10.36 独立固定关闭通用及金库通知增强、两个底层摘要入口；保留 Four.meme 已关闭策略、机器人手动问答、原始卡片、队列和全部周期。无需修改共享模型或凭证，仅重启 Flap。
+
+19:02 已部署业务提交 3d4191f；总控串行全量635/635、服务器379/379。19:03:52 核验两套监控 ai.enabled=false；仅Flap重启，配置和14个可观测任务周期一致，原历史放弃记录与6条待发记录保留。主要游标推进，CoW来源错误仍在，公共RPC短暂失败后恢复。Suite 1.12.51 同步验收，详见Flap HANDOFF。
