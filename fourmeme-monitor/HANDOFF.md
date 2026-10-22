@@ -52,6 +52,15 @@
 
 ## 发布交接记录
 
+### 2026/10/22 待发布：fm-status 动态 GitHub 面板（Suite 1.12.57）
+
+- 用户在 Four.meme 对话明确确认修复并交总控部署；总控读取原对话确认授权。基线 db49a73，取得写锁后实施。
+- 修改共享 install.sh 中 fm-status 的 08 GitHub 面板：优先 githubMonitor.repos，动态列出包括 BNB 在内全部仓库、默认分支、逐仓库提交链接、待补详情和最近检查；新空集合不回退旧名单，首次未同步与已知空仓库分别显示，兼容旧 githubRepos/githubSha。
+- 文件：install.sh、install.test.mjs、根 package.json、README、本交接和 PROJECT_STATE。只改 fm-status GitHub 区块及其数据准备，其他面板、模块版本、监控周期、推送和 AI 关闭策略不变。
+- 本地状态专项25/25、全量709/709、语法及diff检查通过；覆盖BNB与未来动态仓库、各仓库SHA、详情队列、新旧空集合、首次同步及其他面板逐字不变。无测试卡片。
+- 已只读确认服务器 /usr/local/bin/fm-status 与旧版模板完全相同，mode755/root:root，仍读 githubRepos。发布须先GitHub确认，再快进服务器并仅提取fm-status模板原子替换实际命令；不运行完整install.sh，不重启任何服务。上线后只读运行命令核验实际五仓库和字段，记录结果。
+
+
 ### 2026/10/22 已发布：CoW 与 RPC 完整性修复
 
 总控最终验收（北京时间 2026/10/22 19:37:12）：已完成全部阶段并发布，最终业务提交 `ada6bd062c0f2d7a23638e1bfd153b6a7b52a30a`，包含 `2b62b89` CoW/扫描修复、`9ace16c` 测试稳定化、`0abc52e` 预算重试与诊断。Suite 1.12.55 / Four.meme 1.5.21 / Flap 1.10.39；Suite 1.12.56 仅记录本次验收，无需再次重启。

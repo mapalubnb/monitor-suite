@@ -382,7 +382,17 @@ if [ -f "$SNAP" ]; then
     for(const m of moduleItems) for(const r of m.roles||[]) roleCounts[r]=(roleCounts[r]||0)+1;
     const roleNames=Object.keys(roleCounts).sort();
     const sha=(s.githubSha||'')||'未知';
-    const repoEntries=Object.values(s.githubRepos||{}).sort((a,b)=>String(a.full_name||'').localeCompare(String(b.full_name||'')));
+    const github=s.githubMonitor||{};
+    const hasNewGithub=Object.prototype.hasOwnProperty.call(github,'repos');
+    const githubJobs=hasNewGithub&&Array.isArray(github.jobs)?github.jobs:[];
+    const repoEntries=Object.entries((hasNewGithub?github.repos:s.githubRepos)||{}).map(([key,repo])=>{
+      const name=(hasNewGithub?repo.name:repo.full_name)||key;
+      return {name,url:'https://github.com/'+name,
+        branch:hasNewGithub?repo.branch:repo.default_branch, initialized:Boolean(repo.initialized||repo.head||repo.branch),
+        head:hasNewGithub?(repo.head||''):(name==='four-meme-community/four-meme-ai'&&sha!=='未知'?sha:''),
+        checkedAt:hasNewGithub?repo.checkedAt:repo.updated_at,
+        pending:githubJobs.filter(job=>job.repo===name).length};
+    }).sort((a,b)=>a.name.localeCompare(b.name));
     const fp=s.contractFingerprints||{};
     const fpKeys=Object.keys(fp);
     const op=s.onchainParams||{};
@@ -450,9 +460,14 @@ if [ -f "$SNAP" ]; then
     if(!Object.keys(runtime.modules||{}).length) console.log('等待运行指标');
 
     section('08｜📦 GitHub');
-    console.log('最新提交：'+(sha&&sha!=='未知'?mdLink(sha.slice(0,8),'https://github.com/four-meme-community/four-meme-ai/commit/'+sha):sha));
+    console.log('仓库：'+repoEntries.length+' 个｜待补详情：'+(hasNewGithub?githubJobs.length+' 项':'旧版未记录'));
+    if(!hasNewGithub&&sha!=='未知') console.log('旧版主仓库提交：'+mdLink(sha.slice(0,8),'https://github.com/four-meme-community/four-meme-ai/commit/'+sha));
     if(!repoEntries.length) console.log('暂无仓库');
-    for(const repo of repoEntries) console.log(mdLink(repo.full_name||repo.name,repo.html_url||('https://github.com/'+repo.full_name))+' · '+value(repo.default_branch)+' · '+fmtTime(repo.updated_at));
+    for(const [index,repo] of repoEntries.entries()){
+      console.log(String(index+1).padStart(2,'0')+'　'+mdLink(repo.name,repo.url));
+      console.log('默认分支：'+cleanLabel(repo.branch||(hasNewGithub?(repo.initialized?'无默认分支':'待同步'):'未知'))+'｜最新提交：'+(repo.head?mdLink(repo.head.slice(0,8),repo.url+'/commit/'+repo.head):(hasNewGithub&&!repo.initialized?'待同步':'暂无提交')));
+      console.log('待补详情：'+(hasNewGithub?repo.pending+' 项':'旧版未记录')+'｜'+(hasNewGithub?'最近检查：':'仓库更新时间：')+fmtTime(repo.checkedAt));
+    }
     console.log('---');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null

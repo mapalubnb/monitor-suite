@@ -391,3 +391,48 @@ test('Safe status marks nonce failures unhealthy even when the API last succeede
  assert.match(text,/健康 Safe：0\/1/);
  assert.match(text,/nonce 12｜状态 .*异常/);
 });
+
+
+test('fm-status GitHub uses all dynamic repositories with per-repo commits and pending details', () => {
+  const names = ['four-meme-community/four-meme-ai', 'bnb-chain/bnb-chain.github.io', 'four-meme-community/future-repo'];
+  const snapshot = { githubSha: 'f'.repeat(40), githubRepos: { stale: { full_name: 'old/stale' } }, githubMonitor: {
+    repos: Object.fromEntries(names.map((name, i) => [name, { name, branch: i === 1 ? 'master' : 'main', head: String(i + 1).repeat(40), checkedAt: Date.parse('2026-10-22T11:00:00Z') }])),
+    jobs: [{ repo: names[1] }, { repo: names[1] }, { repo: names[2] }],
+  } };
+  const output = renderFourmemeStatus(snapshot), section = output.split('08｜📦 GitHub')[1];
+  assert.match(section, /仓库：3 个｜待补详情：3 项/);
+  for (let i = 0; i < names.length; i++) assert.ok(section.includes('https://github.com/' + names[i] + '/commit/' + String(i + 1).repeat(40)));
+  assert.match(section, /默认分支：master/); assert.match(section, /待补详情：2 项/);
+  assert.match(section, /2026\/10\/22 19:00:00/);
+  assert.doesNotMatch(section, /old\/stale|旧版主仓库提交|ffffffff/);
+});
+
+test('fm-status empty new repository collection never falls back to stale legacy data', () => {
+  const text = renderFourmemeStatus({ githubSha: 'a'.repeat(40), githubRepos: { old: { full_name: 'old/repo' } }, githubMonitor: { repos: {}, jobs: [] } }).split('08｜📦 GitHub')[1];
+  assert.match(text, /仓库：0 个/); assert.match(text, /暂无仓库/);
+  assert.doesNotMatch(text, /old\/repo|aaaaaaaa/);
+});
+
+test('fm-status supports legacy snapshots without assigning the main commit to other repositories', () => {
+  const text = renderFourmemeStatus({ githubSha: 'a'.repeat(40), githubRepos: {
+    'four-meme-community/four-meme-ai': { full_name: 'four-meme-community/four-meme-ai', default_branch: 'main', updated_at: '2026-10-22T10:00:00Z' },
+    'old/other': { full_name: 'old/other', default_branch: 'develop' },
+  } }).split('08｜📦 GitHub')[1];
+  assert.match(text, /旧版主仓库提交/); assert.match(text, /默认分支：develop｜最新提交：暂无提交/);
+  assert.match(text, /旧版未记录/); assert.doesNotMatch(text, /old\/other\/commit/);
+});
+
+test('fm-status new empty repositories show no branch or commit and preserve other panels', () => {
+  const base = { poolConfig: [], apiStructure: {}, frontendPages: {}, openFourTemplates: {} };
+  const original = renderFourmemeStatus(base);
+  const updated = renderFourmemeStatus({ ...base, githubMonitor: { repos: { 'new/empty': { name: 'new/empty', branch: '', head: '', initialized: true } }, jobs: [] } });
+  assert.equal(original.split('08｜📦 GitHub')[0], updated.split('08｜📦 GitHub')[0]);
+  assert.match(updated, /默认分支：无默认分支｜最新提交：暂无提交/);
+  assert.doesNotMatch(updated, /new\/empty\/commit/);
+});
+
+
+test('fm-status newly discovered repository remains pending until its first successful head read', () => {
+  const text = renderFourmemeStatus({ githubMonitor: { repos: { 'new/pending': { name: 'new/pending', branch: '', head: '' } }, jobs: [] } }).split('08｜📦 GitHub')[1];
+  assert.match(text, /默认分支：待同步｜最新提交：待同步/);
+});

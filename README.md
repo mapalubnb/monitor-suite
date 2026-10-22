@@ -6,6 +6,10 @@
 
 当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。协作入口在 Suite 1.12.39 建立，该次仅为文档更新。
 
+## 2026-10-22 fm-status 动态 GitHub 面板
+
+Suite 1.12.57 将 `08｜📦 GitHub` 切换为新版 `githubMonitor.repos`：动态列出全部仓库、默认分支、各自最新提交链接、待补详情数与最近检查时间，包含 BNB 仓库和后续发现仓库。旧快照仍兼容，新版空集合不回退到过期名单；只更新生成的 `fm-status` 命令，不改变其他面板、监控频率、推送或 AI 策略，无需重启服务。
+
 ## 2026-10-22 CoW EthFlow 与 RPC 完整性修复（已发布）
 
 最终业务 Suite 1.12.55 / Flap 1.10.39 / Four.meme 1.5.21，提交 `ada6bd0`：CoW 区分合约 owner 与实际 trader、校验 UID、使用用户有效期并原子更新；日志扫描按实际可读高度完成窗口，未读尾段下轮补齐；历史任务使用低优先级、排除返回旧块 null 的节点，本地预算不足按原周期重试；PublicNode 明确最多支持10地址，大查询完整转交其他节点，监控范围不缩水。共享诊断只记录范围/数量，不暴露凭证和 calldata。
