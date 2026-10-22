@@ -8997,6 +8997,11 @@ function shouldLogActorCatchup(state, lagBefore, lagAfter) {
 async function runActorCheck() {
   await runActorLane(true);
 }
+function deferActorHistory(history, error, now = Date.now()) {
+  history.historyError = error.rpcBudget ? `本地 RPC 预算等待：${error.message}` : error.message;
+  // Backpressure is not a provider failure; keep the existing ten-second cadence.
+  history.historyNextAt = now + (error.rpcBudget ? 10_000 : Math.max(60_000, Number(error.retryAfterMs) || 0));
+}
 async function runActorHistoryCheck() {
   const root = ensureActorMonitorState();
   if (root.historyEndBlock == null) return;
@@ -9009,9 +9014,8 @@ async function runActorHistoryCheck() {
     history.historyError = "";
     history.historyNextAt = Date.now() + 10_000;
   } catch (error) {
-    history.historyError = error.message;
-    history.historyNextAt = Date.now() + 60_000;
-    log("[创建者补扫] " + error.message);
+    deferActorHistory(history, error);
+    log("[创建者补扫] " + history.historyError);
   }
 }
 async function runActorLane(realtime) {
@@ -10392,6 +10396,7 @@ export const __testables = {
   normalizeBscRpcBatchResults,
   fetchValidatedActorBlocks,
   rpcRequestPolicy,
+  deferActorHistory,
   rpcLaneUrls,
   fetchStaticAssetSafe,
   nextUA,

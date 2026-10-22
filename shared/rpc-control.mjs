@@ -98,6 +98,18 @@ export function createRpcControl({ directory = '', now = Date.now, concurrency =
       methods.set(methodKey, stats);
       try { const value = await withDeadline(operation, request.operationTimeoutMs || 30_000, request.cancelSignal, 'RPC operation deadline exceeded'); stats.ok++; return value; }
       catch (error) {
+        if (!request.cancelSignal?.aborted) {
+          const calls = Array.isArray(request.payload) ? request.payload : [request.payload];
+          const filter = calls.find(call => call?.method === 'eth_getLogs')?.params?.[0];
+          // Diagnostics contain counts/ranges, never credential URLs, calldata or addresses.
+          stats.lastFailure = { at: new Date(now()).toISOString(),
+            category: /429|rate.?limit/i.test(error.message) ? 'rate_limit' : /403|401/.test(error.message) ? 'access_denied'
+              : /timeout|timed out/i.test(error.message) || ['TimeoutError', 'AbortError'].includes(error.name) ? 'timeout' : 'response_error',
+            history: Boolean(request.history), batchSize: calls.length,
+            ...(filter ? { fromBlock: filter.fromBlock, toBlock: filter.toBlock,
+              addressCount: Array.isArray(filter.address) ? filter.address.length : filter.address ? 1 : 0,
+              topicChoices: (filter.topics || []).map(topic => Array.isArray(topic) ? topic.length : topic ? 1 : 0) } : {}) };
+        }
         if (!request.cancelSignal?.aborted) { stats.failed++; if (/429|rate.?limit/i.test(error.message)) metrics.upstream429++; else if (/403|401/.test(error.message)) metrics.denied++; else if (/timeout|timed out/i.test(error.message) || ['TimeoutError', 'AbortError'].includes(error.name)) metrics.timeouts++; }
         throw error;
       } finally { stats.lastMs = now() - started; stats.totalMs += stats.lastMs; stats.maxMs = Math.max(stats.maxMs, stats.lastMs); }

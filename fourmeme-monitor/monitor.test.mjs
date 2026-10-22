@@ -2,7 +2,6 @@ import test from "node:test";
 import "./github-monitor.test.mjs";
 import "./creator-discovery.test.mjs";
 import assert from "node:assert/strict";
-import { createServer } from "node:http";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1977,4 +1976,16 @@ test('validated actor reader switches away from HTTP 200 null blocks before ackn
     fetchFn: async url => { seen.push(url); return { ok: true, text: async () => JSON.stringify(calls.map((_, i) => ({ id: i + 1, result: url.includes('null') ? null : block(i + 10) }))) }; } });
   const result = await __testables.fetchValidatedActorBlocks(calls, ['actor'], request, async () => { throw Error('unexpected permissive fallback'); });
   assert.equal(result.length, 2); assert.deepEqual(seen, ['https://null.test', 'https://complete.test']);
+});
+
+
+test('historical budget waits retry on the unchanged cadence and never clear errors or advance cursors', () => {
+  const history = { lastBlock: 100, historyEndBlock: 200, seenTxs: ['old'], historyNextAt: 0 };
+  __testables.deferActorHistory(history, Object.assign(Error('budget full'), { rpcBudget: true }), 1000);
+  assert.equal(history.historyNextAt, 11000); assert.match(history.historyError, /本地 RPC 预算等待/);
+  assert.equal(history.lastBlock, 100); assert.deepEqual(history.seenTxs, ['old']);
+  __testables.deferActorHistory(history, Error('invalid block'), 1000);
+  assert.equal(history.historyNextAt, 61000); assert.equal(history.lastBlock, 100);
+  __testables.deferActorHistory(history, Object.assign(Error('HTTP 429'), { retryAfterMs: 120000 }), 1000);
+  assert.equal(history.historyNextAt, 121000);
 });

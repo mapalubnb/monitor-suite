@@ -103,3 +103,13 @@ test('already cancelled transport never starts or retains capacity',async()=>{
  await assert.rejects(rpc.withEndpoint('https://node.test',()=>assert.fail('must not start'),undefined,{cancelSignal:parent.signal}));
  assert.equal(rpc.summary().active,0);
 });
+
+test('RPC failure diagnostics expose filter shape without credentials or calldata', async () => {
+  const rpc = createRpcControl();
+  await assert.rejects(rpc.withEndpoint('https://node.test/private-key', async () => { throw Error('HTTP 403'); }, undefined,
+    { payload: { method: 'eth_getLogs', params: [{ fromBlock: '0x10', toBlock: '0x20', address: ['private-address'], topics: [['secret-topic', 'another']] }] } }), /403/);
+  const summary = rpc.summary(), info = summary.methods['node.test:eth_getLogs:realtime'].lastFailure;
+  assert.equal(info.category, 'access_denied'); assert.equal(info.addressCount, 1);
+  assert.deepEqual(info.topicChoices, [2]); assert.equal(info.fromBlock, '0x10');
+  assert.doesNotMatch(JSON.stringify(summary), /private-key|private-address|secret-topic/);
+});
