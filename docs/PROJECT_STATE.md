@@ -27,9 +27,9 @@
 ## 项目与发布基线
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
-- 最新已核验业务提交：`fca57f6f24e4f4b95ed9850d6bad6c863adaba79`（Four.meme 创建者独立补全与 GitHub 预算计时）；Flap 业务基线为 `847db12793528b5b389b5d2fb0b02888e9e8ddbd`。这些不是对未来 HEAD 的固定要求。
-- 当前版本：Suite `1.12.47`（发布验收文档）、Four.meme `1.5.18`、Flap `1.10.35`。最新业务发布为 Suite 1.12.46，创建者补全和 GitHub 预算修复已上线；详细证据见 Four.meme HANDOFF。
-- 最新业务发布仅重启 `fourmeme-monitor`，配置及既有周期逐项不变，新增独立 30 秒创建者补全，历史策略保留；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
+- 最新已核验业务提交：`b38a4de5f2a9cfe2dfca12b6ded6da086fb13a8e`（关闭 Four.meme 自动 AI 分析）；Flap 业务基线为 `847db12793528b5b389b5d2fb0b02888e9e8ddbd`。这些不是对未来 HEAD 的固定要求。
+- 当前版本：Suite `1.12.49`（发布验收文档）、Four.meme `1.5.19`、Flap `1.10.35`。最新业务发布为 Suite 1.12.48，Four.meme 自动 AI 已关闭；详细证据见 Four.meme HANDOFF。
+- 最新业务发布仅重启 `fourmeme-monitor`，配置及全部周期逐项不变，保留独立 30 秒创建者补全和历史策略；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
 - 日志：`/root/.pm2/logs/<服务名>-out.log` 与 `-error.log`；备份根目录：`/root/monitor-suite-backups/`。
@@ -98,6 +98,8 @@
 
 1.5.18 发布验收：总控全量复跑 633/633，服务器专项 153/153。10 分钟 GitHub 299 次成功检查，平均 2.004 秒、P95 2.75 秒，budgetWaits=0/请求错误0；未观察自然新提交。创建者独立任务运行、11 个待办全轮转，实际覆盖仍 25/36，来源仍受限。配置与既有周期保持，实时延迟末次0块，历史数据不完整与 OpenFour RPC 预算暂满仍有记录；不宣称全系统无异常。Suite 1.12.47 只同步验收文档。
 
-## 2026/10/22 待发布：关闭 Four.meme 自动 AI
+## 2026/10/22 已部署：关闭 Four.meme 自动 AI
 
 用户在 Four.meme 对话明确要求不再使用自动 AI 分析。总控接手 Suite 1.12.48 / Four.meme 1.5.19；关闭所有自动摘要、重试、增强和编辑补发入口，旧队列仅投递原始内容。保留共享配置、Flap 与机器人手动问答、原始推送和扫描周期。总控串行全量 634/634、根语法检查通过，仅重启 Four.meme，详见模块 HANDOFF。
+
+关闭自动 AI 已于 18:55 部署业务提交 b38a4de，总控串行全量 634/634、服务器专项154/154。18:57 连续指标 ai.enabled=false、队列0、关闭启动日志确认；所有配置与周期不变，Flap/机器人未重启。历史补扫 RPC 数据不完整仍待处理，未跳游标或清队列；业务自然告警端到端未在此窗口发生。备份及证据见 Four.meme HANDOFF，Suite 1.12.49 仅同步验收文档。
