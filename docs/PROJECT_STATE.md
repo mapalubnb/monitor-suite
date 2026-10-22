@@ -27,8 +27,8 @@
 ## 项目与发布基线
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
-- 最新已核验业务提交：`ada6bd062c0f2d7a23638e1bfd153b6a7b52a30a`（CoW EthFlow、日志高度协调、历史预算与 PublicNode 十地址上限适配）；Four.meme 最后业务提交 `0abc52e` 已包含于该提交。
-- 当前版本：Suite `1.12.56`（发布验收文档）、Four.meme `1.5.21`、Flap `1.10.39`。最终业务发布 Suite 1.12.55，两套监控自动 AI 仍关闭。
+- 最新已核验业务提交：`6fe0272c43f0ae16cab577c0f7703a97acc1a837`（fm-status 动态 GitHub 面板）；监控业务基线仍为 `ada6bd0`，Four.meme 最后监控修改 `0abc52e`。
+- 当前版本：Suite `1.12.58`（发布验收文档）、Four.meme `1.5.21`、Flap `1.10.39`。最新命令发布 Suite 1.12.57；监控发布 Suite 1.12.55，两套监控自动 AI 仍关闭。
 - 本次分阶段先更新两套监控，最后节点能力适配仅重启 Flap；机器人未重启。19:37:12 验收全部周期与环境配置不变，CoW恢复、实时扫描追齐、历史补扫继续、队列及历史放弃记录保留。存在公共节点瞬时超时/本地预算等待及独立的旧卡过期问题，详见两模块 HANDOFF；不保证公共服务永久无故障。此验收文档同步无需重启，确切 HEAD 仍需本地/GitHub/服务器三方核对。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
@@ -134,3 +134,11 @@ PublicNode 拒绝根因补齐（Suite 1.12.55 / Flap 1.10.39）：新诊断定�
 ## 2026/10/22 总控接手 fm-status GitHub 面板
 
 Four.meme 对话用户确认修复后，总控核对授权、取得写锁，完成新版动态仓库状态面板与新旧快照兼容。Suite 1.12.57；专项25/25、全量709/709通过。需先GitHub再服务器定向更新实际命令，所有服务无需重启，详细交接见 Four.meme HANDOFF。
+
+## 2026/10/22 fm-status GitHub 面板已上线
+
+总控上线验收（北京时间2026/10/22 19:47:02）：业务提交 `6fe0272c43f0ae16cab577c0f7703a97acc1a837` 已先推 GitHub、核对 SHA，再快进服务器。服务器隔离专项25/25，本地专项25/25及全量709/709通过；已备份并从已验证 install.sh 仅提取 fm-status，sh -n 通过后原子替换 `/usr/local/bin/fm-status`，未运行全量安装。
+
+- 只读执行实际命令，08面板显示5仓库：four-meme-ai、openfour-docs、openfour-boost-launchpad、fourmeme-docs，以及 bnb-chain/bnb-chain.github.io；均有对应默认分支和独立完整提交URL、待补详情0，检查时间为北京时间。BNB 提交 ef5a632d、主仓库 c81f0eeb；不是共用主仓库 SHA。逐项对照实时 githubMonitor.repos 的仓库/分支/head 一致。
+- 实际命令 SHA256 `b12dce5beec981c66a9b40248d67becb936a8f92cf8be10e32b066cad4f3ddec`；旧命令确认与旧模板完全相同，未覆盖额外定制。权限755/root:root，三个服务 PID及环境文件哈希保持，监控周期/推送/AI关闭策略未改，无测试卡片和服务重启。
+- 备份 `/root/monitor-suite-backups/fm-status-1.12.57-20261022-194626` 保存旧命令、隔离测试、完整实际输出及验收JSON。Suite 1.12.58 仅同步验收记录，无需再次安装命令或重启。

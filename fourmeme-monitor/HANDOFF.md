@@ -52,7 +52,14 @@
 
 ## 发布交接记录
 
-### 2026/10/22 待发布：fm-status 动态 GitHub 面板（Suite 1.12.57）
+### 2026/10/22 已发布：fm-status 动态 GitHub 面板（Suite 1.12.57）
+
+总控上线验收（北京时间2026/10/22 19:47:02）：业务提交 `6fe0272c43f0ae16cab577c0f7703a97acc1a837` 已先推 GitHub、核对 SHA，再快进服务器。服务器隔离专项25/25，本地专项25/25及全量709/709通过；已备份并从已验证 install.sh 仅提取 fm-status，sh -n 通过后原子替换 `/usr/local/bin/fm-status`，未运行全量安装。
+
+- 只读执行实际命令，08面板显示5仓库：four-meme-ai、openfour-docs、openfour-boost-launchpad、fourmeme-docs，以及 bnb-chain/bnb-chain.github.io；均有对应默认分支和独立完整提交URL、待补详情0，检查时间为北京时间。BNB 提交 ef5a632d、主仓库 c81f0eeb；不是共用主仓库 SHA。逐项对照实时 githubMonitor.repos 的仓库/分支/head 一致。
+- 实际命令 SHA256 `b12dce5beec981c66a9b40248d67becb936a8f92cf8be10e32b066cad4f3ddec`；旧命令确认与旧模板完全相同，未覆盖额外定制。权限755/root:root，三个服务 PID及环境文件哈希保持，监控周期/推送/AI关闭策略未改，无测试卡片和服务重启。
+- 备份 `/root/monitor-suite-backups/fm-status-1.12.57-20261022-194626` 保存旧命令、隔离测试、完整实际输出及验收JSON。Suite 1.12.58 仅同步验收记录，无需再次安装命令或重启。
+
 
 - 用户在 Four.meme 对话明确确认修复并交总控部署；总控读取原对话确认授权。基线 db49a73，取得写锁后实施。
 - 修改共享 install.sh 中 fm-status 的 08 GitHub 面板：优先 githubMonitor.repos，动态列出包括 BNB 在内全部仓库、默认分支、逐仓库提交链接、待补详情和最近检查；新空集合不回退旧名单，首次未同步与已知空仓库分别显示，兼容旧 githubRepos/githubSha。
