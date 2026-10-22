@@ -287,3 +287,29 @@ test("GitHub 停止后不再请求或写入", async () => {
   assert.equal(context.requests.length, 0);
   assert.deepEqual(context.persisted, {});
 });
+
+for (const duration of [300, 1500, 2500]) test(`GitHub ${duration}ms 响应耗时不重复叠加预算等待`, async () => {
+  let timestamp = 0;
+  let calls = 0;
+  const api = createGithubApi({ token: "test", now: () => timestamp, fetchImpl: async () => {
+    calls++;
+    timestamp += duration;
+    return new Response(JSON.stringify({ data: { rateLimit: { cost: 1, remaining: 4900, resetAt: new Date(3600000).toISOString() } } }));
+  } });
+  await api.heads(GITHUB_REPOSITORIES);
+  assert.equal(api.summary().budgetReadyAt, 750);
+  timestamp = duration > 2000 ? 4000 : 2000;
+  await api.heads(GITHUB_REPOSITORIES);
+  assert.equal(calls, 2);
+  assert.equal(api.summary().budgetWaits, 0);
+});
+
+test("GitHub 预算等待区别于服务端限流，额度不足仍暂停", async () => {
+  let timestamp = 0;
+  const api = createGithubApi({ token: "test", now: () => timestamp, fetchImpl: async () => new Response(JSON.stringify({ data: { rateLimit: { cost: 2, remaining: 200, resetAt: new Date(3600000).toISOString() } } })) });
+  await api.heads(GITHUB_REPOSITORIES);
+  timestamp = 2000;
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => error.code === "GITHUB_BUDGET_WAIT");
+  assert.equal(api.summary().sharedRetryAt, 0);
+  assert.equal(api.summary().budgetWaits, 1);
+});

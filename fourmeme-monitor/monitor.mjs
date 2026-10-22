@@ -4,6 +4,7 @@ import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs"
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
 import { createGithubApi, createGithubMonitor } from "./github-monitor.mjs";
+import { discoverCreators } from "./creator-discovery.mjs";
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
  *
@@ -642,6 +643,12 @@ function scheduleRuntimeMetricsWrite() {
       rpc: rpcControl.summary(),
       http: fourmemeHttp.snapshot(),
       github: githubMonitor.summary(),
+      creatorDiscovery: {
+        lastRunAt: snapshot?.creatorDiscovery?.lastRunAt || 0,
+        watchedCount: snapshot?.creatorDiscovery?.watchedCount || 0,
+        missingCount: snapshot?.creatorDiscovery?.missingCount ?? null,
+        pending: Object.entries(snapshot?.creatorDiscovery?.pending || {}).map(([address, item]) => ({ address, labels: item.labels, attempts: item.attempts, nextRetryAt: item.nextRetryAt, lastError: item.lastError })),
+      },
       snapshotWrites: {
         ...snapshotWriteMetrics,
         averageDurationMs: snapshotWriteMetrics.writes
@@ -1529,6 +1536,7 @@ async function requestBscRpcPayload(payload, timeoutMs, {
   // Code and proxy-slot checks may consume the reserve also used by Flap core
   // checks. Ordinary reads and block backfill must leave that reserve intact.
   const requestOptions = { payload, cost: calls.length,
+    ...(moduleMetricContext.getStore()?.moduleName === "creatorDiscovery" ? { history: true } : {}),
     critical: calls.length > 0 && calls.every(call => ["eth_getStorageAt", "eth_getCode"].includes(call.method)) };
   const dedupeKey = `${timeoutMs}:${dedupeKeySuffix}:${JSON.stringify(payload)}`;
   const existing = inflight.get(dedupeKey);
@@ -8444,15 +8452,41 @@ async function fetchContractCreatorActors(contractEntries, state, options = {}) 
 
   const lookupState = state.creatorLookup || (state.creatorLookup = {});
   let missing = missingCreatorAddresses(contractEntries, state);
-  await fetchCreatorsViaBscScanPages(missing, state, lookupState, Date.now());
+  if (!missing.length) return cachedCreatorMap(state);
+  const offset = (lookupState.targetCursor || 0) % missing.length;
+  const rotated = [...missing.slice(offset), ...missing.slice(0, offset)];
+  await fetchCreatorsViaExplorerApi(rotated.slice(0, 5), state, lookupState, Date.now());
+
+  missing = missingCreatorAddresses(contractEntries, state);
+  await fetchCreatorsViaBscScanPages(rotated.filter(address => missing.includes(address)), state, lookupState, Date.now());
+  lookupState.targetCursor = (offset + Math.max(1, CONFIG.actorMonitor.creatorPageMaxPerRun)) % Math.max(1, missing.length);
 
   missing = missingCreatorAddresses(contractEntries, state);
   await fetchCreatorsViaRecentChain(missing, state, lookupState, Date.now());
 
-  missing = missingCreatorAddresses(contractEntries, state);
-  await fetchCreatorsViaExplorerApi(missing, state, lookupState, Date.now());
-
   return cachedCreatorMap(state);
+}
+
+async function runCreatorDiscoveryCheck() {
+  if (!CONFIG.actorMonitor.enabled || monitorStopping) return;
+  const contracts = buildWatchedContractEntries();
+  if (!contracts.length) return;
+  const previous = snapshot.creatorDiscovery || { lookup: structuredClone(snapshot.chainActorHistory?.creatorLookup || snapshot.chainActorMonitor?.realtime?.creatorLookup || {}) };
+  const known = {
+    ...snapshot.chainActorMonitor?.creators,
+    ...snapshot.chainActorHistory?.creators,
+    ...snapshot.chainActorMonitor?.realtime?.creators,
+    ...previous.creators,
+  };
+  const next = await discoverCreators({
+    previous, contracts, known,
+    lookup: (targets, local) => fetchContractCreatorActors(targets, local),
+    rpc: bscRpcBatch,
+  });
+  if (monitorStopping) return;
+  await monitorStore.transaction(() => { snapshot.creatorDiscovery = next; });
+  const added = Object.keys(next.creators).length - Object.keys(previous.creators || {}).length;
+  if (added || previous.missingCount !== next.missingCount) log(`[创建者补全] 新核验 ${added} 个；覆盖 ${next.watchedCount - next.missingCount}/${next.watchedCount}，剩余地址保留待办`);
 }
 
 async function fetchActorContext(contractEntries, state, options = {}) {
@@ -8966,6 +9000,7 @@ async function runActorLane(realtime) {
   const root = ensureActorMonitorState();
   const state = realtime ? (root.realtime ||= { creators: root.creators || {}, creatorLookup: root.creatorLookup || {}, seenTxs: [] }) : snapshot.chainActorHistory;
   if (realtime) state.creators = { ...state.creators, ...snapshot.chainActorHistory?.creators };
+  state.creators = { ...state.creators, ...snapshot.creatorDiscovery?.creators };
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
     log("[创建者] 尚无合约指纹，等待合约模块建立基线");
@@ -9008,13 +9043,14 @@ async function runActorLane(realtime) {
   const cachedCreatorCount = Object.keys(cachedCreatorMap(state)).length;
   const bootstrapCreatorRefresh = cachedCreatorCount === 0 && CONFIG.actorMonitor.extraActors.length === 0;
   if (bootstrapCreatorRefresh) {
-    log("[创建者] 尚无创建者缓存，先执行一次创建者补全以建立监听地址");
+    log("[创建者] 尚无创建者缓存，等待独立补全建立监听地址");
   }
 
-  let context = await fetchActorContext(contractEntries, state, { refresh: bootstrapCreatorRefresh });
+  let context = await fetchActorContext(contractEntries, state, { refresh: false });
   let actorList = formatActorWatchList(context);
   state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
   state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
+  if (!state.actionActorCount) return;
 
   const lagBefore = Math.max(0, safeLatest - state.lastBlock);
 
@@ -9092,19 +9128,6 @@ async function runActorLane(realtime) {
     } else {
       log(`[创建者] 追块${catchupLog.reason === "start" ? "启动" : "进度"}：延迟 ${lagBefore} → ${state.actorLagBlocks} 块，本轮 ${scannedBatches} 批 / ${scannedBlocks} 块，模式 ${state.blockFeed?.mode || "unknown"}`);
     }
-  }
-
-  if (!realtime) {
-    const beforeCreators = JSON.stringify(state.creators || {});
-    await fetchContractCreatorActors(contractEntries, state, { refresh: true });
-    if (beforeCreators !== JSON.stringify(state.creators || {})) {
-      context = await fetchActorContext(contractEntries, state, { refresh: false });
-      actorList = formatActorWatchList(context);
-      state.actors = Object.fromEntries(actorList.map(actor => [actor.address, actor]));
-      state.actionActorCount = actorList.filter(actor => actor.actionWatched).length;
-    }
-  } else {
-    // 追块期间创建者补全会拖慢实时扫链；进度日志由 shouldLogActorCatchup 节流输出。
   }
 
   if (anyActions) {
@@ -9452,10 +9475,13 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
             try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
           }
         } catch (err) {
-          if (firstRunStatus === "pending") firstRunStatus = "failed";
+          if (firstRunStatus === "pending" && err.code !== "GITHUB_BUDGET_WAIT") firstRunStatus = "failed";
           if (name === "github") githubReposETag = "";
           metricSample.durationMs = Date.now() - startedAt;
-          if (err.message?.includes("[退避中]")) {
+          if (err.code === "GITHUB_BUDGET_WAIT") {
+            metricSample.backoffCount = 1;
+            recordModuleMetric(moduleMetrics, name, metricSample);
+          } else if (err.message?.includes("[退避中]")) {
             if (moduleErrors[name]) moduleErrors[name].healthySince = 0;
             metricSample.backoffCount = 1;
             recordModuleMetric(moduleMetrics, name, metricSample);
@@ -10095,6 +10121,7 @@ modules.push(createModuleRunner("actorHistory", runActorHistoryCheck, 10_000));
 const actorRunner = modules.find(m => m.name === "actor");
 const openFourDiscoveryRunner = createModuleRunner("openfourDiscovery", () => CONFIG.openFourRegistryLogMonitor.enabled ? runOpenFourModuleDiscoveryCheck() : undefined, 30_000);
 modules.push(openFourDiscoveryRunner);
+modules.push(createModuleRunner("creatorDiscovery", runCreatorDiscoveryCheck, 30_000, false));
 
 function calculateNextModuleDueAt(nextDueAt, intervalMs, now = Date.now()) {
   let next = nextDueAt + intervalMs;

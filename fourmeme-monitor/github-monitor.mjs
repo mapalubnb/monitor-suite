@@ -23,12 +23,19 @@ export function createGithubApi({ token, fetchImpl = fetch, now = Date.now, onRe
   const retryAt = { graphql: 0, rest: 0 };
   const failures = { graphql: 0, rest: 0 };
   let sharedRetryAt = 0;
+  let budgetReadyAt = 0;
+  let budgetWaits = 0;
   let restQueue = Promise.resolve();
 
   async function request(path, query) {
     const lane = query ? "graphql" : "rest";
     if (!token?.trim()) throw new Error("GitHub 2秒监控需要 GITHUB_TOKEN；未发送匿名请求");
     if (now() < Math.max(sharedRetryAt, retryAt[lane])) throw new Error("[退避中] GitHub API 冷却，保留游标及详情任务");
+    if (query && now() < budgetReadyAt) {
+      budgetWaits++;
+      throw Object.assign(new Error("GitHub 本地预算等待（非服务端限流）"), { code: "GITHUB_BUDGET_WAIT", retryAt: budgetReadyAt });
+    }
+    const startedAt = now();
     try {
       onRequest();
       const response = await fetchImpl(`https://api.github.com${path}`, {
@@ -55,7 +62,7 @@ export function createGithubApi({ token, fetchImpl = fetch, now = Date.now, onRe
         const rate = data.data.rateLimit;
         budgets.graphql = { cost: rate.cost, remaining: rate.remaining, resetAt: Date.parse(rate.resetAt) };
         if (rate.remaining <= 100) retryAt.graphql = Math.max(retryAt.graphql, Date.parse(rate.resetAt) + 1000);
-        else retryAt.graphql = Math.max(retryAt.graphql, now() + Math.ceil(rate.cost * Math.max(0, Date.parse(rate.resetAt) - now()) / (rate.remaining - 100)));
+        else budgetReadyAt = startedAt + Math.ceil(rate.cost * Math.max(0, Date.parse(rate.resetAt) - startedAt) / (rate.remaining - 100));
       }
       if (query && data.errors?.some(error => error.type === "RATE_LIMITED" || /rate limit|abuse|secondary/i.test(error.message))) {
         sharedRetryAt = Math.max(sharedRetryAt, now() + 60_000);
@@ -77,7 +84,7 @@ export function createGithubApi({ token, fetchImpl = fetch, now = Date.now, onRe
       restQueue = result.catch(() => {});
       return result;
     },
-    summary: () => ({ budgets: structuredClone(budgets), retryAt: { ...retryAt }, sharedRetryAt }),
+    summary: () => ({ budgets: structuredClone(budgets), retryAt: { ...retryAt }, sharedRetryAt, budgetReadyAt, budgetWaits }),
   };
 }
 
