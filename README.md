@@ -6,6 +6,10 @@
 
 当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。协作入口在 Suite 1.12.39 建立，该次仅为文档更新。
 
+## 2026-10-22 关闭 Four.meme 自动 AI 分析
+
+Suite 1.12.48 / Four.meme 1.5.19 按用户要求关闭全部自动 AI 摘要、分析、异步增强、重试和编辑补发；旧 outbox 重投递也只发送原始告警及 diff。扫描周期、原始内容和队列保留，Flap、共享模型配置及机器人手动问答不变。未经用户重新授权，不因模型或凭证恢复而启用。部署状态见 [交接记录](fourmeme-monitor/HANDOFF.md)。
+
 ## 2026-10-22 创建者独立补全与 GitHub 预算计时
 
 Suite 1.12.46 / Four.meme 1.5.18 将创建者补全移至独立 30 秒工作器，继承来源冷却与查询进度；新增候选经过直接创建交易、回执和区块成员校验后才纳入。保留缺失清单与原扫描游标，其他监控周期不变。当前缺少可用浏览器 API/归档渠道，不能将流程修复当作 11 个缺失目标已经补齐。详见 [创建者补全说明](fourmeme-monitor/CREATOR_DISCOVERY.md)。

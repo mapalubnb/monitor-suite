@@ -715,7 +715,7 @@ test("frontend fetch failures are grouped by domain and skip AI", () => {
   assert.match(notifications[0].content, /\/en\/campaign/);
 });
 
-test("AI routing skips operational noise and keeps high-value changes", () => {
+test("Four.meme 所有自动监控通知均关闭 AI 分析", () => {
   assert.equal(__testables.shouldUseAiForNotification({
     title: "⚠️ 前端抓取受限：four.meme",
     content: "原因: backoff",
@@ -724,7 +724,7 @@ test("AI routing skips operational noise and keeps high-value changes", () => {
   assert.equal(__testables.shouldUseAiForNotification({
     title: "前端新路由发现：/en/presale/102364633",
     content: "新页面",
-  }), true);
+  }), false);
   assert.equal(__testables.shouldUseAiForNotification({
     title: "前端 i18n 资源变更（影响 3 页）",
     content: "**类型：全局 i18n 资源变更**",
@@ -732,7 +732,7 @@ test("AI routing skips operational noise and keeps high-value changes", () => {
   assert.equal(__testables.shouldUseAiForNotification({
     title: "前端文案变更：/en/presale/102364633",
     content: "**📝 i18n 国际化字符串变更：**\n+ presale.error: You are not eligible",
-  }), true);
+  }), false);
   assert.equal(__testables.shouldUseAiForNotification({
     title: "链上创建者动作（1项）",
     content: "**ℹ️ 低风险：transfer**",
@@ -740,7 +740,7 @@ test("AI routing skips operational noise and keeps high-value changes", () => {
   assert.equal(__testables.shouldUseAiForNotification({
     title: "链上创建者动作（1项）",
     content: "**🚨 高风险：admin upgrade**",
-  }), true);
+  }), false);
   assert.equal(__testables.shouldUseAiForNotification({
     title: "GitHub 项目变更（1项）",
     content: "🔄 **仓库更新：** description: 旧 → 新",
@@ -748,7 +748,22 @@ test("AI routing skips operational noise and keeps high-value changes", () => {
   assert.equal(__testables.shouldUseAiForNotification({
     title: "API 变更",
     content: "**📡 API 结构变更：/v1/public/config**\n```+ buyFee (string)```",
-  }), true);
+  }), false);
+});
+
+test("Four.meme 关闭 AI 后摘要和补发入口均不调用网络", async () => {
+  const previousFetch = globalThis.fetch;
+  globalThis.fetch = async () => assert.fail("关闭 AI 后不得请求模型");
+  try {
+    assert.equal(await __testables.aiSummarize("合约升级", "合约"), "");
+    assert.equal(await __testables.summarizeWithRetry("GitHub diff", "GitHub"), "");
+    assert.equal(__testables.scheduleAiPatchRetry({ messageId: "test", title: "test", summary: "test" }), undefined);
+    for (const title of ["底池变更", "合约变更", "OpenFour 新模块", "GitHub 新提交", "GitHub 文件 diff", "链上参数变更"]) {
+      assert.equal(__testables.shouldUseAiForNotification({ title, content: "权限升级", skipAi: false }), false);
+    }
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 });
 
 test("long Four.meme cards are kept as complete chunks instead of one-card patches", () => {

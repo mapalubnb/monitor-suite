@@ -112,6 +112,7 @@ await setupHttpKeepAlive();
 
 const GITHUB_INTERVAL_FALLBACK_SECONDS = 2;
 const GITHUB_INTERVAL_MIN_SECONDS = 2;
+const FOURMEME_AI_ANALYSIS_ENABLED = false;
 
 const CONFIG = {
   // Four.meme
@@ -643,6 +644,7 @@ function scheduleRuntimeMetricsWrite() {
       rpc: rpcControl.summary(),
       http: fourmemeHttp.snapshot(),
       github: githubMonitor.summary(),
+      ai: { enabled: FOURMEME_AI_ANALYSIS_ENABLED },
       creatorDiscovery: {
         lastRunAt: snapshot?.creatorDiscovery?.lastRunAt || 0,
         watchedCount: snapshot?.creatorDiscovery?.watchedCount || 0,
@@ -1039,7 +1041,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
   }
 
   // 2. 异步调用 AI → 编辑原消息补充摘要（不阻塞调用方）
-  if (messageId && AI_CONFIG.enabled && AI_CONFIG.apiKey) {
+  if (FOURMEME_AI_ANALYSIS_ENABLED && messageId && AI_CONFIG.enabled && AI_CONFIG.apiKey) {
     summarizeWithRetry(aiInput || content, moduleContext).then(async (summary) => {
       if (!summary) return;
       const enriched = enrichFn
@@ -1068,6 +1070,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
 }
 
 async function summarizeWithRetry(input, moduleContext) {
+  if (!FOURMEME_AI_ANALYSIS_ENABLED) return "";
   const maxAttempts = readPositiveIntEnv("AI_SUMMARY_RETRY_ATTEMPTS", 2);
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -1082,6 +1085,7 @@ async function summarizeWithRetry(input, moduleContext) {
 }
 
 function scheduleAiPatchRetry({ messageId, title, content, template, diffFilePath, cardOpts = {}, summary, attempt = 1 }) {
+  if (!FOURMEME_AI_ANALYSIS_ENABLED) return;
   const maxAttempts = readPositiveIntEnv("AI_PATCH_RETRY_ATTEMPTS", 2);
   const delayMs = Math.min(30_000, 2_000 * attempt);
   setTimeout(async () => {
@@ -1101,7 +1105,7 @@ function scheduleAiPatchRetry({ messageId, title, content, template, diffFilePat
 }
 
 function shouldUseAiForNotification({ title = "", content = "", moduleContext = "", aiInput = "", skipAi = false } = {}) {
-  if (skipAi) return false;
+  if (!FOURMEME_AI_ANALYSIS_ENABLED || skipAi) return false;
   const text = `${title}\n${moduleContext}\n${aiInput || content}`;
 
   // 明确噪音/状态类：不需要 AI。
@@ -1228,6 +1232,7 @@ const AI_SYSTEM_PROMPT = `你是 Four.meme（BSC 链 Meme 代币发射平台）�
  * 调用 AI 对 diff 内容进行总结
  */
 async function aiSummarize(diffContent, moduleContext = "", _retries = 1) {
+  if (!FOURMEME_AI_ANALYSIS_ENABLED) return "";
   return _aiSummarizeBase(diffContent, AI_SYSTEM_PROMPT, moduleContext, { retries: _retries });
 }
 
@@ -10141,6 +10146,7 @@ function buildFourmemeRestartCard() {
 
 async function startAllModules() {
   log("Four.meme 全面监控 v2 启动中...");
+  log("[AI] Four.meme 自动分析已关闭，仅推送原始监控结果和 diff");
   log("模块频率：");
   for (const m of modules) {
     log(`  ${m.name.padEnd(12)} ${(m.intervalMs / 1000).toFixed(0)}s`);
@@ -10272,6 +10278,9 @@ function setSnapshotForTests(value) {
 }
 
 export const __testables = {
+  aiSummarize,
+  summarizeWithRetry,
+  scheduleAiPatchRetry,
   CONFIG,
   diffPoolConfigs,
   buildFourmemeRestartCard,
