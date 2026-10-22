@@ -3,6 +3,7 @@ import { createRpcControl, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-con
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
+import { createGithubApi, createGithubMonitor } from "./github-monitor.mjs";
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
  *
@@ -17,7 +18,7 @@ import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
  *   模块2: 前端代码   — 每 7s（统一页面池，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
  *   模块3: API 结构    — 每 10s（多端点并行，含结构+值 diff）
  *   模块4: OpenFour模板 — 每 2s（新增模板 / 状态变化）
- *   模块5: GitHub     — 有 token 每 30s / 无 token 每 90s（账号仓库列表每 5min）
+ *   模块5: GitHub     — 认证 GraphQL 每 2s；仓库发现 15s；详情异步补充
  *   模块6: 智能合约   — 每 2s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 2s（RPC batch，单次请求）
  *   模块8: 创建者动作 — WebSocket 新区块驱动 + HTTP 兜底（只监听创建者/手动配置地址发起的交易）
@@ -108,9 +109,8 @@ async function setupHttpKeepAlive() {
 
 await setupHttpKeepAlive();
 
-const HAS_GITHUB_TOKEN = Boolean((process.env.GITHUB_TOKEN || "").trim());
-const GITHUB_INTERVAL_FALLBACK_SECONDS = HAS_GITHUB_TOKEN ? 30 : 90;
-const GITHUB_INTERVAL_MIN_SECONDS = HAS_GITHUB_TOKEN ? 30 : 90;
+const GITHUB_INTERVAL_FALLBACK_SECONDS = 2;
+const GITHUB_INTERVAL_MIN_SECONDS = 2;
 
 const CONFIG = {
   // Four.meme
@@ -142,7 +142,7 @@ const CONFIG = {
   githubOwner: "four-meme-community",
   githubRepo: "four-meme-community/four-meme-ai",
   githubApiBranch: "main",
-  githubToken: process.env.GITHUB_TOKEN || "",  // 可选：填入 PAT 提升 rate limit 至 5000/h
+  githubToken: process.env.GITHUB_TOKEN || "",
 
   // 飞书 API（SDK 统一发送，只需 App 凭证 + Chat ID）
   feishuAppId: process.env.FEISHU_APP_ID || "",
@@ -160,7 +160,7 @@ const CONFIG = {
     onchain:  readClampedSecondsEnv("FOURMEME_ONCHAIN_INTERVAL_SECONDS", 2, 1),
     actor:    3_000,   // 模块8: 合约创建者动作
   },
-  githubRepoListIntervalMs: readClampedSecondsEnv("GITHUB_REPO_LIST_INTERVAL_SECONDS", 300, 300),
+  githubRepoListIntervalMs: readClampedSecondsEnv("GITHUB_REPO_LIST_INTERVAL_SECONDS", 15, 15),
 
   // 快照文件
   snapshotFile: join(__dirname, "snapshot.json"),
@@ -641,6 +641,7 @@ function scheduleRuntimeMetricsWrite() {
       modules: modulesSummary,
       rpc: rpcControl.summary(),
       http: fourmemeHttp.snapshot(),
+      github: githubMonitor.summary(),
       snapshotWrites: {
         ...snapshotWriteMetrics,
         averageDurationMs: snapshotWriteMetrics.writes
@@ -9408,7 +9409,7 @@ function clearModuleError(name) {
 /**
  * 创建防重入的模块运行器
  */
-function createModuleRunner(name, fn, intervalMs) {
+function createModuleRunner(name, fn, intervalMs, transactional = true) {
   let firstRunStatus = "pending";
   let resolveFirstRun;
   const firstRun = new Promise(resolve => { resolveFirstRun = resolve; });
@@ -9428,7 +9429,7 @@ function createModuleRunner(name, fn, intervalMs) {
         const metricSample = { moduleName: name, durationMs: 0, requestCount: 0, backoffCount: 0, errorCount: 0 };
         const startedAt = Date.now();
         try {
-          await moduleMetricContext.run(metricSample, () => monitorStore.transaction(fn));
+          await moduleMetricContext.run(metricSample, () => transactional ? monitorStore.transaction(fn) : fn());
           if (firstRunStatus === "pending") firstRunStatus = "complete";
           metricSample.durationMs = Date.now() - startedAt;
           recordModuleMetric(moduleMetrics, name, metricSample);
@@ -9998,74 +9999,6 @@ async function runApiCheck() {
   }
 }
 
-async function runGithubCheck() {
-  if (!snapshot) snapshot = {};
-  // 从快照恢复 ETag（避免重启后浪费 rate limit）
-  if (!githubETag && snapshot.githubETag) githubETag = snapshot.githubETag;
-  if (!githubReposETag && snapshot.githubReposETag) githubReposETag = snapshot.githubReposETag;
-  let githubSnapshotDirty = false;
-
-  const now = Date.now();
-  const lastRepoPoll = Date.parse(snapshot.githubReposLastPollAt || "") || 0;
-  const shouldCheckRepos = !snapshot.githubRepos || now - lastRepoPoll >= CONFIG.githubRepoListIntervalMs;
-  if (shouldCheckRepos) {
-    try {
-      const { repoMap, changes: repoChanges } = await checkGithubRepos(
-        snapshot.githubRepos || null,
-        Boolean(snapshot.githubSha)
-      );
-      snapshot.githubReposLastPollAt = new Date(now).toISOString();
-      if (githubReposETag && snapshot.githubReposETag !== githubReposETag) {
-        snapshot.githubReposETag = githubReposETag;
-        githubSnapshotDirty = true;
-      }
-      if (repoMap && !jsonEqual(snapshot.githubRepos, repoMap)) {
-        snapshot.githubRepos = repoMap;
-        githubSnapshotDirty = true;
-      }
-      if (repoChanges) {
-        const count = (repoChanges.added?.length || 0) + (repoChanges.removed?.length || 0) + (repoChanges.changed?.length || 0);
-        log(`[GitHub] 检测到 ${count} 项账号仓库/项目变更！`);
-        const content = formatGithubRepoChanges(repoChanges);
-        await saveSnapshot(snapshot);
-        githubSnapshotDirty = false;
-        appendHistory("github", `GitHub 项目变更（${count}项）`, content.slice(0, 300), content);
-        await sendNotificationMaybeAi({ title: `GitHub 项目变更（${count}项）`, content, template: "turquoise", moduleContext: "Four.meme GitHub 项目变更", url: `https://github.com/${CONFIG.githubOwner}` });
-      }
-    } catch (err) {
-      log(`[GitHub] 账号仓库列表检查失败，继续检查主仓库提交：${err.message}`);
-    }
-  }
-
-  const { newSha, newCommits } = await checkGithub(snapshot.githubSha || "");
-  // 持久化 ETag
-  if (githubETag && snapshot.githubETag !== githubETag) {
-    snapshot.githubETag = githubETag;
-    githubSnapshotDirty = true;
-  }
-  if (!snapshot.githubSha) {
-    snapshot.githubSha = newSha;
-    await saveSnapshot(snapshot);
-    log(`[GitHub] 首次记录：${newSha.slice(0, 8)}`);
-    return;
-  }
-  if (newCommits.length > 0) {
-    log(`[GitHub] 检测到 ${newCommits.length} 个新提交！`);
-    const content = formatGithubChanges(newCommits);
-    const title = `GitHub 新提交（${newCommits.length}个）`;
-    const fullDiff = buildGithubFullDiff(newCommits);
-    const diffFilePath = saveDiffLocally(title, fullDiff);
-    snapshot.githubSha = newSha;
-    snapshot.githubLastPollAt = new Date().toISOString();
-    snapshot.githubLastCommitCount = newCommits.length;
-    await saveSnapshot(snapshot);
-    appendHistory("github", title, content.slice(0, 300), content);
-    await sendNotificationMaybeAi({ title, content, template: "turquoise", moduleContext: "Four.meme GitHub 仓库新提交", aiInput: fullDiff, diffFilePath, url: `https://github.com/${CONFIG.githubRepo}` });
-  } else {
-    snapshot.githubLastPollAt = new Date().toISOString();
-    if (githubSnapshotDirty) await saveSnapshot(snapshot);
-  }
-}
 
 async function runContractCheck() {
   const newFp = await fetchContractFingerprints();
@@ -10129,12 +10062,31 @@ async function runOnchainCheck() {
    启动 & 信号处理
    ══════════════════════════════════════════ */
 
+const githubApi = createGithubApi({
+  token: CONFIG.githubToken,
+  onRequest: () => {
+    const sample = moduleMetricContext.getStore();
+    if (sample) sample.requestCount++;
+  },
+});
+const githubMonitor = createGithubMonitor({
+  store: monitorStore,
+  api: githubApi,
+  saveDiff: saveDiffLocally,
+  stopped: () => monitorStopping,
+  wake: () => {
+    if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[GitHub 推送] ${error.message}`));
+  },
+});
+
 const modules = [
   createModuleRunner("pool",     runPoolCheck,     CONFIG.intervals.pool),
   createModuleRunner("frontend", runFrontendCheck,  CONFIG.intervals.frontend),
   createModuleRunner("api",      runApiCheck,       CONFIG.intervals.api),
   createModuleRunner("openfourTemplates", runOpenFourTemplateCheck, CONFIG.intervals.openfourTemplates),
-  createModuleRunner("github",   runGithubCheck,    CONFIG.intervals.github),
+  createModuleRunner("github", githubMonitor.pollHeads, CONFIG.intervals.github, false),
+  createModuleRunner("githubDiscovery", githubMonitor.discover, CONFIG.githubRepoListIntervalMs, false),
+  createModuleRunner("githubDetails", githubMonitor.enrich, 1000, false),
   createModuleRunner("contract", runContractCheck,  CONFIG.intervals.contract),
   createModuleRunner("onchain",  runOnchainCheck,   CONFIG.intervals.onchain),
   createModuleRunner("actor",    runActorCheck,     CONFIG.actorMonitor.wsEnabled ? CONFIG.actorMonitor.httpFallbackMs : CONFIG.intervals.actor),
@@ -10209,7 +10161,7 @@ function startModuleTimers() {
       const timerId = setTimeout(async () => {
         await m.run();
         nextDueAt = calculateNextModuleDueAt(nextDueAt, m.intervalMs);
-        const jitter = CONFIG.jitterMs > 0 ? Math.random() * CONFIG.jitterMs : 0;
+        const jitter = !m.name.startsWith("github") && CONFIG.jitterMs > 0 ? Math.random() * CONFIG.jitterMs : 0;
         scheduleModule(Math.max(0, nextDueAt - Date.now()) + jitter);
       }, delayMs);
       upsertModuleTimer(timerId);

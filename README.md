@@ -6,6 +6,12 @@
 
 当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。协作入口在 Suite 1.12.39 建立，该次仅为文档更新。
 
+## 2026-10-22 GitHub 五仓库高频监控（待部署）
+
+Monitor Suite 1.12.44 / Four.meme 1.5.17 覆盖四个 Four.meme 仓库及 `bnb-chain/bnb-chain.github.io` 的默认分支提交和文件 diff，自动纳入 Four.meme 新公开仓库。认证 GraphQL 默认每 2 秒批量探测，仓库发现每 15 秒，详情任务每 1 秒独立处理。首条提醒不等待详情和 AI，diff 后续独立推送；游标、提醒与详情任务原子保存，失败保留并重试。超过 25 个仓库按稳定顺序分轮探测，单仓库周期相应增长。
+
+部署前必须安全配置并验证 `GITHUB_TOKEN`，只调整两项 GitHub 间隔，其他监控频率及过滤保持不变。2026/10/22 总控预检确认服务器有效 Token 为空，用户将自行补填，因此暂不更新或重启服务器；当前生产仍运行 Four.meme 1.5.16。2 秒是探测周期，实际送达受额度、网络和飞书队列影响。完整方案与待办见 [GitHub 监控说明](fourmeme-monitor/GITHUB_MONITORING.md) 和 [交接记录](fourmeme-monitor/HANDOFF.md)。
+
 ## 2026-10-21 关联 Safe 发现与 ERC-4337
 
 Suite 1.12.43 补充发布验收：业务提交 `847db12793528b5b389b5d2fb0b02888e9e8ddbd` 已上线，服务器 Flap 378 项测试通过，新 Safe API 基线及 19 个观察起点已核验，监控频率和环境配置不变。已记录公共 RPC 短暂波动及两类既存来源／卡片错误；本次文档同步无需再次重启。
@@ -34,7 +40,7 @@ Monitor Suite 1.12.40 / Flap 1.10.34 补入资金关联 Safe `0x65ea398b9eb6b7a7
 | OpenFour | 业务模板上线与状态变化，Registry 模块实现和 preset 注册变化 |
 | 合约与链上参数 | 代理实现地址、合约代码、关键参数及 Agent NFT 注册列表变化 |
 | 创建者动作 | 已识别创建者及手动配置地址发起的交易、合约部署和管理操作 |
-| GitHub | 配置账号的仓库变化，以及主仓库的新提交和代码差异 |
+| GitHub | 五个目标仓库默认分支提交和文件 diff，自动纳入 Four.meme 新公开仓库；新版待部署 |
 
 ### Flap.sh
 
@@ -218,7 +224,7 @@ FEISHU_CHAT_ID=oc_xxxxxxxxxxxx
 | `FEISHU_ALLOWED_SENDERS` | 可操作机器人的用户 open_id，逗号分隔；留空拒绝交互操作，自动告警不受影响 |
 | `FEISHU_MENTION_OPEN_ID` | Flap 重点告警需要 @ 的用户，留空不提醒指定用户 |
 | `FLAP_SAFE_API_KEYS` / `FLAP_SAFE_API_KEY` | Safe 多账户轮换 / 单 Key 兼容配置；多 Key 用英文逗号分隔，多 Key 配置优先 |
-| `GITHUB_TOKEN` | 提高 GitHub API 可用额度 |
+| `GITHUB_TOKEN` | GitHub 高频 GraphQL 监控必填；部署前核验权限与实际额度 |
 | `DOUBAO_API_KEY` / `DEEPSEEK_API_KEY` / `QWEN_API_KEY` / `OPENAI_API_KEY` | 可选，填写任意一个以启用 AI 摘要 |
 
 完整配置和每项说明见 [.env.example](.env.example)。保留 `.env` 和运行状态文件，不要提交凭证或删除用于恢复进度的快照。

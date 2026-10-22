@@ -364,8 +364,14 @@ function buildMonitorContext() {
       for (const key of apis) parts.push(`  ${apiEndpointStatusLink(key)}`);
 
       // GitHub
-      parts.push(`GitHub SHA: ${snap.githubSha || "未知"}`);
-      parts.push(`GitHub 仓库: ${Object.keys(snap.githubRepos || {}).length} 个`);
+      const githubRepos = snap.githubMonitor?.repos;
+      if (githubRepos) {
+        parts.push(`GitHub 仓库: ${Object.keys(githubRepos).length} 个｜待补详情 ${snap.githubMonitor.jobs?.length || 0} 项`);
+        for (const repo of Object.values(githubRepos)) parts.push(`  ${repo.name} (${repo.branch || "无默认分支"}): ${repo.head?.slice(0, 12) || "无提交"}`);
+      } else {
+        parts.push(`GitHub SHA: ${snap.githubSha || "未知"}`);
+        parts.push(`GitHub 仓库: ${Object.keys(snap.githubRepos || {}).length} 个`);
+      }
 
       // 合约
       const contracts = snap.contractFingerprints || {};

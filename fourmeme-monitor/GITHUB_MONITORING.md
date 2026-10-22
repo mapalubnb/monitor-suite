@@ -1,0 +1,62 @@
+# GitHub 高频监控（Four.meme 1.5.17）
+
+## 范围
+
+初始五个仓库：
+
+- `four-meme-community/four-meme-ai`
+- `four-meme-community/openfour-docs`
+- `four-meme-community/openfour-boost-launchpad`
+- `four-meme-community/fourmeme-docs`
+- `bnb-chain/bnb-chain.github.io`
+
+全部监控各自的**默认分支**，不是仅固定 `main`，也不是监听所有分支。自动发现范围为 `four-meme-community` 的公开仓库，不自动订阅整个 `bnb-chain` 组织。首次发现建立当前基线，不批量推送历史；已建立基线的空仓库后续首个提交也会提醒。
+
+## 三条独立流程
+
+1. `github`：默认每 2 秒一次认证 GraphQL，五仓库的默认分支、最新 SHA、摘要一并查询。变化后将新游标、首条通知、详情任务原子保存，立即唤醒原有 outbox 发送器。首条明确跳过 AI，不请求 REST 提交详情。
+2. `githubDiscovery`：每 15 秒独立查询账号公开仓库列表，完整翻页后才更新，新增仓库自动参与下一轮 SHA 探测。保留描述、默认分支、归档/禁用等元数据变化提醒；不再以 `pushed_at` 重复发送代码更新卡片。列表消失只报告不可见，保留原监控基线，不断言删除。
+3. `githubDetails`：每 1 秒处理一个就绪任务的一页 REST 数据，先比较固定的旧 SHA 与新 SHA，再逐提交获取全部可分页文件。不同任务轮转。首条通知成功离开 outbox 后才开始详情，详情以**后续独立卡片**推送，不反复编辑首条；AI 沿用已有先发卡再补充机制。失败记录错误、退避并重试，重启恢复进度。
+
+新引擎在网络等待之外执行短事务，慢 REST 不占用头探测事务。其他业务模块的调度、AI、通知公共组件均不修改。飞书仍使用现有统一 outbox；已有发送积压或飞书限流时，无法保证立即送达。
+
+## 配置与额度
+
+发布时在现有服务器安全配置中确认以下值，不将 token 放入 Git 或聊天：
+
+```dotenv
+GITHUB_TOKEN=<用户已创建的有效Token，仅在服务器安全配置>
+GITHUB_INTERVAL_SECONDS=2
+GITHUB_REPO_LIST_INTERVAL_SECONDS=15
+```
+
+旧 `.env` 中显式的 30/90/300 秒仍会覆盖默认值，必须由总控在发布时核对并调整这两项；本次没有改本机或服务器凭证。没有 token 时明确报错，不以 2 秒匿名调用顶替。
+
+五仓库通常一批：若 GraphQL 实测 `cost=1`，每 2 秒约 1800 点/小时；仓库发现单页约 240 次 REST/小时。详情只在有变化时消耗 REST，单工作器正常最多约 3600 页/小时，仍需与其他使用同一用户额度的程序共用预算。
+
+读取真实 GraphQL cost/remaining/reset 和 REST rate-limit 头，保留 100 额度余量；GraphQL 根据实际 cost 与到重置时间的可用预算自动拉长最短请求间隔。遵守 Retry-After、X-Poll-Interval，403/429 二级限流进入共享冷却，401 延长冷却。REST 与 GraphQL 主额度独立；冷却、超时和磁盘压力均可能增大实际间隔。重启后根据下一次响应重建 API 预算；详情重试时间持久化。
+
+超过 25 个仓库时每轮最多查询 25 个，持久化轮转；单仓库周期变为约 `2 × ceil(仓库数 / 25)` 秒，再受额度/请求时长影响，不能仍宣称全部每 2 秒。
+
+## 可靠性与边界
+
+- 初次迁移保留旧主仓库 `githubSha`，其余仓库首次建基线；原有 outbox 不清空。仓库更名按 node ID 迁移。
+- HTTP 200 中的 GraphQL 错误也按失败处理；局部失败不推进相应仓库 SHA，成功仓库仍可通知。
+- 比较和文件分页按 SHA/文件名去重，无“只取前 30 个提交”静默遗漏；失败不删除详情任务。diff 保存失败也重试。
+- 分支回退或默认分支更换不误称新增提交；无新增可达提交时推送比较状态和比较链接。对强推后旧 SHA 不可访问/无共同历史而 compare 失败的任务保留错误，需人工核验，不能保证自动重建丢失历史。
+- diff 是每个新增可达提交的 GitHub API 文件 patch，不是全仓库镜像。二进制、超大 patch 或 API 单提交 3000 文件上限明确标识；无法从 API 获取的内容不伪装完整。回退无新增提交时仅给比较链接，不生成被撤销提交的反向 patch。
+- 大 diff 卡片显示节选，完整 API 返回内容保存在模块 `diffs/`，沿用 7 天清理策略；AI 只是辅助解释。队列积压超过文件保留期时下载文件可能过期，提交链接仍保留。
+- 2 秒是正常条件下的**探测周期**，不是端到端推送 SLA。GitHub 可见性、请求耗时、持久化及飞书排队额外计时；两次采样间出现又被撤回的瞬态提交可能不可见。
+
+## 验收
+
+- 本地运行 `npm run test:fourmeme`、`node shared/run-tests.mjs fourmeme-monitor/github-monitor.test.mjs` 和语法检查；测试注入模拟 API，不请求生产 GitHub、不向飞书发测试卡片。
+- 发布后查看 `runtime-metrics.json` 的 `github`：实际仓库及各自 `checkedAt`、`lastHeadAt`、`headErrors`、发现/详情时间、待补任务和错误、真实 cost/remaining/reset/冷却时间。`lastHeadAt` 是批次处理时间，不代替各仓库成功时间。
+- 机器人问答上下文包含全部仓库、默认分支、SHA 和待补详情数量；精确验收使用上述运行指标，不把问答生成内容当成功凭证。独立 `fm-status` 命令的公共实现未在本次修改。
+- 总控完成 GitHub 推送后部署，重启 `fourmeme-monitor`；机器人展示变更需重启 `feishu-bot`，无需重启 Flap。观察至少一笔自然提交的发现/首条发送/详情完成时间，并核验真实 token 权限及成本。仅模拟测试通过不代表已经上线或已达到 2 秒送达。
+
+## 总控复核进度（2026/10/22）
+
+- 修复超过 25 个仓库时更新基线重排对象键导致的轮转重复，回归断言两轮完整覆盖 32 个仓库。
+- 根版本整合为 1.12.44，根语法检查纳入新模块，README 与 .env.example 已同步频率和 Token 要求。
+- 服务器有效 GITHUB_TOKEN 为空；用户表示后续自行填写，当前不部署、不改服务器频率、不重启服务。GraphQL 权限、真实 cost/remaining/reset、实际周期及自然更新端到端延迟仍待配置 Token 后核验。

@@ -52,4 +52,48 @@
 
 ## 待发布交接
 
-当前无待发布业务改动；本次为交接初始化。下次完成工作时替换本节，填写：问题与证据、改动文件、用户可见变化、测试命令/结果、风险与未决事项、配置/状态迁移、需重启的服务、工作区是否有他人改动。根版本与最终提交由总控整合。
+### 2026/10/22 GitHub 五仓库高频监控（未发布）
+
+总控已接手并整合 Suite 1.12.44，修复超过 25 仓库轮转因重排列表导致覆盖延后问题，加强测试为两轮覆盖全部 32 个仓库。服务器预检确认运行时有效 GITHUB_TOKEN 为空，用户明确后续自行填写、先检查其他部分，因此暂不部署、不改生产配置或重启。以下“未提交”等为模块交接时状态，后续以总控记录为准。 总控复核后全量 615/615、GitHub 专项 23/23、根语法及差异检查均通过，文档本地链接检查通过；代码提交推送后保持待部署，Token、真实 GraphQL 额度、线上周期及自然更新端到端延迟尚未验收。
+
+- 用户明确授权：原四个 Four.meme 仓库均监控默认分支新提交与文件 diff，新增 `bnb-chain/bnb-chain.github.io`；自动纳入 Four.meme 账号后续公开仓库；按 2 秒方案升级，首条不等详情和 AI，其他监控不变。
+- 基线：本地 `main` / `59b92c2277998d9d53f47b8ccb26c2b86a19d872`；开始工作区干净，无其他写入者。已按原子目录流程取得本对话写入锁，结束后核对所有者释放。本次未提交、推送、访问/修改服务器或发送测试卡片。
+- 模块版本：`1.5.16 → 1.5.17`。根版本及发布由总控整合，不把本节视为已上线。
+
+改动文件（均在 `fourmeme-monitor/`）：
+
+| 文件 | 改动 |
+| --- | --- |
+| `github-monitor.mjs` | 新的 GraphQL 批量头探测、独立完整分页发现、持久化 REST 详情任务、预算与退避、原子提醒及游标 |
+| `monitor.mjs` | 替换旧 GitHub 调度入口；2 秒探测 / 15 秒发现 / 1 秒详情；仅 GitHub 使用网络请求之外的短事务并取消随机抖动；导出 GitHub 运行指标 |
+| `github-monitor.test.mjs` | 新增 23 项隔离测试，覆盖五仓库、首条快发、分页、局部错误、原子失败、限流、重启、轮转、分支变化等 |
+| `monitor.test.mjs` | 纳入新测试；启动卡首轮模块数从 10 更新为 12 |
+| `feishu-bot.mjs` | 仅更新 Four.meme GitHub 问答上下文，展示所有仓库 SHA/默认分支与待补详情数；未更改 Flap 或公共命令实现 |
+| `package.json` | 模块版本与模块语法检查入口 |
+| `GITHUB_MONITORING.md` | 方案、配置、实际额度、迁移、限制和验收说明 |
+| `HANDOFF.md` | 本交接 |
+
+行为与迁移：
+
+- 五仓库一次 GraphQL 获取默认分支头；首条与任务/游标原子保存并立即唤醒 outbox，`skipAi=true`。首条送达后才后台获取 diff，按提交发送后续独立详情卡（不编辑首条），AI 沿用先发再补充。其他监控周期、过滤及共享发送器不变。
+- 持久化 `snapshot.githubMonitor`；旧主仓库 SHA 继续追踪，另外四仓库首次建立当前基线，不推送其全部历史。新增公开仓库在独立发现周期自动纳入。保留旧 outbox，不操作生产快照。
+- 保留仓库描述/默认分支/归档/禁用与列表消失提醒；去掉 `pushed_at` 导致的重复“项目更新”。所有监控仓库详情可分页、去重，不静默截取前 30 个提交。失败任务不会被删除。
+- 旧 `checkGithub` 等辅助函数保留供已有专项测试兼容，已不用于生产调度；旧 `runGithubCheck` 已移除。
+
+本地验证（隔离环境、模拟 GitHub 响应）：
+
+- `node shared/run-tests.mjs fourmeme-monitor/github-monitor.test.mjs`：23/23 通过。
+- `npm run test:fourmeme`：135/135 通过。
+- `npm test`：615/615 通过。
+- `npm run check`、`node --check fourmeme-monitor/github-monitor.mjs`、`node --check fourmeme-monitor/feishu-bot.mjs`、`git diff --check`：通过。
+- 初次回归中启动卡测试仍预期 10 个模块，新增发现/详情调度后实际为 12；已同步该测试，最终全部通过。未进行真实 PAT/GraphQL 联调，未声称线上已达到 2 秒。
+
+总控发布前必须确认：
+
+1. 用户创建的 Token 是否已安全配置且可访问 GraphQL；本对话未读取、索取或写入 Token。缺少 Token 时新实现明确报错，不再用匿名请求回退，必须在部署前完成核验。
+2. 仅调整 `GITHUB_INTERVAL_SECONDS=2`、`GITHUB_REPO_LIST_INTERVAL_SECONDS=15`；旧 `.env` 显式值会覆盖新默认值，其他环境配置保持原值。核验实测 cost/remaining/reset，再确认 2 秒循环预算可持续。
+3. 整合根版本、README 和 `.env.example` 中 GitHub 的旧频率说明；公共 `fm-status` 如需新增完整 GitHub 展示由总控统筹。根 `npm run check` 可补新模块文件，现模块自身 check 已覆盖。
+4. 先验证提交推送 GitHub，确认远端确切 SHA 后再部署；备份快照及分片。重启 `fourmeme-monitor`；若启用机器人上下文展示更新，重启 `feishu-bot`；不要重启 Flap。
+5. 验收 `runtime-metrics.json.github` 五个目标与成功探测时间、实际 cost、剩余额度、冷却与详情积压；观察自然更新的首条/详情发送时间，核对其他模块周期未变。
+
+风险边界：2 秒是调度周期，不是送达保证；飞书共享 outbox 积压、网络和 GitHub 可见性仍影响延迟。详情遇 API 3000 文件上限、二进制或大 patch 缺失会明确提示；强推旧 SHA 不可访问的任务保留重试及错误，可能需人工处置。超过 25 个仓库分轮探测，周期会增长。两轮之间又撤回的瞬态提交无法保证捕获。详情文件仍按现有 7 天策略清理。详细解释见 `GITHUB_MONITORING.md`。
