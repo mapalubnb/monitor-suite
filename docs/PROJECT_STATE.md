@@ -27,9 +27,9 @@
 ## 项目与发布基线
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
-- 最新已核验业务提交：`847db12793528b5b389b5d2fb0b02888e9e8ddbd`（Flap 关联 Safe 与 ERC-4337）；Four.meme 业务基线仍为 `281261e551e85ca213faed93b51f9f3f12c671b9`。这些不是对未来 HEAD 的固定要求。
-- 当前版本：Suite `1.12.43`（发布验收文档）、Four.meme `1.5.16`、Flap `1.10.35`。业务发布为 Suite 1.12.42，已补齐关联 Safe 即时发现及 ERC-4337 观察；详细证据见 Flap HANDOFF。
-- 业务发布仅重启 `flap-monitor`，`.env`、监控频率、历史策略及原有过滤规则保留；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
+- 最新已核验业务提交：`40f2a961fef109ea8166d86bdd45c56ccf520648`（Four.meme GitHub 五仓库监控）；Flap 业务基线为 `847db12793528b5b389b5d2fb0b02888e9e8ddbd`。这些不是对未来 HEAD 的固定要求。
+- 当前版本：Suite `1.12.45`（发布验收文档）、Four.meme `1.5.17`、Flap `1.10.35`。最新业务发布为 Suite 1.12.44，五仓库 GitHub 监控已上线；详细证据见 Four.meme HANDOFF。
+- 最新业务发布仅重启 `fourmeme-monitor` 与 `feishu-bot`，仅调整 GitHub 探测 2 秒、仓库发现 15 秒，其他配置、监控周期与历史策略保留；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
 - 日志：`/root/.pm2/logs/<服务名>-out.log` 与 `-error.log`；备份根目录：`/root/monitor-suite-backups/`。
@@ -86,6 +86,8 @@
 
 总控已完成先推 GitHub 后部署，业务提交 847db12793528b5b389b5d2fb0b02888e9e8ddbd，Suite 1.12.42 / Flap 1.10.35；本地全量 592 项、服务器 Flap 378 项测试通过。2026/10/21 17:15:41 验收确认环境配置与调度周期不变，新 Safe API 基线已建立，19 个观察地址生效，扫描持续推进。Suite 1.12.43 仅同步验收文档，无需重启；旧公共池卡片、CoW 来源错误和公共 RPC 波动仍有明确记录，详见 Flap HANDOFF。
 
-## 2026/10/22 待部署：GitHub 五仓库高频监控
+## 2026/10/22 已部署：GitHub 五仓库高频监控
 
-用户在 Four.meme 对话授权五仓库默认分支新提交与 diff、2 秒探测、15 秒新增仓库发现，并明确交总控部署核验。总控已接手 Suite 1.12.44 / Four.meme 1.5.17，详见 Four.meme HANDOFF。服务器仍为 59b92c2、Four.meme 1.5.16；预检发现有效 GITHUB_TOKEN 为空，用户将自行补填，要求先检查其他部分。不得在 Token 验证前启动新版或将待发布版本当生产版本；不得改变其他模块频率。后续只调整已授权的两项 GitHub 间隔，先推送 GitHub，再部署、按需重启 Four.meme 与机器人，不重启 Flap。
+用户在 Four.meme 对话授权五仓库默认分支新提交与 diff、2 秒探测、15 秒新增仓库发现，并明确交总控部署核验。总控整合 Suite 1.12.44 / Four.meme 1.5.17，详见 Four.meme HANDOFF。预检阶段因 GITHUB_TOKEN 为空暂缓部署；用户补填并验证后，按先 GitHub 后服务器的顺序完成发布。
+
+用户补填 Token 后已完成部署，业务提交 `40f2a961fef109ea8166d86bdd45c56ccf520648`。上述 Token 缺失为部署前历史，现五仓库认证 GraphQL 与 REST diff 读取均验证成功。18:18 上线，仅两项 GitHub 环境配置变化；其他环境行与旧配置比较一致，其他模块运行间隔一致，Flap PID 818101 未变。服务器专项 135/135；55 秒采样 24 次成功状态，平均间隔 2399ms，范围 1152–5020ms，GraphQL cost=1。详情与 outbox 无积压；未观察到自然新提交，端到端延迟尚未实测。AI HTTP 403、BscScan 页面风控及历史创建者缺失回执仍需后续核验，未清空状态或跳过游标。备份及详细验收见 Four.meme HANDOFF。
