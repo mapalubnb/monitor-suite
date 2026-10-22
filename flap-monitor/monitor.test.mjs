@@ -4164,3 +4164,19 @@ test('registry only acknowledges available log height and preserves unread tail 
   await __testables.checkFlapRegistryLogs(restored, opts);
   assert.equal(restored.registryMonitor.lastBlock, 105);
 });
+
+
+test('PublicNode address limit routes the entire filter elsewhere and preserves small-query availability', async () => {
+  const original = globalThis.fetch, calls = []; __testables.resetBscRpcHealth();
+  globalThis.fetch = async (url, options) => { const request = JSON.parse(options.body); calls.push({ url, request }); return { ok: true, json: async () => ({ result: [] }) }; };
+  const addresses = Array.from({ length: 11 }, (_, i) => '0x' + (i + 1).toString(16).padStart(40, '0'));
+  try {
+    const filter = { address: addresses, fromBlock: '0x1', toBlock: '0x2' };
+    await __testables.executeBscGetLogsRequest([filter], { history: true, rpcUrls: ['https://bsc.publicnode.com', 'https://wide.test'] });
+    assert.equal(calls.length, 1); assert.equal(calls[0].url, 'https://wide.test');
+    assert.deepEqual(calls[0].request.params[0].address, addresses);
+    await __testables.executeBscGetLogsRequest([{ ...filter, address: addresses.slice(0, 10) }], { history: true, rpcUrls: ['https://bsc.publicnode.com'] });
+    assert.equal(calls[1].url, 'https://bsc.publicnode.com');
+    assert.equal(calls[1].request.params[0].address.length, 10);
+  } finally { globalThis.fetch = original; __testables.resetBscRpcHealth(); }
+});

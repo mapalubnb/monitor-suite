@@ -2837,6 +2837,12 @@ async function queryBscLogs(params, options) {
     const host = new URL(url).hostname;
     const hasAddress = Array.isArray(params[0]?.address) ? params[0].address.length > 0 : Boolean(params[0]?.address);
     const publicAddressRequired = (host === 'publicnode.com' || host.endsWith('.publicnode.com')) && new URL(url).pathname === '/';
+    // PublicNode explicitly rejects >10 addresses with HTTP 403. Route the whole
+    // filter elsewhere; never truncate it or quarantine valid single-address scans.
+    if (publicAddressRequired && Array.isArray(params[0]?.address) && params[0].address.length > 10) {
+      errors.push(host + ': 公共节点最多支持 10 个合约地址，完整查询交备用节点');
+      continue;
+    }
     if (!hasAddress && (publicAddressRequired || logRpcAddressRequired.get(url) > Date.now())) {
       errors.push(host + ': 不支持无合约地址的日志查询');
       continue;
