@@ -27,9 +27,9 @@
 ## 项目与发布基线
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
-- 最新已核验业务提交：`40f2a961fef109ea8166d86bdd45c56ccf520648`（Four.meme GitHub 五仓库监控）；Flap 业务基线为 `847db12793528b5b389b5d2fb0b02888e9e8ddbd`。这些不是对未来 HEAD 的固定要求。
-- 当前版本：Suite `1.12.45`（发布验收文档）、Four.meme `1.5.17`、Flap `1.10.35`。最新业务发布为 Suite 1.12.44，五仓库 GitHub 监控已上线；详细证据见 Four.meme HANDOFF。
-- 最新业务发布仅重启 `fourmeme-monitor` 与 `feishu-bot`，仅调整 GitHub 探测 2 秒、仓库发现 15 秒，其他配置、监控周期与历史策略保留；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
+- 最新已核验业务提交：`fca57f6f24e4f4b95ed9850d6bad6c863adaba79`（Four.meme 创建者独立补全与 GitHub 预算计时）；Flap 业务基线为 `847db12793528b5b389b5d2fb0b02888e9e8ddbd`。这些不是对未来 HEAD 的固定要求。
+- 当前版本：Suite `1.12.47`（发布验收文档）、Four.meme `1.5.18`、Flap `1.10.35`。最新业务发布为 Suite 1.12.46，创建者补全和 GitHub 预算修复已上线；详细证据见 Four.meme HANDOFF。
+- 最新业务发布仅重启 `fourmeme-monitor`，配置及既有周期逐项不变，新增独立 30 秒创建者补全，历史策略保留；本次验收文档同步无需再次重启。确切上线提交与状态以 `git rev-parse HEAD`、GitHub `refs/heads/main` 及服务器 HEAD 三方核对为准，不把本文件的版本号当上线凭证。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
 - 日志：`/root/.pm2/logs/<服务名>-out.log` 与 `-error.log`；备份根目录：`/root/monitor-suite-backups/`。
@@ -92,6 +92,8 @@
 
 用户补填 Token 后已完成部署，业务提交 `40f2a961fef109ea8166d86bdd45c56ccf520648`。上述 Token 缺失为部署前历史，现五仓库认证 GraphQL 与 REST diff 读取均验证成功。18:18 上线，仅两项 GitHub 环境配置变化；其他环境行与旧配置比较一致，其他模块运行间隔一致，Flap PID 818101 未变。服务器专项 135/135；55 秒采样 24 次成功状态，平均间隔 2399ms，范围 1152–5020ms，GraphQL cost=1。详情与 outbox 无积压；未观察到自然新提交，端到端延迟尚未实测。AI HTTP 403、BscScan 页面风控及历史创建者缺失回执仍需后续核验，未清空状态或跳过游标。备份及详细验收见 Four.meme HANDOFF。
 
-## 2026/10/22 待发布：创建者独立补全与 GitHub 跳轮
+## 2026/10/22 已部署：创建者独立补全与 GitHub 跳轮
 
-用户在 Four.meme 对话直接授权先修复、测试后交总控部署，随后由模块对话只读排查历史补扫与 AI 403。总控接手 Suite 1.12.46 / Four.meme 1.5.18，新增独立 30 秒创建者补全，不改既有周期、凭证或策略；GitHub 修正预算计时并区分本地等待。无可用浏览器 API/归档来源的 11 个缺失目标保留待办，不能声称已补齐。仅需重启 Four.meme，计划连续采样 10 分钟。详见 Four.meme HANDOFF 和 CREATOR_DISCOVERY.md。
+用户在 Four.meme 对话直接授权先修复、测试后交总控部署，随后由模块对话只读排查历史补扫与 AI 403。总控接手 Suite 1.12.46 / Four.meme 1.5.18，新增独立 30 秒创建者补全，不改既有周期、凭证或策略；GitHub 修正预算计时并区分本地等待。无可用浏览器 API/归档来源的 11 个缺失目标保留待办，不能声称已补齐。业务提交 `fca57f6` 已于 18:38 部署，仅重启 Four.meme；连续采样及发布验收见 HANDOFF。详见 Four.meme HANDOFF 和 CREATOR_DISCOVERY.md。
+
+1.5.18 发布验收：总控全量复跑 633/633，服务器专项 153/153。10 分钟 GitHub 299 次成功检查，平均 2.004 秒、P95 2.75 秒，budgetWaits=0/请求错误0；未观察自然新提交。创建者独立任务运行、11 个待办全轮转，实际覆盖仍 25/36，来源仍受限。配置与既有周期保持，实时延迟末次0块，历史数据不完整与 OpenFour RPC 预算暂满仍有记录；不宣称全系统无异常。Suite 1.12.47 只同步验收文档。
