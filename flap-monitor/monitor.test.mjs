@@ -11,6 +11,32 @@ import { ingestRegistryLog, REGISTRY_TOPIC } from './registry-notifications.mjs'
 process.env.FLAP_MONITOR_TEST = "1";
 const { __testables } = await import("./monitor.mjs");
 
+test('Flap 全部 AI 分析关闭：共享配置开启也不请求、不重试、不编辑或补发，原始卡片仍投递', async () => {
+  const { AI } = await import('../shared/ai-client.mjs');
+  const saved = Object.getOwnPropertyDescriptors(AI), originalFetch = globalThis.fetch;
+  let requests = 0, summaries = 0, enrichments = 0;
+  try {
+    Object.defineProperties(AI, { enabled: { configurable: true, get: () => true },
+      apiKey: { configurable: true, get: () => 'test-only-not-a-real-key' } });
+    globalThis.fetch = async () => { requests++; throw Error('不应请求 AI'); };
+    assert.equal(__testables.FLAP_AI_ANALYSIS_ENABLED, false);
+    for (const title of ['Flap 全站前端资源变更', '重点变更：Factory enabled', 'CAstore 金库', '手动检测 页面变更'])
+      assert.equal(__testables.shouldUseAiForNotification({ title, skipAi: false }), false);
+    assert.equal(await __testables.aiSummarize('业务 diff', '页面', 3), '');
+    assert.equal(await __testables.aiIntroduceCaStoreVault('金库名称和链接', '金库', 3), '');
+    const sends = [], opts = { diffButtonText: '下载完整 DIFF' };
+    const id = await __testables.sendThenEnrichWithAi('金库变更', '原始内容', 'orange', '金库', '输入',
+      () => { enrichments++; return '分析'; }, '/test/diff.txt', 'https://flap.sh/bnb/CAstore',
+      async () => { summaries++; return '分析'; }, opts,
+      async (...args) => { sends.push(args); return 'original-card'; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(id, 'original-card'); assert.equal(sends.length, 1);
+    assert.match(sends[0][1], /原始内容/); assert.match(sends[0][1], /https:\/\/flap.sh/);
+    assert.equal(sends[0][3], '/test/diff.txt'); assert.equal(sends[0][4], opts);
+    assert.equal(requests, 0); assert.equal(summaries, 0); assert.equal(enrichments, 0);
+  } finally { Object.defineProperties(AI, saved); globalThis.fetch = originalFetch; }
+});
+
 test('审计撤销仅留档，孤立授权等待期间不阻塞角色变更通知', async () => {
   const { createContractIntegrityState, ingestContractIntegrityEvent } = await import('./contract-integrity-monitor.mjs');
   const { VAULT_PORTAL_ADDRESS, GRANT_REVOKER_ROLE, AUDITOR_ROLE, ROLE_ADMIN_CHANGED, GRANT_REVOKED, GRANT_USED } = await import('./vault-portal-v116.mjs');

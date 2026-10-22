@@ -1058,16 +1058,18 @@ function sendAlertCard(sendCardFn, title, content, template) {
 }
 
 const isTooLongForSingleCard = isMultiPartCard;
+// 用户已关闭 Flap 全部 AI 分析；共享模型配置不能重新启用本模块。
+const FLAP_AI_ANALYSIS_ENABLED = false;
 
 /**
- * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
+ * 推送原始 diff；Flap AI 分析已关闭，保留原通知和附件投递。
  * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
-async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, summarizeFn = aiSummarize, cardOpts = {}) {
+async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, summarizeFn = aiSummarize, cardOpts = {}, sendCardFn = sendCardViaApi) {
   const initialContent = buildCardUrlPrefix(url, content) + content;
-  const messageId = await sendCardViaApi(title, initialContent, template, diffFilePath, cardOpts);
+  const messageId = await sendCardFn(title, initialContent, template, diffFilePath, cardOpts);
 
-  if (messageId && AI_CONFIG.enabled && AI_CONFIG.apiKey) {
+  if (FLAP_AI_ANALYSIS_ENABLED && messageId && AI_CONFIG.enabled && AI_CONFIG.apiKey) {
     const summarize = summarizeFn || aiSummarize;
     summarize(aiInput || initialContent, moduleContext).then(async (summary) => {
       if (!summary) return;
@@ -1093,6 +1095,7 @@ async function sendThenEnrichWithAi(title, content, template, moduleContext, aiI
 }
 
 function shouldUseAiForNotification({ title = "", content = "", moduleContext = "", aiInput = "", skipAi = false } = {}) {
+  if (!FLAP_AI_ANALYSIS_ENABLED) return false;
   if (skipAi) return false;
   const text = `${title}\n${moduleContext}\n${aiInput || content}`;
   if (/请求失败|处理失败|退避恢复|基线已修复|页面样本无效|模块异常|模块恢复|状态/i.test(text)) return false;
@@ -1962,10 +1965,12 @@ const CA_STORE_VAULT_AI_PROMPT = `根据金库名字、文案和链接，用中�
 const AI_BRIEFING_INPUT_LIMIT = 6000; // 给 AI 的输入上限（提升以容纳完整 i18n 文案列表）
 
 async function aiSummarize(diffContent, moduleContext = "", _retries = 1) {
+  if (!FLAP_AI_ANALYSIS_ENABLED) return "";
   return _aiSummarizeBase(diffContent, AI_SYSTEM_PROMPT, moduleContext, { retries: _retries, maxTokens: 320 });
 }
 
 async function aiIntroduceCaStoreVault(input, moduleContext = "", _retries = 1) {
+  if (!FLAP_AI_ANALYSIS_ENABLED) return "";
   return _aiSummarizeBase(input, CA_STORE_VAULT_AI_PROMPT, moduleContext, { retries: _retries, maxTokens: 180 });
 }
 
@@ -7176,7 +7181,7 @@ async function startMonitor() {
       ['registryDelivery', registryDeliveryJob], ['registryAudit', registryAuditJob], ['registryPending', registryPendingJob],
     ].map(([name, job]) => [name, job.snapshot()]));
     writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs,
-      registryPending: registryPendingHealth }));
+      registryPending: registryPendingHealth, ai: { enabled: FLAP_AI_ANALYSIS_ENABLED } }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
   }
   const rpcMetricsTimer = setInterval(() => {
@@ -8294,6 +8299,11 @@ if (!IS_TEST_MODE) {
 }
 
 export const __testables = {
+  FLAP_AI_ANALYSIS_ENABLED,
+  shouldUseAiForNotification,
+  sendThenEnrichWithAi,
+  aiSummarize,
+  aiIntroduceCaStoreVault,
   buildFlapRestartCard,
   checkFlapRegistryLogs,
   deliverRegistryChanges,
