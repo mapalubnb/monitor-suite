@@ -361,16 +361,22 @@ test("OpenFour failed count and truncated preset pages never become removals", a
 });
 
 test("HTTP timeout includes stalled response body after headers", async () => {
-  let headersSent = false;
-  const server = createServer((_, res) => { res.writeHead(200); res.flushHeaders(); headersSent = true; res.write('partial'); });
-  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  // Isolate the body deadline from localhost connection startup and CI scheduling.
+  const original = globalThis.fetch; let headersSent = false, bodyRead = false;
+  globalThis.fetch = async (_url, { signal }) => {
+    headersSent = true;
+    return { body: true, arrayBuffer: () => {
+      bodyRead = true;
+      return new Promise((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+      });
+    } };
+  };
   try {
-    await assert.rejects(__testables.fetchWithTimeout(`http://127.0.0.1:${server.address().port}/`, {}, 150), /abort/i);
-    assert.equal(headersSent, true);
-  } finally {
-    server.closeAllConnections();
-    await new Promise(resolve => server.close(resolve));
-  }
+    await assert.rejects(__testables.fetchWithTimeout('https://body-deadline.test/', {}, 30), /abort/i);
+    assert.equal(headersSent, true); assert.equal(bodyRead, true);
+  } finally { globalThis.fetch = original; }
 });
 
 test("contract code cache preserves fast slot checks and expires for periodic audit", async () => {
