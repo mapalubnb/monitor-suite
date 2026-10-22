@@ -260,6 +260,54 @@ test('failed first scan settles startup progress without claiming success', asyn
   assert.equal(runner.firstRunStatus, 'failed');
 });
 
+test('GitHub 网络错误合并重复日志，冷却与恢复不误标为风控', async () => {
+  const previousLog = console.log;
+  const logs = [];
+  let mode = 'failure';
+  console.log = message => logs.push(message);
+  try {
+    const runner = __testables.createModuleRunner('github', async () => {
+      if (mode === 'failure') throw Object.assign(new Error('网络超时'), { code: 'GITHUB_REQUEST_FAILED', kind: 'timeout' });
+      if (mode === 'cooldown') throw Object.assign(new Error('[退避中] 网络恢复等待'), { code: 'GITHUB_COOLDOWN' });
+    }, 2000, false);
+    await runner.run();
+    await runner.run();
+    mode = 'cooldown';
+    for (let index = 0; index < 4; index++) await runner.run();
+    mode = 'success';
+    await runner.run();
+    assert.equal(runner.intervalMs, 2000);
+    assert.equal(logs.filter(message => message.includes('异常：')).length, 1);
+    assert.equal(logs.filter(message => message.includes('[退避中]')).length, 1);
+    assert.match(logs.join('\n'), /请求恢复.*timeout.*2 次/);
+    assert.doesNotMatch(logs.join('\n'), /因风控|全量比对|退避结束/);
+  } finally {
+    console.log = previousLog;
+  }
+});
+
+test('GitHub 详情等待期间空轮次不谎报恢复', async () => {
+  const previousLog = console.log;
+  const logs = [];
+  let mode = 'failure';
+  console.log = message => logs.push(message);
+  try {
+    const runner = __testables.createModuleRunner('githubDetails', async () => {
+      if (mode === 'failure') throw Object.assign(new Error('网络超时'), { code: 'GITHUB_REQUEST_FAILED', kind: 'timeout' });
+      return mode === 'success';
+    }, 1000, false);
+    await runner.run();
+    mode = 'idle';
+    await runner.run();
+    assert.doesNotMatch(logs.join('\n'), /请求恢复/);
+    mode = 'success';
+    await runner.run();
+    assert.match(logs.join('\n'), /请求恢复/);
+  } finally {
+    console.log = previousLog;
+  }
+});
+
 test('real module runner atomically persists its state and notification and rolls back failed scans', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'fourmeme-transaction-'));
   const config = __testables.CONFIG;

@@ -313,3 +313,136 @@ test("GitHub 预算等待区别于服务端限流，额度不足仍暂停", asyn
   assert.equal(api.summary().sharedRetryAt, 0);
   assert.equal(api.summary().budgetWaits, 1);
 });
+
+test("GitHub 首次十秒超时不再额外等待，连续失败退避且成功后复位", async () => {
+  let timestamp = 0;
+  let failing = true;
+  let calls = 0;
+  const api = createGithubApi({ token: "test", now: () => timestamp, fetchImpl: async () => {
+    calls++;
+    timestamp += 10_000;
+    if (failing) throw new DOMException("timeout", "TimeoutError");
+    return new Response("{}");
+  } });
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => error.kind === "timeout" && error.retryAt === 10000);
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => error.retryAt === 24000);
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => error.code === "GITHUB_COOLDOWN");
+  assert.equal(calls, 2);
+  assert.equal(api.summary().diagnostics.graphql.failureCount, 2);
+  timestamp = 24000;
+  failing = false;
+  await api.heads(GITHUB_REPOSITORIES);
+  assert.equal(api.summary().diagnostics.graphql.consecutiveFailures, 0);
+  failing = true;
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => error.retryAt === 44000);
+});
+
+test("GitHub 快速断连仍至少间隔两秒，不泄露原始错误内容", async () => {
+  let timestamp = 1000;
+  let calls = 0;
+  const api = createGithubApi({ token: "secret-token", now: () => timestamp, fetchImpl: async () => {
+    calls++;
+    throw new TypeError("secret-token https://private.example", { cause: { code: "ECONNRESET" } });
+  } });
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => {
+    assert.equal(error.retryAt, 3000);
+    assert.equal(error.errorCode, "ECONNRESET");
+    assert.doesNotMatch(error.message, /secret-token|private/);
+    return error.kind === "network";
+  });
+  timestamp = 2999;
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => error.code === "GITHUB_COOLDOWN");
+  assert.equal(calls, 1);
+  assert.equal(api.summary().sharedRetryAt, 0);
+});
+
+test("GitHub REST 网络失败不冻结 GraphQL，响应体失败记录阶段", async () => {
+  const api = createGithubApi({ token: "test", now: () => 1000, fetchImpl: async (_url, options) => {
+    if (options.method === "POST") return new Response("{}");
+    return { status: 200, ok: true, headers: new Headers(), json: async () => { throw new TypeError("fetch failed", { cause: { code: "UND_ERR_SOCKET" } }); } };
+  } });
+  await assert.rejects(api.rest("/test"), error => error.phase === "body" && error.errorCode === "UND_ERR_SOCKET");
+  await api.heads(GITHUB_REPOSITORIES);
+  assert.equal(api.summary().sharedRetryAt, 0);
+});
+
+test("GitHub 连续二级限流扩大等待，不被网络快速恢复绕过", async () => {
+  let timestamp = 1000;
+  let calls = 0;
+  const api = createGithubApi({ token: "test", now: () => timestamp, fetchImpl: async () => { calls++; return new Response("{}", { status: 429 }); } });
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES));
+  assert.equal(api.summary().sharedRetryAt, 61000);
+  timestamp = 61000;
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES));
+  assert.equal(api.summary().sharedRetryAt, 181000);
+  timestamp = 180999;
+  await assert.rejects(api.rest("/test"), error => error.code === "GITHUB_COOLDOWN");
+  assert.equal(calls, 2);
+});
+
+test("GitHub HTTP 403 原因未知与认证失败保持保护且不伪装网络超时", async () => {
+  for (const [status, kind, wait] of [[403, "forbidden", 60000], [401, "auth", 300000]]) {
+    const api = createGithubApi({ token: "test", now: () => 1000, fetchImpl: async () => new Response("{}", { status }) });
+    await assert.rejects(api.rest("/test"), error => error.kind === kind);
+    assert.equal(api.summary().sharedRetryAt, 1000 + wait);
+    await assert.rejects(api.heads(GITHUB_REPOSITORIES), error => error.code === "GITHUB_COOLDOWN");
+  }
+});
+
+test("GitHub 主额度和 X-Poll-Interval 等待不因网络恢复缩短", async () => {
+  for (const [headers, readyAt] of [[{ "x-ratelimit-remaining": "0", "x-ratelimit-reset": "120" }, 121000], [{ "x-poll-interval": "45" }, 46000]]) {
+    const api = createGithubApi({ token: "test", now: () => 1000, fetchImpl: async () => new Response("{}", { status: 503, headers }) });
+    await assert.rejects(api.rest("/test"));
+    assert.equal(api.summary().retryAt.rest, readyAt);
+    await assert.rejects(api.rest("/test"), error => error.retryAt === readyAt);
+  }
+});
+
+test("GitHub Retry-After 日期和无效值不污染冷却时间", async () => {
+  for (const [header, expected] of [[new Date(180000).toUTCString(), 180000], ["invalid", 61000]]) {
+    const api = createGithubApi({ token: "test", now: () => 1000, fetchImpl: async () => new Response("{}", { status: 429, headers: { "retry-after": header } }) });
+    await assert.rejects(api.rest("/test"));
+    assert.equal(api.summary().sharedRetryAt, expected);
+  }
+});
+
+test("GitHub 耗时样本有界且仅记录成功请求，诊断副本不可改内部状态", async () => {
+  let timestamp = 0;
+  const api = createGithubApi({ token: "test", now: () => timestamp, fetchImpl: async () => { timestamp += 750; return new Response("{}"); } });
+  for (let index = 0; index < 125; index++) await api.heads(GITHUB_REPOSITORIES);
+  const summary = api.summary();
+  assert.equal(summary.diagnostics.graphql.successSamples, 120);
+  assert.equal(summary.diagnostics.graphql.successP95Ms, 750);
+  summary.diagnostics.graphql.successSamples = 0;
+  assert.equal(api.summary().diagnostics.graphql.successSamples, 120);
+});
+
+test("GitHub 详情冷却只调整就绪时间，不累加请求失败或丢失分页", async () => {
+  const context = await changedFixture();
+  await context.store.drain();
+  const original = structuredClone(context.persisted.githubMonitor.jobs[0]);
+  const retryAt = original.createdAt + 120000;
+  context.api.rest = async () => { throw Object.assign(new Error("冷却"), { code: "GITHUB_COOLDOWN", retryAt }); };
+  await assert.rejects(context.monitor.enrich());
+  assert.deepEqual(context.persisted.githubMonitor.jobs[0], { ...original, retryAt });
+  assert.equal(await context.monitor.enrich(), false);
+  context.advance(120000);
+  context.api.rest = async () => ({ data: { status: "ahead", commits: [{ sha: "new" }], total_commits: 1 } });
+  assert.equal(await context.monitor.enrich(), true);
+  assert.equal(context.persisted.githubMonitor.jobs[0].stage, "files");
+});
+
+test("GitHub 探测网络中断不推进游标，恢复后仍推送新提交并保留详情", async () => {
+  const context = fixture();
+  await context.monitor.pollHeads();
+  const heads = context.api.heads;
+  context.change();
+  context.api.heads = async () => { throw Object.assign(new Error("timeout"), { code: "GITHUB_REQUEST_FAILED", kind: "timeout" }); };
+  await assert.rejects(context.monitor.pollHeads());
+  assert.equal(context.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]].head, "old");
+  context.api.heads = heads;
+  await context.monitor.pollHeads();
+  await context.monitor.pollHeads();
+  assert.equal(context.persisted._notificationOutbox.length, 1);
+  assert.equal(context.persisted.githubMonitor.jobs.length, 1);
+});

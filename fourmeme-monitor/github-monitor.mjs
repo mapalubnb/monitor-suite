@@ -26,16 +26,36 @@ export function createGithubApi({ token, fetchImpl = fetch, now = Date.now, onRe
   let budgetReadyAt = 0;
   let budgetWaits = 0;
   let restQueue = Promise.resolve();
+  const cooldownReasons = { graphql: "", rest: "", shared: "" };
+  const diagnostics = {};
+  const durations = { graphql: [], rest: [] };
+
+  function pause(lane, until, reason) {
+    if (!Number.isFinite(until)) return;
+    if (lane === "shared") {
+      if (until >= sharedRetryAt) { sharedRetryAt = until; cooldownReasons.shared = reason; }
+    } else if (until >= retryAt[lane]) {
+      retryAt[lane] = until;
+      cooldownReasons[lane] = reason;
+    }
+  }
 
   async function request(path, query) {
     const lane = query ? "graphql" : "rest";
     if (!token?.trim()) throw new Error("GitHub 2秒监控需要 GITHUB_TOKEN；未发送匿名请求");
-    if (now() < Math.max(sharedRetryAt, retryAt[lane])) throw new Error("[退避中] GitHub API 冷却，保留游标及详情任务");
+    const readyAt = Math.max(sharedRetryAt, retryAt[lane]);
+    if (now() < readyAt) {
+      const reason = cooldownReasons[sharedRetryAt > retryAt[lane] ? "shared" : lane];
+      throw Object.assign(new Error(`[退避中] GitHub ${lane} ${reason}，恢复时间 ${formatBeijingTime(readyAt)}`), { code: "GITHUB_COOLDOWN", reason, retryAt: readyAt });
+    }
     if (query && now() < budgetReadyAt) {
       budgetWaits++;
       throw Object.assign(new Error("GitHub 本地预算等待（非服务端限流）"), { code: "GITHUB_BUDGET_WAIT", retryAt: budgetReadyAt });
     }
     const startedAt = now();
+    let status = 0;
+    let phase = "connect-or-headers";
+    let kind = "network";
     try {
       onRequest();
       const response = await fetchImpl(`https://api.github.com${path}`, {
@@ -44,36 +64,54 @@ export function createGithubApi({ token, fetchImpl = fetch, now = Date.now, onRe
         ...(query ? { body: JSON.stringify({ query }) } : {}),
         signal: AbortSignal.timeout(10_000),
       });
+      status = response.status;
+      phase = "body";
       const remaining = response.headers.get("x-ratelimit-remaining");
       const reset = response.headers.get("x-ratelimit-reset");
       if (remaining !== null && reset !== null) budgets[lane] = { remaining: Number(remaining), resetAt: Number(reset) * 1000 };
-      if (budgets[lane]?.remaining <= 100) retryAt[lane] = Math.max(retryAt[lane], budgets[lane].resetAt + 1000);
+      if (budgets[lane]?.remaining <= 100) pause(lane, budgets[lane].resetAt + 1000, "主额度保留等待");
       const retryAfter = response.headers.get("retry-after");
-      if (retryAfter !== null) sharedRetryAt = Math.max(sharedRetryAt, now() + (Number.isFinite(Number(retryAfter)) ? Number(retryAfter) * 1000 : Math.max(0, Date.parse(retryAfter) - now())));
+      if (retryAfter !== null) pause("shared", now() + (Number.isFinite(Number(retryAfter)) ? Math.max(0, Number(retryAfter)) * 1000 : Math.max(0, Date.parse(retryAfter) - now())), "服务端 Retry-After");
       const pollInterval = Number(response.headers.get("x-poll-interval"));
-      if (pollInterval > 0) retryAt[lane] = Math.max(retryAt[lane], now() + pollInterval * 1000);
+      if (pollInterval > 0) pause(lane, now() + pollInterval * 1000, "服务端 X-Poll-Interval");
       if (!response.ok) {
-        if (response.status === 403 || response.status === 429) sharedRetryAt = Math.max(sharedRetryAt, now() + 60_000);
-        if (response.status === 401) sharedRetryAt = Math.max(sharedRetryAt, now() + 300_000);
+        kind = response.status === 429 ? "rate-limit" : response.status === 403 ? "forbidden" : response.status === 401 ? "auth" : response.status >= 500 ? "server" : "http";
+        await response.body?.cancel();
         throw new Error(`GitHub ${lane} HTTP ${response.status}`);
       }
       const data = await response.json();
       if (query && data.data?.rateLimit) {
         const rate = data.data.rateLimit;
         budgets.graphql = { cost: rate.cost, remaining: rate.remaining, resetAt: Date.parse(rate.resetAt) };
-        if (rate.remaining <= 100) retryAt.graphql = Math.max(retryAt.graphql, Date.parse(rate.resetAt) + 1000);
+        if (rate.remaining <= 100) pause("graphql", Date.parse(rate.resetAt) + 1000, "主额度保留等待");
         else budgetReadyAt = startedAt + Math.ceil(rate.cost * Math.max(0, Date.parse(rate.resetAt) - startedAt) / (rate.remaining - 100));
       }
       if (query && data.errors?.some(error => error.type === "RATE_LIMITED" || /rate limit|abuse|secondary/i.test(error.message))) {
-        sharedRetryAt = Math.max(sharedRetryAt, now() + 60_000);
+        kind = "rate-limit";
         throw new Error("GitHub GraphQL 限流，保留游标");
       }
       failures[lane] = 0;
+      const durationMs = Math.max(0, now() - startedAt);
+      durations[lane].push(durationMs);
+      if (durations[lane].length > 120) durations[lane].shift();
+      const ordered = [...durations[lane]].sort((left, right) => left - right);
+      diagnostics[lane] = { ...diagnostics[lane], lastSuccessAt: now(), lastDurationMs: durationMs, consecutiveFailures: 0, successSamples: ordered.length, successP95Ms: ordered[Math.ceil(ordered.length * 0.95) - 1], successMaxMs: ordered.at(-1) };
       return { data, hasNext: /rel="next"/.test(response.headers.get("link") || "") };
     } catch (error) {
       failures[lane]++;
-      retryAt[lane] = Math.max(retryAt[lane], now() + Math.min(60_000, 1000 * 2 ** Math.min(failures[lane], 6)));
-      throw error;
+      if (kind === "network" && error instanceof SyntaxError) kind = "response";
+      const rawCode = [error.cause?.code, error.code, error.name].find(value => typeof value === "string");
+      const errorCode = typeof rawCode === "string" && /^[A-Za-z0-9_]{1,64}$/.test(rawCode) ? rawCode : "UNKNOWN";
+      if (kind === "network" && /timeout/i.test(errorCode)) kind = "timeout";
+      const transient = ["network", "timeout", "server"].includes(kind);
+      const delayMs = Math.min(60_000, 2000 * 2 ** Math.min(failures[lane] - 1, 5));
+      pause(lane, transient && failures[lane] === 1 ? Math.max(now(), startedAt + 2000) : now() + delayMs, transient ? "网络或上游故障恢复等待" : "请求失败恢复等待");
+      if (kind === "rate-limit" || kind === "forbidden") pause("shared", now() + Math.min(900_000, 60_000 * 2 ** Math.min(failures[lane] - 1, 4)), kind === "rate-limit" ? "服务端限流" : "HTTP 403 拒绝（原因待核验）");
+      if (kind === "auth") pause("shared", now() + 300_000, "认证失败");
+      const detail = { kind, errorCode, status, phase, durationMs: Math.max(0, now() - startedAt), failedAt: now(), retryAt: Math.max(retryAt[lane], sharedRetryAt), consecutiveFailures: failures[lane] };
+      diagnostics[lane] = { ...diagnostics[lane], ...detail, failureCount: (diagnostics[lane]?.failureCount || 0) + 1 };
+      const label = kind === "rate-limit" ? "限流" : kind;
+      throw Object.assign(new Error(`GitHub ${lane} ${label}${status ? ` HTTP ${status}` : ""}，阶段 ${phase}，错误码 ${errorCode}，耗时 ${detail.durationMs}ms，最早恢复 ${formatBeijingTime(detail.retryAt)}`), { code: "GITHUB_REQUEST_FAILED", ...detail });
     }
   }
 
@@ -84,7 +122,7 @@ export function createGithubApi({ token, fetchImpl = fetch, now = Date.now, onRe
       restQueue = result.catch(() => {});
       return result;
     },
-    summary: () => ({ budgets: structuredClone(budgets), retryAt: { ...retryAt }, sharedRetryAt, budgetReadyAt, budgetWaits }),
+    summary: () => ({ budgets: structuredClone(budgets), retryAt: { ...retryAt }, sharedRetryAt, budgetReadyAt, budgetWaits, cooldownReasons: { ...cooldownReasons }, diagnostics: structuredClone(diagnostics) }),
   };
 }
 
@@ -114,7 +152,7 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
   async function guarded(lane, fn) {
     if (running.has(lane) || stopped()) return;
     running.add(lane);
-    try { await fn(); } finally { running.delete(lane); }
+    try { return await fn(); } finally { running.delete(lane); }
   }
 
   async function pollHeads() {
@@ -210,7 +248,7 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
     return guarded("details", async () => {
       const pending = new Set((store.state._notificationOutbox || []).map(entry => entry.id));
       const job = structuredClone(view().jobs.find(item => item.retryAt <= now() && !pending.has(item.noticeId)));
-      if (!job) return;
+      if (!job) return false;
       try {
         if (job.stage === "compare") {
           const result = await api.rest(`/repos/${job.repo}/compare/${job.base}...${job.head}?per_page=100&page=${job.page}`);
@@ -266,13 +304,18 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
           state.lastDetailAt = now();
         });
         wake();
+        return true;
       } catch (error) {
         await change(state => {
           const original = state.jobs.find(item => item.id === job.id);
           if (!original) return;
+          if (error.code === "GITHUB_COOLDOWN" || error.code === "GITHUB_BUDGET_WAIT") {
+            original.retryAt = error.retryAt;
+            return;
+          }
           original.attempts++;
           original.lastError = error.message;
-          original.retryAt = now() + Math.min(300_000, 2000 * 2 ** Math.min(original.attempts, 7));
+          original.retryAt = Math.max(error.retryAt || 0, now() + Math.min(300_000, 2000 * 2 ** Math.min(original.attempts, 7)));
         });
         throw error;
       }

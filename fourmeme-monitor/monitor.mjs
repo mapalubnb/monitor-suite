@@ -9462,6 +9462,11 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
   let running = false;
   let pending = false;
   let backoffSkips = 0;
+  const githubTask = ["github", "githubDiscovery", "githubDetails"].includes(name);
+  let githubFailures = 0;
+  let githubLastLogAt = 0;
+  let githubLastFailureKind = "";
+  let githubCooldownLogAt = 0;
   const run = async () => {
     if (monitorStopping) return;
     if (running) {
@@ -9475,10 +9480,15 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
         const metricSample = { moduleName: name, durationMs: 0, requestCount: 0, backoffCount: 0, errorCount: 0 };
         const startedAt = Date.now();
         try {
-          await moduleMetricContext.run(metricSample, () => transactional ? monitorStore.transaction(fn) : fn());
+          const result = await moduleMetricContext.run(metricSample, () => transactional ? monitorStore.transaction(fn) : fn());
           if (firstRunStatus === "pending") firstRunStatus = "complete";
           metricSample.durationMs = Date.now() - startedAt;
           recordModuleMetric(moduleMetrics, name, metricSample);
+          if (githubTask && githubFailures > 0 && (name !== "githubDetails" || result === true)) {
+            log(`[${name}] 请求恢复：此前 ${githubLastFailureKind} 失败 ${githubFailures} 次，本轮检查完成；详情完成情况以队列为准`);
+            githubFailures = 0;
+            githubCooldownLogAt = 0;
+          }
           // warn if recovering from backoff skips (only notify if significant)
           if (backoffSkips > 0) {
             const skipped = backoffSkips;
@@ -9493,7 +9503,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
               ).catch(err => { log(`[飞书] 退避恢复推送失败：${err.message}`); });
             }
           }
-          clearModuleError(name);
+          if (name !== "githubDetails" || result === true) clearModuleError(name);
           if (!IS_TEST_MODE) {
             try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
           }
@@ -9504,6 +9514,14 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
           if (err.code === "GITHUB_BUDGET_WAIT") {
             metricSample.backoffCount = 1;
             recordModuleMetric(moduleMetrics, name, metricSample);
+          } else if (githubTask && err.code === "GITHUB_COOLDOWN") {
+            if (moduleErrors[name]) moduleErrors[name].healthySince = 0;
+            metricSample.backoffCount = 1;
+            recordModuleMetric(moduleMetrics, name, metricSample);
+            if (!githubCooldownLogAt || Date.now() - githubCooldownLogAt >= 60_000) {
+              log(`[${name}] ${err.message}`);
+              githubCooldownLogAt = Date.now();
+            }
           } else if (err.message?.includes("[退避中]")) {
             if (moduleErrors[name]) moduleErrors[name].healthySince = 0;
             metricSample.backoffCount = 1;
@@ -9515,7 +9533,16 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
           } else {
             metricSample.errorCount = 1;
             recordModuleMetric(moduleMetrics, name, metricSample);
-            log(`[${name}] 异常：${err.message}`);
+            if (!githubTask || err.code !== "GITHUB_REQUEST_FAILED") {
+              log(`[${name}] 异常：${err.message}`);
+            } else {
+              githubFailures++;
+              if (githubFailures === 1 || githubLastFailureKind !== err.kind || Date.now() - githubLastLogAt >= 60_000) {
+                log(`[${name}] 异常：${err.message}，本次故障累计失败 ${githubFailures} 次`);
+                githubLastLogAt = Date.now();
+              }
+              githubLastFailureKind = err.kind;
+            }
             recordModuleError(name, err.message);
           }
         } finally {
