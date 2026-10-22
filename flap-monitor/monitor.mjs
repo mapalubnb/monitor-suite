@@ -3,7 +3,7 @@ import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.m
 import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
-import { recoverLiveCursor, activateHistoryGap, selectReadyHistoryRange, deferHistoryRange } from "../shared/scan-recovery.mjs";
+import { recoverLiveCursor, activateHistoryGap, selectReadyHistoryRange, deferHistoryRange, readAvailableLogWindow } from "../shared/scan-recovery.mjs";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 /**
  * Flap.sh 页面监控脚本 v2 — 高频并行版
@@ -3296,12 +3296,13 @@ async function scanFlapRegistryLogs(snapshot, { history = false, sendCardFn = se
   const fromBlock = Math.max(0, state[cursorKey] + 1 - (history ? 0 : 5));
   const toBlock = Math.min(history ? state.historyEndBlock : state.safeLatestBlock,
     state[cursorKey] + (history ? CONFIG.registryMonitor.maxBlocksPerRun : Math.min(100, CONFIG.registryMonitor.maxBlocksPerRun)));
-  const logs = await rpcCallFn("eth_getLogs", [{
+  const window = await readAvailableLogWindow(Math.max(fromBlock, state[cursorKey]), toBlock, end => rpcCallFn("eth_getLogs", [{
     address: CONFIG.registryMonitor.address,
     topics: [[...CONFIG.registryMonitor.watchedEventTopics]],
     fromBlock: numberToHex(fromBlock),
-    toBlock: numberToHex(toBlock),
-  }], { history });
+    toBlock: numberToHex(end),
+  }], { history }));
+  const logs = window.value;
 
   const candidates = [];
   for (const item of logs || []) {
@@ -3311,7 +3312,7 @@ async function scanFlapRegistryLogs(snapshot, { history = false, sendCardFn = se
   }
   const delivery = await deliverRegistryChanges(snapshot, deliveryOptions);
   if (delivery.errors.length) throw new Error(delivery.errors.join('；'));
-  state[cursorKey] = toBlock;
+  state[cursorKey] = window.end;
   state[history ? "historyLastSuccessAt" : "lastBlockAt"] = ts();
   if (!history) state.lagBlocks = Math.max(0, state.safeLatestBlock - state.lastBlock);
   persistStateFn(snapshot);

@@ -1935,3 +1935,40 @@ test('creator discovery streams bounded blocks and reads only deployment receipt
   assert.equal(requests.flat().some(call => call.method === 'eth_getBlockReceipts'), false);
   await assert.rejects(__testables.findCreatorsInRange(1, 2, [address], async () => [null, null]), /保留历史游标/);
 });
+
+
+test('actor history shares low priority and excludes null-history provider only from history defaults', () => {
+  const payload = [{ method: 'eth_getBlockByNumber', params: ['0x10', true] }];
+  assert.equal(__testables.rpcRequestPolicy(payload, 'actorHistory').history, true);
+  assert.equal(__testables.rpcRequestPolicy(payload, 'creatorDiscovery').history, true);
+  assert.equal(__testables.rpcRequestPolicy(payload, 'actor').history, false);
+  const pools = __testables.CONFIG.rpcPools, previous = { ...pools };
+  try {
+    pools.block = ['https://bsc.rpc.blxrbdn.com', 'https://history.test']; pools.historyblock = [];
+    assert.deepEqual(__testables.rpcLaneUrls(payload, 'actorHistory'), ['https://history.test']);
+    assert.deepEqual(__testables.rpcLaneUrls(payload, 'actor'), pools.block);
+    pools.historyblock = ['https://explicit.test'];
+    assert.deepEqual(__testables.rpcLaneUrls(payload, 'actorHistory'), pools.historyblock);
+  } finally { Object.assign(pools, previous); }
+});
+
+test('actor local budget failure never repeats the exhausted batch through a permissive fallback', async () => {
+  let fallbacks = 0; const error = Object.assign(Error('budget'), { rpcBudget: true });
+  await assert.rejects(__testables.fetchValidatedActorBlocks([{ method: 'eth_getBlockByNumber', params: ['0x10', true] }], ['actor'],
+    async () => { throw error; }, async () => { fallbacks++; return []; }), e => e === error);
+  assert.equal(fallbacks, 0);
+});
+
+
+test('validated actor reader switches away from HTTP 200 null blocks before acknowledging a window', async () => {
+  const calls = [10, 11].map(n => ({ method: 'eth_getBlockByNumber', params: ['0x' + n.toString(16), true] }));
+  const block = n => ({ number: '0x' + n.toString(16), hash: '0x' + String(n).padStart(64, '0'),
+    parentHash: '0x' + String(n - 1).padStart(64, '0'), transactions: [] });
+  const seen = [];
+  const pool = __testables.createRpcEndpointPool(['https://null.test', 'https://complete.test'], { isBackedOff: () => false });
+  const control = { pressure: () => 0, cooldown: () => null, failure: () => {}, withEndpoint: async (_u, op) => op() };
+  const request = (payload, timeout, options) => __testables.requestBscRpcPayload(payload, timeout, { ...options, pool, control, inflight: new Map(),
+    fetchFn: async url => { seen.push(url); return { ok: true, text: async () => JSON.stringify(calls.map((_, i) => ({ id: i + 1, result: url.includes('null') ? null : block(i + 10) }))) }; } });
+  const result = await __testables.fetchValidatedActorBlocks(calls, ['actor'], request, async () => { throw Error('unexpected permissive fallback'); });
+  assert.equal(result.length, 2); assert.deepEqual(seen, ['https://null.test', 'https://complete.test']);
+});

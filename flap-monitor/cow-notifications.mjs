@@ -16,7 +16,6 @@ export function decodeCowTrades(logs, wallets, orders = {}) {
     try {
       if (log.topics.length !== 2 || !/^0x0{24}[0-9a-f]{40}$/i.test(log.topics[1])) continue;
       const owner = lower('0x' + log.topics[1].slice(-40));
-      if (!wallets.has(owner)) continue;
       const hex = lower(log.data).slice(2);
       if (!/^[0-9a-f]+$/.test(hex) || hex.length % 64) continue;
       const words = hex.match(/.{64}/g);
@@ -26,10 +25,11 @@ export function decodeCowTrades(logs, wallets, orders = {}) {
       if (!validUid(uid) || '0x' + uid.slice(66, 106) !== owner) continue;
       const sellToken = '0x' + words[0].slice(-40), buyToken = '0x' + words[1].slice(-40);
       const order = orders[uid];
+      if (!wallets.has(owner) && !(order?.trader && wallets.has(lower(order.trader)))) continue;
       if (order && (lower(order.owner) !== owner || lower(order.sellToken) !== sellToken || lower(order.buyToken) !== buyToken)) continue;
       const sellAmount = BigInt('0x' + words[2]).toString(), buyAmount = BigInt('0x' + words[3]).toString();
       if (uint(sellAmount) === 0n || uint(buyAmount) === 0n) continue;
-      trades.push({ log, kind: 'cowTrade', orderUid: uid, owner, sellToken, buyToken,
+      trades.push({ log, kind: 'cowTrade', orderUid: uid, owner, trader: order?.trader || owner, sellToken, buyToken,
         receiver: order?.receiver && !/^0x0{40}$/.test(order.receiver) ? lower(order.receiver) : owner,
         sellAmount, buyAmount, feeAmount: BigInt('0x' + words[4]).toString(),
         direction: cowDirection(sellToken, buyToken), token: BASE_ASSETS.has(buyToken) ? sellToken : buyToken,
@@ -160,7 +160,7 @@ export function selectCowNotification(state, nowMs) {
     const lastTrade = trades.at(-1) || previous.lastTrade;
     if (lastTrade) lines.push(`本次成交：${amount(lastTrade.sellAmount, data.sellToken, state)} → ${amount(lastTrade.buyAmount, data.buyToken, state)}`,
       `[最近成交](https://bscscan.com/tx/${lastTrade.transactionHash})｜区块 ${lastTrade.blockNumber}`);
-    lines.push(`钱包：${link(data.owner)}`, `订单：${uid}`, `🕒 ${changes.at(-1).observedAt || new Date(nowMs).toISOString()}`);
+    lines.push(`钱包：${link(data.trader || data.owner)}`, `订单：${uid}`, `🕒 ${changes.at(-1).observedAt || new Date(nowMs).toISOString()}`);
     const nextRecord = { status, hasFill, lastTrade: lastTrade ? { sellAmount: lastTrade.sellAmount,
       buyAmount: lastTrade.buyAmount, transactionHash: lastTrade.transactionHash, blockNumber: lastTrade.blockNumber } : undefined,
       totals: totals ? { executedSellAmount: totals.executedSellAmount,

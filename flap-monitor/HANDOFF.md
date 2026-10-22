@@ -63,6 +63,18 @@
 
 ## 验证与待发布交接
 
+### 2026/10/22 待发布：CoW 与 RPC 完整性修复
+
+- 用户在总控明确授权方案全部实现、频率不变，验证后先 GitHub 后服务器。总控持锁串行实施，基线 98758f6；Suite 1.12.52 / Flap 1.10.37 / Four.meme 1.5.20。
+- Flap：early-signal-monitor.mjs 区分 EthFlow owner/trader，校验 UID owner、按 userValidTo 到期，订单/事件/队列原子内存提交；异常记录在 cowValidation 健康项保留并每轮重查，正常记录继续扫描。仅将旧 owner 兼容错误的退避置为可重试，成功后才恢复健康。cow-notifications.mjs 用订单 UID 的已知 trader 归属核验成交、显示真实钱包，继续复用原卡和投递 ID。
+- Flap monitor.mjs 与 shared/scan-recovery.mjs：注册、提前信号统一窗口按日志节点已知可用高度重读，失败不确认、尾段不跳过、不退回已完成游标；高度短暂落后留到下一次既有调度，不触发普通故障长退避。
+- Four.meme monitor.mjs：actorHistory 与 creatorDiscovery 使用历史预算；新增可选 historyblock/historyread 池，默认历史区块排除实测返回 null 的 blxrbdn，实时节点保留；严格读取已尝试所有节点后不再次发起宽松 batch。生产配置不需变更。
+- 文件还包括两模块相关回归、版本、README、.env.example、MONITORING.md、CREATOR_DISCOVERY.md、本交接与 PROJECT_STATE；未改变调度间隔、WSS、Safe Key、AI 关闭策略、历史放弃、原消息队列及去重 ID。
+- 本地根语法检查通过；隔离串行全量（所有 *.test.mjs，含未列入旧 npm test 清单的用例）701/701 通过。新增测试覆盖身份误归属、UID 伪造、有效期、队列满回滚、重启幂等、发送失败重投、节点落后缩窗及尾段追齐、null 区块切备用、预算不足不重复请求。
+- 真实 API 4 笔订单内存回放全部接受，旧 EthFlow 已成交订单启动 pending=0、再次回放 pending=0；未发测试卡片。旧注册纯逻辑测试误写工作区快照导致 Windows EPERM，已注入不落盘回调；生产存储未改。三个旧投递测试的合成 UID/浮点秒时间改为合法输入，不放宽身份校验。
+- 发布需重启 Flap 和 Four.meme；机器人不重启。风险：公共节点仍可能拒绝/限流/超时，供应商问题不能保证永久消失；确认实际游标、所有周期、CoW 正常检查、队列与旧状态保留后记录验收。尚无自然新 EthFlow 操作的端到端送达证据。
+
+
 ### 2026/10/22 已发布：1.10.36 关闭 Flap 全部 AI 分析
 
 - 用户明确要求关闭 Flap 的所有 AI 分析，另明确授权本地验证后通知总控部署。基于 `4e1225c992b86a1f2eb2040b907c27797d70ea46`；未提交、推送、改服务器或重启。

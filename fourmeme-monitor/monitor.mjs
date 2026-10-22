@@ -210,7 +210,7 @@ const CONFIG = {
   hostRequestMinDelayMs: readNonNegativeIntEnv("FOURMEME_HOST_REQUEST_MIN_DELAY_MS", 60),
 
   // ── BSC RPC ──
-  rpcPools: Object.fromEntries(['read', 'block', 'logs'].map(lane => [lane,
+  rpcPools: Object.fromEntries(['read', 'block', 'logs', 'historyblock', 'historyread'].map(lane => [lane,
     (process.env[`FOURMEME_RPC_${lane.toUpperCase()}_URLS`] || '').split(/[\s,]+/).filter(Boolean)])),
   bscRpcUrls: [...new Set((process.env.FOURMEME_BSC_RPC_URLS || [
     "https://bsc.rpc.blxrbdn.com",
@@ -1519,9 +1519,23 @@ const rpcControl = createRpcControl({ directory: IS_TEST_MODE ? "" : join(__dirn
 const bscRpcEndpointPool = createRpcEndpointPool(CONFIG.bscRpcUrls, { isBackedOff: url => Boolean(currentBackoffState(getDomain(url))) || Boolean(rpcControl.cooldown(url)) });
 const bscRpcInflight = new Map();
 const routedRpcPools = new Map();
+function rpcRequestPolicy(payload, moduleName = moduleMetricContext.getStore()?.moduleName) {
+  const calls = Array.isArray(payload) ? payload : [payload];
+  return { payload, cost: calls.length, history: ['creatorDiscovery', 'actorHistory'].includes(moduleName),
+    critical: calls.length > 0 && calls.every(call => ['eth_getStorageAt', 'eth_getCode'].includes(call.method)) };
+}
+function rpcLaneUrls(payload, moduleName = moduleMetricContext.getStore()?.moduleName) {
+  const base = (Array.isArray(payload) ? payload : [payload]).some(item => item.method === 'eth_getLogs') ? 'logs' : rpcReadLane(payload);
+  const history = rpcRequestPolicy(payload, moduleName).history;
+  const configured = history ? CONFIG.rpcPools['history' + base] : null;
+  const fallback = CONFIG.rpcPools[base]?.length ? CONFIG.rpcPools[base] : base === 'block' ? CONFIG.rpcPools.read : [];
+  const urls = configured?.length ? configured : fallback?.length ? fallback : CONFIG.bscRpcUrls;
+  // This public endpoint returns null for old blocks. Keep it available to the live lane.
+  return history && base === 'block' && !configured?.length
+    ? urls.filter(url => new URL(url).hostname !== 'bsc.rpc.blxrbdn.com') : urls;
+}
 function rpcPoolFor(payload) {
-  const lane = (Array.isArray(payload) ? payload : [payload]).some(item => item.method === 'eth_getLogs') ? 'logs' : rpcReadLane(payload);
-  const urls = CONFIG.rpcPools[lane]?.length ? CONFIG.rpcPools[lane] : lane === 'block' ? CONFIG.rpcPools.read : CONFIG.rpcPools[lane];
+  const urls = rpcLaneUrls(payload);
   if (!urls.length) return bscRpcEndpointPool;
   const key = JSON.stringify(urls);
   if (!routedRpcPools.has(key)) routedRpcPools.set(key, createRpcEndpointPool(urls,
@@ -1540,10 +1554,8 @@ async function requestBscRpcPayload(payload, timeoutMs, {
   const calls = Array.isArray(payload) ? payload : [payload];
   // Code and proxy-slot checks may consume the reserve also used by Flap core
   // checks. Ordinary reads and block backfill must leave that reserve intact.
-  const requestOptions = { payload, cost: calls.length,
-    ...(moduleMetricContext.getStore()?.moduleName === "creatorDiscovery" ? { history: true } : {}),
-    critical: calls.length > 0 && calls.every(call => ["eth_getStorageAt", "eth_getCode"].includes(call.method)) };
-  const dedupeKey = `${timeoutMs}:${dedupeKeySuffix}:${JSON.stringify(payload)}`;
+  const requestOptions = rpcRequestPolicy(payload);
+  const dedupeKey = `${requestOptions.history}:${timeoutMs}:${dedupeKeySuffix}:${JSON.stringify(payload)}`;
   const existing = inflight.get(dedupeKey);
   if (existing) return existing;
 
@@ -8634,7 +8646,9 @@ async function fetchValidatedActorBlocks(
       dedupeKeySuffix: `actor-raw:${[...actorAddresses].sort().join(",")}`,
     });
   } catch (err) {
-    if (err?.code === "BSC_RPC_ALL_BACKED_OFF") throw err;
+    // Production request already validated and tried every eligible provider.
+    // A second, permissive batch would repeat the load and accept null blocks.
+    if (rpcRequestFn === requestBscRpcPayload || err?.code === "BSC_RPC_ALL_BACKED_OFF" || err?.rpcBudget || err?.rpcCooldown) throw err;
     actorRawScanState.lastMode = "batchFallback";
     actorRawScanState.fallbacks++;
     log(`[创建者] 区块读取或校验失败，回退标准 RPC：${err?.message || "未知错误"}`);
@@ -10377,6 +10391,8 @@ export const __testables = {
   bscRpcBatch,
   normalizeBscRpcBatchResults,
   fetchValidatedActorBlocks,
+  rpcRequestPolicy,
+  rpcLaneUrls,
   fetchStaticAssetSafe,
   nextUA,
   browserHeaders,

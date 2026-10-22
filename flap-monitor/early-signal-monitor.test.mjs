@@ -763,3 +763,66 @@ test('fast lane commits the first receipt before waiting for a later receipt', a
   assert.equal(commits, 1);
   assert.ok(state.pendingChanges.some(event => event.kind === 'liquidityAdded'));
 });
+
+
+test('EthFlow retains settlement owner and trader, uses user expiry, and commits atomically', () => {
+  const sample = history.orders[0], contract = '0xba3cb449bd2b4adddbc894d8697f5170800eadec';
+  const flow = { ...sample, uid: '0x' + 'ab'.repeat(32) + contract.slice(2) + 'ffffffff', owner: contract,
+    onchainUser: OWNER, receiver: OWNER, ethflowData: { userValidTo: nowMs / 1000 + 60 }, validTo: 4294967295, status: 'open' };
+  const state = createEarlySignalState();
+  ingestCowOrders(state, OWNER, [flow], { nowMs });
+  assert.equal(state.orders[flow.uid].owner, contract);
+  assert.equal(state.orders[flow.uid].trader, OWNER);
+  assert.equal(state.orders[flow.uid].validTo, flow.ethflowData.userValidTo);
+  const resumed = JSON.parse(JSON.stringify(state));
+  ingestCowOrders(resumed, OWNER, [flow], { nowMs: nowMs + 1 });
+  assert.equal(resumed.pendingChanges.length, 1);
+  ingestCowOrders(resumed, OWNER, [flow], { nowMs: nowMs + 61000 });
+  assert.equal(resumed.orders[flow.uid].status, 'expired');
+  assert.equal(resumed.pendingChanges.length, 2);
+  const before = JSON.stringify(state);
+  assert.throws(() => ingestCowOrders(state, OWNER, [{ ...flow, status: 'fulfilled' }, { ...flow, onchainUser: TOKEN }], { nowMs }), /owner/);
+  assert.equal(JSON.stringify(state), before);
+  assert.throws(() => ingestCowOrders(state, OWNER, [{ ...flow, uid: '0x' + 'aa'.repeat(56) }], { nowMs }), /UID/);
+  const full = createEarlySignalState(); full.pendingChanges = Array(2000).fill({ id: 'existing' });
+  const saved = JSON.stringify(full);
+  assert.throws(() => ingestCowOrders(full, OWNER, [flow], { nowMs }), /积压/);
+  assert.equal(JSON.stringify(full), saved);
+});
+
+test('CoW malformed record is quarantined without blocking valid account orders', async () => {
+  const state = createEarlySignalState(), sample = history.orders[0];
+  const flow = { ...sample, uid: '0x' + 'ab'.repeat(32) + 'ba3cb449bd2b4adddbc894d8697f5170800eadec' + 'ffffffff',
+    owner: '0xba3cb449bd2b4adddbc894d8697f5170800eadec', onchainUser: OWNER, receiver: OWNER,
+    ethflowData: { userValidTo: nowMs / 1000 - 60 }, status: 'fulfilled' };
+  const config = { mode: 'external', sources: ['cow'], scheduledSource: true, wallets: [OWNER], safes: [] };
+  const fetchFn = async () => ({ ok: true, json: async () => [flow, { ...flow, uid: 'invalid' }] });
+  await runEarlySignalScan({ state, config, fetchFn, nowMs, rpcBatch: async () => [] });
+  assert.equal(state.health['cow:' + OWNER].lastError, '');
+  assert.equal(state.health['cowValidation:' + OWNER].rejected.length, 1);
+  assert.equal(state.pendingChanges.length, 0);
+  assert.equal(Object.keys(state.orders).length, 1);
+});
+
+test('early log scan caps all filters to available height and catches tail without cursor regression', async () => {
+  const state = createEarlySignalState(); state.realtimeCursor = 100;
+  let logHead = 102; const ranges = [];
+  const rpc = async calls => Promise.all(calls.map(async ({ method, params }) => {
+    if (method === 'eth_chainId') return '0x38';
+    if (method === 'eth_blockNumber') return '0x69';
+    if (method === 'eth_getBlockByNumber') return { number: params[0], hash: '0x' + Number(params[0]).toString(16).padStart(64, '0'), transactions: [] };
+    if (method === 'eth_getLogs') { const end = Number(params[0].toBlock); ranges.push(end);
+      if (end > logHead) throw Object.assign(new Error('head lag'), { rpcHeadLag: true, availableHead: logHead });
+      return []; }
+    throw Error(method);
+  }));
+  const config = { realtime: true, nativeTransactions: false, wallets: [], safes: [], observationWallets: [] };
+  await scanEarlyChain(state, config, rpc, nowMs);
+  assert.equal(state.realtimeCursor, 102);
+  assert.ok(ranges.includes(105) && ranges.includes(102));
+  logHead = 105; await scanEarlyChain(state, config, rpc, nowMs + 1000);
+  assert.equal(state.realtimeCursor, 105);
+  logHead = 103;
+  await assert.rejects(scanEarlyChain(state, config, rpc, nowMs + 2000), /head lag/);
+  assert.equal(state.realtimeCursor, 105);
+});

@@ -2,7 +2,7 @@ import { observedSafeConfig, mergeObservedSafes, SAFE_FACTORIES, PROXY_CREATION,
 import { ENTRY_POINT_V07, USER_OPERATION_EVENT } from './erc4337-codec.mjs';
 import { formatBeijingTime } from '../shared/display-format.cjs';
 import { withDeadline } from '../shared/request-deadline.mjs';
-import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
+import { recoverLiveCursor, activateHistoryGap, readAvailableLogWindow } from "../shared/scan-recovery.mjs";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { CORE_SAFES, AUXILIARY_SAFES, EXECUTION_WALLETS, CORE_OWNERS, ALLOWANCE_MODULE, PROXY_ADMINS,
@@ -73,6 +73,10 @@ export function loadEarlySignalState(path) {
     if (health && (name === "chain" || /RPC 本地队列|RPC 节点预算|RPC 备用竞速/.test(health.lastError || ""))) {
       health.nextAttemptAtMs = Math.min(health.nextAttemptAtMs || 0, Date.now() + 10_000);
     }
+  }
+  // Retry legacy compatibility failures once after upgrade; successful parsing clears health.
+  for (const [name, health] of Object.entries(state.health)) {
+    if (name.startsWith('cow:') && health.lastError === 'CoW 订单 owner 不匹配') health.nextAttemptAtMs = 0;
   }
   migratePoolEvidence(state, new Set(watchedWallets()));
   pruneDiscoveryPools(state);
@@ -345,6 +349,11 @@ async function sourcePass(state, name, fn, nowMs, intervalMs = 0) {
     await fn();
     Object.assign(health, { lastSuccessAt: iso(nowMs), lastSuccessMs: nowMs, failures: 0, lastError: "", nextAttemptAtMs: 0 });
   } catch (error) {
+    if (error.rpcHeadLag) {
+      health.lastError = error.message;
+      health.nextAttemptAtMs = nowMs + 1000;
+      return; // Still pending, not a successful scan; retry on the existing next tick.
+    }
     health.failures = (health.failures || 0) + 1;
     health.lastError = error.message;
     const rpcSource = ["chain", "realtime", "assets", "balances", "positions"].includes(name);
@@ -352,15 +361,35 @@ async function sourcePass(state, name, fn, nowMs, intervalMs = 0) {
   }
 }
 
-export function ingestCowOrders(state, owner, orders, { nowMs = Date.now(), bootstrap = false } = {}) {
+export function normalizeCowOrder(order, account) {
+  const owner = normalizeAddress(order.owner), trader = normalizeAddress(account);
+  if (!/^0x[a-f0-9]{112}$/i.test(order.uid || '') || !owner || !trader
+    || lower('0x' + order.uid.slice(66, 106)) !== owner) throw new Error('CoW 订单 UID / owner 不匹配');
+  const ethflow = order.ethflowData != null;
+  if (owner !== trader && !(ethflow && normalizeAddress(order.onchainUser) === trader))
+    throw new Error('CoW 订单 owner 不匹配');
+  const validTo = ethflow ? Number(order.ethflowData.userValidTo) : Number(order.validTo);
+  if (!Number.isSafeInteger(validTo) || validTo <= 0) throw new Error('CoW 订单有效期无效');
+  return { ...order, uid: lower(order.uid), owner, validTo };
+}
+export function ingestCowOrders(state, owner, orders, options = {}) {
+  if (!Array.isArray(orders)) throw new Error('CoW 订单响应不是数组');
+  const normalized = orders.map(order => normalizeCowOrder(order, owner));
+  // No await: commit all affected fields together, including outbox capacity failures.
+  const draft = { ...state, orders: { ...state.orders }, events: { ...state.events },
+    pendingChanges: [...state.pendingChanges], tokens: structuredClone(state.tokens), health: { ...state.health } };
+  applyCowOrders(draft, owner, normalized, options);
+  for (const key of ['orders', 'events', 'pendingChanges', 'tokens', 'health']) state[key] = draft[key];
+}
+function applyCowOrders(state, owner, orders, { nowMs = Date.now(), bootstrap = false } = {}) {
   if (!Array.isArray(orders)) throw new Error("CoW 订单响应不是数组");
   for (const order of orders) {
     if (!/^0x[a-f0-9]{112}$/i.test(order.uid || "")) continue;
-    if (lower(order.owner) !== lower(owner)) throw new Error("CoW 订单 owner 不匹配");
+
     const previous = state.orders[order.uid];
     const status = ["open", "presignaturePending"].includes(order.status) && Number(order.validTo) * 1000 <= nowMs ? "expired" : order.status;
     const fingerprint = [status, order.executedSellAmount, order.executedBuyAmount].join(":");
-    const next = { uid: order.uid, owner: lower(owner), receiver: lower(order.receiver || owner), buyToken: lower(order.buyToken), sellToken: lower(order.sellToken),
+    const next = { uid: order.uid, owner: lower(order.owner), trader: lower(owner), receiver: lower(order.receiver || owner), buyToken: lower(order.buyToken), sellToken: lower(order.sellToken),
       executedSellAmount: String(order.executedSellAmount ?? '0'), executedBuyAmount: String(order.executedBuyAmount ?? '0'),
       sellAmount: String(order.sellAmount ?? '0'), orderKind: order.kind,
       fingerprint, status, revision: (previous?.revision || 0) + (previous?.fingerprint === fingerprint ? 0 : 1), creationDate: order.creationDate, validTo: order.validTo, lastSeenAt: iso(nowMs) };
@@ -372,7 +401,7 @@ export function ingestCowOrders(state, owner, orders, { nowMs = Date.now(), boot
     const stage = buying && ["fulfilled", "open", "presignaturePending"].includes(status) ? "stocking" : "observation";
     emit(state, { id: `cow:${order.uid}:${next.revision}:${fingerprint}`, source: "cow", kind: "order", token, stage,
       orderUid: order.uid, status, sourceTime: order.creationDate,
-      owner: next.owner, sellToken: next.sellToken, buyToken: next.buyToken, direction: cowDirection(next.sellToken, next.buyToken),
+      owner: next.owner, trader: next.trader, sellToken: next.sellToken, buyToken: next.buyToken, direction: cowDirection(next.sellToken, next.buyToken),
       executedSellAmount: next.executedSellAmount, executedBuyAmount: next.executedBuyAmount, sellAmount: next.sellAmount, orderKind: next.orderKind,
       orderChange: !previous ? 'new' : previous.status !== status ? 'status' : 'progress',
       detail: `CoW ${status}｜${owner}｜卖出 ${order.sellToken} → 买入 ${order.buyToken}｜原始卖出数量 ${order.sellAmount}｜累计成交原始数量：卖出 ${order.executedSellAmount ?? '未知'} / 买入 ${order.executedBuyAmount ?? '未知'}｜有效期 ${iso(Number(order.validTo) * 1000)}` }, { nowMs });
@@ -394,7 +423,14 @@ export async function scanCowOrders(state, config, fetchFn, nowMs) {
       if (page.length < 100) { complete = true; break; }
     }
     if (!complete) throw new Error("CoW 订单超过分页上限，未完成快照");
-    ingestCowOrders(state, owner, all, { nowMs, bootstrap });
+    const valid = [], rejected = [];
+    for (const order of all) {
+      try { valid.push(normalizeCowOrder(order, owner)); }
+      catch (error) { rejected.push({ uid: String(order?.uid || '').slice(0, 114), error: error.message }); }
+    }
+    const validationKey = `cowValidation:${lower(owner)}`;
+    state.health[validationKey] = { lastError: rejected.length ? `CoW ${rejected.length} 笔订单身份/格式待核验` : '', rejected, checkedAt: iso(nowMs) };
+    ingestCowOrders(state, owner, valid, { nowMs, bootstrap });
   }, nowMs, config.scheduledSource ? 0 : config.cowIntervalMs || 10000);
 }
 
@@ -602,22 +638,27 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
     .filter(([, info]) => Number.isInteger(info.replayFrom)).map(([a, info]) => [a, info.replayFrom]) : [];
   if (replayStarts.length) scanCursor = Math.min(scanCursor, ...replayStarts.map(([, b]) => b - 1));
   const from = Math.max(0, scanCursor + 1 - (config.realtime ? 5 : 0));
-  const to = Math.min(head, scanCursor + (config.maxBlocksPerRun || 10));
+  let to = Math.min(head, scanCursor + (config.maxBlocksPerRun || 10));
   if (from > to) return;
   const reorgRevision = state.reorgRevision || 0;
-  const boundary = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(to), false]);
   config = observedSafeConfig(state, config);
   const filters = earlyLogFilters(state, config);
-  const logs = [];
-  // Some public BSC nodes disable batch eth_getLogs: keep these requests independent.
-  for (let i = 0; i < filters.length; i += 3) {
-    const pages = await Promise.all(filters.slice(i, i + 3).map(filter =>
-      strictRpc(rpcBatch, "eth_getLogs", [{ ...filter, fromBlock: blockTag(from), toBlock: blockTag(to) }])));
-    for (const page of pages) {
-      if (!Array.isArray(page)) throw new Error("eth_getLogs 非数组");
-      logs.push(...page);
+  const window = await readAvailableLogWindow(Math.max(from, scanCursor), to, async end => {
+    const boundary = await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(end), false]);
+    const logs = [];
+    // Retry every filter at the same reduced height, so no partial window is committed.
+    for (let i = 0; i < filters.length; i += 3) {
+      const pages = await Promise.all(filters.slice(i, i + 3).map(filter =>
+        strictRpc(rpcBatch, "eth_getLogs", [{ ...filter, fromBlock: blockTag(from), toBlock: blockTag(end) }])));
+      for (const page of pages) {
+        if (!Array.isArray(page)) throw new Error("eth_getLogs 非数组");
+        logs.push(...page);
+      }
     }
-  }
+    return { boundary, logs };
+  });
+  to = window.end;
+  const { boundary, logs } = window.value;
   const transactionMap = new Map();
   if (config.nativeTransactions !== false) {
     const wallets = new Set([...watchedWallets(config), ...observationAddresses(config)]);

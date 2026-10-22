@@ -3566,7 +3566,7 @@ test("registry preserves old gap and continues live scans while history RPC is b
   const snapshot = {registryMonitor:{lastBlock:100,knownVaults:{},lagBlocks:999}};
   let head=10000;
   const rpcCallFn=async method=>method==='eth_blockNumber'?'0x'+head.toString(16):[];
-  await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn});
+  await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn, persistStateFn: () => {}});
   const state=snapshot.registryMonitor;
   assert.equal(state.lastBlock,10000);
   assert.equal(state.lagBlocks,0);
@@ -3574,20 +3574,20 @@ test("registry preserves old gap and continues live scans while history RPC is b
   let release, started;
   const entered=new Promise(resolve=>{started=resolve;});
   const waiting=new Promise(resolve=>{release=resolve;});
-  const history=__testables.checkFlapRegistryLogs(snapshot,{history:true,rpcCallFn:async (_method,_params,opts)=>{
+  const history=__testables.checkFlapRegistryLogs(snapshot,{history:true,persistStateFn: () => {},rpcCallFn:async (_method,_params,opts)=>{
     assert.equal(opts.history,true);started();await waiting;throw new Error('archive unavailable');
   }});
   const rejected=assert.rejects(history,/archive unavailable/);
   await entered;
   head=10010;
-  await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn});
+  await __testables.checkFlapRegistryLogs(snapshot,{rpcCallFn, persistStateFn: () => {}});
   assert.equal(state.lastBlock,10010);
   assert.equal(state.historyLastBlock,100);
   assert.equal(state.historyEndBlock,9980);
   release();await rejected;
   const reloaded=JSON.parse(JSON.stringify(snapshot));
   const ranges=[];
-  await __testables.checkFlapRegistryLogs(reloaded,{history:true,rpcCallFn:async (_method,params)=>{ranges.push(params[0]);return [];}});
+  await __testables.checkFlapRegistryLogs(reloaded,{history:true,persistStateFn: () => {},rpcCallFn:async (_method,params)=>{ranges.push(params[0]);return [];}});
   assert.equal(Number(ranges[0].fromBlock),101);
   assert.equal(reloaded.registryMonitor.lastBlock,10010);
   assert.equal(reloaded.registryMonitor.historyLastBlock,3100);
@@ -3869,8 +3869,8 @@ test('CoW notice and progress patch survive restart and only acknowledge the per
   const { createEarlySignalState, ingestCowOrders } = await import('./early-signal-monitor.mjs');
   let state = createEarlySignalState(), disk, patches = 0, sends = 0;
   const owner = '0x81459cd6b1bdf55d01a824350a79a0c201530992';
-  const order = { uid: '0x' + 'ab'.repeat(56), owner, sellToken: '0x' + '12'.repeat(20),
-    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', executedSellAmount: '100', executedBuyAmount: '500', validTo: Date.now() / 1000 + 600 };
+  const order = { uid: '0x' + 'ab'.repeat(32) + owner.slice(2) + 'ffffffff', owner, sellToken: '0x' + '12'.repeat(20),
+    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', executedSellAmount: '100', executedBuyAmount: '500', validTo: Math.floor(Date.now() / 1000) + 600 };
   ingestCowOrders(state, owner, [order]);
   const opts = { saveStateFn: (_path, value) => { disk = JSON.stringify(value); },
     sendCardFn: async () => { sends++; return 'cow-card'; }, patchCardFn: async id => {
@@ -3894,8 +3894,8 @@ test('failed CoW edit retains events, retries without creating another message, 
   const { createEarlySignalState, ingestCowOrders } = await import('./early-signal-monitor.mjs');
   const state = createEarlySignalState(); let time = Date.now(), sends = 0;
   const owner = '0x81459cd6b1bdf55d01a824350a79a0c201530992';
-  const order = { uid: '0x' + 'ab'.repeat(56), owner, sellToken: '0x' + '12'.repeat(20),
-    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', executedSellAmount: '100', validTo: time / 1000 + 600 };
+  const order = { uid: '0x' + 'ab'.repeat(32) + owner.slice(2) + 'ffffffff', owner, sellToken: '0x' + '12'.repeat(20),
+    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', executedSellAmount: '100', validTo: Math.floor(time / 1000) + 600 };
   const opts = { now: () => time, saveStateFn: () => {}, sendCardFn: async () => { sends++; return 'cow-card'; }, patchCardFn: async () => { throw Error('temporary patch failure'); } };
   ingestCowOrders(state, owner, [order]);
   await __testables.deliverFlapEarlySignals(state, opts);
@@ -3918,8 +3918,8 @@ test('failed CoW initial send persists exact delivery and retries once across re
   const { createEarlySignalState, ingestCowOrders } = await import('./early-signal-monitor.mjs');
   let state = createEarlySignalState(), disk;
   const owner = '0x81459cd6b1bdf55d01a824350a79a0c201530992';
-  ingestCowOrders(state, owner, [{ uid: '0x' + 'ab'.repeat(56), owner, sellToken: '0x' + '12'.repeat(20),
-    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', validTo: Date.now() / 1000 + 600 }]);
+  ingestCowOrders(state, owner, [{ uid: '0x' + 'ab'.repeat(32) + owner.slice(2) + 'ffffffff', owner, sellToken: '0x' + '12'.repeat(20),
+    buyToken: '0x55d398326f99059ff775485246999027b3197955', status: 'open', validTo: Math.floor(Date.now() / 1000) + 600 }]);
   const opts = { saveStateFn: (_path, value) => { disk = JSON.stringify(value); } };
   await assert.rejects(__testables.deliverFlapEarlySignals(state, { ...opts, sendCardFn: async () => { throw Error('offline'); } }), /offline/);
   state = JSON.parse(disk);
@@ -4146,4 +4146,21 @@ test('Factory replacement fork arriving before removed stays active and sends it
   await __testables.processFactoryPoolFeedEvent(state, { ...first, removed: true }, 'factory-wss', options);
   assert.equal(cards.length, 3);
   assert.equal(state.assets['0x' + '12'.repeat(20)].eventKey, factoryPoolEventKey(replacement));
+});
+
+
+test('registry only acknowledges available log height and preserves unread tail across restart', async () => {
+  const snapshot = { registryMonitor: { lastBlock: 100, latestBlock: 105 } }; let logHead = 103;
+  const rpcCallFn = async (method, params) => {
+    if (method === 'eth_blockNumber') return '0x69';
+    const end = Number(params[0].toBlock);
+    if (end > logHead) throw Object.assign(Error('head lag'), { rpcHeadLag: true, availableHead: logHead });
+    return [];
+  };
+  const opts = { rpcCallFn, persistStateFn: () => {}, sendCardFn: async () => { throw Error('unexpected send'); } };
+  await __testables.checkFlapRegistryLogs(snapshot, opts);
+  assert.equal(snapshot.registryMonitor.lastBlock, 103);
+  const restored = JSON.parse(JSON.stringify(snapshot)); logHead = 105;
+  await __testables.checkFlapRegistryLogs(restored, opts);
+  assert.equal(restored.registryMonitor.lastBlock, 105);
 });

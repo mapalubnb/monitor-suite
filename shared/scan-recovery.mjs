@@ -1,3 +1,16 @@
+// A successful smaller window acknowledges only that window, never the requested tail.
+export async function readAvailableLogWindow(from, to, read) {
+  let end = to;
+  for (let attempt = 0; ; attempt++) {
+    try { return { end, value: await read(end) }; }
+    catch (error) {
+      if (!error.rpcHeadLag || !Number.isSafeInteger(error.availableHead)
+        || error.availableHead < from || error.availableHead >= end || attempt >= 2) throw error;
+      end = error.availableHead;
+    }
+  }
+}
+
 // Preserve every unscanned interval before moving a stalled live lane forward.
 export function recoverLiveCursor(state, { head, cursorKey, hashKey, maxLag = 2000, lookback = 20 }) {
   const cursor = state[cursorKey];

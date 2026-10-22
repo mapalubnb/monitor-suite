@@ -237,3 +237,22 @@ test('重组移除额度历史后不沿用旧消耗证据', () => {
   assert.ok(selectEarlyNotification(state, now));
   assert.equal(selectCowNotification(state, now), null);
 });
+
+
+test('EthFlow settlement requires the known UID/trader binding and never attributes other contract orders', () => {
+  const contract = '0xba3cb449bd2b4adddbc894d8697f5170800eadec';
+  const flowUid = uid.slice(0, 66) + contract.slice(2) + uid.slice(106);
+  const logs = structuredClone(receipt.logs);
+  const trade = logs.find(l => l.topics[0] === COW_TRADE_TOPIC);
+  trade.topics[1] = '0x' + contract.slice(2).padStart(64, '0');
+  trade.data = trade.data.replace(owner.slice(2), contract.slice(2));
+  const wallets = new Set([owner]);
+  assert.equal(decodeCowTrades(logs, wallets, {}).length, 0);
+  const orders = { [flowUid]: { owner: contract, trader: owner, sellToken: sell, buyToken: buy, receiver: owner } };
+  const decoded = decodeCowTrades(logs, wallets, orders);
+  assert.equal(decoded.length, 1);
+  assert.equal(decoded[0].owner, contract); assert.equal(decoded[0].trader, owner);
+  assert.equal(decoded[0].orderUid, flowUid);
+  orders[flowUid].owner = owner;
+  assert.equal(decodeCowTrades(logs, wallets, orders).length, 0);
+});
