@@ -1,4 +1,5 @@
 import { observedSafeConfig } from './safe-observation.mjs';
+import { createMiniAppMonitor } from './mini-app-monitor.mjs';
 import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.mjs';
 import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
@@ -458,7 +459,7 @@ function inferUiComponentContext(value, file = "", assetPath = "") {
   const route = getPageRouteFromAssetPath(assetPath || file);
 
   if (/castore|vault|gift|reserve|staking|lista|stock|burn|buyback|snow|lucky|buffet|flapixel/.test(lower) || route === "CAstore") {
-    return { key: "castore-vault-card", label: "CAstore 金库卡片/模板列表", confidence: route === "CAstore" ? "高" : "中" };
+    return { key: "castore-vault-card", label: "CAstore 机制模板卡片/模板列表", confidence: route === "CAstore" ? "高" : "中" };
   }
   if (/group\/nav-dropdown|nav-dropdown|group-hover\/item|group-focus-visible\/item|border-b border-\[#303236\]|\/bnb\/board|docs\.flap|token-social|lucide-arrow-up-right/.test(lower)) {
     return { key: "navigation-menu", label: "顶部导航/下拉菜单", confidence: "高" };
@@ -837,8 +838,8 @@ function emptyFlapChangeMeta() {
 
 /* ── 快照读写 ── */
 const CURRENT_SCHEMA_VERSION = 6;
-const CA_STORE_VAULT_SCHEMA_VERSION = 4;
-const ASSET_ANALYSIS_SCHEMA_VERSION = 3;
+const CA_STORE_VAULT_SCHEMA_VERSION = 5;
+const ASSET_ANALYSIS_SCHEMA_VERSION = 4;
 const METADATA_SCHEMA_FIELDS = Object.freeze([
   "creator", "description", "website", "telegram", "twitter", "github", "youtube", "debox", "buy",
   "name", "symbol", "image", "sell",
@@ -894,7 +895,7 @@ function migrateSnapshot(data) {
     log("[快照迁移] v3 → v4：新增 vaultFactories 字段");
   }
   if (ver < 5) {
-    log("[快照迁移] v4 → v5：CAstore 金库实例保留重复项");
+    log("[快照迁移] v4 → v5：CAstore 机制模板实例保留重复项");
   }
   if (ver < 6) log("[快照迁移] v5 → v6：新增 Flap Vault Portal 链上监控字段");
   if (!data.registryMonitor) data.registryMonitor = {};
@@ -1994,7 +1995,7 @@ function buildBriefingInput(url, changes, assetStats, caStoreVaultDiffs = []) {
 
   if (caStoreVaultDiffs.length > 0) {
     lines.push("");
-    lines.push("CAstore 金库变更:");
+    lines.push("CAstore 机制模板变更:");
     for (const d of caStoreVaultDiffs) {
       const label = d.area ? `${d.area} / ${d.name}` : d.name;
       if (d.type === "reordered") {
@@ -2350,7 +2351,7 @@ function buildCardBriefing(url, aiSummary, assetStats, textChangeCount, i18nChan
   ];
 
   if (caStoreVaultDiffs.length > 0) {
-    lines.push(`**🏦 CAstore 金库变更（${caStoreVaultDiffs.length} 项）：**`);
+    lines.push(`**🏦 CAstore 机制模板变更（${caStoreVaultDiffs.length} 项）：**`);
     for (const d of caStoreVaultDiffs) {
       const label = d.area ? `${d.area} / ${d.name}` : d.name;
       if (d.type === "reordered") {
@@ -4356,7 +4357,7 @@ function findMatchingBracket(content, start, openChar, closeChar) {
 
 function parseWebpackExportAliases(jsContent) {
   const aliases = new Map();
-  const moduleRe = /(\d+):function\([^)]*\)\{/g;
+  const moduleRe = /(\d+):(?:function\([^)]*\)|\([^)]*\)=>)\{/g;
   let moduleMatch;
   while ((moduleMatch = moduleRe.exec(jsContent)) !== null) {
     const bodyStart = jsContent.indexOf("{", moduleMatch.index);
@@ -4368,23 +4369,23 @@ function parseWebpackExportAliases(jsContent) {
     const exportMatch = body.match(/\.d\([^,]+,\s*\{([\s\S]*?)\}\)/);
     if (!exportMatch) continue;
     const exportToLocal = new Map();
-    const exportRe = /(\w+)\s*:\s*function\(\)\s*\{\s*return\s+(\w+)\s*\}/g;
+    const exportRe = /([\w$]+)\s*:\s*(?:function\(\)\s*\{\s*return\s+([\w$]+)\s*\}|\(\)\s*=>\s*([\w$]+))/g;
     let exportItem;
     while ((exportItem = exportRe.exec(exportMatch[1])) !== null) {
-      exportToLocal.set(exportItem[1], exportItem[2]);
+      exportToLocal.set(exportItem[1], exportItem[2] || exportItem[3]);
     }
     if (exportToLocal.size === 0) continue;
 
     const localValues = new Map();
-    const letRe = /\blet\s+([\s\S]*?);/g;
+    const letRe = /\b(?:let|const|var)\s+([\s\S]*?);/g;
     let letMatch;
     while ((letMatch = letRe.exec(body)) !== null) {
-      const assignRe = /(\w+)\s*=\s*(["'])(.*?)\2/g;
+      const assignRe = /([\w$]+)\s*=\s*(["'])(.*?)\2/g;
       let assign;
       while ((assign = assignRe.exec(letMatch[1])) !== null) {
         localValues.set(assign[1], assign[3]);
       }
-      const arrayAssignRe = /(\w+)\s*=\s*\[((?:(["'])[^"']*\3\s*,?\s*)+)\]/g;
+      const arrayAssignRe = /([\w$]+)\s*=\s*\[((?:(["'])[^"']*\3\s*,?\s*)+)\]/g;
       let arrayAssign;
       while ((arrayAssign = arrayAssignRe.exec(letMatch[1])) !== null) {
         const values = [];
@@ -4410,11 +4411,11 @@ function extractVaultFactories(jsContent) {
   if (!markerMatch) return null;
   const exportAliases = parseWebpackExportAliases(jsContent);
   const importAliases = new Map();
-  const varDeclStart = jsContent.lastIndexOf("var ", markerMatch.index);
-  const varDeclEnd = jsContent.indexOf(";", varDeclStart);
-  if (varDeclStart !== -1 && varDeclEnd !== -1 && varDeclEnd < markerMatch.index) {
-    const decl = jsContent.slice(varDeclStart, varDeclEnd);
-    const importRe = /(\w+)\s*=\s*a\((\d+)\)/g;
+  const moduleStarts = [...jsContent.slice(0, markerMatch.index).matchAll(/\d+:(?:function\([^)]*\)|\([^)]*\)=>)\{/g)];
+  const varDeclStart = moduleStarts.at(-1)?.index ?? 0;
+  if (varDeclStart < markerMatch.index) {
+    const decl = jsContent.slice(varDeclStart, markerMatch.index);
+    const importRe = /([\w$]+)\s*=\s*\w+\((\d+)\)/g;
     let importMatch;
     while ((importMatch = importRe.exec(decl)) !== null) {
       importAliases.set(importMatch[1], importMatch[2]);
@@ -4457,7 +4458,7 @@ function extractVaultFactories(jsContent) {
     const trimmed = expr.trim();
     const quoted = trimmed.match(/^["']([^"']*)["']$/);
     if (quoted) return quoted[1];
-    const alias = trimmed.match(/^(\w+)\.(\w+)$/);
+    const alias = trimmed.match(/^([\w$]+)\.([\w$]+)$/);
     if (alias) {
       const moduleId = importAliases.get(alias[1]);
       if (moduleId) return exportAliases.get(`${moduleId}.${alias[2]}`) || null;
@@ -4490,7 +4491,7 @@ function extractVaultFactories(jsContent) {
     }
     const objText = block.slice(start + 1, end - 1);
     const obj = {};
-    const kvRe = /(\w+)\s*:\s*(\d+)/g;
+    const kvRe = /([\w$]+)\s*:\s*(\d+)/g;
     let kv;
     while ((kv = kvRe.exec(objText)) !== null) obj[kv[1]] = parseInt(kv[2], 10);
     return Object.keys(obj).length > 0 ? obj : null;
@@ -4504,7 +4505,7 @@ function extractVaultFactories(jsContent) {
     const extra = block.slice(start + 1, end);
     const literal = extra.match(/legacyFactories\s*:\s*["']([^"']+)["']/);
     if (literal) return literal[1];
-    const joined = extra.match(/legacyFactories\s*:\s*(\w+)\.(\w+)\.join\(["']([^"']*)["']\)/);
+    const joined = extra.match(/legacyFactories\s*:\s*([\w$]+)\.([\w$]+)\.join\(["']([^"']*)["']\)/);
     if (joined) {
       const moduleId = importAliases.get(joined[1]);
       const value = moduleId ? exportAliases.get(`${moduleId}.${joined[2]}`) : null;
@@ -4543,9 +4544,10 @@ function extractVaultFactories(jsContent) {
   }
 
   const factories = [];
+  let unresolvedFactories = 0;
   for (const block of objectBlocks) {
     const factory = readStringField(block, "factory");
-    if (!factory || !/^0x[a-fA-F0-9]{40}$/.test(factory)) continue;
+    if (!factory || !/^0x[a-fA-F0-9]{40}$/.test(factory)) { unresolvedFactories++; continue; }
     const name = readStringField(block, "name") || readStringField(block, "title") || readStringField(block, "label") || "(未知金库工厂)";
     const descriptionI18nKey = readStringField(block, "descriptionI18nKey");
     const shortDescriptionI18nKey = readStringField(block, "shortDescriptionI18nKey");
@@ -4560,13 +4562,14 @@ function extractVaultFactories(jsContent) {
       constraints: readConstraints(block),
       descriptionI18nKey,
       shortDescriptionI18nKey,
+      displayNameI18nKey: readStringField(block, 'displayNameI18nKey'),
       logo,
       legacyFactories,
     });
   }
 
   if (factories.length === 0) return null;
-  return { vaultPortal, factories };
+  return { vaultPortal, factories, unresolvedFactories };
 }
 
 /**
@@ -4619,7 +4622,7 @@ function factoryListToMap(factories) {
 
 function extractVaultFactoryMapFromFeatures(features) {
   for (const entry of Object.values(features?.assetContents || {})) {
-    if (entry.vaultFactories && entry.vaultFactories.factories.length > 0) {
+    if (entry.vaultFactories && !entry.vaultFactories.unresolvedFactories && entry.vaultFactories.factories.length > 0) {
       return factoryListToMap(entry.vaultFactories.factories);
     }
   }
@@ -4676,8 +4679,9 @@ function mergeRoundVaultFactoryMaps(entries = []) {
 }
 
 function collectRoundVaultFactory(roundEntries, url, features) {
+  if (features.caStoreCatalogComplete && !IS_TEST_MODE) getMiniAppMonitor().setTemplates(features.caStoreVaults);
   const map = extractVaultFactoryMapFromFeatures(features);
-  if (map) roundEntries.push({ url, map });
+  if (map) roundEntries.push({ url, map, parserVersion: features.assetAnalysisSchemaVersion });
   return map;
 }
 
@@ -4685,6 +4689,13 @@ async function sendRoundVaultFactoryChange({ snapshot, roundVaultFactoryEntries,
   if (!roundVaultFactoryEntries?.length) return { sent: false, changed: false };
   const { map: currentVFMap, conflicts } = mergeRoundVaultFactoryMaps(roundVaultFactoryEntries);
   const oldVFMap = snapshot.vaultFactories || {};
+  if (!snapshot.mechanismFactoryParserVersion && roundVaultFactoryEntries.some(e => e.parserVersion === 4)) {
+    snapshot.vaultFactories = currentVFMap;
+    snapshot.mechanismFactoryParserVersion = 4;
+    saveSnapshotFn(snapshot);
+    log('[机制模板] 新解析器完整工厂基线已建立，不补发历史配置');
+    return { sent: false, changed: true, initialized: true };
+  }
   const hasOldData = Object.keys(oldVFMap).length > 0;
   if (!hasOldData) {
     snapshot.vaultFactories = currentVFMap;
@@ -5445,6 +5456,26 @@ function extractPageFeatures(html, options = {}) {
   return features;
 }
 
+function completeMechanismTemplates(features) {
+  if (!/\/bnb\/CAstore(?:\?|$)/i.test(features.originalUrl || '')) return;
+  const factories = Object.values(extractVaultFactoryMapFromFeatures(features) || {}).filter(v => v.showInCAStore);
+  const strings = features.i18nStrings;
+  if (!factories.length || !strings || factories.length < features.caStoreVaults.length)
+    throw Error('机制模板完整配置或语言包缺失，保留旧基线');
+  const sections = factories.map(f => {
+    const prefix = f.descriptionI18nKey?.replace(/\.description$/, '');
+    const name = strings[f.displayNameI18nKey] || strings[`vaults.${f.name}.name`] || strings[`${prefix}.name`] || f.name;
+    const description = ['description', 'shortDescription', 'longInfo'].map(field => strings[`${prefix}.${field}`] || strings[`vaults.${f.name}.${field}`]).filter(Boolean).join('\n');
+    if (!description) throw Error(`机制模板说明缺失：${f.name}`);
+    return { name, nameKey: normalizeVaultName(name), description, factory: f.factory, chain: 'bnb',
+      area: '机制模板', areaKey: 'featured vaults', occurrence: 1, key: `factory::${f.factory.toLowerCase()}`,
+      sourceUrl: `https://flap.sh/bnb/CAstore/vault/${f.factory}?lang=zh`, signature: md5(`${name}\n${description}`) };
+  }).sort((a, b) => a.key.localeCompare(b.key));
+  features.caStoreVaults = sections;
+  features.caStoreVaultHash = md5(JSON.stringify(sections.map(v => [v.key, v.signature])));
+  features.caStoreCatalogComplete = true;
+}
+
 function diffCaStoreVaultSections(oldSections = [], newSections = []) {
   if (!Array.isArray(oldSections) || !Array.isArray(newSections)) return [];
   if (oldSections.length === 0 || newSections.length === 0) return [];
@@ -5510,7 +5541,7 @@ function shouldRefreshDerivedFeatureBaseline(oldFeatures, newFeatures) {
 }
 
 function formatCaStoreVaultDiffsForChanges(diffs) {
-  const lines = ["🏦 CAstore 金库内容变更："];
+  const lines = ["🏦 CAstore 机制模板内容变更："];
   for (const d of diffs) {
     const label = d.area ? `${d.area} / ${d.name}` : d.name;
     if (d.type === "reordered") {
@@ -5564,14 +5595,14 @@ function resolveCaStoreVaultFactory(change, vaultFactoryMap = {}) {
 }
 
 function caStoreVaultChangeLabel(type) {
-  if (type === "added") return "新增金库";
-  if (type === "modified") return "金库文案更新";
-  if (type === "removed") return "移除金库";
-  return "金库变更";
+  if (type === "added") return "新增机制模板";
+  if (type === "modified") return "机制模板文案更新";
+  if (type === "removed") return "移除机制模板";
+  return "机制模板变更";
 }
 
 function getCaStoreVaultDisplayName(change) {
-  return change?.name || change?.newName || change?.oldName || "未知金库";
+  return change?.name || change?.newName || change?.oldName || "未知机制模板";
 }
 
 function getCaStoreVaultCopy(change) {
@@ -5581,7 +5612,7 @@ function getCaStoreVaultCopy(change) {
 
 function buildCaStoreVaultAiInput(change, factory, launchUrl) {
   return [
-    "用中文介绍该 CAstore 金库用途和注意点，不编造数据。",
+    "用中文介绍该 CAstore 机制模板用途和注意点，不编造数据。",
     "",
     `变更类型: ${caStoreVaultChangeLabel(change?.type)}`,
     `金库名字: ${getCaStoreVaultDisplayName(change)}`,
@@ -5605,22 +5636,23 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
       : changedText(typeLabel);
   const content = buildFlapCardContent({
     summary: [
-      `- 金库: ${cardText(name)}`,
+      `- 机制模板: ${cardText(name)}`,
       `- 类型: ${typeText}`,
       factory ? `- Factory: ${addressLink(factory)}` : "- Factory: 未匹配到",
-      launchUrl ? `- 金库链接: ${flapLink("打开金库", launchUrl)}` : "",
+      factory ? `- 模板详情: ${flapLink("打开机制模板", `https://flap.sh/bnb/CAstore/vault/${factory}?lang=zh`)}` : "",
+      launchUrl ? `- 创建入口: ${flapLink("使用模板", launchUrl)}` : "",
     ],
-    primaryTitle: "金库文案",
+    primaryTitle: "机制模板说明",
     primary: [`- ${cardText(copy)}`],
     ai: "",
   });
 
   return {
-    title: `${titlePrefix}CAstore 金库变更：${name}`,
+    title: `${titlePrefix}CAstore 机制模板变更：${name}`,
     content,
     template: change?.type === "removed" ? "red" : change?.type === "added" ? "green" : "orange",
-    url: launchUrl || change?.sourceUrl || "https://flap.sh/bnb/CAstore",
-    moduleContext: "Flap.sh CAstore 金库内容介绍",
+    url: change?.sourceUrl || launchUrl || "https://flap.sh/bnb/CAstore",
+    moduleContext: "Flap.sh CAstore 机制模板内容介绍",
     aiInput: buildCaStoreVaultAiInput(change, factory, launchUrl),
     factory,
     launchUrl,
@@ -5650,8 +5682,8 @@ function omitStandaloneCaStoreVaultDiffs(notification) {
   const standaloneKeys = new Set(standaloneDiffs.map(stableKey));
   const meta = { ...(notification.meta || {}) };
   meta.caStoreVaultDiffs = (meta.caStoreVaultDiffs || []).filter(diff => !standaloneKeys.has(stableKey(diff)));
-  meta.fullDiffLines = (meta.fullDiffLines || []).filter(line => !/^🏦 CAstore 金库/.test(String(line || "")));
-  const changes = (notification.changes || []).filter(line => !/^🏦 CAstore 金库/.test(String(line || "")) && !/^  [🟢🔴✏️]/.test(String(line || "")));
+  meta.fullDiffLines = (meta.fullDiffLines || []).filter(line => !/^🏦 CAstore (?:机制模板|金库)/.test(String(line || "")));
+  const changes = (notification.changes || []).filter(line => !/^🏦 CAstore (?:机制模板|金库)/.test(String(line || "")) && !/^  [🟢🔴✏️]/.test(String(line || "")));
   return {
     ...notification,
     changes,
@@ -5720,7 +5752,7 @@ function getFlapPageQuality(url, html, features) {
     reasons.push(`疑似错误页(${matchedError.source})`);
   }
 
-  if (/\/bnb\/CAstore/i.test(url) && !/Vault|金库|金庫|CA STORE|STORE|Connect Wallet/i.test(text)) {
+  if (/\/bnb\/CAstore/i.test(url) && !/Vault|金库|金庫|机制模板|機制模板|FEATURED TEMPLATES|CA STORE|STORE|Connect Wallet/i.test(text)) {
     warnings.push("CAstore 关键文案缺失");
   } else if (/\/(?:launch|create)(?:$|\?)/i.test(url) && !/Create|Token|Connect Wallet/i.test(text)) {
     warnings.push("创建页关键文案缺失");
@@ -6203,7 +6235,7 @@ function diffFeatures(oldF, newF) {
     if (caStoreVaultDiffs.length > 0) {
       meta.caStoreVaultDiffs = caStoreVaultDiffs;
       changes.push(...formatCaStoreVaultDiffsForChanges(caStoreVaultDiffs));
-      meta.fullDiffLines.push("【CAstore 金库完整 Diff】");
+      meta.fullDiffLines.push("【CAstore 机制模板完整 Diff】");
       meta.fullDiffLines.push(...formatCaStoreVaultDiffsForChanges(caStoreVaultDiffs));
     }
   }
@@ -6890,8 +6922,31 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
    单次检测模式（node monitor.mjs check）
    ══════════════════════════════════════════ */
 
+let miniAppMonitor;
+function getMiniAppMonitor() {
+  if (miniAppMonitor) return miniAppMonitor;
+  // Dedicated ignored state; never rewrite the existing page/chain snapshots.
+  mkdirSync(CONFIG.snapshotDir, { recursive: true });
+  const file = join(CONFIG.snapshotDir, 'mini-app-state.json');
+  const store = createSnapshotStore(file);
+  miniAppMonitor = createMiniAppMonitor({
+    initial: existsSync(file) ? readSnapshot(file) : {}, persist: state => store.write(state),
+    fetchText: async url => {
+      if (new URL(url).hostname === 'flap.sh') return fetchPage(url);
+      const response = await fetchSafe(url);
+      if (!response.ok) throw Error(`小程序资源 HTTP ${response.status}`);
+      return response.text();
+    },
+    rpc: (method, params) => bscRpcCall(method, params),
+    deliver: (payload, options) => sendCardViaApi(payload.title, payload.content, payload.template, undefined, options),
+    log: message => log(`[Flap 小程序] ${message}`),
+  });
+  return miniAppMonitor;
+}
+
 async function runCheck() {
   log("=== 手动触发检测 ===");
+  await getMiniAppMonitor().run();
   let snapshot = loadSnapshot() || { pages: {}, vaultFactories: {} };
   let hasDetectedChange = false;
   let hasNotifiedChange = false;
@@ -6919,6 +6974,7 @@ async function runCheck() {
       const oldAssetQuality = oldForAssets ? getStoredFeatureQuality(url, oldForAssets) : null;
       await hydrateAssetContents(features, oldAssetQuality?.valid ? oldForAssets : null, { roundAssetCache });
 
+      completeMechanismTemplates(features);
       collectRoundVaultFactory(roundVaultFactoryEntries, url, features);
 
       if (!snapshot.pages[key]) {
@@ -6971,7 +7027,7 @@ async function runCheck() {
         if (shouldRefreshDerivedFeatureBaseline(oldFeatures, features)) {
           snapshot.pages[key] = features;
           snapshot.pages[key].originalUrl = url;
-          log(`  [基线补全] ${url} — 已保存 CAstore 金库结构，未发现业务变更`);
+          log(`  [基线补全] ${url} — 已保存 CAstore 机制模板结构，未发现业务变更`);
         } else {
           log(`  [正常] ${url} — 无变化`);
         }
@@ -7188,7 +7244,7 @@ async function startMonitor() {
       ['registryDelivery', registryDeliveryJob], ['registryAudit', registryAuditJob], ['registryPending', registryPendingJob],
     ].map(([name, job]) => [name, job.snapshot()]));
     writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs,
-      registryPending: registryPendingHealth, ai: { enabled: FLAP_AI_ANALYSIS_ENABLED } }));
+      registryPending: registryPendingHealth, miniApps: miniAppMonitor?.status(), ai: { enabled: FLAP_AI_ANALYSIS_ENABLED } }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
   }
   const rpcMetricsTimer = setInterval(() => {
@@ -7760,6 +7816,7 @@ async function startMonitor() {
       if (i18n) { features.i18nStrings = i18n.i18nStrings; features.i18nHash = i18n.i18nHash; features.i18nChunk = i18n.i18nChunk; }
       // 下载资源内容用于内容级 diff
       const hydrateStats = await hydrateAssetContents(features, null, { roundAssetCache: initAssetCache });
+      completeMechanismTemplates(features);
       const dlCount = hydrateStats.downloaded;
       return { key, features, i18n, dlCount };
     }));
@@ -7964,6 +8021,8 @@ async function startMonitor() {
   let pendingPoll = false;
   async function poll() {
     if (isShuttingDown) return;
+    // Reuse the page cadence without blocking other channels or overlapping scans.
+    void getMiniAppMonitor().run().catch(error => log(`[Flap 小程序] ${error.message}`));
     if (isPolling) {
       pendingPoll = true;  // 记录有待执行的轮询
       return;
@@ -8068,6 +8127,7 @@ async function startMonitor() {
             await hydrateAssetContents(features, oldQuality?.valid ? oldFeatures : null, { roundAssetCache });
           }
 
+          completeMechanismTemplates(features);
           if (failCounts[key]) failCounts[key].count = 0;
           // 退避恢复警告
           if (backoffSkips[key] > 0) {
@@ -8145,7 +8205,7 @@ async function startMonitor() {
           } else if (shouldRefreshDerivedFeatureBaseline(oldFeatures, features)) {
             snapshot.pages[key] = features;
             saveSnapshot(snapshot);
-            log(`[基线补全] ${url} 已保存 CAstore 金库结构，未发现业务变更`);
+            log(`[基线补全] ${url} 已保存 CAstore 机制模板结构，未发现业务变更`);
           }
         } catch (err) {
           if (!failCounts[key]) failCounts[key] = { count: 0, lastMsg: "", lastFailTime: 0, hourlyErrors: [] };
@@ -8296,6 +8356,7 @@ async function gracefulShutdown(signal) {
     try { await global.__earlySignalDrain(); } catch (error) { log("提前信号停机保存失败：" + error.message); }
   }
   if (scheduledDrain) await scheduledDrain;
+  await miniAppMonitor?.wait();
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   process.exit(0);
@@ -8316,6 +8377,9 @@ export const __testables = {
   deliverRegistryChanges,
   fetchPage,
   extractCaStoreVaultSections,
+  completeMechanismTemplates,
+  parseI18nFromChunk,
+  flattenI18n,
   CONFIG,
   migrateSnapshot,
   deliverFlapEarlySignals,

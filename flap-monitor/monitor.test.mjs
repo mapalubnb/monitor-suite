@@ -2431,7 +2431,7 @@ test("Flap UI style context inference maps real Tailwind patterns to concrete co
 
   assert.equal(
     __testables.inferUiComponentContext("rounded-[4px] border object-cover", "page-59769a4a66f32125.js", "/_next/static/chunks/app/[chain]/CAstore/page-59769a4a66f32125.js").label,
-    "CAstore 金库卡片/模板列表",
+    "CAstore 机制模板卡片/模板列表",
   );
 });
 
@@ -2482,13 +2482,13 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   };
   const notification = __testables.buildCaStoreVaultChangeNotification(diff, {});
 
-  assert.equal(notification.title, "CAstore 金库变更：禮物稅收金庫");
-  assert.match(notification.content, /金库:/);
+  assert.equal(notification.title, "CAstore 机制模板变更：禮物稅收金庫");
+  assert.match(notification.content, /机制模板:/);
   assert.match(notification.content, /禮物稅收金庫/);
   assert.match(notification.content, /指定一個 X 帳戶/);
-  assert.match(notification.content, /<font color="green">新增金库<\/font>/);
+  assert.match(notification.content, /<font color="green">新增机制模板<\/font>/);
   assert.equal(notification.launchUrl, "https://flap.sh/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh");
-  assert.match(notification.content, /金库链接: \[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh\)/);
+  assert.match(notification.content, /创建入口: \[使用模板\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh\)/);
   assert.doesNotMatch(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
@@ -4179,4 +4179,47 @@ test('PublicNode address limit routes the entire filter elsewhere and preserves 
     assert.equal(calls[1].url, 'https://bsc.publicnode.com');
     assert.equal(calls[1].request.params[0].address.length, 10);
   } finally { globalThis.fetch = original; __testables.resetBscRpcHealth(); }
+});
+
+
+test('新版 webpack 箭头导出和美元标识符可解析机制模板工厂', () => {
+  const js = '1:(e,t,n)=>{n.d(t,{\$k:()=>f,Kl:()=>v});const f="0x1111111111111111111111111111111111111111",v="FOMOX";},2:(e,t,r)=>{var x=r(1);let a={vaultTypes:[{name:x.Kl,factory:x.\$k,enabled:!0,showInCAStore:!0}]};}';
+  const result = __testables.extractVaultFactories(js);
+  assert.equal(result.factories[0].name, 'FOMOX');
+  assert.equal(result.factories[0].factory, '0x1111111111111111111111111111111111111111');
+});
+
+test('真实机制模板配置覆盖22项和第二页长说明，排序不误报、旧基线静默迁移', () => {
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/templates-20261023.json', import.meta.url)));
+  const features = __testables.extractPageFeatures('<h1>机制模板</h1>', { url: fixture.source });
+  features.assetContents = { config: { vaultFactories: fixture.factories } };
+  features.i18nStrings = fixture.strings;
+  __testables.completeMechanismTemplates(features);
+  assert.equal(features.caStoreVaults.length, 22);
+  assert(features.caStoreVaults.some(v => v.name.includes('燃燒分紅')));
+  assert(features.caStoreVaults.find(v => v.name.includes('模因')).description.includes('第一幕'));
+  const next = structuredClone(features);
+  next.assetContents.config.vaultFactories.factories.reverse();
+  __testables.completeMechanismTemplates(next);
+  assert.equal(next.caStoreVaultHash, features.caStoreVaultHash);
+  next.i18nStrings['vaults.LivingMemeVault.longInfo'] += ' 新说明';
+  __testables.completeMechanismTemplates(next);
+  assert.equal(__testables.diffFeatures(features, next).meta.caStoreVaultDiffs.length, 1);
+  const old = structuredClone(features); old.caStoreVaultSchemaVersion = 4;
+  assert.equal(__testables.diffFeatures(old, next).meta.caStoreVaultDiffs.length, 0);
+  delete next.i18nStrings;
+  assert.throws(() => __testables.completeMechanismTemplates(next), /保留旧基线/);
+});
+
+
+test('工厂解析器迁移静默保存完整基线，随后新增仍即时提醒', async () => {
+  const factory = '0x1111111111111111111111111111111111111111';
+  const snapshot = { vaultFactories: {} }; let sends = 0, saves = 0;
+  const options = { snapshot, roundVaultFactoryEntries: [{ url: 'https://flap.sh/bnb/CAstore', parserVersion: 4, map: { [factory]: { factory, name: 'Existing' } } }], sendCardFn: async () => { sends++; return 'id'; }, saveSnapshotFn: () => { saves++; }, appendHistoryFn: () => {} };
+  assert.equal((await __testables.sendRoundVaultFactoryChange(options)).initialized, true);
+  assert.equal(sends, 0); assert.equal(saves, 1);
+  const added = '0x2222222222222222222222222222222222222222';
+  options.roundVaultFactoryEntries[0].map[added] = { factory: added, name: 'New' };
+  assert.equal((await __testables.sendRoundVaultFactoryChange(options)).sent, true);
+  assert.equal(sends, 1);
 });
