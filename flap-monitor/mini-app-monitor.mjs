@@ -190,14 +190,42 @@ export async function scanAgentMarkets(previous, manifest, rpc) {
 }
 
 export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, deliver, log = () => {} }) {
+  // 用户于 2026/10/27 删除此市场监控；不能因官网再次列出或重启恢复。
+  const excluded = row => row?.slug === 'agent-bonding-curve'
+    || row?.appId === 'vaultui_agent-bonding-curve_01M5FK4RKTKXQ8GDT8ZMZMAYVD';
   const cache = new Map();
   const box = createTransactionalOutbox({ initial, persist, deliver, onError: e => log(`小程序投递失败：${e.message}`) });
   let flight, templates = [], templateCursor = 0;
   const notify = (title, content) => box.enqueue({ title: `${title.startsWith("机制模板") ? "Flap" : "Flap 小程序"}｜${title}`, content: formatDisplayText(content), template: 'orange' });
   async function pass() {
+    // 在首次投递前归档旧队列和状态，不把主动停用误报为官网移除。
+    await box.transaction(() => {
+      const removed = (box.state.catalog || []).filter(excluded);
+      const names = new Set(['ID AGENT CURVE', 'ID AGENT CURVE 曲线市场', ...removed.map(row => row.name)]);
+      const pending = box.state._notificationOutbox || [];
+      const suppressed = pending.filter(entry => {
+        const payload = entry.payload || {};
+        return String(payload.title || '').startsWith('Flap 小程序｜')
+          && (/https:\/\/flap\.sh\/apps\/agent-bonding-curve(?:[?\s/#]|$)/.test(payload.content || '')
+            || names.has(String(payload.content || '').split('\n')[0]));
+      });
+      if (suppressed.length) {
+        box.state.disabledAppNotifications = [...(box.state.disabledAppNotifications || []), ...suppressed];
+        box.state._notificationOutbox = pending.filter(entry => !suppressed.includes(entry));
+      }
+      for (const [appId, app] of Object.entries(box.state.apps || {})) {
+        if (!excluded({ ...app.config?.catalog, appId })) continue;
+        (box.state.disabledApps ||= {})[appId] = { ...app, disabledReason: '用户删除监控：2026/10/27', error: box.state.errors?.[appId] };
+        delete box.state.apps[appId];
+      }
+      for (const appId of Object.keys(box.state.errors || {})) {
+        if (excluded({ appId }) || removed.some(row => row.appId === appId)) delete box.state.errors[appId];
+      }
+      if (box.state.catalog) box.state.catalog = box.state.catalog.filter(row => !excluded(row));
+    });
     await box.drain();
     try {
-      const rows = parseAppList(await fetchText(APPS_URL));
+      const rows = parseAppList(await fetchText(APPS_URL)).filter(row => !excluded(row));
       await box.transaction(async () => {
         const old = box.state.catalog;
         if (old) {
