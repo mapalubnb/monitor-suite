@@ -5,6 +5,8 @@ import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.m
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
 import { createGithubApi, createGithubMonitor } from "./github-monitor.mjs";
 import { discoverCreators } from "./creator-discovery.mjs";
+import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
+import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
  *
@@ -417,6 +419,7 @@ function describeAssetDownloadError(error) {
 }
 
 function recordFrontendAssetFailure(url, failure, now = Date.now()) {
+  assertFrontendActive();
   if (!url) return null;
   const previous = frontendAssetRetryState.get(url);
   const failCount = (previous?.failCount || 0) + 1;
@@ -446,12 +449,14 @@ function recordFrontendAssetFailure(url, failure, now = Date.now()) {
 }
 
 function clearFrontendAssetFailure(url) {
+  assertFrontendActive();
   if (!frontendAssetRetryState.delete(url)) return false;
   frontendAssetDiagnosticsDirty = true;
   return true;
 }
 
 function persistFrontendAssetFailureDiagnostics() {
+  assertFrontendActive();
   if (IS_TEST_MODE || !frontendAssetDiagnosticsDirty) return false;
   try {
     const failures = [...frontendAssetRetryState.values()]
@@ -520,8 +525,11 @@ function classifyFetchFailure(err) {
   return "error";
 }
 
-function sleep(ms) {
-  return new Promise(r => setTimeout(r, ms));
+async function sleep(ms) {
+  assertFrontendActive();
+  let timer;
+  try { return await withAbortSignal(() => new Promise(r => { timer = setTimeout(r, ms); }), frontendSignal()); }
+  finally { clearTimeout(timer); }
 }
 
 function createHostLimiter({ minDelayMs = 0, maxConcurrent = 6, now = () => Date.now(), sleepFn = sleep } = {}) {
@@ -535,27 +543,40 @@ function createHostLimiter({ minDelayMs = 0, maxConcurrent = 6, now = () => Date
     try { return new URL(url).host; } catch { return String(url || ""); }
   }
 
-  async function schedule(url, task) {
+  async function schedule(url, task, signal) {
+    signal?.throwIfAborted();
     const host = hostKey(url);
     if ((active.get(host) || 0) >= maxConcurrent) {
-      await new Promise(resolve => {
+      await new Promise((resolve, reject) => {
         if (!waiters.has(host)) waiters.set(host, []);
-        waiters.get(host).push(resolve);
+        const wake = () => { signal?.removeEventListener('abort', cancel); resolve(); };
+        const cancel = () => {
+          const queue = waiters.get(host);
+          const index = queue?.indexOf(wake) ?? -1;
+          if (index >= 0) queue.splice(index, 1);
+          signal?.removeEventListener('abort', cancel);
+          reject(signal.reason);
+        };
+        waiters.get(host).push(wake);
+        signal?.addEventListener('abort', cancel, { once: true });
       });
     } else active.set(host, (active.get(host) || 0) + 1);
     try {
       const previousStart = startChains.get(host) || Promise.resolve();
       const start = previousStart.catch(() => {}).then(async () => {
+        signal?.throwIfAborted();
         if (delayMs > 0 && lastStartedAt.has(host)) {
           const waitMs = delayMs - (now() - lastStartedAt.get(host));
-          if (waitMs > 0) await sleepFn(waitMs);
+          if (waitMs > 0) await withAbortSignal(() => sleepFn(waitMs), signal);
         }
+        signal?.throwIfAborted();
         lastStartedAt.set(host, now());
       });
       startChains.set(host, start);
-      await start;
+      void start.catch(() => {});
+      await withAbortSignal(() => start, signal);
       if (startChains.get(host) === start) startChains.delete(host);
-      return await task();
+      return await withAbortSignal(() => task(), signal);
     } finally {
       const next = waiters.get(host)?.shift();
       if (next) next();
@@ -578,8 +599,8 @@ function shouldLimitHostRequest(url) {
   }
 }
 
-function scheduleHostRequest(url, task) {
-  return shouldLimitHostRequest(url) ? hostRequestLimiter.schedule(url, task) : task();
+function scheduleHostRequest(url, task, signal) {
+  return shouldLimitHostRequest(url) ? hostRequestLimiter.schedule(url, task, signal) : withAbortSignal(task, signal);
 }
 
 const moduleMetricContext = new AsyncLocalStorage();
@@ -664,6 +685,7 @@ function scheduleRuntimeMetricsWrite() {
       actorFastSkips: actorRawScanState.fastSkips,
       actorFallbacks: actorRawScanState.fallbacks,
       frontend: {
+        lifecycle: modules.find(m => m.name === 'frontend')?.health(),
         pages: Object.keys(snapshot?.frontendPages || {}).length,
         resources: Object.keys(snapshot?._frontendAssetStore || {}).length,
         lastRunAt: frontendMetrics.lastRunAt,
@@ -975,6 +997,7 @@ function persistMonitorSnapshot(data) {
   snapshotWriteMetrics.totalDurationMs += snapshotWriteMetrics.lastDurationMs;
 }
 async function saveSnapshot() {
+  assertFrontendActive();
   monitorStore.flush();
 }
 
@@ -1173,6 +1196,7 @@ async function deliverNotification({ title, content, template = "red", moduleCon
  * @returns {string|null} 本地文件路径（供卡片按钮引用），内容过短时返回 null
  */
 function saveDiffLocally(title, diffText) {
+  assertFrontendActive();
   if (!diffText || diffText.length < 50) return null;
   if (!hasMeaningfulFrontendDiffBody(diffText)) return null;
   try {
@@ -1246,6 +1270,7 @@ let historyWriteQueue = Promise.resolve();
 let historyLineCount = -1; // -1 = 未初始化，首次写入时统计
 
 function appendHistory(module, title, summary, diffSnippet = "") {
+  assertFrontendActive();
   const record = {
     ts: new Date().toISOString(),
     module,
@@ -1255,6 +1280,7 @@ function appendHistory(module, title, summary, diffSnippet = "") {
   };
   historyWriteQueue = historyWriteQueue.then(() => {
     try {
+      if (frontendSignal()?.aborted) return;
       appendFileSync(HISTORY_FILE, JSON.stringify(record) + "\n", "utf-8");
       // 首次写入时统计行数，后续用计数器追踪
       if (historyLineCount < 0) {
@@ -1277,22 +1303,42 @@ function appendHistory(module, title, summary, diffSnippet = "") {
 
 /* ── HTTP 请求工具（含反风控 + 5xx/超时/瞬时网络错误重试）── */
 async function fetchWithTimeout(url, opts, timeoutMs) {
-  const dispatch = async () => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      recordCurrentModuleRequest();
-      const res = await fetch(url, { ...opts, signal: opts?.signal ? AbortSignal.any([opts.signal, ctrl.signal]) : ctrl.signal });
-      const body = res.body ? await res.arrayBuffer() : null;
-      return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
-    } finally {
-      clearTimeout(timer);
+  assertFrontendActive();
+  const parent = frontendSignal();
+  const sources = [...new Set([parent, opts?.signal].filter(Boolean))];
+  const linked = sources.length > 1 ? new AbortController() : null;
+  const forwards = sources.map(source => {
+    const forward = () => linked?.abort(source.reason);
+    if (linked) {
+      if (source.aborted) forward();
+      else source.addEventListener('abort', forward, { once: true });
     }
-  };
-  const schedule = task => scheduleHostRequest(url, task);
-  return isFourmemeHttp(url)
-    ? fourmemeHttp.request(url, opts, schedule, dispatch, timeoutMs)
-    : schedule(dispatch);
+    return () => source.removeEventListener('abort', forward);
+  });
+  const progress = frontendRequest(url);
+  try { return await withDeadline(async signal => {
+    const dispatch = async () => {
+      signal.throwIfAborted();
+      assertFrontendActive();
+      progress('headers');
+      recordCurrentModuleRequest();
+      const res = await withAbortSignal(() => fetch(url, { ...opts, signal }), signal);
+      signal.throwIfAborted();
+      progress('body');
+      const body = res.body ? await withAbortSignal(() => res.arrayBuffer(), signal) : null;
+      signal.throwIfAborted();
+      assertFrontendActive();
+      return new Response(body, { status: res.status, statusText: res.statusText, headers: res.headers });
+    };
+    const schedule = task => scheduleHostRequest(url, task, signal);
+    // An abortable round must not own a flight used by another module. Assets
+    // within a round still share assetCache; uncancelled GET sharing is unchanged.
+    const requestOpts = parent ? { ...opts, signal: parent } : opts;
+    return isFourmemeHttp(url)
+      ? fourmemeHttp.request(url, requestOpts, schedule, dispatch, timeoutMs)
+      : schedule(dispatch);
+  }, timeoutMs, linked?.signal || parent || opts?.signal, '请求超时（Abort）：含排队及响应体'); }
+  finally { forwards.forEach(dispose => dispose()); progress(); }
 }
 
 const TRANSIENT_NETWORK_ERROR_CODES = new Set([
@@ -1347,6 +1393,7 @@ function formatNetworkError(err) {
 }
 
 async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, requestFn = fetchWithTimeout, delayFn = sleep) {
+  assertFrontendActive();
   const domain = getDomain(url);
   const backoffState = isFourmemeHttp(url) ? null : currentBackoffState(domain);
   if (backoffState) {
@@ -1356,6 +1403,7 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, re
   const maxRetries = 2; // 5xx、超时和瞬时网络错误最多重试 2 次（共 3 次尝试）
   let lastStatus = 0;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    assertFrontendActive();
     try {
       const res = await requestFn(url, opts, timeoutMs);
       if (res.status === 429 || res.status === 403) {
@@ -1382,7 +1430,8 @@ async function fetchSafe(url, opts = {}, timeoutMs = CONFIG.defaultTimeoutMs, re
       if (res.ok && !isFourmemeHttp(url)) recordSuccess(domain);
       return res;
     } catch (err) {
-      if (err.name === "AbortError") {
+      assertFrontendActive();
+      if (err.name === "AbortError" || err.name === "TimeoutError") {
         lastStatus = -1;
         if (attempt < maxRetries) {
           await delayFn(1_000 * (attempt + 1));
@@ -2542,8 +2591,10 @@ function extractStrings(content, ext) {
 }
 
 async function fetchStaticAssetSafe(url, opts, timeoutMs = 8_000, requestFn = fetchWithTimeout, delayFn = sleep) {
+  assertFrontendActive();
   let lastError;
   for (let attempt = 0; attempt < 2; attempt++) {
+    assertFrontendActive();
     try {
       const response = await requestFn(url, opts, timeoutMs);
       if (response.status >= 500 && attempt === 0) {
@@ -2553,8 +2604,9 @@ async function fetchStaticAssetSafe(url, opts, timeoutMs = 8_000, requestFn = fe
       }
       return response;
     } catch (error) {
+      assertFrontendActive();
       lastError = error;
-      if (attempt === 0 && (error?.name === "AbortError" || isTransientNetworkError(error))) {
+      if (attempt === 0 && (error?.name === "AbortError" || error?.name === "TimeoutError" || isTransientNetworkError(error))) {
         await delayFn(500);
         continue;
       }
@@ -2579,6 +2631,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
   diagnostics = false,
   fetchFn = fetchStaticAssetSafe,
 } = {}) {
+  frontendStage('assets');
   const results = {};
   const failures = [];
   const BATCH = readPositiveIntEnv("FOURMEME_FRONTEND_ASSET_CONCURRENCY", 6);
@@ -2586,12 +2639,14 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
   const entries = [...assetUrls.entries()]; // [[filename, url], ...]
 
   async function fetchAsset(assetKey, asset) {
+    assertFrontendActive();
     const url = typeof asset === "string" ? asset : asset.url;
     const previous = typeof asset === "object" ? asset.previous : null;
     const referer = typeof asset === "object" ? asset.referer : "";
     const userAgent = typeof asset === "object" ? asset.userAgent : PROCESS_BROWSER_UA;
     if (sharedCache?.has(url)) {
       const cached = await sharedCache.get(url).catch(error => ({ error }));
+      assertFrontendActive();
       return cached?.data
         ? { data: { ...cached.data, filename: assetKey } }
         : { failure: {
@@ -2651,6 +2706,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
 
     if (sharedCache) sharedCache.set(url, promise);
     const outcome = await promise;
+    assertFrontendActive();
     if (outcome?.data) {
       clearFrontendAssetFailure(url);
       return { data: { ...outcome.data, filename: assetKey } };
@@ -2672,6 +2728,7 @@ async function downloadAssetContents(assetUrls, sharedCache = null, {
       sleep(idx * STAGGER).then(() => fetchAsset(assetKey, asset))
     );
     const batchResults = await Promise.allSettled(tasks);
+    assertFrontendActive();
     for (const r of batchResults) {
       if (r.status === "fulfilled" && r.value?.data) {
         results[r.value.data.filename] = r.value.data;
@@ -3238,6 +3295,7 @@ function i18nExtractionReason(oldFeatures) {
 }
 
 function logI18nExtractionResult(oldFeatures, i18nResult, source = "streaming HTML") {
+  assertFrontendActive();
   if (!shouldLogI18nExtraction(oldFeatures, i18nResult)) return;
   const count = Object.keys(i18nResult.i18nStrings || {}).length;
   const key = `i18n-extract:${oldFeatures?.i18nHash || "none"}:${i18nResult.i18nHash}:${count}`;
@@ -3248,6 +3306,7 @@ function logI18nExtractionResult(oldFeatures, i18nResult, source = "streaming HT
 }
 
 function logFrontendInfoRateLimited(key, message, cooldownSeconds = readPositiveIntEnv("FOURMEME_FRONTEND_INFO_LOG_COOLDOWN_SECONDS", 300)) {
+  assertFrontendActive();
   const now = Date.now();
   const cooldownMs = Math.max(1, cooldownSeconds) * 1000;
   const state = frontendInfoLogState.get(key) || { lastLogAt: 0, suppressed: 0 };
@@ -3466,6 +3525,7 @@ function flattenI18n(obj, prefix) {
 }
 
 async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
+  frontendStage('i18n');
   // 注意：i18n 解析需要原始 JS 源码（搜索 JSON.parse('...')），
   // 而 downloadAssetContents 只保留了提取后的 strings/hash，无法复用。
   // 因此这里需要单独下载 chunk 候选文件。
@@ -3495,6 +3555,7 @@ async function fetchI18nStrings(assetUrlMap, baseUrl = "https://four.meme") {
   });
 
   const results = await Promise.allSettled(tasks);
+  assertFrontendActive();
   // 选择包含最多翻译键的结果（而非第一个），避免返回不完整的子集
   let best = null;
   for (const r of results) {
@@ -4760,6 +4821,7 @@ function summarizeAssetDownloadFailures(failures = []) {
 }
 
 function logFrontendAssetWarning(url, { requested, expected, available, failures }, now = Date.now(), logger = log) {
+  assertFrontendActive();
   const label = urlLabel(url);
   if (!failures?.length) {
     frontendAssetWarningState.delete(label);
@@ -4783,6 +4845,7 @@ async function runLimited(taskFactories, limit) {
   let next = 0;
   async function worker() {
     while (next < taskFactories.length) {
+      assertFrontendActive();
       const idx = next++;
       try {
         results[idx] = { status: "fulfilled", value: await taskFactories[idx]() };
@@ -4793,6 +4856,7 @@ async function runLimited(taskFactories, limit) {
   }
   const workers = Array.from({ length: Math.max(1, Math.min(limit, taskFactories.length)) }, worker);
   await Promise.all(workers);
+  assertFrontendActive();
   return results;
 }
 
@@ -4818,6 +4882,7 @@ function chooseBetterFrontendPage(existing, candidate) {
  * oldFeatures: 上一轮的快照数据（用于 assetHash 比对决定是否跳过下载）
  */
 async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
+  frontendStage('html');
   let features = null;
   const startedAt = Date.now();
   const pageUserAgent = PROCESS_BROWSER_UA;
@@ -4992,6 +5057,7 @@ async function fetchAllFrontendData(oldPages = {}, urls = getFrontendMonitorUrls
 }
 
 async function fetchFrontendDiscoverySeedPages(urls = []) {
+  frontendStage('discovery-seeds');
   const pages = {};
   if (!urls.length) return pages;
   const limit = readPositiveIntEnv("FOURMEME_FRONTEND_DISCOVERY_SEED_CONCURRENCY", 2);
@@ -5031,6 +5097,7 @@ async function fetchFrontendDiscoverySeedPages(urls = []) {
 }
 
 async function fetchFrontendDataWithDiscovery(oldPages = {}) {
+  frontendStage('pages');
   const assetCache = new Map();
   const baseUrls = getFrontendMonitorUrls();
   const baseUrlSet = new Set(baseUrls.map(canonicalFrontendUrl));
@@ -9455,7 +9522,27 @@ function clearModuleError(name) {
 /**
  * 创建防重入的模块运行器
  */
-function createModuleRunner(name, fn, intervalMs, transactional = true) {
+function createModuleRunner(name, fn, intervalMs, transactional = true, options = {}) {
+  const guard = name === 'frontend' ? createFrontendGuard({
+    timeoutMs: 180_000, changed: scheduleRuntimeMetricsWrite,
+    initiallyAlerted: snapshot._frontendWatchdogIncident?.active === true,
+    isSuccessful: () => fn !== runFrontendCheck || (frontendMetrics.success > 0 && frontendMetrics.failed === 0 && !frontendMetrics.skipped),
+    notify: async event => {
+      await monitorStore.transaction(async () => {
+        const old = snapshot._frontendWatchdogIncident;
+        if (event.type === 'stalled' && old?.active) return;
+        if (event.type === 'recovered' && !old?.active) return;
+        snapshot._frontendWatchdogIncident = { active: event.type === 'stalled', at: Date.now(), lastFailure: event.lastFailure };
+        await sendNotificationMaybeAi({
+          title: event.type === 'stalled' ? '前端监控停滞：已取消超时轮次' : '前端监控已恢复',
+          content: event.type === 'stalled'
+            ? `前端整轮超过180秒，已取消并回滚，本轮未提交的快照和通知不生效。\n原5秒调度继续重试。\n阶段：${event.lastFailure?.stage}\n最近请求：${event.lastFailure?.requests?.map(r => `${r.stage} ${r.url}`).join('\n') || '无活动请求'}\n时间：${ts()}`
+            : `前端采集已恢复，继续与旧有效基线比较。\n停滞期间的瞬态变化可能无法补回。\n时间：${ts()}`,
+          template: event.type === 'stalled' ? 'red' : 'green', skipAi: true,
+        });
+      });
+    }, ...options,
+  }) : null;
   let firstRunStatus = "pending";
   let resolveFirstRun;
   const firstRun = new Promise(resolve => { resolveFirstRun = resolve; });
@@ -9480,7 +9567,12 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
         const metricSample = { moduleName: name, durationMs: 0, requestCount: 0, backoffCount: 0, errorCount: 0 };
         const startedAt = Date.now();
         try {
-          const result = await moduleMetricContext.run(metricSample, () => transactional ? monitorStore.transaction(fn) : fn());
+          const invoke = signal => transactional ? monitorStore.transaction(async () => {
+            const result = await fn();
+            if (signal) assertFrontendActive();
+            return result;
+          }, { signal }) : fn();
+          const result = await moduleMetricContext.run(metricSample, () => guard ? guard.run(invoke) : invoke());
           if (firstRunStatus === "pending") firstRunStatus = "complete";
           metricSample.durationMs = Date.now() - startedAt;
           recordModuleMetric(moduleMetrics, name, metricSample);
@@ -9508,6 +9600,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
             try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
           }
         } catch (err) {
+          if (err.code === 'FRONTEND_DEADLINE') pending = false;
           if (firstRunStatus === "pending" && err.code !== "GITHUB_BUDGET_WAIT") firstRunStatus = "failed";
           if (name === "github") githubReposETag = "";
           metricSample.durationMs = Date.now() - startedAt;
@@ -9554,7 +9647,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true) {
       running = false;
     }
   };
-  return { name, run, intervalMs, firstRun, get firstRunStatus() { return firstRunStatus; } };
+  return { name, run, intervalMs, firstRun, health: () => guard?.snapshot(), checkHealth: () => guard?.check(), get firstRunStatus() { return firstRunStatus; } };
 }
 
 /* ══════════════════════════════════════════
@@ -9609,6 +9702,7 @@ async function runFrontendCheck() {
   const prunedBeforeRun = pruneFrontendSnapshot(snapshot);
   const oldPages = snapshot.frontendPages || {};
   const { pages: newPages, failedUrls, failedDetails = [], discoveryHistoryChanged = false, pendingRoutePages = [] } = await fetchFrontendDataWithDiscovery(oldPages);
+  frontendStage('compare');
   frontendMetrics.success = Object.keys(newPages).length;
   frontendMetrics.skipped = failedDetails.filter(d => d.reason === 'backoff').length;
   frontendMetrics.failed = failedUrls.length - frontendMetrics.skipped;
@@ -10224,6 +10318,10 @@ async function startAllModules() {
 }
 
 function startModuleTimers() {
+  // This timer does not depend on any scan Promise completing.
+  global.__frontendHealthTimer = setInterval(() => {
+    modules.find(m => m.name === 'frontend')?.checkHealth();
+  }, 5_000);
   // 启动各模块独立定时器（递归 setTimeout 实现 per-tick 抖动）
   const moduleTimers = []; // 存储定时器 ID，供优雅退出时清理
   for (const m of modules) {
@@ -10237,10 +10335,14 @@ function startModuleTimers() {
     function scheduleModule(delayMs = 0) {
       if (monitorStopping) return;
       const timerId = setTimeout(async () => {
-        await m.run();
-        nextDueAt = calculateNextModuleDueAt(nextDueAt, m.intervalMs);
-        const jitter = !m.name.startsWith("github") && CONFIG.jitterMs > 0 ? Math.random() * CONFIG.jitterMs : 0;
-        scheduleModule(Math.max(0, nextDueAt - Date.now()) + jitter);
+        try {
+          if (m.name === 'frontend') void m.run().catch(err => log(`[frontend] 调度异常：${err.message}`));
+          else await m.run();
+        } finally {
+          nextDueAt = calculateNextModuleDueAt(nextDueAt, m.intervalMs);
+          const jitter = !m.name.startsWith("github") && CONFIG.jitterMs > 0 ? Math.random() * CONFIG.jitterMs : 0;
+          scheduleModule(Math.max(0, nextDueAt - Date.now()) + jitter);
+        }
       }, delayMs);
       upsertModuleTimer(timerId);
     }
@@ -10281,6 +10383,7 @@ if (!IS_TEST_MODE) {
 async function gracefulShutdown(signal) {
   if (monitorStopping) return;
   monitorStopping = true;
+  clearInterval(global.__frontendHealthTimer);
   log(`收到 ${signal}，正在优雅退出...`);
   // 停止所有模块定时器，防止退出期间继续生产新通知
   if (global.__moduleTimers) {

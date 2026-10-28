@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
+import { withAbortSignal } from './request-deadline.mjs';
 
 // Each scan sees isolated root fields. Only changed fields are merged at commit;
 // snapshot and notifications are persisted by one atomic rename before delivery.
@@ -8,7 +9,13 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
   let draining = false;
   const context = new AsyncLocalStorage();
   const encode = value => JSON.stringify(value);
-  const scope = () => { const tx = context.getStore(); return tx?.active ? tx : undefined; };
+  const scope = () => {
+    const tx = context.getStore();
+    // A cancelled invocation must never fall back to the live root, including
+    // callbacks which resume after transaction() has already rejected.
+    if (tx?.cancelled) throw tx.cancelled;
+    return tx?.active ? tx : undefined;
+  };
   function field(key) {
     const tx = scope();
     if (!tx) return root[key];
@@ -35,11 +42,15 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
     has: (_, key) => field(key) !== undefined,
   });
   function write(next) { persist(next); root = next; }
-  async function transaction(fn) {
+  async function transaction(fn, { signal } = {}) {
     if (scope()) return fn();
-    const tx = { active: true, before: new Map(), values: new Map(), notifications: [] };
+    signal?.throwIfAborted();
+    const tx = { active: true, before: new Map(), values: new Map(), notifications: [], cancelled: null };
+    const cancel = () => { tx.cancelled = signal.reason; };
+    signal?.addEventListener('abort', cancel, { once: true });
     try {
-      const result = await context.run(tx, fn);
+      const result = await withAbortSignal(() => context.run(tx, fn), signal);
+      signal?.throwIfAborted();
       const next = { ...root };
       let dirty = false;
       for (const [key, value] of tx.values) {
@@ -49,7 +60,9 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
           throw new Error(`并发快照字段冲突：${String(key)}，下轮重试`);
         }
         if (value === undefined) delete next[key];
-        else next[key] = value;
+        // Abortable work may retain nested references after returning. Do not
+        // publish those references into the live snapshot.
+        else next[key] = signal ? structuredClone(value) : value;
         dirty = true;
       }
       if (tx.notifications.length) {
@@ -62,6 +75,7 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
       // Timers/requests created inside a scan inherit AsyncLocalStorage. Release
       // large cloned snapshots even when those async resources outlive the scan.
       tx.active = false;
+      signal?.removeEventListener('abort', cancel);
       tx.before.clear();
       tx.values.clear();
       tx.notifications.length = 0;
@@ -74,6 +88,7 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
     return entry.id;
   }
   async function drain(now = Date.now()) {
+    scope();
     if (draining) return;
     draining = true;
     try {
@@ -101,5 +116,5 @@ export function createTransactionalOutbox({ initial = {}, persist, deliver, onEr
       }
     } finally { draining = false; }
   }
-  return { state, transaction, enqueue, drain, inTransaction: () => !!scope(), flush: () => { if (!scope()) write({ ...root }); }, replace: value => { root = value; } };
+  return { state, transaction, enqueue, drain, inTransaction: () => !!scope(), flush: () => { if (!scope()) write({ ...root }); }, replace: value => { scope(); root = value; } };
 }

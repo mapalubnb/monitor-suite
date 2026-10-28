@@ -2037,3 +2037,89 @@ test('historical budget waits retry on the unchanged cadence and never clear err
   __testables.deferActorHistory(history, Object.assign(Error('HTTP 429'), { retryAfterMs: 120000 }), 1000);
   assert.equal(history.historyNextAt, 121000);
 });
+
+test('请求及响应体忽略abort也会到期，随后请求正常', async () => {
+  const old = globalThis.fetch;
+  try {
+    for (const body of [false, true]) {
+      globalThis.fetch = async () => body ? { body: true, arrayBuffer: () => new Promise(() => {}) } : new Promise(() => {});
+      await assert.rejects(__testables.fetchWithTimeout('https://noncooperative.test/', {}, 20), /超时/);
+    }
+    globalThis.fetch = async () => new Response('ok');
+    assert.equal(await (await __testables.fetchWithTimeout('https://noncooperative.test/', {}, 1000)).text(), 'ok');
+  } finally { globalThis.fetch = old; }
+});
+
+test('host排队取消移除等待者，挂起占位取消后释放，不执行已取消任务', async () => {
+  const limiter = __testables.createHostLimiter({ maxConcurrent: 1 });
+  const one = new AbortController(), two = new AbortController();
+  const a = limiter.schedule('https://queue.test/a', () => new Promise(() => {}), one.signal);
+  const b = limiter.schedule('https://queue.test/b', () => assert.fail('cancelled queue ran'), two.signal);
+  const ar = assert.rejects(a, /one/), br = assert.rejects(b, /two/);
+  const c = limiter.schedule('https://queue.test/c', async () => 'third');
+  two.abort(Error('two')); one.abort(Error('one'));
+  await Promise.all([ar, br]); assert.equal(await c, 'third');
+});
+
+test('无取消的同URL请求继续复用，调用方取消不影响另一模块请求', async () => {
+  const old = globalThis.fetch; let calls = 0, release, bothStarted;
+  const gate = new Promise(r => { release = r; }), started = new Promise(r => { bothStarted = r; });
+  globalThis.fetch = async () => { if (++calls === 2) bothStarted(); await gate; return new Response('ok'); };
+  try {
+    const url = 'https://dedupe-deadline.four.meme/en';
+    const a = __testables.fetchWithTimeout(url, {}, 1000), b = __testables.fetchWithTimeout(url, {}, 1000);
+    const ctrl = new AbortController();
+    const c = __testables.fetchWithTimeout(url, { signal: ctrl.signal }, 1000);
+    const cancelled = assert.rejects(c, /cancelled/); await started; ctrl.abort(Error('cancelled'));
+    release();
+    await cancelled;
+    assert.equal(await (await a).text(), 'ok'); assert.equal(await (await b).text(), 'ok');
+    assert.equal(calls, 2);
+  } finally { globalThis.fetch = old; }
+});
+
+test('前端runner超时结束firstRun并可继续下一轮，迟到事务被隔离', async () => {
+  let release, calls = 0;
+  const gate = new Promise(r => { release = r; });
+  const state = __testables.setSnapshotForTests({ probe: 1 });
+  const runner = __testables.createModuleRunner('frontend', async () => {
+    if (++calls === 1) { state.probe = 2; await gate; state.probe = 99; }
+    else state.probe = 3;
+  }, 5000, true, { timeoutMs: 20, notify: () => {} });
+  await runner.run();
+  assert.equal(await runner.firstRun, 'failed'); assert.equal(state.probe, 1);
+  await runner.run(); assert.equal(state.probe, 3);
+  release(); await new Promise(r => setImmediate(r)); assert.equal(state.probe, 3);
+  assert.equal(runner.health().running, false);
+  __testables.setSnapshotForTests({});
+});
+
+test('前端取消后迟到资源不写缓存，下一轮可正常读取同一资源', async () => {
+  const { createFrontendGuard } = await import('./frontend-lifecycle.mjs');
+  const guard = createFrontendGuard({ timeoutMs: 20 });
+  let release, finish;
+  const gate = new Promise(r => { release = r; }), done = new Promise(r => { finish = r; });
+  const url = 'https://static.four.meme/_next/static/chunks/cancel-late.js';
+  const assets = new Map([['cancel-late.js', url]]);
+  let rejected;
+  const run = guard.run(async () => {
+    try { await __testables.downloadAssetContents(assets, new Map(), { fetchFn: async () => { await gate; return new Response('const x="Late resource"'); } }); }
+    catch (e) { rejected = e; throw e; }
+    finally { finish(); }
+  });
+  await assert.rejects(run, /截止时间/);
+  release(); await done; assert.match(rejected.message, /截止时间/);
+  const result = await __testables.downloadAssetContents(assets, new Map(), { fetchFn: async () => new Response('const x="Fresh resource"') });
+  assert(result['cancel-late.js']);
+});
+
+test('前端轮次内的显式取消信号仍生效', async () => {
+  const { createFrontendGuard } = await import('./frontend-lifecycle.mjs');
+  const guard = createFrontendGuard({ timeoutMs: 1000 });
+  const ctrl = new AbortController(); const old = globalThis.fetch;
+  globalThis.fetch = async () => { ctrl.abort(Error('explicit cancellation')); return new Promise(() => {}); };
+  try {
+    await assert.rejects(guard.run(() => __testables.fetchWithTimeout('https://explicit.test/', { signal: ctrl.signal }, 1000)), /explicit cancellation/);
+    assert.equal(guard.snapshot().timeouts, 0);
+  } finally { globalThis.fetch = old; }
+});
