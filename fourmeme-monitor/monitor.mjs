@@ -604,6 +604,9 @@ function scheduleHostRequest(url, task, signal) {
 }
 
 const moduleMetricContext = new AsyncLocalStorage();
+// Capture the module root once: diagnostic timers must not inherit a scan's
+// cancelled transaction or frontend lifecycle after that scan has ended.
+const runInMonitorRootContext = AsyncLocalStorage.snapshot();
 let runtimeMetricsTimer = null;
 
 function createModuleMetricsState() {
@@ -642,7 +645,7 @@ function recordModuleMetric(metrics, name, sample = {}) {
 
 function scheduleRuntimeMetricsWrite() {
   if (IS_TEST_MODE || runtimeMetricsTimer) return;
-  runtimeMetricsTimer = setTimeout(() => {
+  runtimeMetricsTimer = setTimeout(() => runInMonitorRootContext(() => {
     runtimeMetricsTimer = null;
     const memory = process.memoryUsage();
     const staleBefore = Date.now() - 2 * 60 * 60_000;
@@ -704,7 +707,7 @@ function scheduleRuntimeMetricsWrite() {
         log(`[性能] 指标写入失败：${err.message}`);
       }
     });
-  }, 5_000);
+  }), 5_000);
   runtimeMetricsTimer.unref?.();
 }
 
@@ -10426,6 +10429,7 @@ function setSnapshotForTests(value) {
 }
 
 export const __testables = {
+  runInMonitorRootContext,
   aiSummarize,
   summarizeWithRetry,
   scheduleAiPatchRetry,

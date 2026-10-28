@@ -2123,3 +2123,22 @@ test('前端轮次内的显式取消信号仍生效', async () => {
     assert.equal(guard.snapshot().timeouts, 0);
   } finally { globalThis.fetch = old; }
 });
+
+test('后台指标回调脱离已取消前端事务，仍可读取有效快照', async () => {
+  let release, finish;
+  const gate = new Promise(r => { release = r; }), done = new Promise(r => { finish = r; });
+  const state = __testables.setSnapshotForTests({ probe: 7 });
+  let read;
+  const runner = __testables.createModuleRunner('frontend', async () => {
+    state.probe = 99;
+    await gate;
+    try {
+      assert.throws(() => state.probe, /截止时间/);
+      read = __testables.runInMonitorRootContext(() => state.probe);
+    } finally { finish(); }
+  }, 5000, true, { timeoutMs: 20, notify: () => {} });
+  await runner.run();
+  release(); await done;
+  assert.equal(read, 7);
+  __testables.setSnapshotForTests({});
+});
