@@ -6,9 +6,11 @@
 
 当前项目按“总控与发布、Four.meme、Flap、链上核验”分对话管理，共用本地 `main`，只读可并行、写入串行。模块对话负责实现与测试，总控统一提交、推送和服务器发布；链上核验默认只读。先读 [协作规则](AGENTS.md) 和 [项目现状与发布交接](docs/PROJECT_STATE.md)，再读 [Four.meme 交接](fourmeme-monitor/HANDOFF.md)、[Flap 交接](flap-monitor/HANDOFF.md) 或 [链上核验约定](docs/CHAIN_REVIEW.md)。协作入口在 Suite 1.12.39 建立，该次仅为文档更新。
 
-## 2026-10-30 新增 Flap GitHub 仓库（Four.meme 1.5.25，待发布）
+## 2026-10-30 新增 Flap GitHub 仓库（Four.meme 1.5.25，已发布）
 
 现有 GitHub 引擎新增 `flap-sh/FlapVaultExample`、`flap-sh/flap-vault-component-template`、`flap-sh/flap-skills`，与原五仓库一起监控默认分支提交及文件 diff。每 15 秒发现 `four-meme-community` 与 `flap-sh` 新公开仓库并自动纳入；保留 2 秒批量提交探测、1 秒详情调度，首条不等详情，AI 仍关闭。首次接入建立基线，不回放全部历史；两个账号完整分页成功后才提交目录，失败保留原状态。由总控测试、先推 GitHub 后部署核验，其他监控保持不变。
+
+业务提交8366843已先推GitHub再部署，仅Four.meme重启；全量757项、服务器318项测试通过。八仓库GraphQL与三仓库REST权限实测成功，cost=1；连续185秒八仓库checkedAt持续更新，原SHA保留、三个新增通知各发送一次、最终队列0，环境和全部周期不变。一次REST超时后恢复；窗口没有自然新提交，首条/diff端到端延迟未实测。Suite1.12.69同步验收，详见Four.meme HANDOFF。
 
 ## 2026-10-28 前端停滞恢复（Four.meme 1.5.24）
 

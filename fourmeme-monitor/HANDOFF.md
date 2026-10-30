@@ -52,9 +52,18 @@
 
 ## 发布交接记录
 
-### 2026/10/30 flap-sh 三仓库与新仓库自动发现（1.5.25，待总控发布）
+### 2026/10/30 flap-sh 三仓库与新仓库自动发现（1.5.25，已发布）
 
 总控发布前复核：用户原始授权已核对；Suite1.12.68整合，全部测试文件隔离串行757/757通过，根语法/diff检查通过。生产Token只读验证八仓库GraphQL成功（cost=1），三个Flap仓库REST提交文件读取均成功，flap-sh目录恰为三项且无下一页；未输出凭证、未发测试卡。
+
+总控上线验收（北京时间2026/10/30 13:35）：
+
+- 业务提交`8366843ebecbdf794610f29eadd30275fbcd55ba`，Suite1.12.68 / Four.meme1.5.25；先推GitHub确认确切SHA，再服务器隔离Four.meme与shared测试318/318、语法检查、备份状态分片并快进。仅Four.meme重启，PID192264；Flap3271473与bot1203994未变。Suite1.12.69仅记录验收，不再重启。
+- 连续13:32:25.437–13:35:30.627观察185.190秒/186样本；头探测计数增加77，目录发现增加12。八仓库各观测37个不同checkedAt（指标约5秒落盘，不能据此推算真实2秒请求间隔）；均main，SHA与权限预检一致。双账号目录为4+3项，独立BNB仓库继续监控；旧五仓库SHA保留、详情任务0，没有回放历史。
+- 三条自然“GitHub 新增监控仓库”通知各完成一次发送，最终outbox0；未发测试卡。窗口无自然提交变化，提交首条和文件diff的真实送达延迟尚未实测；流程由隔离回归和真实REST只读权限核验覆盖。
+- GraphQL cost=1、remaining4505；REST remaining4852，budgetWaits0、headErrors空。REST在13:33:08发生一次connect-or-headers超时，13:33:14恢复，未连带停止GraphQL；结束两通道consecutiveFailures均0。不能保证上游永久无故障或2秒必送达。
+- 全部环境/ai-models哈希、Four.meme全部任务周期、Flap14项周期逐项一致，两套AI仍关闭；前端18页成功、整轮超时0，进程错误日志新增0字节。保留旧快照、游标及发送状态，无手工重置。
+- 备份`/root/monitor-suite-backups/github-flap-1.12.68-20261030-133154`包含旧代码、受限配置、停止后快照及全部分片、路由审批、测试、前后核验和采样acceptance.json。以下“未部署”等为模块交接阶段记录，以本段已上线结果为准。
 
 - 用户要求新增 `https://github.com/flap-sh` 当前三个项目和未来新增仓库监控，并明确答复“交总控部署核验”。GitHub 公开组织页面核对当前三个仓库为 `FlapVaultExample`、`flap-vault-component-template`、`flap-skills`。复用既有 Four.meme GitHub 引擎及飞书渠道，不另启进程，不修改 Flap 模块。
 - 文件：`github-monitor.mjs`、`github-monitor.test.mjs`、模块 `package.json`、`GITHUB_MONITORING.md`、本交接、根 README。根版本、提交推送和服务器由总控整合。
