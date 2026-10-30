@@ -1,8 +1,10 @@
-# GitHub 高频监控（Four.meme 1.5.22）
+# GitHub 高频监控（Four.meme 1.5.25）
 
 1.5.19 起依用户要求关闭 Four.meme 全部自动 AI 分析。GitHub 首条和详情均只推送原始信息及 diff，不调用模型、不补发 AI 摘要；其他监控周期不变。以下旧流程中提到的 AI 增强不再启用，共享模型配置与 Flap 不受影响。
 
 ## 本次调整
+
+1.5.25 新增 `flap-sh` 三个现有公开仓库及未来公开仓库自动发现，复用当前 GitHub 引擎和推送渠道。旧五仓库快照由发现流程增量纳入新账号，保留 SHA、详情任务及通知队列；两个账号完整分页成功后才提交目录，任一失败不误报移除。所有调度周期、限流策略和 AI 关闭状态不变。
 
 1.5.22 仅优化 GitHub 失败恢复和诊断，不调整 2 秒提交探测、15 秒仓库发现、1 秒详情调度，自动 AI 继续关闭。
 
@@ -19,19 +21,22 @@
 
 ## 仓库范围
 
-初始五个仓库：
+初始八个仓库：
 
 - `four-meme-community/four-meme-ai`
 - `four-meme-community/openfour-docs`
 - `four-meme-community/openfour-boost-launchpad`
 - `four-meme-community/fourmeme-docs`
 - `bnb-chain/bnb-chain.github.io`
+- `flap-sh/FlapVaultExample`
+- `flap-sh/flap-vault-component-template`
+- `flap-sh/flap-skills`
 
-全部监控各自的**默认分支**，不是仅固定 `main`，也不是监听所有分支。自动发现范围为 `four-meme-community` 的公开仓库，不自动订阅整个 `bnb-chain` 组织。首次发现建立当前基线，不批量推送历史；已建立基线的空仓库后续首个提交也会提醒。
+全部监控各自的**默认分支**，不是仅固定 `main`，也不是监听所有分支。自动发现范围为 `four-meme-community` 和 `flap-sh` 的公开仓库，不自动订阅整个 `bnb-chain` 组织。首次发现建立当前基线，不批量推送历史；已建立基线的空仓库后续首个提交也会提醒。
 
 ## 三条独立流程
 
-1. `github`：默认每 2 秒一次认证 GraphQL，五仓库的默认分支、最新 SHA、摘要一并查询。变化后将新游标、首条通知、详情任务原子保存，立即唤醒原有 outbox 发送器。首条明确跳过 AI，不请求 REST 提交详情。
+1. `github`：默认每 2 秒一次认证 GraphQL，八仓库的默认分支、最新 SHA、摘要一并查询。变化后将新游标、首条通知、详情任务原子保存，立即唤醒原有 outbox 发送器。首条明确跳过 AI，不请求 REST 提交详情。
 2. `githubDiscovery`：每 15 秒独立查询账号公开仓库列表，完整翻页后才更新，新增仓库自动参与下一轮 SHA 探测。保留描述、默认分支、归档/禁用等元数据变化提醒；不再以 `pushed_at` 重复发送代码更新卡片。列表消失只报告不可见，保留原监控基线，不断言删除。
 3. `githubDetails`：每 1 秒处理一个就绪任务的一页 REST 数据，先比较固定的旧 SHA 与新 SHA，再逐提交获取全部可分页文件。不同任务轮转。首条通知成功离开 outbox 后才开始详情，详情以**后续独立卡片**推送，不反复编辑首条；AI 沿用已有先发卡再补充机制。失败记录错误、退避并重试，重启恢复进度。
 
@@ -49,7 +54,7 @@ GITHUB_REPO_LIST_INTERVAL_SECONDS=15
 
 旧 `.env` 中显式的 30/90/300 秒仍会覆盖默认值，必须由总控在发布时核对并调整这两项；本次没有改本机或服务器凭证。没有 token 时明确报错，不以 2 秒匿名调用顶替。
 
-五仓库通常一批：若 GraphQL 实测 `cost=1`，每 2 秒约 1800 点/小时；仓库发现单页约 240 次 REST/小时。详情只在有变化时消耗 REST，单工作器正常最多约 3600 页/小时，仍需与其他使用同一用户额度的程序共用预算。
+八仓库仍在一批上限内：若 GraphQL 实测 `cost=1`，每 2 秒约 1800 点/小时；两个账号各一页时，仓库发现约 480 次 REST/小时（翻页另计）。详情只在有变化时消耗 REST，单工作器正常最多约 3600 页/小时，仍需与其他使用同一用户额度的程序共用预算。
 
 读取真实 GraphQL cost/remaining/reset 和 REST rate-limit 头，保留 100 额度余量；GraphQL 根据实际 cost 与到重置时间的可用预算自动拉长最短请求间隔。遵守 Retry-After、X-Poll-Interval，403/429 二级限流进入共享冷却，401 延长冷却。REST 与 GraphQL 主额度独立；冷却、超时和磁盘压力均可能增大实际间隔。重启后根据下一次响应重建 API 预算；详情重试时间持久化。
 

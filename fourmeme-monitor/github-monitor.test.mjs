@@ -31,14 +31,63 @@ async function changedFixture() {
   return context;
 }
 
-test("GitHub 五仓库单次 GraphQL 建立基线，不回放历史", async () => {
+test("GitHub 旧五仓库状态接入flap-sh，保留游标任务，新仓库翻页纳入且只提醒一次", async () => {
+  const old = fixture();
+  await old.monitor.pollHeads();
+  old.change();
+  await old.monitor.pollHeads();
+  const initial = structuredClone(old.persisted);
+  for (const name of GITHUB_REPOSITORIES.slice(5)) delete initial.githubMonitor.repos[name];
+  const context = fixture(initial);
+  const catalog = GITHUB_REPOSITORIES.map((full_name, i) => ({ full_name, node_id: `node${i}` }));
+  const extra = { full_name: 'flap-sh/new-project', node_id: 'new-project' };
+  const paths = [];
+  context.api.rest = async path => {
+    paths.push(path);
+    if (path.includes('/users/four-meme-community/')) return { data: catalog.slice(0, 4) };
+    return path.endsWith('page=1') ? { data: catalog.slice(5), hasNext: true } : { data: [extra] };
+  };
+  await context.monitor.discover();
+  await context.monitor.discover();
+  assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 9);
+  assert.deepEqual(context.persisted.githubMonitor.jobs, initial.githubMonitor.jobs);
+  assert.equal(context.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]].head, 'new');
+  assert.equal(context.persisted._notificationOutbox.length, 5); // original + four additions
+  assert.equal(paths.filter(p => p.includes('/users/flap-sh/') && p.endsWith('page=2')).length, 2);
+  context.change(GITHUB_REPOSITORIES[0]);
+  context.heads.set(extra.full_name, { id: extra.node_id, nameWithOwner: extra.full_name, defaultBranchRef: { name: 'master', target: { oid: 'first' } } });
+  await context.monitor.pollHeads();
+  assert.equal(context.persisted._notificationOutbox.length, 5); // no historical replay
+  context.change(extra.full_name, 'second');
+  await context.monitor.pollHeads();
+  assert.equal(context.persisted.githubMonitor.jobs.at(-1).repo, extra.full_name);
+  assert.equal(context.persisted.githubMonitor.jobs.at(-1).base, 'first');
+});
+
+test("GitHub 第二账号失败不提交半份目录、不误报其他账号移除", async () => {
+  const context = fixture();
+  context.api.rest = async path => ({ data: GITHUB_REPOSITORIES.filter(n => n.startsWith(path.includes('/users/flap-sh/') ? 'flap-sh/' : 'four-meme-community/')).map(full_name => ({ full_name, node_id: full_name })) });
+  await context.monitor.discover();
+  const before = structuredClone(context.persisted);
+  context.api.rest = async path => {
+    if (path.includes('/users/flap-sh/')) throw Error('flap unavailable');
+    return { data: [] };
+  };
+  await assert.rejects(context.monitor.discover(), /flap unavailable/);
+  assert.deepEqual(context.persisted, before);
+  context.api.rest = async () => ({ data: [{ full_name: 'unexpected/repo', node_id: 'bad' }] });
+  await assert.rejects(context.monitor.discover(), /账号不匹配/);
+  assert.deepEqual(context.persisted, before);
+});
+
+test("GitHub 八仓库单次 GraphQL 建立基线，不回放历史", async () => {
   const context = fixture();
   await context.monitor.pollHeads();
   assert.equal(context.requests.length, 1);
   assert.deepEqual(context.requests[0], GITHUB_REPOSITORIES);
-  assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 5);
+  assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 8);
   assert.equal(context.persisted._notificationOutbox, undefined);
-  assert.match(buildHeadQuery(GITHUB_REPOSITORIES), /repo4: repository/);
+  assert.match(buildHeadQuery(GITHUB_REPOSITORIES), /repo7: repository/);
 });
 
 test("GitHub 每个仓库都提醒，首条不请求详情、不等待 AI，重复探测不重复推送", async () => {
@@ -47,8 +96,8 @@ test("GitHub 每个仓库都提醒，首条不请求详情、不等待 AI，重�
   for (const name of GITHUB_REPOSITORIES) context.change(name);
   await context.monitor.pollHeads();
   await context.monitor.pollHeads();
-  assert.equal(context.persisted._notificationOutbox.length, 5);
-  assert.equal(context.persisted.githubMonitor.jobs.length, 5);
+  assert.equal(context.persisted._notificationOutbox.length, 8);
+  assert.equal(context.persisted.githubMonitor.jobs.length, 8);
   assert.ok(context.persisted._notificationOutbox.every(entry => entry.payload.skipAi));
   assert.ok(context.requests.every(Array.isArray));
   await context.monitor.enrich();
@@ -90,7 +139,7 @@ test("GitHub 仓库发现完整翻页、自动纳入，下轮监测提交", asyn
   const context = fixture();
   await context.monitor.pollHeads();
   const name = "four-meme-community/new-repo";
-  context.api.rest = async path => ({ data: path.endsWith("page=1") ? [] : [{ node_id: "new-id", full_name: name }], hasNext: path.endsWith("page=1") });
+  context.api.rest = async path => path.includes('/users/flap-sh/') ? { data: [] } : ({ data: path.endsWith("page=1") ? [] : [{ node_id: "new-id", full_name: name }], hasNext: path.endsWith("page=1") });
   await context.monitor.discover();
   context.heads.set(name, { id: "new-id", nameWithOwner: name, defaultBranchRef: { name: "master", target: { oid: "first" } } });
   await context.monitor.pollHeads();
@@ -109,13 +158,13 @@ test("GitHub 仓库列表翻页失败不发布不完整结果", async () => {
     return { data: [{ node_id: "new-id", full_name: "four-meme-community/new" }], hasNext: true };
   };
   await assert.rejects(context.monitor.discover(), /timeout/);
-  assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 5);
+  assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 8);
 });
 
 test("GitHub 更名按 node ID 迁移，不丢失基线", async () => {
   const context = fixture();
   await context.monitor.pollHeads();
-  context.api.rest = async () => ({ data: [{ node_id: "node0", full_name: "four-meme-community/renamed" }] });
+  context.api.rest = async path => ({ data: path.includes('/users/flap-sh/') ? [] : [{ node_id: "node0", full_name: "four-meme-community/renamed" }] });
   await context.monitor.discover();
   assert.equal(context.persisted.githubMonitor.repos["four-meme-community/renamed"].head, "old");
   assert.equal(context.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]], undefined);
@@ -232,7 +281,7 @@ test("GitHub 保留仓库元数据变化，pushed_at 不重复发项目提醒", 
   const context = fixture();
   let description = "old";
   let pushed = "old";
-  context.api.rest = async () => ({ data: [{ node_id: "node0", full_name: GITHUB_REPOSITORIES[0], description, pushed_at: pushed }] });
+  context.api.rest = async path => ({ data: path.includes('/users/flap-sh/') ? [] : [{ node_id: "node0", full_name: GITHUB_REPOSITORIES[0], description, pushed_at: pushed }] });
   await context.monitor.discover();
   pushed = "new";
   await context.monitor.discover();
@@ -262,8 +311,8 @@ test("GitHub 大于 25 仓库跨轮分批，持久化轮转不遗漏", async () 
   assert.equal(context.persisted.githubMonitor.headOffset, 25);
   await context.monitor.pollHeads();
   assert.equal(context.requests.length, 2);
-  assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 32);
-  assert.equal(new Set(context.requests.flat()).size, 32);
+  assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 35);
+  assert.equal(new Set(context.requests.flat()).size, 35);
   assert.ok(Object.values(context.persisted.githubMonitor.repos).every(repo => repo.initialized));
 });
 

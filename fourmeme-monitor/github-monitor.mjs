@@ -1,12 +1,17 @@
 import { randomUUID } from "node:crypto";
 import { formatBeijingTime } from "../shared/display-format.cjs";
 
+export const GITHUB_DISCOVERY_OWNERS = ["four-meme-community", "flap-sh"];
+
 export const GITHUB_REPOSITORIES = [
   "four-meme-community/four-meme-ai",
   "four-meme-community/openfour-docs",
   "four-meme-community/openfour-boost-launchpad",
   "four-meme-community/fourmeme-docs",
   "bnb-chain/bnb-chain.github.io",
+  "flap-sh/FlapVaultExample",
+  "flap-sh/flap-vault-component-template",
+  "flap-sh/flap-skills",
 ];
 
 export function buildHeadQuery(names) {
@@ -128,7 +133,7 @@ export function createGithubApi({ token, fetchImpl = fetch, now = Date.now, onRe
 
 function freshState(snapshot) {
   const repos = {};
-  for (const name of new Set([...GITHUB_REPOSITORIES, ...Object.keys(snapshot.githubRepos || {}).filter(name => name.startsWith("four-meme-community/"))])) {
+  for (const name of new Set([...GITHUB_REPOSITORIES, ...Object.keys(snapshot.githubRepos || {}).filter(name => GITHUB_DISCOVERY_OWNERS.includes(name.split("/")[0]))])) {
     repos[name] = { name, head: name === GITHUB_REPOSITORIES[0] ? snapshot.githubSha || "" : "", branch: name === GITHUB_REPOSITORIES[0] ? "main" : "" };
   }
   return { version: 1, repos, jobs: [], lastHeadAt: 0, lastDiscoveryAt: 0, lastDetailAt: 0 };
@@ -209,11 +214,16 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
   async function discover() {
     return guarded("discovery", async () => {
       const found = new Map();
-      for (let page = 1; ; page++) {
-        const response = await api.rest(`/users/four-meme-community/repos?per_page=100&sort=full_name&direction=asc&page=${page}`);
-        if (!Array.isArray(response.data) || response.data.some(repo => !repo.full_name || !repo.node_id)) throw new Error("GitHub 仓库列表响应不完整");
-        for (const repo of response.data) found.set(repo.node_id, repo);
-        if (!response.hasNext) break;
+      // Publish only after both accounts are fully read. A failed account/page
+      // must not make its previous repositories look deleted. Existing v1
+      // snapshots acquire the new account through this same discovery path.
+      for (const owner of GITHUB_DISCOVERY_OWNERS) {
+        for (let page = 1; ; page++) {
+          const response = await api.rest(`/users/${owner}/repos?per_page=100&sort=full_name&direction=asc&page=${page}`);
+          if (!Array.isArray(response.data) || response.data.some(repo => !repo.full_name || !repo.node_id || repo.full_name.split("/")[0].toLowerCase() !== owner.toLowerCase())) throw new Error("GitHub 仓库列表响应不完整或账号不匹配");
+          for (const repo of response.data) found.set(repo.node_id, repo);
+          if (!response.hasNext) break;
+        }
       }
       await change(async state => {
         const previousCatalog = state.catalog || store.state.githubRepos;

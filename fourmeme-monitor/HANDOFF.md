@@ -52,6 +52,17 @@
 
 ## 发布交接记录
 
+### 2026/10/30 flap-sh 三仓库与新仓库自动发现（1.5.25，待总控发布）
+
+总控发布前复核：用户原始授权已核对；Suite1.12.68整合，全部测试文件隔离串行757/757通过，根语法/diff检查通过。生产Token只读验证八仓库GraphQL成功（cost=1），三个Flap仓库REST提交文件读取均成功，flap-sh目录恰为三项且无下一页；未输出凭证、未发测试卡。
+
+- 用户要求新增 `https://github.com/flap-sh` 当前三个项目和未来新增仓库监控，并明确答复“交总控部署核验”。GitHub 公开组织页面核对当前三个仓库为 `FlapVaultExample`、`flap-vault-component-template`、`flap-skills`。复用既有 Four.meme GitHub 引擎及飞书渠道，不另启进程，不修改 Flap 模块。
+- 文件：`github-monitor.mjs`、`github-monitor.test.mjs`、模块 `package.json`、`GITHUB_MONITORING.md`、本交接、根 README。根版本、提交推送和服务器由总控整合。
+- 初始仓库从5增至8；自动发现账号从 `four-meme-community` 增至包含 `flap-sh`。旧 `githubMonitor` 状态不重置，发现流程增量加入三仓库；首次建基线不补历史。双账号完整分页成功后才原子更新合并目录；失败保留旧目录，不误报仓库消失。返回账号不匹配拒绝采纳。默认分支新提交、首条不等详情、后台文件diff和新仓库提醒沿用原路径。
+- 不改2秒提交/15秒发现/1秒详情及其他任何模块周期、预算退避、AI关闭、快照、队列或凭证。两账号各一页时发现约480 REST请求/小时；8仓库仍可一批GraphQL，实际cost需线上读取，2秒不是送达保证。任一账号分页失败本轮不更新整个目录，但独立提交探测继续。
+- 验证：隔离运行 GitHub/monitor/http-recovery/frontend-lifecycle/transactional-outbox 合计230/230通过（GitHub39项）；`npm run check:fourmeme`、`git diff --check`通过。覆盖旧五仓库迁移保留SHA/任务/队列、双账号分页/去重、新仓库首次基线及后续提交、部分账号失败不误报、8仓库单批和35仓库轮转。初轮仅旧测试固定32仓库断言需随新增3仓库更新为35，修正后全部通过。无生产API测试、无飞书测试卡。
+- 发布要求：核对生产Token可读三个仓库的GraphQL和REST，完整旧状态分片与配置备份，先推GitHub确认SHA再服务器快进，仅重启Four.meme；观察原5+新增3的默认分支SHA/checkedAt持续推进，两个账号发现成功及实际额度，确认首条/详情队列和其他周期不变。可保留自然新增监控仓库通知；不要手动清基线或补全部历史。尚未部署，不宣称线上已生效。
+
 ### 2026/10/28 总控修复前端长期停滞（1.5.24，已发布）
 
 - 用户明确授权全部修复；总控接手共享边界、模块实现与发布。现场复核frontend仍runs6119、lastRunAt=2026/10/23 15:41:00.777，18页最后成功15:40:56、HTTP当前冷却空；其他任务持续运行。已证实等待不结束机制，实际挂起URL未知。
