@@ -1,5 +1,9 @@
 # 项目状态与独立发布
 
+### 2026/10/31 13:44 请求恢复版本上线验收
+
+业务提交 `d890da0d644eb60433c665bcf61bbb2441350feb` 已先推GitHub后部署；Suite1.12.72 / Flap1.10.43，Flap PID583989 online，Four.meme192264与机器人1203994未重启。全量Flap421/421、服务器恢复专项3/3、语法与diff通过。根.env逐字一致、14任务周期逐项一致、完整性历史放弃记录一致，原17条待发记录数量保留，AI关闭。13:44多次采样扫描延迟0块、游标持续推进；CoW旧错误随退避到期逐一恢复，未手工清错。Safe当前错误为空。备份 `/root/monitor-suite-backups/flap-recovery-1.12.72-20261031`。瞬时上游限流/超时仍可能发生；旧飞书卡超过14天编辑期限为独立既存问题。
+
 2026/10/31 13:35 已独立发布：Suite1.12.70 / Flap1.10.42，业务提交 a421ec2c0fefab6fa8c4225d4d33a95a36f4ecc6。本地/GitHub/服务器一致；Flap PID580511 online，Four.meme192264与机器人1203994未重启。418/418回归、服务器专项13/13通过。根.env与14任务周期、完整性历史放弃记录不变，AI关闭；旧3页面快照保留且legacySiteMonitor.enabled=false。备份/root/monitor-suite-backups/flap-cool-1.12.70-20261031。页面启动目标均为flap.cool，继续观察实际采集。CoW429、旧卡超过14天编辑期限为既存异常。
 
 ## 2026/10/31 用户最新协作决定（优先于旧记录）
@@ -35,7 +39,7 @@
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
 - 最新已核验业务提交：`a421ec2c0fefab6fa8c4225d4d33a95a36f4ecc6`（Flap 新域名）；Four.meme业务基线`8366843`，fm-status基线`6fe0272`。
-- 当前版本：Suite `1.12.71`（独立发布规则清理）、Four.meme `1.5.25`、Flap `1.10.42`。本次仅文档与根版本同步，无需重启监控。
+- 当前版本：Suite `1.12.72`、Four.meme `1.5.25`、Flap `1.10.43`。最新业务为请求恢复优化，验收见顶部。
 - 本次分阶段先更新两套监控，最后节点能力适配仅重启 Flap；机器人未重启。19:37:12 验收全部周期与环境配置不变，CoW恢复、实时扫描追齐、历史补扫继续、队列及历史放弃记录保留。存在公共节点瞬时超时/本地预算等待及独立的旧卡过期问题，详见两模块 HANDOFF；不保证公共服务永久无故障。此验收文档同步无需重启，确切 HEAD 仍需本地/GitHub/服务器三方核对。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。
