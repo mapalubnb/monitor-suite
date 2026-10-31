@@ -52,7 +52,7 @@ GITHUB_INTERVAL_SECONDS=2
 GITHUB_REPO_LIST_INTERVAL_SECONDS=15
 ```
 
-旧 `.env` 中显式的 30/90/300 秒仍会覆盖默认值，必须由总控在发布时核对并调整这两项；本次没有改本机或服务器凭证。没有 token 时明确报错，不以 2 秒匿名调用顶替。
+旧 `.env` 中显式的 30/90/300 秒仍会覆盖默认值，必须由执行对话在发布时核对并调整这两项；本次没有改本机或服务器凭证。没有 token 时明确报错，不以 2 秒匿名调用顶替。
 
 八仓库仍在一批上限内：若 GraphQL 实测 `cost=1`，每 2 秒约 1800 点/小时；两个账号各一页时，仓库发现约 480 次 REST/小时（翻页另计）。详情只在有变化时消耗 REST，单工作器正常最多约 3600 页/小时，仍需与其他使用同一用户额度的程序共用预算。
 
@@ -77,9 +77,9 @@ GITHUB_REPO_LIST_INTERVAL_SECONDS=15
 - 本地运行 `npm run test:fourmeme`、`node shared/run-tests.mjs fourmeme-monitor/github-monitor.test.mjs` 和语法检查；测试注入模拟 API，不请求生产 GitHub、不向飞书发测试卡片。
 - 发布后查看 `runtime-metrics.json` 的 `github`：实际仓库及各自 `checkedAt`、`lastHeadAt`、`headErrors`、发现/详情时间、待补任务和错误、真实 cost/remaining/reset/冷却时间。`lastHeadAt` 是批次处理时间，不代替各仓库成功时间。
 - 机器人问答上下文包含全部仓库、默认分支、SHA 和待补详情数量；精确验收使用上述运行指标，不把问答生成内容当成功凭证。独立 `fm-status` 命令的公共实现未在本次修改。
-- 总控完成 GitHub 推送后部署，重启 `fourmeme-monitor`；机器人展示变更需重启 `feishu-bot`，无需重启 Flap。观察至少一笔自然提交的发现/首条发送/详情完成时间，并核验真实 token 权限及成本。仅模拟测试通过不代表已经上线或已达到 2 秒送达。
+- 执行对话完成 GitHub 推送后部署，重启 `fourmeme-monitor`；机器人展示变更需重启 `feishu-bot`，无需重启 Flap。观察至少一笔自然提交的发现/首条发送/详情完成时间，并核验真实 token 权限及成本。仅模拟测试通过不代表已经上线或已达到 2 秒送达。
 
-## 总控复核进度（2026/10/22）
+## 执行对话复核进度（2026/10/22）
 
 - 修复超过 25 个仓库时更新基线重排对象键导致的轮转重复，回归断言两轮完整覆盖 32 个仓库。
 - 根版本整合为 1.12.44，根语法检查纳入新模块，README 与 .env.example 已同步频率和 Token 要求。
