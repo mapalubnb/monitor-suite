@@ -3,7 +3,7 @@ import { parseHTML } from 'linkedom';
 import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
 import { formatBeijingTime, formatDisplayText } from '../shared/display-format.cjs';
 
-export const APPS_URL = 'https://flap.sh/apps?lang=zh';
+export const APPS_URL = 'https://flap.cool/apps?lang=zh';
 export function appConfigDiff(before, after, path = '') {
   if (stable(before) === stable(after)) return [];
   if (before && after && typeof before === 'object' && typeof after === 'object' && !Array.isArray(before) && !Array.isArray(after))
@@ -49,7 +49,9 @@ export function parseAppList(html) {
       throw Error('小程序目录身份无效或重复');
     seen.add(row.slug);
   }
-  return rows.map(({ appId, slug, name, displayTitle, category }) => ({ appId, slug, name, displayTitle, category }));
+  return rows.map(({ appId, slug, name, displayTitle, category }) => ({ appId, slug,
+    name: typeof name === 'string' && name !== '$undefined' ? name : slug,
+    displayTitle: displayTitle === '$undefined' ? undefined : displayTitle, category }));
 }
 
 export function parseRegistration(html, app) {
@@ -206,7 +208,7 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
       const suppressed = pending.filter(entry => {
         const payload = entry.payload || {};
         return String(payload.title || '').startsWith('Flap 小程序｜')
-          && (/https:\/\/flap\.sh\/apps\/agent-bonding-curve(?:[?\s/#]|$)/.test(payload.content || '')
+          && (/https:\/\/flap\.(?:sh|cool)\/apps\/agent-bonding-curve(?:[?\s/#]|$)/.test(payload.content || '')
             || names.has(String(payload.content || '').split('\n')[0]));
       });
       if (suppressed.length) {
@@ -229,30 +231,30 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
       await box.transaction(async () => {
         const old = box.state.catalog;
         if (old) {
-          for (const row of rows) if (!old.some(v => v.appId === row.appId)) await notify('新增应用', `${row.displayTitle?.zh || row.name}\nhttps://flap.sh/apps/${row.slug}`);
+          for (const row of rows) if (!old.some(v => v.appId === row.appId)) await notify('新增应用', `${row.displayTitle?.zh || row.name}\nhttps://flap.cool/apps/${row.slug}`);
           for (const row of old) if (!rows.some(v => v.appId === row.appId)) await notify('应用目录移除', `${row.name}\n${APPS_URL}\n仅表示目录未再列出，不代表链上停用。`);
         }
         box.state.catalog = rows;
       });
       for (const row of rows) {
         try {
-          const registration = parseRegistration(await fetchText(`https://flap.sh/apps/${row.slug}?lang=zh`), row);
+          const registration = parseRegistration(await fetchText(`https://flap.cool/apps/${row.slug}?lang=zh`), row);
           const artifact = await readAppArtifact(registration, fetchText, cache);
           await box.transaction(async () => {
             const apps = box.state.apps ||= {};
             const old = apps[row.appId];
             const config = { ...artifact, enabled: registration.enabled, artifactEnabled: registration.artifact.enabled, catalog: row };
-            if (old && stable(old.config) !== stable(config)) await notify('描述、资源或配置变更', `${row.name}\nhttps://flap.sh/apps/${row.slug}\n${appConfigDiff(old.config, config).join('\n')}`);
+            if (old && stable(old.config) !== stable(config)) await notify('描述、资源或配置变更', `${row.name}\nhttps://flap.cool/apps/${row.slug}\n${appConfigDiff(old.config, config).join('\n')}`);
             apps[row.appId] = { ...old, config, lastSuccess: formatBeijingTime(new Date()), lastError: '' };
           });
           if (row.slug === 'agent-bonding-curve' && registration.enabled && registration.artifact.enabled) {
             const result = await scanAgentMarkets(box.state.apps[row.appId]?.markets, artifact.manifest, rpc);
             await box.transaction(async () => {
               box.state.apps[row.appId].markets = result.state;
-              if (result.reorganized) await notify('市场采样重组', `${row.name}\n先前采样区块已不在规范链，旧市场判断需重新核对。当前重新建立市场基线，不补发历史市场。\nhttps://flap.sh/apps/${row.slug}`);
+              if (result.reorganized) await notify('市场采样重组', `${row.name}\n先前采样区块已不在规范链，旧市场判断需重新核对。当前重新建立市场基线，不补发历史市场。\nhttps://flap.cool/apps/${row.slug}`);
               for (const event of result.events) {
                 const m = event.row;
-                await notify(event.type, `${m.name} (${m.symbol})\n市场：${m.market}\n底池币种：${m.quoteToken}\n阶段：${m.phase === 3 ? '已毕业' : m.phase === 2 ? '发射中' : '曲线阶段'}\n${m.phase === 3 ? "代币" : "预测代币（未确认部署）"}：${m.phase === 3 ? m.token : m.predictedToken}\n交易对：${m.pair}\n采样区块：${result.block.number} (${result.block.hash})\n发现时间：${formatBeijingTime(new Date())}\nhttps://flap.sh/apps/${row.slug}\n按规范区块的公开 Reader 状态识别，不代表官方背书。`);
+                await notify(event.type, `${m.name} (${m.symbol})\n市场：${m.market}\n底池币种：${m.quoteToken}\n阶段：${m.phase === 3 ? '已毕业' : m.phase === 2 ? '发射中' : '曲线阶段'}\n${m.phase === 3 ? "代币" : "预测代币（未确认部署）"}：${m.phase === 3 ? m.token : m.predictedToken}\n交易对：${m.pair}\n采样区块：${result.block.number} (${result.block.hash})\n发现时间：${formatBeijingTime(new Date())}\nhttps://flap.cool/apps/${row.slug}\n按规范区块的公开 Reader 状态识别，不代表官方背书。`);
               }
             });
           }
@@ -293,6 +295,6 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
     await box.drain();
   }
   return { run: () => flight ||= pass().finally(() => { flight = null; }), wait: () => flight,
-    setTemplates: rows => { templates = rows.filter(row => address(row.factory) && row.sourceUrl === `https://flap.sh/bnb/CAstore/vault/${row.factory}?lang=zh`); },
+    setTemplates: rows => { templates = rows.filter(row => address(row.factory) && row.sourceUrl === `https://flap.cool/bnb/CAstore/vault/${row.factory}?lang=zh`); },
     status: () => ({ lastSuccess: box.state.lastSuccess, lastError: box.state.lastError, errors: box.state.errors || {}, detailErrors: box.state.detailErrors || {}, templateDetails: Object.keys(box.state.templateDetails || {}).length, apps: Object.keys(box.state.apps || {}).length, pending: (box.state._notificationOutbox || []).length }) };
 }

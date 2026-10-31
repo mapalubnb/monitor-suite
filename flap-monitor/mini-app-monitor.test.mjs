@@ -8,6 +8,10 @@ const flight = object => `<script>self.__next_f.push(${JSON.stringify([1, '7:' +
 const word = v => BigInt(v).toString(16).padStart(64, '0');
 const addr = n => '0x' + n.toString(16).padStart(40, '0');
 const block = { number: '0x100', hash: '0x' + 'a'.repeat(64) };
+test('新站小程序未定义名称回退为 slug', () => {
+  const [row] = parseAppList(flight({ apps: [{ appId: 'stonks', slug: 'stonkspad', name: '$undefined', displayTitle: '$undefined' }] }));
+  assert.equal(row.name, 'stonkspad'); assert.equal(row.displayTitle, undefined);
+});
 const reader = fixture.manifest.walletContracts.find(v => v.id === 'reader').address;
 const factory = fixture.manifest.walletContracts.find(v => v.id === 'factory').address;
 function cards(rows) {
@@ -99,7 +103,7 @@ test('模板详情只读取名称和说明，忽略风险加载占位、代币�
   const monitor = createMiniAppMonitor({ persist: state => { saved = structuredClone(state); },
     fetchText: async url => url.includes('/apps?') ? flight({ apps: [] }) : current,
     deliver: async p => { sent.push(p); return 'id'; } });
-  monitor.setTemplates([{ factory: addr(1), sourceUrl: `https://flap.sh/bnb/CAstore/vault/${addr(1)}?lang=zh` }]);
+  monitor.setTemplates([{ factory: addr(1), sourceUrl: `https://flap.cool/bnb/CAstore/vault/${addr(1)}?lang=zh` }]);
   await monitor.run(); assert.equal(sent.length, 0);
   current = '<h1>Loading</h1>'; await monitor.run();
   assert.equal(saved.templateDetails[addr(1)].description, '说明');
@@ -150,9 +154,9 @@ test('停用 Agent Curve：旧队列先归档，目录失败或重启均不补�
   const entry = (id, content) => ({ id, payload: { title: 'Flap 小程序｜市场毕业', content }, nextAttemptAt: 0, attempts: 0, parts: [] });
   let saved = { catalog: [app], apps: { [app.appId]: { config: { catalog: app }, markets: { cursor: 16 } } },
     errors: { [app.appId]: { failures: 3 } }, _notificationOutbox: [
-      entry('market', '市场\nhttps://flap.sh/apps/agent-bonding-curve'),
+      entry('market', '市场\nhttps://flap.cool/apps/agent-bonding-curve'),
       entry('error', 'ID AGENT CURVE\n连续 3 次失败'),
-      entry('other', '另一个应用\nhttps://flap.sh/apps/other') ] };
+      entry('other', '另一个应用\nhttps://flap.cool/apps/other') ] };
   const delivered = [], requests = [];
   let broken = true;
   const make = () => createMiniAppMonitor({ initial: saved, persist: s => { saved = structuredClone(s); },

@@ -26,12 +26,12 @@ test('Flap 全部 AI 分析关闭：共享配置开启也不请求、不重试�
     assert.equal(await __testables.aiIntroduceCaStoreVault('金库名称和链接', '金库', 3), '');
     const sends = [], opts = { diffButtonText: '下载完整 DIFF' };
     const id = await __testables.sendThenEnrichWithAi('金库变更', '原始内容', 'orange', '金库', '输入',
-      () => { enrichments++; return '分析'; }, '/test/diff.txt', 'https://flap.sh/bnb/CAstore',
+      () => { enrichments++; return '分析'; }, '/test/diff.txt', 'https://flap.cool/bnb/CAstore',
       async () => { summaries++; return '分析'; }, opts,
       async (...args) => { sends.push(args); return 'original-card'; });
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(id, 'original-card'); assert.equal(sends.length, 1);
-    assert.match(sends[0][1], /原始内容/); assert.match(sends[0][1], /https:\/\/flap.sh/);
+    assert.match(sends[0][1], /原始内容/); assert.match(sends[0][1], /https:\/\/flap.cool/);
     assert.equal(sends[0][3], '/test/diff.txt'); assert.equal(sends[0][4], opts);
     assert.equal(requests, 0); assert.equal(summaries, 0); assert.equal(enrichments, 0);
   } finally { Object.defineProperties(AI, saved); globalThis.fetch = originalFetch; }
@@ -59,7 +59,7 @@ test('审计撤销仅留档，孤立授权等待期间不阻塞角色变更通�
 });
 
 test("conditional page fetch reuses a 304 body and never caches a region error", async () => {
-  const cache = new Map(), url = "https://flap.sh/launch";
+  const cache = new Map(), url = "https://flap.cool/launch";
   const fetchFn = async (_url, opts) => {
     assert.equal(opts.headers["If-None-Match"], undefined);
     return { ok: true, status: 200, headers: new Headers({ etag: '"build-1"' }), text: async () => "<h1>Create Token</h1>" };
@@ -198,7 +198,7 @@ test("incomplete frontend downloads never become a reusable baseline and recover
 test("actual CAStore card boundaries retain FOMOX and dynamic airdrop while excluding FAQ", () => {
   const html = '<div data-ca-vault-card="true"><h3><span>FOMOX</span></h3><p>固定为 2 小时。</p></div>'
     + '<div data-ca-vault-card="true"><h3>动态空投</h3><p>按持仓分配</p></div><h3>什么是金库？</h3><p>问答说明</p>';
-  const cards = __testables.extractCaStoreVaultSections(html, { url: "https://flap.sh/bnb/CAstore?lang=zh" });
+  const cards = __testables.extractCaStoreVaultSections(html, { url: "https://flap.cool/bnb/CAstore?lang=zh" });
   assert.deepEqual(cards.map(c => c.name), ["FOMOX", "动态空投"]);
   assert.equal(cards[0].description, "固定为 2 小时。");
   assert.equal(cards[1].description, "按持仓分配");
@@ -208,7 +208,7 @@ test("Vault Factory failed delivery retains baseline until successful retry", as
   const address = "0x0000000000000000000000000000000000000001";
   const old = { name: "Gift", enabled: true, showInCAStore: true };
   const snapshot = { vaultFactories: { [address]: old } };
-  const entries = [{ url: "https://flap.sh/bnb/CAstore", map: { [address]: { ...old, enabled: false } } }];
+  const entries = [{ url: "https://flap.cool/bnb/CAstore", map: { [address]: { ...old, enabled: false } } }];
   let saves = 0;
   const options = { snapshot, roundVaultFactoryEntries: entries, saveSnapshotFn: () => saves++, appendHistoryFn: () => {} };
   const failed = await __testables.sendRoundVaultFactoryChange({ ...options, sendCardFn: async () => null });
@@ -1760,7 +1760,7 @@ test("Factory catchup advances with only configuration events and no full blocks
 test("shared Flap asset-only page changes are summarized into one site-wide notification", () => {
   const notifications = [
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       title: "Flap 页面变更",
       template: "red",
       changes: [
@@ -1778,7 +1778,7 @@ test("shared Flap asset-only page changes are summarized into one site-wide noti
       snapshotUpdate: { key: "castore", features: { marker: "castore" } },
     },
     {
-      url: "https://flap.sh/launch",
+      url: "https://flap.cool/launch",
       title: "Flap 页面变更",
       template: "red",
       changes: [
@@ -1801,11 +1801,11 @@ test("shared Flap asset-only page changes are summarized into one site-wide noti
 
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
-  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].url, "https://flap.cool");
   assert.match(grouped[0].changes.join("\n"), /影响页面 2 个/);
-  assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.sh\/bnb\/CAstore/);
-  assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.sh\/launch/);
-  assert.match(grouped[0].content, /\[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
+  assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.cool\/bnb\/CAstore/);
+  assert.match(grouped[0].changes.join("\n"), /https:\/\/flap\.cool\/launch/);
+  assert.match(grouped[0].content, /\[\/bnb\/CAstore\]\(https:\/\/flap\.cool\/bnb\/CAstore\)/);
   assert.equal(grouped[0].skipAi, false);
   assert.equal(grouped[0].useFullDiffForAi, true);
   assert.equal(grouped[0].snapshotUpdates.length, 2);
@@ -1814,7 +1814,7 @@ test("shared Flap asset-only page changes are summarized into one site-wide noti
 test("specific Flap page content changes remain page-level notifications", () => {
   const notifications = [
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       title: "Flap 页面变更",
       template: "red",
       changes: ["🏦 CAstore 金库内容变更：", "  🟢 新增金库: Gift Vault"],
@@ -1829,7 +1829,7 @@ test("specific Flap page content changes remain page-level notifications", () =>
       snapshotUpdate: { key: "castore", features: { marker: "castore" } },
     },
     {
-      url: "https://flap.sh/launch",
+      url: "https://flap.cool/launch",
       title: "Flap 页面变更",
       template: "red",
       changes: ["📦 前端资源变更： 不变 20 | 修改 2"],
@@ -1849,7 +1849,7 @@ test("specific Flap page content changes remain page-level notifications", () =>
 
   assert.equal(grouped.length, 2);
   assert.equal(grouped[0].title, "Flap 页面变更");
-  assert.equal(grouped[0].url, "https://flap.sh/bnb/CAstore");
+  assert.equal(grouped[0].url, "https://flap.cool/bnb/CAstore");
   assert.equal(grouped[1].title, "Flap 全站前端资源变更");
 });
 
@@ -1882,7 +1882,7 @@ test("shared resource diffs are extracted and coalesced even when one page has C
   };
   const notifications = [
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       title: "Flap 页面变更",
       template: "red",
       changes: ["🏦 CAstore 金库内容变更：", "  🔴 移除金库: Hot Vaults / Perpetual Short Vault", "📦 前端资源变更：修改 2", "🔧 配置参数变更："],
@@ -1892,7 +1892,7 @@ test("shared resource diffs are extracted and coalesced even when one page has C
       },
       snapshotUpdate: { key: "castore", features: {} },
     },
-    ...["https://flap.sh/create", "https://flap.sh/launch"].map((url, i) => ({
+    ...["https://flap.cool/create", "https://flap.cool/launch"].map((url, i) => ({
       url,
       title: "Flap 页面变更",
       template: "red",
@@ -1905,18 +1905,18 @@ test("shared resource diffs are extracted and coalesced even when one page has C
   const grouped = __testables.coalesceFlapNotifications(notifications);
 
   assert.equal(grouped.length, 2);
-  assert.equal(grouped[0].url, "https://flap.sh/bnb/CAstore");
+  assert.equal(grouped[0].url, "https://flap.cool/bnb/CAstore");
   assert.equal(grouped[0].meta.assetStats, null);
   assert.equal(grouped[0].meta.caStoreVaultDiffs.length, 1);
   assert.equal(grouped[1].title, "Flap 全站前端资源变更");
-  assert.equal(grouped[1].url, "https://flap.sh");
+  assert.equal(grouped[1].url, "https://flap.cool");
   assert.equal(grouped[1].snapshotUpdates.length, 3);
 });
 
 test("asset notifications containing business keywords stay page-level", () => {
   const notifications = [
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       title: "Flap 页面变更",
       template: "red",
       changes: [
@@ -1954,7 +1954,7 @@ test("asset notifications containing business keywords stay page-level", () => {
 
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 页面变更");
-  assert.equal(grouped[0].url, "https://flap.sh/bnb/CAstore");
+  assert.equal(grouped[0].url, "https://flap.cool/bnb/CAstore");
 });
 
 test("shared business resource diffs across pages are coalesced into one site-wide notification", () => {
@@ -1985,7 +1985,7 @@ test("shared business resource diffs across pages are coalesced into one site-wi
     i18nDiffs: [],
     caStoreVaultDiffs: [],
   };
-  const notifications = ["https://flap.sh/bnb/CAstore", "https://flap.sh/create", "https://flap.sh/launch"].map((url, i) => ({
+  const notifications = ["https://flap.cool/bnb/CAstore", "https://flap.cool/create", "https://flap.cool/launch"].map((url, i) => ({
     url,
     title: "Flap 页面变更",
     template: "red",
@@ -1998,7 +1998,7 @@ test("shared business resource diffs across pages are coalesced into one site-wi
 
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
-  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].url, "https://flap.cool");
   assert.doesNotMatch(grouped[0].content, /结论摘要|证据详情|本地初筛/);
   assert.match(grouped[0].content, /\*\*资源统计\*\*[\s\S]*不变 28 \/ 重命名 2 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
   assert.match(grouped[0].content, /<font color="green">新增文案<\/font>: <font color="green">Create an account and generate a wallet<\/font>/);
@@ -2061,7 +2061,7 @@ test("Flap asset extraction explains SVG paths Tailwind utilities and style pseu
   assert(meta.assetStats.uiStyleDiffs.some(d => d.contextLabel === "弹窗/下拉层/滚动区"));
 
   const content = __testables.buildCardBriefing(
-    "https://flap.sh/create",
+    "https://flap.cool/create",
     null,
     meta.assetStats,
     0,
@@ -2122,7 +2122,7 @@ test("minified code fragments are folded into intent signals instead of readable
 
   const { changes, meta } = __testables.diffFeatures(oldFeatures, newFeatures);
   const content = __testables.buildCardBriefing(
-    "https://flap.sh/create",
+    "https://flap.cool/create",
     null,
     meta.assetStats,
     0,
@@ -2191,14 +2191,14 @@ test("structured shared resource diffs coalesce even when semantic page routes d
   };
 
   const grouped = __testables.coalesceFlapNotifications([
-    makeNotification("https://flap.sh/bnb/CAstore", "[chain]/CAstore", "castore"),
-    makeNotification("https://flap.sh/launch", "launch", "launch"),
-    makeNotification("https://flap.sh/create", "create", "create"),
+    makeNotification("https://flap.cool/bnb/CAstore", "[chain]/CAstore", "castore"),
+    makeNotification("https://flap.cool/launch", "launch", "launch"),
+    makeNotification("https://flap.cool/create", "create", "create"),
   ]);
 
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
-  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].url, "https://flap.cool");
   assert.equal(grouped[0].snapshotUpdates.length, 3);
 });
 
@@ -2272,18 +2272,18 @@ test("same Flap business change coalesces even when page chunks and UI impact di
   };
 
   const grouped = __testables.coalesceFlapNotifications([
-    makeNotification({ url: "https://flap.sh/create", key: "create", pageRoute: "create", pageFile: "page-62ecac793de5f41d.js", uiCount: 2, uiFiles: ["407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
-    makeNotification({ url: "https://flap.sh/bnb/CAstore", key: "castore", pageRoute: "[chain]/CAstore", pageFile: "page-50dce0de0e0c111a.js", uiCount: 8, uiFiles: ["6055-d674eedd435ff478.js", "1946-b696c7945cec7add.js", "407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
-    makeNotification({ url: "https://flap.sh/launch", key: "launch", pageRoute: "launch", pageFile: "page-d53a27e3a7a1ff1e.js", uiCount: 2, uiFiles: ["407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
+    makeNotification({ url: "https://flap.cool/create", key: "create", pageRoute: "create", pageFile: "page-62ecac793de5f41d.js", uiCount: 2, uiFiles: ["407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
+    makeNotification({ url: "https://flap.cool/bnb/CAstore", key: "castore", pageRoute: "[chain]/CAstore", pageFile: "page-50dce0de0e0c111a.js", uiCount: 8, uiFiles: ["6055-d674eedd435ff478.js", "1946-b696c7945cec7add.js", "407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
+    makeNotification({ url: "https://flap.cool/launch", key: "launch", pageRoute: "launch", pageFile: "page-d53a27e3a7a1ff1e.js", uiCount: 2, uiFiles: ["407-7088d032298ec180.js", "4643-7d9eda7b083f9d52.js"] }),
   ]);
 
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
-  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].url, "https://flap.cool");
   assert.equal(grouped[0].snapshotUpdates.length, 3);
-  assert.equal((grouped[0].content.match(/https:\/\/flap\.sh\/create/g) || []).length, 1);
-  assert.equal((grouped[0].content.match(/https:\/\/flap\.sh\/bnb\/CAstore/g) || []).length, 1);
-  assert.equal((grouped[0].content.match(/https:\/\/flap\.sh\/launch/g) || []).length, 1);
+  assert.equal((grouped[0].content.match(/https:\/\/flap\.cool\/create/g) || []).length, 1);
+  assert.equal((grouped[0].content.match(/https:\/\/flap\.cool\/bnb\/CAstore/g) || []).length, 1);
+  assert.equal((grouped[0].content.match(/https:\/\/flap\.cool\/launch/g) || []).length, 1);
   assert.match(grouped[0].content, /\*\*资源统计\*\*[\s\S]*不变 28 \/ 重命名 1 \/ 修改 8 \/ 新增 0 \/ 移除 0/);
   assert.doesNotMatch(grouped[0].content, /实现意图信号/);
   assert.doesNotMatch(grouped[0].content, /UI\/样式信号/);
@@ -2337,14 +2337,14 @@ test("shared minified implementation signals are coalesced without raw code in t
   });
 
   const grouped = __testables.coalesceFlapNotifications([
-    makeNotification("https://flap.sh/bnb/CAstore", "castore"),
-    makeNotification("https://flap.sh/launch", "launch"),
-    makeNotification("https://flap.sh/create", "create"),
+    makeNotification("https://flap.cool/bnb/CAstore", "castore"),
+    makeNotification("https://flap.cool/launch", "launch"),
+    makeNotification("https://flap.cool/create", "create"),
   ]);
 
   assert.equal(grouped.length, 1);
   assert.equal(grouped[0].title, "Flap 全站前端资源变更");
-  assert.equal(grouped[0].url, "https://flap.sh");
+  assert.equal(grouped[0].url, "https://flap.cool");
   assert.doesNotMatch(grouped[0].content, /实现意图信号/);
   assert.doesNotMatch(grouped[0].content, /税费\/税务信息/);
   assert.doesNotMatch(grouped[0].content, /分红参数/);
@@ -2392,8 +2392,8 @@ test("shared UI style signals coalesce into one explanatory site-wide notificati
   });
 
   const grouped = __testables.coalesceFlapNotifications([
-    makeNotification("https://flap.sh/launch", "launch"),
-    makeNotification("https://flap.sh/create", "create"),
+    makeNotification("https://flap.cool/launch", "launch"),
+    makeNotification("https://flap.cool/create", "create"),
   ]);
 
   assert.equal(grouped.length, 1);
@@ -2464,8 +2464,8 @@ test("CAstore Chinese vault headings are extracted as structured vault sections"
 test("removed Robinhood page is not polled and its old baseline is retired", () => {
   assert(!__testables.CONFIG.urls.some(url => /robinhood/i.test(url)));
   const key = url => url.replace(/[^a-zA-Z0-9]/g, "_");
-  const bnb = key("https://flap.sh/bnb/CAstore?lang=zh");
-  const old = key("https://flap.sh/robinhood/CAstore?lang=zh");
+  const bnb = key("https://flap.cool/bnb/CAstore?lang=zh");
+  const old = key("https://flap.cool/robinhood/CAstore?lang=zh");
   const state = { _schemaVersion: 6, pages: { [bnb]: { marker: "keep" }, [old]: { marker: "remove" } } };
   const migrated = __testables.migrateSnapshot(state);
   assert.equal(migrated.pages[bnb].marker, "keep");
@@ -2487,8 +2487,8 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
   assert.match(notification.content, /禮物稅收金庫/);
   assert.match(notification.content, /指定一個 X 帳戶/);
   assert.match(notification.content, /<font color="green">新增机制模板<\/font>/);
-  assert.equal(notification.launchUrl, "https://flap.sh/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh");
-  assert.match(notification.content, /创建入口: \[使用模板\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh\)/);
+  assert.equal(notification.launchUrl, "https://flap.cool/launch?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh");
+  assert.match(notification.content, /创建入口: \[使用模板\]\(https:\/\/flap\.cool\/launch\?vaultfactory=0x08E41a61C5D25420E3cb314Bc513EC99B2841003&chain=bnb&lang=zh\)/);
   assert.doesNotMatch(notification.content, /AI 分析异步生成中/);
   assert.match(notification.aiInput, /金库名字: 禮物稅收金庫/);
 
@@ -2507,7 +2507,7 @@ test("CAstore vault change notification is simple, linked, AI-ready and suppress
 
 test("standalone CAstore vault card can be omitted from mixed page card", () => {
   const notification = {
-    url: "https://flap.sh/bnb/CAstore",
+    url: "https://flap.cool/bnb/CAstore",
     changes: [
       "🏦 CAstore 金库内容变更：",
       "  🔴 移除金库: Hot Vaults / Perpetual Short Vault",
@@ -2554,12 +2554,12 @@ test("round asset cache reuses shared chunks across pages", async () => {
   const [first, second] = await Promise.all([
     __testables.downloadAssetContents(
       ["/_next/static/chunks/8101-a.js", "/_next/static/chunks/webpack-a.js"],
-      "https://flap.sh",
+      "https://flap.cool",
       { roundAssetCache, fetchAsset },
     ),
     __testables.downloadAssetContents(
       ["/_next/static/chunks/8101-a.js", "/_next/static/chunks/app/launch/page-a.js"],
-      "https://flap.sh",
+      "https://flap.cool",
       { roundAssetCache, fetchAsset },
     ),
   ]);
@@ -2641,7 +2641,7 @@ test("Flap metadata schema analysis alerts on add remove and reorder", () => {
     metadataSchemas: [{ kind: "input", source: "launch-new.js", orderedFields: ["description", "creator", "website", "twitter"] }],
   })[0];
   assert.equal(reorder.reordered, true);
-  const content = __testables.buildMetadataSchemaWarningContent("https://flap.sh/create", [diff, reorder]);
+  const content = __testables.buildMetadataSchemaWarningContent("https://flap.cool/create", [diff, reorder]);
   assert.match(content, /metadata schema 变化: 2 组/);
   assert.match(content, /新增：telegram/);
   assert.match(content, /删除：website/);
@@ -2651,10 +2651,10 @@ test("Flap metadata schema analysis alerts on add remove and reorder", () => {
 test("metadata schema warnings never collapse into a generic site-wide asset card", () => {
   const schemaDiff = { kind: "input", previous: ["creator"], current: ["creator", "buy"], added: ["buy"], removed: [], reordered: false, source: "create.js" };
   const notification = {
-    url: "https://flap.sh/create",
+    url: "https://flap.cool/create",
     title: "Flap metadata schema 变更",
     changes: ["Flap 前端 metadata schema 变更"],
-    content: __testables.buildMetadataSchemaWarningContent("https://flap.sh/create", [schemaDiff]),
+    content: __testables.buildMetadataSchemaWarningContent("https://flap.cool/create", [schemaDiff]),
     meta: { ...__testables.emptyFlapChangeMeta(), metadataSchemaDiffs: [schemaDiff], assetStats: { substantiveFiles: 1 } },
   };
   const [result] = __testables.coalesceFlapNotifications([notification]);
@@ -2952,7 +2952,7 @@ test("asset semantic profile classifies page chunks and shared runtime chunks", 
 test("page-specific chunk changes remain page-level notifications", () => {
   const notifications = [
     {
-      url: "https://flap.sh/launch",
+      url: "https://flap.cool/launch",
       title: "Flap 页面变更",
       template: "red",
       changes: ["📦 前端资源变更： 修改 1"],
@@ -2976,7 +2976,7 @@ test("page-specific chunk changes remain page-level notifications", () => {
       snapshotUpdate: { key: "launch", features: {} },
     },
     {
-      url: "https://flap.sh/create",
+      url: "https://flap.cool/create",
       title: "Flap 页面变更",
       template: "red",
       changes: ["📦 前端资源变更： 修改 1"],
@@ -3004,14 +3004,14 @@ test("page-specific chunk changes remain page-level notifications", () => {
   const grouped = __testables.coalesceFlapNotifications(notifications);
 
   assert.equal(grouped.length, 2);
-  assert.equal(grouped[0].url, "https://flap.sh/launch");
-  assert.equal(grouped[1].url, "https://flap.sh/create");
+  assert.equal(grouped[0].url, "https://flap.cool/launch");
+  assert.equal(grouped[1].url, "https://flap.cool/create");
 });
 
 test("manual Flap check can reuse the same notification coalescing path", () => {
   const notifications = [
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       title: "手动检测 — 页面变更",
       template: "red",
       changes: ["📦 前端资源变更： 不变 28 | 修改 2"],
@@ -3026,7 +3026,7 @@ test("manual Flap check can reuse the same notification coalescing path", () => 
       snapshotUpdate: { key: "castore", features: { marker: "castore" } },
     },
     {
-      url: "https://flap.sh/launch",
+      url: "https://flap.cool/launch",
       title: "手动检测 — 页面变更",
       template: "red",
       changes: ["📦 前端资源变更： 不变 20 | 修改 2"],
@@ -3065,7 +3065,7 @@ test("page change card puts concrete page link and important copy before ai anal
   const longOldText = "旧手续费 " + "旧配置说明 ".repeat(40).trim();
   const longNewText = "新手续费 " + "新配置说明 ".repeat(40).trim();
   const content = __testables.buildCardBriefing(
-    "https://flap.sh/bnb/CAstore",
+    "https://flap.cool/bnb/CAstore",
     null,
     {
       unchanged: 28,
@@ -3090,7 +3090,7 @@ test("page change card puts concrete page link and important copy before ai anal
   );
 
   assert(content.startsWith("**🌐 影响页面**"));
-  assert.match(content, /- 页面: \[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
+  assert.match(content, /- 页面: \[\/bnb\/CAstore\]\(https:\/\/flap\.cool\/bnb\/CAstore\)/);
   assert.match(content, /\*\*🎯 重点变更\*\*/);
   assert.doesNotMatch(content, /\*\*🤖 AI 分析\*\*/);
   assert.match(content, /\*\*资源统计\*\*[\s\S]*不变 28 \/ 重命名 0 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
@@ -3109,7 +3109,7 @@ test("launch text card summarizes anti-farmer duration changes and keeps full so
   const cssNoise = `span:first-child]:h-1 [&>span:first-child]:rounded-none [&[role=slider]]:h-3 style="--radix-slider-thumb-transform:translateX(-50%)"`;
   const addedDescription = "This feature ensures that trades occur primarily in the tax liquidity pool during the protection period, improving the stability of token tax revenue.";
   const content = __testables.buildCardBriefing(
-    "https://flap.sh/launch",
+    "https://flap.cool/launch",
     null,
     null,
     8,
@@ -3146,7 +3146,7 @@ test("launch text card summarizes anti-farmer duration changes and keeps full so
 test("site-wide asset card keeps only page scope resource stats and ai", () => {
   const notification = __testables.buildSiteWideAssetNotification([
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       changes: ["📦 前端资源变更： 不变 28 | 修改 2", "🔇 构建噪音： 1 文件 4 处 (webpack.js)"],
       meta: {
         assetStats: { unchanged: 28, renamed: 0, modified: 2, added: 0, removed: 0, noiseFiles: 1, noiseCount: 4, substantiveFiles: 1, substantiveCount: 2, substantiveFileNames: ["webpack.js"] },
@@ -3159,7 +3159,7 @@ test("site-wide asset card keeps only page scope resource stats and ai", () => {
   assert(notification.content.indexOf("**🌐 影响页面**") < notification.content.indexOf("**资源统计**"));
   assert.match(notification.content, /\*\*资源统计\*\*/);
   assert.doesNotMatch(notification.content, /\*\*🤖 AI 分析\*\*/);
-  assert.match(notification.content, /\[\/bnb\/CAstore\]\(https:\/\/flap\.sh\/bnb\/CAstore\)/);
+  assert.match(notification.content, /\[\/bnb\/CAstore\]\(https:\/\/flap\.cool\/bnb\/CAstore\)/);
   assert.match(notification.content, /不变 28 \/ 重命名 0 \/ 修改 2 \/ 新增 0 \/ 移除 0/);
   assert.doesNotMatch(notification.content, /结论摘要|证据详情|本地初筛|重点变更/);
   assert.doesNotMatch(notification.content, /完整资源 Diff/);
@@ -3170,7 +3170,7 @@ test("site-wide asset card keeps only page scope resource stats and ai", () => {
 test("site-wide asset-only notification is not promoted by negative business words", () => {
   const notification = __testables.buildSiteWideAssetNotification([
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       changes: ["📦 前端资源变更： 不变 28 | 修改 2"],
       meta: {
         assetStats: { unchanged: 28, renamed: 0, modified: 2, added: 0, removed: 0, noiseFiles: 0, noiseCount: 0, substantiveFiles: 1, substantiveCount: 2, substantiveFileNames: ["webpack-167217394b1418fd.js"] },
@@ -3189,7 +3189,7 @@ test("site-wide asset-only notification is not promoted by negative business wor
 test("site-wide asset card summarizes runtime resources without raw webpack fragments", () => {
   const notification = __testables.buildSiteWideAssetNotification([
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       changes: [
         "📦 前端资源变更： 不变 28 | 修改 2",
         "📝 webpack-fcd3cb604bdd2e6d.js → webpack-167217394b1418fd.js (46 处实质变更 + 4 噪音已过滤)",
@@ -3202,7 +3202,7 @@ test("site-wide asset card summarizes runtime resources without raw webpack frag
       snapshotUpdate: { key: "castore", features: {} },
     },
     {
-      url: "https://flap.sh/launch",
+      url: "https://flap.cool/launch",
       changes: [
         "📦 前端资源变更： 不变 28 | 修改 2",
         "📝 webpack-fcd3cb604bdd2e6d.js → webpack-167217394b1418fd.js (46 处实质变更 + 4 噪音已过滤)",
@@ -3238,8 +3238,8 @@ test("vault factory card summarizes counts before details", () => {
   assert(content.indexOf("新增 1") < content.indexOf("Gift Vault"));
   assert(content.indexOf("Gift Vault") < content.indexOf("Old Vault"));
   assert.match(content, /enabled：<font color="red">true<\/font> → <font color="green">false<\/font>/);
-  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${addedFactory}&chain=bnb&lang=zh`));
-  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${modifiedFactory}&chain=bnb&lang=zh`));
+  assert.match(content, new RegExp(`https://flap\\.cool/launch\\?vaultfactory=${addedFactory}&chain=bnb&lang=zh`));
+  assert.match(content, new RegExp(`https://flap\\.cool/launch\\?vaultfactory=${modifiedFactory}&chain=bnb&lang=zh`));
 });
 
 test("hidden new vault factory also includes its Flap launch link", () => {
@@ -3250,22 +3250,22 @@ test("hidden new vault factory also includes its Flap launch link", () => {
     modified: [],
   });
   assert.match(content, /新增隐藏金库工厂/);
-  assert.match(content, new RegExp(`https://flap\\.sh/launch\\?vaultfactory=${factory}&chain=bnb&lang=zh`));
+  assert.match(content, new RegExp(`https://flap\\.cool/launch\\?vaultfactory=${factory}&chain=bnb&lang=zh`));
 });
 
 test("round vault factory aggregation stabilizes conflicting page snapshots", () => {
   const factory = "0xD5f57C8FbFFE993ca7c73858DEBE18f79ff4a3F8";
   const entries = [
     {
-      url: "https://flap.sh/bnb/CAstore",
+      url: "https://flap.cool/bnb/CAstore",
       map: { [factory]: { name: "ShortOnlyVaultOracle", factory, enabled: true, showInCAStore: false, ai: false, constraints: null } },
     },
     {
-      url: "https://flap.sh/launch",
+      url: "https://flap.cool/launch",
       map: { [factory]: { name: "ShortOnlyVaultOracle", factory, enabled: true, showInCAStore: true, ai: false, constraints: null } },
     },
     {
-      url: "https://flap.sh/create",
+      url: "https://flap.cool/create",
       map: { [factory]: { name: "ShortOnlyVaultOracle", factory, enabled: true, showInCAStore: false, ai: false, constraints: null } },
     },
   ];
@@ -3308,7 +3308,7 @@ test("vault factory extraction resolves webpack aliases for visible CAStore vaul
 
   const diff = __testables.diffVaultFactories({
     "0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb": { ...stocks, showInCAStore: true },
-  }, __testables.mergeRoundVaultFactoryMaps([{ url: "https://flap.sh/bnb/CAstore", map: __testables.factoryListToMap(vf.factories) }]).map);
+  }, __testables.mergeRoundVaultFactoryMaps([{ url: "https://flap.cool/bnb/CAstore", map: __testables.factoryListToMap(vf.factories) }]).map);
   const content = __testables.formatVaultFactoryChanges(diff);
   const title = __testables.buildVaultFactoryChangeTitle(diff, "🏦 ");
 
@@ -3317,10 +3317,10 @@ test("vault factory extraction resolves webpack aliases for visible CAStore vaul
   assert.match(title, /新增可见 1 \/ 下架 1/);
   assert.match(content, /IndexVault/);
   assert.match(content, /0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5&chain=bnb&lang=zh/);
+  assert.match(content, /https:\/\/flap\.cool\/launch\?vaultfactory=0x5418f7e8fF90354DB0eCD48c8b710219244Eb3C5&chain=bnb&lang=zh/);
   assert.match(content, /StocksVault/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb&chain=bnb&lang=zh/);
-  assert.match(content, /https:\/\/flap\.sh\/launch\?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a&chain=bnb&lang=zh/);
+  assert.match(content, /https:\/\/flap\.cool\/launch\?vaultfactory=0x40a9a2FDa017E0923EA0B403F2f063f9E51168Fb&chain=bnb&lang=zh/);
+  assert.match(content, /https:\/\/flap\.cool\/launch\?vaultfactory=0xf8aC088F06D155f3C3F531f1Ef80B14f1604530a&chain=bnb&lang=zh/);
   assert.match(content, /showInCAStore/);
 });
 
@@ -3347,18 +3347,18 @@ test("Vault Portal log extraction detects on-chain registered vault address", ()
   assert.match(content, /Vault Portal:/);
   assert.doesNotMatch(content, /证据详情/);
   assert.match(content, /0x5418f7e8ff90354db0ecd48c8b710219244eb3c5/);
-  assert.match(content, /金库链接：\[打开金库\]\(https:\/\/flap\.sh\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh\)/);
+  assert.match(content, /金库链接：\[打开金库\]\(https:\/\/flap\.cool\/launch\?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh\)/);
   assert.match(content, /0x9e239cd0/);
   assert.equal(
     __testables.buildVaultFactoryLaunchUrl(addresses[0]),
-    "https://flap.sh/launch?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh",
+    "https://flap.cool/launch?vaultfactory=0x5418f7e8ff90354db0ecd48c8b710219244eb3c5&chain=bnb&lang=zh",
   );
 });
 
 test("operational notice card is readable and action oriented", () => {
   const content = __testables.buildOperationalNoticeContent({
     status: "页面请求失败",
-    url: "https://flap.sh/launch",
+    url: "https://flap.cool/launch",
     severity: "orange",
     reason: "HTTP 403",
     consecutiveFailures: 3,
@@ -3367,7 +3367,7 @@ test("operational notice card is readable and action oriented", () => {
   assert(content.startsWith("- 状态: 页面请求失败"));
   assert.match(content, /- 状态: 页面请求失败/);
   assert.match(content, /- 连续失败: 3 次/);
-  assert.match(content, /- 页面: \[\/launch\]\(https:\/\/flap\.sh\/launch\)/);
+  assert.match(content, /- 页面: \[\/launch\]\(https:\/\/flap\.cool\/launch\)/);
   assert.doesNotMatch(content, /结论摘要|证据详情|打开页面/);
   assert.doesNotMatch(content, /建议动作/);
   assert.match(content, /HTTP 403/);
@@ -3376,7 +3376,7 @@ test("operational notice card is readable and action oriented", () => {
 test("full diff uses detailed lines without summary truncation", () => {
   const diff = __testables.buildFlapFullDiff({
     diffTitle: "=== Flap.sh 详细 Diff ===",
-    url: "https://flap.sh",
+    url: "https://flap.cool",
     changes: ["📝 chunk.js (20 处实质变更)", "  ... 还有 12 处新增"],
     meta: {
       fullDiffLines: [
@@ -3402,7 +3402,7 @@ test("flap cards keep every readable copy change without truncation", () => {
     newText: `${longNew}-${i}`,
   }));
   const content = __testables.buildCardBriefing(
-    "https://flap.sh/create",
+    "https://flap.cool/create",
     null,
     null,
     textChanges.length,
@@ -4215,7 +4215,7 @@ test('真实机制模板配置覆盖22项和第二页长说明，排序不误报
 test('工厂解析器迁移静默保存完整基线，随后新增仍即时提醒', async () => {
   const factory = '0x1111111111111111111111111111111111111111';
   const snapshot = { vaultFactories: {} }; let sends = 0, saves = 0;
-  const options = { snapshot, roundVaultFactoryEntries: [{ url: 'https://flap.sh/bnb/CAstore', parserVersion: 4, map: { [factory]: { factory, name: 'Existing' } } }], sendCardFn: async () => { sends++; return 'id'; }, saveSnapshotFn: () => { saves++; }, appendHistoryFn: () => {} };
+  const options = { snapshot, roundVaultFactoryEntries: [{ url: 'https://flap.cool/bnb/CAstore', parserVersion: 4, map: { [factory]: { factory, name: 'Existing' } } }], sendCardFn: async () => { sends++; return 'id'; }, saveSnapshotFn: () => { saves++; }, appendHistoryFn: () => {} };
   assert.equal((await __testables.sendRoundVaultFactoryChange(options)).initialized, true);
   assert.equal(sends, 0); assert.equal(saves, 1);
   const added = '0x2222222222222222222222222222222222222222';

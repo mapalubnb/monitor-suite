@@ -1,3 +1,4 @@
+import { fetchSite, migrateSitePages } from './site-domain.mjs';
 import { observedSafeConfig } from './safe-observation.mjs';
 import { createMiniAppMonitor } from './mini-app-monitor.mjs';
 import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.mjs';
@@ -109,9 +110,9 @@ function readPositiveIntEnv(name, fallback, min = 1) {
 /* ── 配置 ── */
 const CONFIG = {
   urls: [
-    "https://flap.sh/bnb/CAstore?lang=zh",
-    "https://flap.sh/launch?chain=bnb&lang=zh",
-    "https://flap.sh/create?chain=bnb&lang=zh",
+    "https://flap.cool/bnb/CAstore?lang=zh",
+    "https://flap.cool/launch?chain=bnb&lang=zh",
+    "https://flap.cool/create?chain=bnb&lang=zh",
   ],
   // 飞书 API（用于发送 diff 文件附件）
   feishuAppId: process.env.FEISHU_APP_ID || "",
@@ -864,10 +865,11 @@ function loadSnapshot() {
  * 快照版本迁移
  */
 function migrateSnapshot(data) {
+  migrateSitePages(data, urlToKey);
   data.pages ||= {};
   // Retire the removed page baseline so status and saved resources stay current.
   for (const key of Object.keys(data.pages)) {
-    if (key.startsWith(urlToKey("https://flap.sh/robinhood/"))) delete data.pages[key];
+    if (key.startsWith(urlToKey("https://flap.cool/robinhood/"))) delete data.pages[key];
   }
   for (const url of CONFIG.urls) {
     const previousUrl = url.split("?")[0];
@@ -1805,7 +1807,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   ].filter(line => line !== "");
 
   return {
-    url: "https://flap.sh",
+    url: "https://flap.cool",
     title: `${titlePrefix}Flap 全站前端资源变更`,
     template: "orange",
     changes,
@@ -2594,7 +2596,7 @@ async function fetchSafe(url, opts = {}) {
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
       const res = await withDeadline(async signal => {
-        const response = await fetch(url, { ...opts, signal });
+        const response = await fetchSite(url, { ...opts, signal });
         const body = await response.text();
         return { ok: response.ok, status: response.status, headers: response.headers, url: response.url, text: async () => body };
       }, CONFIG.fetchTimeoutMs, opts.signal, '页面请求或响应体读取超时');
@@ -2794,7 +2796,7 @@ async function fetchRpcJson(url, payload, timeoutMs, signal, history = false, sc
     started = true;
     let response;
     try {
-      response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" },
+      response = await fetchSite(url, { method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload), signal: effectiveSignal });
       effectiveSignal.throwIfAborted();
       if (!response.ok) {
@@ -5039,7 +5041,7 @@ function buildMetadataSchemaWarningContent(url, diffs) {
 }
 
 const assetRetryCache = new Map();
-async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", options = {}) {
+async function downloadAssetContents(assetPaths, baseUrl = "https://flap.cool", options = {}) {
   const results = {};
   const BATCH = 6;
   const STAGGER = 80;
@@ -5138,7 +5140,7 @@ async function hydrateAssetContents(features, oldFeatures = null, options = {}) 
     return { downloaded: 0, reused: Object.keys(features.assetContents || {}).length };
   }
   const plan = planAssetContentDownload(oldFeatures, features);
-  const downloaded = await downloadAssetContents(plan.toDownload, "https://flap.sh", options);
+  const downloaded = await downloadAssetContents(plan.toDownload, "https://flap.cool", options);
   const missing = plan.toDownload.filter(path => !downloaded[assetPathToFilename(path)]);
   if (missing.length) throw new Error(`静态资源未完整：${missing.length}/${plan.toDownload.length} 个下载失败，保留旧快照`);
   features.assetContents = { ...plan.reusedContents, ...downloaded };
@@ -5261,7 +5263,7 @@ function flattenI18n(obj, prefix) {
 /**
  * 并行下载 i18n chunk 候选，找到第一个有效的
  */
-async function fetchI18nStrings(assetFiles, baseUrl = "https://flap.sh") {
+async function fetchI18nStrings(assetFiles, baseUrl = "https://flap.cool") {
   const candidates = findI18nChunkCandidates(assetFiles);
   if (candidates.length === 0) return null;
   // Share bounded downloads and successful retry cache with asset analysis.
@@ -5469,7 +5471,7 @@ function completeMechanismTemplates(features) {
     if (!description) throw Error(`机制模板说明缺失：${f.name}`);
     return { name, nameKey: normalizeVaultName(name), description, factory: f.factory, chain: 'bnb',
       area: '机制模板', areaKey: 'featured vaults', occurrence: 1, key: `factory::${f.factory.toLowerCase()}`,
-      sourceUrl: `https://flap.sh/bnb/CAstore/vault/${f.factory}?lang=zh`, signature: md5(`${name}\n${description}`) };
+      sourceUrl: `https://flap.cool/bnb/CAstore/vault/${f.factory}?lang=zh`, signature: md5(`${name}\n${description}`) };
   }).sort((a, b) => a.key.localeCompare(b.key));
   features.caStoreVaults = sections;
   features.caStoreVaultHash = md5(JSON.stringify(sections.map(v => [v.key, v.signature])));
@@ -5639,7 +5641,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
       `- 机制模板: ${cardText(name)}`,
       `- 类型: ${typeText}`,
       factory ? `- Factory: ${addressLink(factory)}` : "- Factory: 未匹配到",
-      factory ? `- 模板详情: ${flapLink("打开机制模板", `https://flap.sh/bnb/CAstore/vault/${factory}?lang=zh`)}` : "",
+      factory ? `- 模板详情: ${flapLink("打开机制模板", `https://flap.cool/bnb/CAstore/vault/${factory}?lang=zh`)}` : "",
       launchUrl ? `- 创建入口: ${flapLink("使用模板", launchUrl)}` : "",
     ],
     primaryTitle: "机制模板说明",
@@ -5651,7 +5653,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
     title: `${titlePrefix}CAstore 机制模板变更：${name}`,
     content,
     template: change?.type === "removed" ? "red" : change?.type === "added" ? "green" : "orange",
-    url: change?.sourceUrl || launchUrl || "https://flap.sh/bnb/CAstore",
+    url: change?.sourceUrl || launchUrl || "https://flap.cool/bnb/CAstore",
     moduleContext: "Flap.sh CAstore 机制模板内容介绍",
     aiInput: buildCaStoreVaultAiInput(change, factory, launchUrl),
     factory,
@@ -6932,7 +6934,7 @@ function getMiniAppMonitor() {
   miniAppMonitor = createMiniAppMonitor({
     initial: existsSync(file) ? readSnapshot(file) : {}, persist: state => store.write(state),
     fetchText: async url => {
-      if (new URL(url).hostname === 'flap.sh') return fetchPage(url);
+      if (new URL(url).hostname === 'flap.cool') return fetchPage(url);
       const response = await fetchSafe(url);
       if (!response.ok) throw Error(`小程序资源 HTTP ${response.status}`);
       return response.text();

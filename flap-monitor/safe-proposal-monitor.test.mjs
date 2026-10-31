@@ -613,7 +613,7 @@ test("mixed MultiSend keeps each Vault Factory separate from quote tokens, dedup
   assert.equal(vault.actions.length, 2);
   const card = buildSafeProposalContent([vault]);
   assert.match(card, /Vault Factory 注册／配置更新/);
-  assert.ok(card.includes(`https://flap.sh/launch?vaultfactory=${TOKEN}&chain=bnb&lang=zh`));
+  assert.ok(card.includes(`https://flap.cool/launch?vaultfactory=${TOKEN}&chain=bnb&lang=zh`));
   assert.equal((card.match(/vaultfactory=/g) || []).length, 1);
   assert.doesNotMatch(buildSafeProposalContent(result.changes.filter(c => !c.vaultFactory)), /vaultfactory=/);
   assert.match(card, /未提供（四参数版本）/);

@@ -154,7 +154,7 @@ test('Vault Factory 合约变更附带金库链接，Portal 不误生成链接',
     {address: factory, type: 'event', field: '配置更新'},
     {address: portal, type: 'event', field: '权限更新'},
   ], {catalog: {[factory]: {kind: 'vaultFactory'}, [portal]: {kind: 'vaultPortal'}}});
-  assert.ok(content.includes(`https://flap.sh/launch?vaultfactory=${factory}&chain=bnb&lang=zh`));
+  assert.ok(content.includes(`https://flap.cool/launch?vaultfactory=${factory}&chain=bnb&lang=zh`));
   assert.ok(!content.includes(`vaultfactory=${portal}`));
 });
 
