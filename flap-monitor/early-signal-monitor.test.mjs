@@ -222,7 +222,7 @@ test('CoW hung body does not block the next address or accept a late order', asy
     ? new Promise(resolve => { late = resolve; }) : Promise.resolve([]) });
   await runEarlySignalScan({ state, config, fetchFn, rpcBatch: async () => [], nowMs });
   assert.match(state.health['cow:' + OWNER].lastError, /超时/);
-  assert.equal(state.health['cow:' + other].lastSuccessMs, nowMs);
+  assert.ok(state.health['cow:' + other].lastSuccessMs >= nowMs);
   late([{ uid: '0x' + 'ab'.repeat(56), owner: OWNER, buyToken: TOKEN, status: 'open', validTo: nowMs / 1000 + 600 }]);
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(Object.keys(state.orders).length, 0);

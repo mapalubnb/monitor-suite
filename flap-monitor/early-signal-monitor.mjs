@@ -334,6 +334,7 @@ async function jsonGet(url, { fetchFn = globalThis.fetch, timeoutMs = 5000, apiK
     signal.throwIfAborted();
     if (!response.ok) {
       const error = new Error(`HTTP ${response.status} (${new URL(url).hostname})`);
+      error.status = response.status;
       const raw = response.headers?.get?.("retry-after");
       error.retryAfterMs = Number.isFinite(Number(raw)) ? Number(raw) * 1000 : Math.max(0, Date.parse(raw) - Date.now()) || 0;
       await response.body?.cancel?.();
@@ -411,12 +412,38 @@ function applyCowOrders(state, owner, orders, { nowMs = Date.now(), bootstrap = 
 export async function scanCowOrders(state, config, fetchFn, nowMs) {
   const owners = uniq([...(config.wallets || EXECUTION_WALLETS), ...(config.safes || CORE_SAFES.map(([a]) => a))])
     .filter(a => !RELATED_SAFES.some(s => lower(s) === lower(a)));
-  for (const owner of owners) await sourcePass(state, `cow:${lower(owner)}`, async () => {
+  const clock = config.cowClock || Date.now;
+  const sleep = config.cowSleep || (ms => new Promise(resolve => setTimeout(resolve, ms)));
+  const started = clock();
+  const currentTime = () => nowMs + Math.max(0, clock() - started);
+  const transport = state.cowTransport ||= { nextAttemptAtMs: 0, cursor: 0, failures: 0 };
+  if (transport.nextAttemptAtMs > currentTime()) return;
+  const start = transport.cursor % Math.max(1, owners.length);
+  const ordered = [...owners.slice(start), ...owners.slice(0, start)];
+  let limited = false, lastRequestAt = 0;
+  for (const owner of ordered) {
+    if (limited) break;
+    transport.cursor = (owners.indexOf(owner) + 1) % Math.max(1, owners.length);
+    await sourcePass(state, `cow:${lower(owner)}`, async () => {
     const bootstrap = !state.health[`cow:${lower(owner)}`]?.lastSuccessAt;
     const all = [];
     let complete = false;
     for (let offset = 0; offset < 1000; offset += 100) {
-      const page = await jsonGet(`${config.cowApiBaseUrl || "https://api.cow.fi/bnb/api/v1"}/account/${owner}/orders?limit=100&offset=${offset}`, { fetchFn, timeoutMs: config.timeoutMs });
+      if (lastRequestAt) await sleep(Math.max(0, 250 - (clock() - lastRequestAt)));
+      lastRequestAt = clock();
+      let page;
+      try {
+        page = await jsonGet(`${config.cowApiBaseUrl || "https://api.cow.fi/bnb/api/v1"}/account/${owner}/orders?limit=100&offset=${offset}`, { fetchFn, timeoutMs: config.timeoutMs });
+      } catch (error) {
+        if (error.status === 429) {
+          limited = true;
+          transport.failures = (transport.failures || 0) + 1;
+          transport.nextAttemptAtMs = currentTime() + Math.max(error.retryAfterMs || 0, Math.min(1800000, 5000 * 2 ** Math.min(9, transport.failures - 1)));
+          transport.lastError = error.message;
+          error.retryAfterMs = Math.max(error.retryAfterMs || 0, transport.nextAttemptAtMs - currentTime());
+        }
+        throw error;
+      }
       if (!Array.isArray(page)) throw new Error("CoW 分页格式错误");
       all.push(...page);
       // Complete snapshot prevents missing old, still open orders. Never infer cancellation from absence.
@@ -431,7 +458,10 @@ export async function scanCowOrders(state, config, fetchFn, nowMs) {
     const validationKey = `cowValidation:${lower(owner)}`;
     state.health[validationKey] = { lastError: rejected.length ? `CoW ${rejected.length} 笔订单身份/格式待核验` : '', rejected, checkedAt: iso(nowMs) };
     ingestCowOrders(state, owner, valid, { nowMs, bootstrap });
-  }, nowMs, config.scheduledSource ? 0 : config.cowIntervalMs || 10000);
+    transport.lastSuccessAt = iso(currentTime());
+  }, currentTime(), config.scheduledSource ? 0 : config.cowIntervalMs || 10000);
+  }
+  if (!limited) { transport.nextAttemptAtMs = 0; transport.failures = 0; transport.lastError = ''; }
 }
 
 export function syncEarlyProposals(state, safeState, nowMs = Date.now()) {
@@ -588,15 +618,18 @@ export async function readEarlyFullBlocks(state, numbers, rpcBatch, maxCacheByte
     else cache.delete(number);
   }
   const missing = numbers.filter(number => !verified.has(number));
-  const fetched = missing.length ? await rpcBatch(missing.map(number => ({ method: 'eth_getBlockByNumber', params: [blockTag(number), true] })), { requireAllResults: true }) : [];
-  for (let i = 0; i < missing.length; i++) {
+  // 小批次及时缓存成功结果；后续批次失败仍保留可复核的区块，不推进扫描游标。
+  for (let offset = 0; offset < missing.length; offset += 4) {
+  const batch = missing.slice(offset, offset + 4);
+  const fetched = await rpcBatch(batch.map(number => ({ method: 'eth_getBlockByNumber', params: [blockTag(number), true] })), { requireAllResults: true });
+  for (let i = 0; i < batch.length; i++) {
     const block = fetched[i];
     if (!Array.isArray(block?.transactions)) throw new Error('完整区块交易不可用');
-    if (block.number != null && Number(block.number) !== missing[i]) throw new Error('完整区块高度不一致');
-    verified.set(missing[i], block);
+    if (block.number != null && Number(block.number) !== batch[i]) throw new Error('完整区块高度不一致');
+    verified.set(batch[i], block);
     const bytes = Buffer.byteLength(JSON.stringify(block));
     if (/^0x[0-9a-f]{64}$/i.test(block.hash || '') && bytes <= maxCacheBytes) {
-      cache.set(missing[i], { hash: lower(block.hash), block: structuredClone(block), bytes });
+      cache.set(batch[i], { hash: lower(block.hash), block: structuredClone(block), bytes });
       let totalBytes = [...cache.values()].reduce((sum, entry) => sum + entry.bytes, 0);
       while (cache.size > 64 || totalBytes > maxCacheBytes) {
         const oldest = cache.keys().next().value;
@@ -604,6 +637,7 @@ export async function readEarlyFullBlocks(state, numbers, rpcBatch, maxCacheByte
         cache.delete(oldest);
       }
     }
+  }
   }
   while (cache.size > 64) cache.delete(cache.keys().next().value);
   return numbers.map(number => structuredClone(verified.get(number)));
@@ -724,7 +758,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   // Source health entries can be held by a concurrent API pass across an await.
   // An API pass can hold its pagination progress across an await. Do not
   // replace that live object with the chain transaction's cloned copy.
-  Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress });
+  Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress, cowTransport: state.cowTransport, scanTimings: state.scanTimings });
 }
 
 export async function validateFastBlocks(state, head, rpcBatch, nowMs) {
@@ -800,7 +834,7 @@ export async function processEarlyReceiptHints(state, hints, config, rpcBatch, n
     draft.fastBlocks ||= {};
     if (Number(receipt.blockNumber) > (state.realtimeCursor ?? state.cursor ?? 0)) draft.fastBlocks[Number(receipt.blockNumber)] = lower(receipt.blockHash);
     // Preserve live API progress across the synchronous chain commit.
-    Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress });
+    Object.assign(state, draft, { health: state.health, discoveryProgress: state.discoveryProgress, cowTransport: state.cowTransport, scanTimings: state.scanTimings });
     for (const event of events) if (event.token) tokens.add(event.token);
     processed.push(hint.transactionHash);
     // Persist and start delivery per receipt; later transactions must not hold up this one.
@@ -987,7 +1021,19 @@ function prune(state, nowMs) {
 export async function runEarlySignalScan({ state, config = {}, rpcBatch, fetchFn = globalThis.fetch, safeState, nowMs = Date.now() }) {
   if (!state || typeof rpcBatch !== "function") throw new Error("缺少提前监控状态或 RPC");
   syncEarlyProposals(state, safeState, nowMs);
-  if (config.mode !== "external") await sourcePass(state, config.realtime ? "realtime" : "chain", () => scanEarlyChain(state, config, rpcBatch, nowMs), nowMs);
+  if (config.mode !== "external") await sourcePass(state, config.realtime ? "realtime" : "chain", async () => {
+    const started = Date.now(), methods = {};
+    const measuredRpc = async (calls, options) => {
+      const key = [...new Set(calls.map(c => c.method + (c.method === 'eth_getBlockByNumber' && c.params?.[1] === true ? ':full' : '')))].join(',');
+      const metric = methods[key] ||= { requests: 0, calls: 0, elapsedMs: 0, failures: 0 };
+      metric.requests++; metric.calls += calls.length;
+      const at = Date.now();
+      try { return await rpcBatch(calls, options); } catch (e) { metric.failures++; throw e; }
+      finally { metric.elapsedMs += Date.now() - at; }
+    };
+    try { await scanEarlyChain(state, config, measuredRpc, nowMs); }
+    finally { (state.scanTimings ||= {})[config.realtime ? 'realtime' : 'history'] = { at: iso(Date.now()), elapsedMs: Date.now() - started, methods }; }
+  }, nowMs);
   if (config.mode !== "chain") {
     const enabled = source => !config.sources || config.sources.includes(source);
     const periodicInterval = config.scheduledSource ? 0 : 10000;

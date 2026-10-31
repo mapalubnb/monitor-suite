@@ -710,6 +710,10 @@ export async function runSafeProposalScan({
         baseBackoffMs * (2 ** Math.min(9, safeState.consecutiveFailures - 1))));
       safeState.nextAttemptAtMs = nowMs + backoffMs;
       safeState.lastError = outcome.reason?.message || "Safe API 请求失败";
+      safeState.failureKind = /排队|间隔等待|冷却/.test(safeState.lastError) ? 'waiting'
+        : /429|额度/.test(safeState.lastError) ? 'rate_limit'
+        : /超时|timeout/i.test(safeState.lastError) ? 'timeout' : 'request_error';
+      safeState.lastFailureAt = runAt;
       errors.push(`${safe}: ${safeState.lastError}`);
       continue;
     }
@@ -719,6 +723,7 @@ export async function runSafeProposalScan({
     safeState.baselineEstablished = true;
     safeState.lastSuccessAt = runAt;
     safeState.lastError = "";
+    safeState.failureKind = '';
     safeState.consecutiveFailures = 0;
     safeState.nextAttemptAtMs = 0;
     const suppressForSafe = suppressNotifications;

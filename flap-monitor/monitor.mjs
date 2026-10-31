@@ -7246,7 +7246,9 @@ async function startMonitor() {
       ['registryDelivery', registryDeliveryJob], ['registryAudit', registryAuditJob], ['registryPending', registryPendingJob],
     ].map(([name, job]) => [name, job.snapshot()]));
     writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs,
-      registryPending: registryPendingHealth, miniApps: miniAppMonitor?.status(), ai: { enabled: FLAP_AI_ANALYSIS_ENABLED } }));
+      registryPending: registryPendingHealth, miniApps: miniAppMonitor?.status(),
+      earlyScanTimings: earlySignalState.scanTimings || {}, cowTransport: earlySignalState.cowTransport || {},
+      ai: { enabled: FLAP_AI_ANALYSIS_ENABLED } }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
   }
   const rpcMetricsTimer = setInterval(() => {
