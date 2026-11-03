@@ -1,6 +1,8 @@
 # Monitor Suite 📡
 
-## 2026/11/3 Owner 权限监控（Suite 1.12.73 / Flap 1.10.44）
+## 2026/11/3 Owner 权限监控（Suite 1.12.74 / Flap 1.10.45）
+
+上线验收补正：关联 Safe 提案 API 保留 EIP-55 地址大小写，避免小写地址触发 HTTP 422。
 
 新增 14 个核心权限 owner、3 个增强观察 owner 和嵌套 Safe 的 6 名二级签名人角色目录；分级不赋予官方身份或加池归属。新增合约 owner 独立观察、管理批量调用解析、嵌套 Safe 提案/权限监控、EIP-7702 委托变化检测。飞书卡片增加去重的 owner 角色标注，未知 owner 标为角色待核验。现有调度、降噪、历史放弃及 AI 关闭设置保持不变。详细范围与公共 RPC 覆盖限制见 `flap-monitor/MONITORING.md`。
 

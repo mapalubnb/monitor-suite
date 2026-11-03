@@ -18,7 +18,8 @@ test('owner coverage: 14 core, 3 enhanced, 6 nested; never promote liquidity tru
   assert.equal(Object.values(OWNER_CATALOG).filter(o => o.priority === 'enhanced').length, 3);
   assert.equal(Object.values(OWNER_CATALOG).filter(o => o.priority === 'nested').length, 6);
   for (const a of Object.keys(OWNER_CATALOG)) assert.ok(observationAddresses().includes(a));
-  assert.ok(RELATED_SAFES.includes(NESTED_OWNER_SAFE));
+  assert.ok(RELATED_SAFES.some(a => a.toLowerCase() === NESTED_OWNER_SAFE));
+  assert.equal(RELATED_SAFES.find(a => a.toLowerCase() === NESTED_OWNER_SAFE), '0x1d60bBBEF79Fb9540D271Dbb01925380323A8f66');
   assert.ok(!watchedWallets().includes(manager));
   assert.ok(!watchedWallets().includes(NESTED_OWNER_SAFE));
   assert.ok(earlyLogFilters(createEarlySignalState()).some(f => f.address === manager && !f.topics));

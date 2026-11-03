@@ -25,7 +25,7 @@ export const EXECUTION_WALLETS = [
 export const CORE_OWNERS = CORE_PERMISSION_OWNERS;
 // Read-only BSC verification at block 128109250 (2026-10-17).
 // A funded/actively signed Safe is a financial relation, not Portal authority.
-export const RELATED_SAFES = [NESTED_OWNER_SAFE, "0x65eA398b9EB6b7A75FD5A1018463039374A0b908",
+export const RELATED_SAFES = ["0x1d60bBBEF79Fb9540D271Dbb01925380323A8f66", "0x65eA398b9EB6b7A75FD5A1018463039374A0b908",
   // 2026-10-21: verified 1/1 Safe; shared owner, not an official execution wallet.
   "0xDFEe42AcB3FCE076033eDcf2084687340b8f2FAB",
 ];

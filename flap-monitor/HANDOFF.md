@@ -1,5 +1,9 @@
 # Flap 监控交接
 
+## 2026/11/3 Owner 监控验收补正（Suite 1.12.74 / Flap 1.10.45）
+
+723b83e 已先推 GitHub 后部署，Flap 单独重启。现场已读到 5 个 7702 委托和嵌套 Safe 3/6、guard、fallback、模块基线；发现新增关联 Safe 传给 API 的小写地址触发 422，改为现有 EIP-55 地址并增加断言。补正后 Flap 409/409、专项 5/5 通过。原环境配置逐字一致，保留状态游标；备份位于 /root/monitor-suite-backups/flap-owner-1.12.73-20261103。最终部署验收另记。
+
 ## 2026/11/3 Owner 权限监控实现与验证（Suite 1.12.73 / Flap 1.10.44）
 
 用户明确授权本对话完成所有 owner 监控优化和卡片标注。修改 owner-catalog、early-signal-catalog/monitor/topics、address-observation、operational-call-codec、safe-proposal-monitor、contract-integrity-monitor、monitor 发送/编辑入口及对应测试，更新根/Flap 版本、README、MONITORING。本地 Flap 409/409、全项目 699/699、新增专项 5/5、语法及 diff 检查通过。14 核心权限＋3 增强观察＋6 二级关联均不提升官方/流动性归属。嵌套 Safe 纳入提案轮询和权限核验；7702 采用原扩展周期检测；批量调用限制目标、深度、数量与 ABI 边界。新增 owner 卡片角色图例，未知角色明确标注。
