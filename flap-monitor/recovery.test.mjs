@@ -32,3 +32,28 @@ test('完整区块后批失败保留前批缓存，重试复核规范哈希且�
   fail=false;const blocks=await readEarlyFullBlocks(state,[1,2,3,4,5,6],rpc);
   assert.equal(blocks.length,6);assert.deepEqual(full,[1,2,3,4,5,6]);
 });
+
+test('实时两批读取有界并行，失败等待在途批完成且重试复用成功缓存', async () => {
+  const state = {}; let active = 0, peak = 0, fail = true, firstDone = false;
+  const full = [];
+  const rpc = async calls => {
+    const batch = calls.filter(c => c.params[1]);
+    if (batch.length) {
+      active++; peak = Math.max(peak, active);
+      try {
+        if (Number(batch[0].params[0]) === 5 && fail) throw Error('unavailable');
+        await new Promise(resolve => setTimeout(resolve, 10));
+        full.push(...batch.map(c => Number(c.params[0]))); firstDone = true;
+      } finally { active--; }
+    }
+    return calls.map(c => ({ number: c.params[0], hash: '0x' + Number(c.params[0]).toString(16).padStart(64, '0'), transactions: c.params[1] ? [] : undefined }));
+  };
+  const numbers = Array.from({length: 12}, (_, i) => i + 1);
+  await assert.rejects(readEarlyFullBlocks(state, numbers, rpc, 8 * 1024 * 1024, 2), /unavailable/);
+  assert.equal(active, 0); assert.equal(firstDone, true); assert.equal(peak, 2);
+  assert.deepEqual(full, [1,2,3,4]);
+  fail = false;
+  const result = await readEarlyFullBlocks(state, numbers, rpc, 8 * 1024 * 1024, 2);
+  assert.equal(peak, 2); assert.deepEqual(result.map(b => Number(b.number)), numbers);
+  assert.deepEqual([...full].sort((a,b)=>a-b), numbers);
+});

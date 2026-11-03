@@ -617,7 +617,7 @@ export async function refreshNativeBalances(state, config, rpcBatch, nowMs) {
 }
 const fullBlockCaches = new WeakMap();
 const FULL_BLOCK_CACHE_BYTES = 8 * 1024 * 1024;
-export async function readEarlyFullBlocks(state, numbers, rpcBatch, maxCacheBytes = FULL_BLOCK_CACHE_BYTES) {
+export async function readEarlyFullBlocks(state, numbers, rpcBatch, maxCacheBytes = FULL_BLOCK_CACHE_BYTES, concurrency = 1) {
   let cache = fullBlockCaches.get(state);
   if (!cache) { cache = new Map(); fullBlockCaches.set(state, cache); }
   const cachedNumbers = numbers.filter(number => cache.has(number));
@@ -631,25 +631,33 @@ export async function readEarlyFullBlocks(state, numbers, rpcBatch, maxCacheByte
   }
   const missing = numbers.filter(number => !verified.has(number));
   // 小批次及时缓存成功结果；后续批次失败仍保留可复核的区块，不推进扫描游标。
-  for (let offset = 0; offset < missing.length; offset += 4) {
-  const batch = missing.slice(offset, offset + 4);
-  const fetched = await rpcBatch(batch.map(number => ({ method: 'eth_getBlockByNumber', params: [blockTag(number), true] })), { requireAllResults: true });
-  for (let i = 0; i < batch.length; i++) {
-    const block = fetched[i];
-    if (!Array.isArray(block?.transactions)) throw new Error('完整区块交易不可用');
-    if (block.number != null && Number(block.number) !== batch[i]) throw new Error('完整区块高度不一致');
-    verified.set(batch[i], block);
-    const bytes = Buffer.byteLength(JSON.stringify(block));
-    if (/^0x[0-9a-f]{64}$/i.test(block.hash || '') && bytes <= maxCacheBytes) {
-      cache.set(batch[i], { hash: lower(block.hash), block: structuredClone(block), bytes });
-      let totalBytes = [...cache.values()].reduce((sum, entry) => sum + entry.bytes, 0);
-      while (cache.size > 64 || totalBytes > maxCacheBytes) {
-        const oldest = cache.keys().next().value;
-        totalBytes -= cache.get(oldest).bytes;
-        cache.delete(oldest);
+  const readBatch = async batch => {
+    const fetched = await rpcBatch(batch.map(number => ({ method: 'eth_getBlockByNumber', params: [blockTag(number), true] })), { requireAllResults: true });
+    for (let i = 0; i < batch.length; i++) {
+      const block = fetched[i];
+      if (!Array.isArray(block?.transactions)) throw new Error('完整区块交易不可用');
+      if (block.number != null && Number(block.number) !== batch[i]) throw new Error('完整区块高度不一致');
+      verified.set(batch[i], block);
+      const bytes = Buffer.byteLength(JSON.stringify(block));
+      if (/^0x[0-9a-f]{64}$/i.test(block.hash || '') && bytes <= maxCacheBytes) {
+        cache.set(batch[i], { hash: lower(block.hash), block: structuredClone(block), bytes });
+        let totalBytes = [...cache.values()].reduce((sum, entry) => sum + entry.bytes, 0);
+        while (cache.size > 64 || totalBytes > maxCacheBytes) {
+          const oldest = cache.keys().next().value;
+          totalBytes -= cache.get(oldest).bytes;
+          cache.delete(oldest);
+        }
       }
     }
-  }
+  };
+  const width = concurrency === 2 ? 8 : 4;
+  for (let offset = 0; offset < missing.length; offset += width) {
+    const batches = [missing.slice(offset, offset + 4)];
+    if (width === 8 && offset + 4 < missing.length) batches.push(missing.slice(offset + 4, offset + 8));
+    // Drain both requests before rejecting; no late work can race the next scan.
+    const results = await Promise.allSettled(batches.map(readBatch));
+    const failed = results.find(result => result.status === 'rejected');
+    if (failed) throw failed.reason;
   }
   while (cache.size > 64) cache.delete(cache.keys().next().value);
   return numbers.map(number => structuredClone(verified.get(number)));
@@ -709,7 +717,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   if (config.nativeTransactions !== false) {
     const wallets = new Set([...watchedWallets(config), ...observationAddresses(config)]);
     const observerLogHashes = new Set(logs.filter(l => shouldPrioritizeEarlyLog(l, state)).map(l => lower(l.transactionHash)));
-    const blocks = await readEarlyFullBlocks(state, Array.from({ length: to - from + 1 }, (_, i) => from + i), rpcBatch);
+    const blocks = await readEarlyFullBlocks(state, Array.from({ length: to - from + 1 }, (_, i) => from + i), rpcBatch, FULL_BLOCK_CACHE_BYTES, config.realtime ? 2 : 1);
     for (const block of blocks) {
       if (!Array.isArray(block.transactions)) throw new Error("完整区块交易不可用");
       for (const tx of block.transactions) if (wallets.has(lower(tx.from)) || wallets.has(lower(tx.to)) || observerLogHashes.has(lower(tx.hash))) transactionMap.set(lower(tx.hash), tx);
