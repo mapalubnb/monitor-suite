@@ -1,6 +1,7 @@
 import { observedSafeConfig, mergeObservedSafes, SAFE_FACTORIES, PROXY_CREATION, verifySafeDiscoveries, rewindObservedSafes, verifyApiObservedSafe } from './safe-observation.mjs';
 import { ENTRY_POINT_V07, USER_OPERATION_EVENT } from './erc4337-codec.mjs';
 import { annotateOwners, ownerLink, OWNER_MANAGEMENT_CONTRACT } from './owner-catalog.mjs';
+import { safeApiAddress } from './safe-api-address.mjs';
 import { formatBeijingTime } from '../shared/display-format.cjs';
 import { withDeadline } from '../shared/request-deadline.mjs';
 import { recoverLiveCursor, activateHistoryGap, readAvailableLogWindow } from "../shared/scan-recovery.mjs";
@@ -178,7 +179,7 @@ function chainOrder(a, b) {
 
 // Receipt decoding accepts only recognized factories/managers or verified pool addresses.
 export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.now(), silent = false, transaction = null } = {}) {
-  if (!receipt || Number(receipt.status) !== 1) return [];
+  if (!receipt || ![0, 1].includes(Number(receipt.status))) return [];
   config = observedSafeConfig(state, config);
   const options = { nowMs, silent };
   const wallets = new Set(watchedWallets(config));
@@ -205,6 +206,8 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
   for (const event of observeAddressTransaction(receipt, transaction, state, config, wallets)) {
     add({ blockNumber: receipt.blockNumber, blockHash: receipt.blockHash, transactionHash: receipt.transactionHash, logIndex: event.observationLogIndex ?? -1 }, event);
   }
+  // Failed transactions can be observed, but none of their attempted effects are successful events.
+  if (Number(receipt.status) === 0) return emitted;
   const cowTrades = decodeCowTrades(logs, wallets, state.orders);
   const cowTransfers = matchCowTransfers(logs, cowTrades, TOPICS.Transfer);
   for (const { log, ...trade } of cowTrades) {
@@ -499,9 +502,9 @@ export function syncEarlyProposals(state, safeState, nowMs = Date.now()) {
 export async function scanAddressDiscovery(state, config, fetchFn, nowMs, rpcBatch) {
   const base = (config.safeApiBaseUrl || "https://api.safe.global/tx-service/bnb/api/v1").replace(/\/$/, "");
   const opts = { fetchFn, timeoutMs: config.timeoutMs, apiKey: config.safeApiKey || "" };
-  const safes = uniq([...(config.safes || CORE_SAFES.map(([a]) => a)), ...AUXILIARY_SAFES, ...(config.relatedSafes ?? RELATED_SAFES)]);
+  const safes = uniq([...(config.safes || CORE_SAFES.map(([a]) => a)), ...AUXILIARY_SAFES, ...(config.relatedSafes ?? RELATED_SAFES)].map(safeApiAddress));
   const progress = state.discoveryProgress ||= { safes: [], owners: [] };
-  for (const safe of safes.filter(safe => !progress.safes.includes(safe))) {
+  for (const safe of safes.filter(safe => !progress.safes.some(done => lower(done) === lower(safe)))) {
     const info = await jsonGet(`${base}/safes/${safe}/`, opts);
     if (lower(info.address) !== lower(safe) || !Array.isArray(info.owners) || !Array.isArray(info.modules)) throw new Error("Safe 元数据无效");
     const previous = state.safeInfo[lower(safe)];
@@ -512,8 +515,8 @@ export async function scanAddressDiscovery(state, config, fetchFn, nowMs, rpcBat
     state.safeInfo[lower(safe)] = info;
     progress.safes.push(safe);
   }
-  const owners = uniq([...CORE_OWNERS, ...Object.values(state.safeInfo).flatMap(s => s.owners)]);
-  for (const owner of owners.filter(owner => !progress.owners.includes(owner))) {
+  const owners = uniq([...CORE_OWNERS, ...Object.values(state.safeInfo).flatMap(s => s.owners)].map(safeApiAddress));
+  for (const owner of owners.filter(owner => !progress.owners.some(done => lower(done) === lower(owner)))) {
     const response = await jsonGet(`${base}/owners/${owner}/safes/`, opts);
     if (!Array.isArray(response.safes)) throw new Error("Safe owner 反查格式无效");
     for (const safe of response.safes) {

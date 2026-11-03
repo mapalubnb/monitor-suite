@@ -1,5 +1,6 @@
 import { withDeadline } from '../shared/request-deadline.mjs';
 import { OWNER_MANAGEMENT_CONTRACT, annotateOwners, ownerLink } from './owner-catalog.mjs';
+import { safeApiAddress } from './safe-api-address.mjs';
 import { formatBeijingTime } from "../shared/display-format.cjs";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from 'node:timers/promises';
@@ -382,7 +383,7 @@ function buildSafeApiUrl(apiBaseUrl, safe, nonce) {
     nonce__gte: String(nonce),
     limit: "100",
   });
-  return `${base}/safes/${safe}/multisig-transactions/?${query}`;
+  return `${base}/safes/${safeApiAddress(safe)}/multisig-transactions/?${query}`;
 }
 
 function retryAfterMilliseconds(response) {
@@ -409,7 +410,8 @@ export async function fetchSafeProposals({
   while (url) {
     if (visited.has(url) || visited.size >= 10) throw new Error("Safe API 分页超过上限或循环");
     const parsed = new URL(url, firstUrl);
-    if (parsed.origin !== new URL(firstUrl).origin || parsed.pathname !== new URL(firstUrl).pathname) throw new Error("Safe API 分页地址无效");
+    if (parsed.origin !== new URL(firstUrl).origin || parsed.pathname.toLowerCase() !== new URL(firstUrl).pathname.toLowerCase()) throw new Error("Safe API 分页地址无效");
+    parsed.pathname = new URL(firstUrl).pathname;
     for (const [key, value] of new URL(firstUrl).searchParams) parsed.searchParams.set(key, value);
     visited.add(url);
     if (visited.size > 1) await new Promise(resolve => setTimeout(resolve, SAFE_API_STAGGER_MS));
@@ -834,7 +836,7 @@ export async function runSafeProposalScan({
         // A consumed nonce alone cannot distinguish replacement from indexer lag.
         const query = new URLSearchParams({ executed: "true", nonce: String(first.nonce), limit: "100" });
         await new Promise(resolve => setTimeout(resolve, SAFE_API_STAGGER_MS));
-        const history = await fetchSafeJson(base + "/safes/" + apiAddressBySafe.get(first.safe) + "/multisig-transactions/?" + query, options);
+        const history = await fetchSafeJson(base + "/safes/" + safeApiAddress(apiAddressBySafe.get(first.safe)) + "/multisig-transactions/?" + query, options);
         const winner = history.results?.find(item => item.isExecuted && Number(item.nonce) === first.nonce
           && normalizeAddress(item.safe) === first.safe && normalizeHash(item.transactionHash));
         if (!winner) continue;

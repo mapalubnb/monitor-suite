@@ -112,9 +112,9 @@ function readPositiveIntEnv(name, fallback, min = 1) {
 /* ── 配置 ── */
 const CONFIG = {
   urls: [
-    "https://flap.cool/bnb/CAstore?lang=zh",
-    "https://flap.cool/launch?chain=bnb&lang=zh",
-    "https://flap.cool/create?chain=bnb&lang=zh",
+    "https://flap.sh/bnb/CAstore?lang=zh",
+    "https://flap.sh/launch?chain=bnb&lang=zh",
+    "https://flap.sh/create?chain=bnb&lang=zh",
   ],
   // 飞书 API（用于发送 diff 文件附件）
   feishuAppId: process.env.FEISHU_APP_ID || "",
@@ -855,8 +855,9 @@ function loadSnapshot() {
     if (existsSync(CONFIG.snapshotFile)) {
       const data = readSnapshot(CONFIG.snapshotFile);
       const pageCount = Object.keys(data.pages || {}).length;
+      const restored = data.siteDomainRestoredAt;
       const migrated = migrateSnapshot(data);
-      if (Object.keys(migrated.pages).length !== pageCount) saveSnapshot(migrated);
+      if (Object.keys(migrated.pages).length !== pageCount || restored !== migrated.siteDomainRestoredAt) saveSnapshot(migrated);
       return migrated;
     }
   } catch (error) { throw new Error(`快照读取失败，停止启动以保护基线：${error.message}`); }
@@ -871,7 +872,7 @@ function migrateSnapshot(data) {
   data.pages ||= {};
   // Retire the removed page baseline so status and saved resources stay current.
   for (const key of Object.keys(data.pages)) {
-    if (key.startsWith(urlToKey("https://flap.cool/robinhood/"))) delete data.pages[key];
+    if (key.startsWith(urlToKey("https://flap.sh/robinhood/"))) delete data.pages[key];
   }
   for (const url of CONFIG.urls) {
     const previousUrl = url.split("?")[0];
@@ -1811,7 +1812,7 @@ function buildSiteWideAssetNotification(assetOnlyNotifications, options = {}) {
   ].filter(line => line !== "");
 
   return {
-    url: "https://flap.cool",
+    url: "https://flap.sh",
     title: `${titlePrefix}Flap 全站前端资源变更`,
     template: "orange",
     changes,
@@ -2682,7 +2683,7 @@ function bscRpcPreferenceKey(method, params = []) {
 }
 
 function bscRpcBatchPreferenceKey(calls = []) {
-  const methods = [...new Set(calls.map(call => call?.method || "unknown"))].sort();
+  const methods = [...new Set(calls.map(call => bscRpcPreferenceKey(call?.method, call?.params || [])))].sort();
   return `batch:${methods.join("+") || "empty"}`;
 }
 
@@ -5045,7 +5046,7 @@ function buildMetadataSchemaWarningContent(url, diffs) {
 }
 
 const assetRetryCache = new Map();
-async function downloadAssetContents(assetPaths, baseUrl = "https://flap.cool", options = {}) {
+async function downloadAssetContents(assetPaths, baseUrl = "https://flap.sh", options = {}) {
   const results = {};
   const BATCH = 6;
   const STAGGER = 80;
@@ -5144,7 +5145,7 @@ async function hydrateAssetContents(features, oldFeatures = null, options = {}) 
     return { downloaded: 0, reused: Object.keys(features.assetContents || {}).length };
   }
   const plan = planAssetContentDownload(oldFeatures, features);
-  const downloaded = await downloadAssetContents(plan.toDownload, "https://flap.cool", options);
+  const downloaded = await downloadAssetContents(plan.toDownload, "https://flap.sh", options);
   const missing = plan.toDownload.filter(path => !downloaded[assetPathToFilename(path)]);
   if (missing.length) throw new Error(`静态资源未完整：${missing.length}/${plan.toDownload.length} 个下载失败，保留旧快照`);
   features.assetContents = { ...plan.reusedContents, ...downloaded };
@@ -5267,7 +5268,7 @@ function flattenI18n(obj, prefix) {
 /**
  * 并行下载 i18n chunk 候选，找到第一个有效的
  */
-async function fetchI18nStrings(assetFiles, baseUrl = "https://flap.cool") {
+async function fetchI18nStrings(assetFiles, baseUrl = "https://flap.sh") {
   const candidates = findI18nChunkCandidates(assetFiles);
   if (candidates.length === 0) return null;
   // Share bounded downloads and successful retry cache with asset analysis.
@@ -5475,7 +5476,7 @@ function completeMechanismTemplates(features) {
     if (!description) throw Error(`机制模板说明缺失：${f.name}`);
     return { name, nameKey: normalizeVaultName(name), description, factory: f.factory, chain: 'bnb',
       area: '机制模板', areaKey: 'featured vaults', occurrence: 1, key: `factory::${f.factory.toLowerCase()}`,
-      sourceUrl: `https://flap.cool/bnb/CAstore/vault/${f.factory}?lang=zh`, signature: md5(`${name}\n${description}`) };
+      sourceUrl: `https://flap.sh/bnb/CAstore/vault/${f.factory}?lang=zh`, signature: md5(`${name}\n${description}`) };
   }).sort((a, b) => a.key.localeCompare(b.key));
   features.caStoreVaults = sections;
   features.caStoreVaultHash = md5(JSON.stringify(sections.map(v => [v.key, v.signature])));
@@ -5645,7 +5646,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
       `- 机制模板: ${cardText(name)}`,
       `- 类型: ${typeText}`,
       factory ? `- Factory: ${addressLink(factory)}` : "- Factory: 未匹配到",
-      factory ? `- 模板详情: ${flapLink("打开机制模板", `https://flap.cool/bnb/CAstore/vault/${factory}?lang=zh`)}` : "",
+      factory ? `- 模板详情: ${flapLink("打开机制模板", `https://flap.sh/bnb/CAstore/vault/${factory}?lang=zh`)}` : "",
       launchUrl ? `- 创建入口: ${flapLink("使用模板", launchUrl)}` : "",
     ],
     primaryTitle: "机制模板说明",
@@ -5657,7 +5658,7 @@ function buildCaStoreVaultChangeNotification(change, vaultFactoryMap = {}, optio
     title: `${titlePrefix}CAstore 机制模板变更：${name}`,
     content,
     template: change?.type === "removed" ? "red" : change?.type === "added" ? "green" : "orange",
-    url: change?.sourceUrl || launchUrl || "https://flap.cool/bnb/CAstore",
+    url: change?.sourceUrl || launchUrl || "https://flap.sh/bnb/CAstore",
     moduleContext: "Flap.sh CAstore 机制模板内容介绍",
     aiInput: buildCaStoreVaultAiInput(change, factory, launchUrl),
     factory,
@@ -6938,7 +6939,7 @@ function getMiniAppMonitor() {
   miniAppMonitor = createMiniAppMonitor({
     initial: existsSync(file) ? readSnapshot(file) : {}, persist: state => store.write(state),
     fetchText: async url => {
-      if (new URL(url).hostname === 'flap.cool') return fetchPage(url);
+      if (new URL(url).hostname === 'flap.sh') return fetchPage(url);
       const response = await fetchSafe(url);
       if (!response.ok) throw Error(`小程序资源 HTTP ${response.status}`);
       return response.text();
@@ -8450,6 +8451,7 @@ export const __testables = {
   processFactoryPoolFeedEvent,
   backfillFactoryPoolFeedEvents,
   resetBscRpcHealth,
+  bscRpcBatchPreferenceKey,
   rpcControl,
   buildVaultFactoryLaunchUrl,
   parseWebpackExportAliases,

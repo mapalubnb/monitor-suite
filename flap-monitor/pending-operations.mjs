@@ -82,7 +82,8 @@ export function reconcileOperationObservations(early, pendingState) {
     if (r.confirmedBlockHash && r.confirmedBlockHash !== event.blockHash) continue;
     // A successful outer Safe receipt does not establish inner execution success.
     if ((r.viaSafe || r.via4337) && !['executed', 'failed'].includes(event.safeExecutionStatus)) continue;
-    const status = r.viaSafe || r.via4337 ? event.safeExecutionStatus : 'executed';
+    const status = event.safeExecutionStatus === 'failed' ? 'failed'
+      : r.viaSafe || r.via4337 ? event.safeExecutionStatus : 'executed';
     if (r.confirmedDetail !== event.detail || r.status !== status) {
       Object.assign(r, { confirmedDetail: event.detail, status,
         confirmedBlockHash: event.blockHash, confirmedBlockNumber: event.blockNumber, settled: false });

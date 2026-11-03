@@ -2,8 +2,6 @@ export const LEGACY_URLS = ['https://flap.sh/bnb/CAstore?lang=zh', 'https://flap
 
 export function assertAllowedUrl(value) {
   const url = new URL(value);
-  const host = url.hostname.toLowerCase().replace(/\.$/, '');
-  if (host === 'flap.sh' || host.endsWith('.flap.sh')) throw Error('旧域名已停用，禁止请求');
   if (!['https:', 'http:'].includes(url.protocol)) throw Error('不支持的请求协议');
   return url;
 }
@@ -19,7 +17,14 @@ export async function fetchSite(url, options = {}, fetchFn = globalThis.fetch) {
     await response.body?.cancel();
     if (!location) throw Error('重定向缺少目标');
     const next = assertAllowedUrl(new URL(location, current));
-    if (next.origin !== current.origin) throw Error('禁止跨域重定向');
+    if (next.origin !== current.origin) {
+      const headers = new Headers(options.headers);
+      const publicSiteReturn = current.origin === 'https://flap.cool' && next.origin === 'https://flap.sh'
+        && ['GET', 'HEAD'].includes(String(options.method || 'GET').toUpperCase())
+        && !options.body && !headers.has('authorization') && !headers.has('cookie')
+        && !headers.has('x-api-key') && options.credentials !== 'include';
+      if (!publicSiteReturn) throw Error('禁止跨域重定向');
+    }
     current = next;
     requestUrl = next.href;
   }
@@ -28,11 +33,16 @@ export async function fetchSite(url, options = {}, fetchFn = globalThis.fetch) {
 
 export function migrateSitePages(data, keyOf) {
   data.pages ||= {};
-  for (const oldUrl of LEGACY_URLS) {
-    const newUrl = oldUrl.replace('flap.sh', 'flap.cool');
-    const old = data.pages[keyOf(oldUrl)] || data.pages[keyOf(oldUrl.split('?')[0])];
-    if (old && !data.pages[keyOf(newUrl)]) data.pages[keyOf(newUrl)] = structuredClone(old);
+  // The cool baseline is newer than the retained sh baseline. Copy exactly once,
+  // retain both, and never overwrite a refreshed sh baseline on later restarts.
+  if (!data.siteDomainRestoredAt) {
+    for (const url of LEGACY_URLS) {
+      const cool = url.replace('flap.sh', 'flap.cool');
+      const baseline = data.pages[keyOf(cool)] || data.pages[keyOf(cool.split('?')[0])];
+      if (baseline) data.pages[keyOf(url)] = structuredClone(baseline);
+    }
+    data.siteDomainRestoredAt = '2026/11/3';
   }
-  data.legacySiteMonitor = { urls: LEGACY_URLS, enabled: false, reason: '保留配置与旧快照；禁止访问旧域名' };
+  data.legacySiteMonitor = { urls: LEGACY_URLS, enabled: true, reason: '用户确认域名恢复；flap.cool 基线保留' };
   return data;
 }

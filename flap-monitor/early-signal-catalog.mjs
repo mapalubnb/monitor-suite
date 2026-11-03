@@ -1,4 +1,4 @@
-import { CORE_PERMISSION_OWNERS, OWNER_CATALOG, NESTED_OWNER_SAFE } from './owner-catalog.mjs';
+import { CORE_PERMISSION_OWNERS, OWNER_CATALOG } from './owner-catalog.mjs';
 // BSC evidence audited 2026-09-25. Roles describe observed activity, not legal identity.
 // Never promote an address solely because it shares a Safe owner or receives a transfer.
 export const CORE_SAFES = Object.freeze([
@@ -30,19 +30,7 @@ export const RELATED_SAFES = ["0x1d60bBBEF79Fb9540D271Dbb01925380323A8f66", "0x6
   "0xDFEe42AcB3FCE076033eDcf2084687340b8f2FAB",
 ];
 export const OBSERVATION_WALLETS = [...Object.keys(OWNER_CATALOG),
-  "0x01bE21A32c281E98Ef239b89CE9e7b1babA2ABcd",
-  "0x0806D3920dAFd50e8cEb189c82D2d3a217e2A045",
-  "0x5d9D048471df8961B8E1d2f8bf4332090F1C361a",
-  "0x7cec45a85BCdA408b83A7107Bad5bA54F0b0128b",
-  "0x3737721dCb6B8737cB8b9223380C59334cbDf4BF",
-  "0xde1ffc96E701707299612c9c51CB398460675661",
-  "0x0754Ae4F8F9090A95Fd28B473ba1e66dDcfACEFd",
-  "0x01db37579E55cE13f4504019025e36047bDaD845",
-  "0x1d60bBBEF79Fb9540D271Dbb01925380323A8f66",
-  "0xd8B61d3c1fe630d1a827256231c14bd61B0d4Ad5",
-  "0x4c08e9166F2cc66dAF63eF9254017a74fe4d9a2f",
-  "0x90deF8Dedf8F3218900454aC1Ff736549e8090Fb",
-  // Received funds from the operating Safe and RELATED_SAFES; no LP attribution.
+  // Funded by operating/related Safes; observation only, no LP attribution.
   "0x24160Dfca52F12017338932DEcE5c85c4F971aeB",
 ];
 export function observationAddresses(config = {}) {
