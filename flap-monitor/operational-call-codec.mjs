@@ -1,4 +1,5 @@
 import { ALLOWANCE_MODULE, COW_SETTLEMENT, POSITION_MANAGERS, DEX } from "./early-signal-catalog.mjs";
+import { ownerLink } from './owner-catalog.mjs';
 import { VAULT_PORTAL_ADDRESS, GRANT_REVOKER_ROLE, AUDITOR_ROLE, portalRoleName } from './vault-portal-v116.mjs';
 
 export const hexWords = data => {
@@ -35,6 +36,12 @@ export function decodeOperationalCall(transaction, path = "0") {
     if (base.operation !== 0) return unknown("非 CALL，保留原始调用");
     if (data === "0x") return { ...base, kind: "funding", recipient: to, amount: BigInt(transaction.value || 0).toString(), asset: "BNB" };
     const w = hexWords(data.slice(10));
+    if (to === '0x8e097e40cd5fc5c32d4231a64b50e10e5dce9791' && selector === '0x59f0115e' && w.length === 0)
+      return { ...base, kind: 'vaultCreationEnable' };
+    if (to === '0xe2ce6ab80874fa9fa2aae65d277dd6b8e65c9de0' && selector === '0xc6455c9c' && w.length === 2)
+      return { ...base, kind: 'dividendExclude', token: abiAddress(w[0]), account: abiAddress(w[1]) };
+    if (['0x3659cfe6', '0x17e4c4d9'].includes(selector) && w.length === 1)
+      return { ...base, kind: 'upgradeTarget', implementation: abiAddress(w[0]) };
     if (to === VAULT_PORTAL_ADDRESS) {
       if (selector === '0x211be400' && w.length === 0) return { ...base, kind: 'grantRoleAdmin', role: GRANT_REVOKER_ROLE, newAdmin: AUDITOR_ROLE };
       if (selector === '0x6e500b55' && w.length === 1) return { ...base, kind: 'grantRevoke', digest: '0x' + w[0] };
@@ -144,7 +151,10 @@ export function describeOperationalAction(a, metadata = {}) {
     auditGrantSubmit: `📝 通过签名授权提交审计报告\n代币：${addressLink(a.token)}\n授权绑定代币：${addressLink(a.grantToken)}\n工厂：${addressLink(a.factory)}\n指定提交者：${addressLink(a.deployer)}\n风险等级：${a.riskLevel}\n报告 CID：${plainLabel(a.ipfsCid)}\nUI 标识：${plainLabel(a.artifactId)}\n授权 nonce：${a.nonce}\n授权有效性仍需链上核验。`,
     ownership: `管理员变更 → ${a.account}`,
     module: `${a.enabled ? "启用" : "停用"} Safe 模块 ${a.module}`,
-    safeOwner: `Safe 所有者${a.action}：${a.account}${a.newOwner ? ` → ${a.newOwner}` : ''}${a.threshold ? `\n签名阈值：${a.threshold}` : ''}`,
+    safeOwner: `Safe 所有者${a.action}：${ownerLink(a.account)}${a.newOwner ? ` → ${ownerLink(a.newOwner)}` : ''}${a.threshold ? `\n签名阈值：${a.threshold}` : ''}`,
+    vaultCreationEnable: `开启信号奖励金库创建\n工厂：${addressLink(a.to)}\n执行结果以链上开关为准。`,
+    dividendExclude: `排除地址分红资格\n代币：${addressLink(a.token)}\n被排除地址：${addressLink(a.account)}`,
+    upgradeTarget: `实现升级调用 ${a.to} → ${a.implementation}\n实际升级对象以 Upgraded 事件核验。`,
     safeThreshold: `Safe 签名阈值拟变更为 ${a.threshold}`,
     liquidityCall: `仓位管理器调用：${a.reason}\n合约：${addressLink(a.to)}\n实际数量和执行结果以回执为准。`,
     allowance: `${a.reason} ${a.selector}${a.delegate ? `\n委托：${addressLink(a.delegate)}` : ""}${a.asset ? `\n资产：${token === "BNB" ? "BNB" : addressLink(a.asset)}\n额度：${quantity}\n重置间隔：${a.resetMinutes} 分钟` : ""}`,

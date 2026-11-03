@@ -305,7 +305,8 @@ test("contract state scan establishes a baseline then reports slot getter and se
   assert.equal(baseline.changed, false);
   assert.equal(state.contracts[FLAP_CORE_CONTRACTS.factory].slots.implementation, fixture.values.implementation);
   assert.equal(state.catalog[FLAP_CORE_CONTRACTS.vaultPortal].kind, "vaultPortal");
-  assert.equal(contractIntegritySubscriptionAddresses(state).length, 3);
+  assert.equal(contractIntegritySubscriptionAddresses(state).length, 4);
+  assert.ok(contractIntegritySubscriptionAddresses(state).includes('0x9e27098dcd8844bcc6287a557e0b4d09c86b8a4b'));
 
   const nextImplementation = `0x${"22".repeat(20)}`;
   fixture.values.block++;

@@ -1,5 +1,11 @@
 # Flap 监控交接
 
+## 2026/11/3 Owner 权限监控实现与验证（Suite 1.12.73 / Flap 1.10.44）
+
+用户明确授权本对话完成所有 owner 监控优化和卡片标注。修改 owner-catalog、early-signal-catalog/monitor/topics、address-observation、operational-call-codec、safe-proposal-monitor、contract-integrity-monitor、monitor 发送/编辑入口及对应测试，更新根/Flap 版本、README、MONITORING。本地 Flap 409/409、全项目 699/699、新增专项 5/5、语法及 diff 检查通过。14 核心权限＋3 增强观察＋6 二级关联均不提升官方/流动性归属。嵌套 Safe 纳入提案轮询和权限核验；7702 采用原扩展周期检测；批量调用限制目标、深度、数量与 ABI 边界。新增 owner 卡片角色图例，未知角色明确标注。
+
+发布需求：先推 GitHub 再部署，仅重启 flap-monitor；备份 .env、监控状态与队列，保留原频率/Key/降噪/历史放弃。当前仅完成本地验证，服务器连接间歇超时，部署验收另记。原 17 个普通观察地址线上已确认，新增合约 owner 尚未在旧版名单；此前口头不确定的覆盖现已核实。公共 RPC 内部 trace、私有 pending、采样间临时委托变化仍有覆盖限制，详见 MONITORING。
+
 ### 2026/10/31 13:51 持续观察补充
 
 13:47 曾再次观察到实时扫描延迟72块；13:51:37自动追平至0块，13:51:46为3块，游标持续推进，未清空状态或跳过积压。CoW全部10个地址均已成功查询且错误为空；Safe在13:47:28成功、当时错误为空。机制模板22项详情与1个启用小程序采集无错误。再次比对根.env逐字相同、14项调度周期相同、AI关闭。RPC仍有瞬时超时和本地预算等待，因此本次验收证明可恢复，不代表持续零延迟。

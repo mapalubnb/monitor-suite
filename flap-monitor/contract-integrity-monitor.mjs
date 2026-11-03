@@ -1,4 +1,5 @@
 import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
+import { OWNER_CATALOG, OWNER_MANAGEMENT_CONTRACT, NESTED_OWNER_SAFE, annotateOwners } from './owner-catalog.mjs';
 import { createHash } from "node:crypto";
 import { buildVaultFactoryLaunchUrl } from "./vault-links.mjs";
 import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
@@ -38,6 +39,7 @@ const BEACON_UPGRADED_TOPIC = CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS[2];
 const BIT_FLAGS_CHANGED_TOPIC = CONTRACT_INTEGRITY_FACTORY_EVENT_TOPICS[5];
 
 const EVENT_LABELS = Object.freeze({
+  '0x8be0079c531659141344cd1fd0a4f28419497f9722a3daafe3b4186f6b6457e0': '合约 owner 转移',
   [ROLE_ADMIN_CHANGED]: '角色管理权限变更',
   [GRANT_REVOKED]: '审计授权已撤销',
   [GRANT_USED]: '审计授权已使用',
@@ -136,10 +138,17 @@ const IGNORED_OPERATIONAL_TOPICS = new Set([
   VAULT_FACTORY_REGISTERED_TOPIC,
   VAULT_FACTORY_CATEGORY_SET_TOPIC,
 ]);
-const FULL_LOG_MONITOR_KINDS = new Set(["swapRegistry", "vaultPortal", "vaultFactory"]);
+const FULL_LOG_MONITOR_KINDS = new Set(["swapRegistry", "vaultPortal", "vaultFactory", "ownerManager"]);
 const VERIFIED_CATALOG_SOURCES = new Set(["builtin", "onchain-getter", "vault-portal-event"]);
 
 const GETTERS = Object.freeze({
+  'proxy-admin': [['owner', '0x8da5cb5b', 'address']],
+  ownerSafe: [
+    ['owners', '0xa0e67e2b', 'address[]'],
+    ['threshold', '0xe75235b8', 'uint'],
+    ['modulesFirst100', '0xcc2f8452' + '1'.padStart(64, '0') + '64'.padStart(64, '0'), 'address[]'],
+    ['masterCopy', '0xa619486e', 'address', 'implementation'],
+  ],
   factory: [
     ["version", "0x54fd4d50", "string"],
     ["newFeatureSwitch", "0xb1aad1e1", "bool"],
@@ -244,6 +253,10 @@ export function decodeContractValue(raw, type = "bytes32") {
 
 function staticCatalog() {
   return {
+    ...Object.fromEntries(Object.entries(OWNER_CATALOG).map(([address, owner]) => [address, {
+      address, label: owner.label, kind: address === NESTED_OWNER_SAFE ? 'ownerSafe' : address === OWNER_MANAGEMENT_CONTRACT ? 'ownerManager' : 'owner',
+      proxy: address === OWNER_MANAGEMENT_CONTRACT, source: 'builtin', verified: true, observationOnly: true,
+    }])),
     ...Object.fromEntries(PROXY_ADMINS.map(address => [address, {
       address, label: "Flap 升级 ProxyAdmin", kind: "proxy-admin", proxy: false, source: "builtin", verified: true,
     }])),
@@ -441,6 +454,13 @@ export async function runContractIntegrityStateScan({
 
   const stateCalls = [];
   for (const entry of entries) {
+    if (entry.kind === 'ownerSafe') {
+      for (const [field, slot] of [['guard', '0x4a204f620c8c5ccdca3fd54d003badd85ba500436a431f0cbda4f558c93c34c8'],
+        ['fallbackHandler', '0x6c9a6c4a39284e37ed1cf53d337577d14212a4870fb976a4366c693b939918d5']]) {
+        stateCalls.push({ address: entry.address, field, type: 'getter', valueType: 'address',
+          call: { method: 'eth_getStorageAt', params: [entry.address, slot, blockTag] } });
+      }
+    }
     if (entry.proxy) {
       for (const [field, slot] of [["implementation", EIP1967_IMPLEMENTATION_SLOT], ["admin", EIP1967_ADMIN_SLOT], ["beacon", EIP1967_BEACON_SLOT]]) {
         stateCalls.push({ address: entry.address, field, type: "slot", call: { method: "eth_getStorageAt", params: [entry.address, slot, blockTag] } });
@@ -472,7 +492,7 @@ export async function runContractIntegrityStateScan({
       const comparable = Array.isArray(decoded) ? decoded.join(",") : decoded;
       compareField(state, changes, item.address, item.field, contract.getters[item.field]?.value, comparable, "getter");
       contract.getters[item.field] = { value: comparable, rawHash: hashText(raw), updatedAt: nowIso() };
-      if (item.valueType === "address[]") {
+      if (item.valueType === "address[]" && !['owners', 'modulesFirst100'].includes(item.field)) {
         for (const address of decoded) {
           state.trackedAssets[address] = { ...(state.trackedAssets[address] || {}), address, label: address, source: `${state.catalog[item.address]?.label || item.address}:${item.field}`, lastSeenAt: nowIso() };
         }
@@ -486,7 +506,7 @@ export async function runContractIntegrityStateScan({
 
   const codeTargets = new Set();
   for (const entry of Object.values(state.catalog)) {
-    if (forceCodeAudit || !state.contracts[entry.address]?.codeHash) codeTargets.add(entry.address);
+    if (forceCodeAudit || !state.contracts[entry.address]?.codeHash || (extended && ['owner', 'ownerSafe', 'ownerManager'].includes(entry.kind))) codeTargets.add(entry.address);
   }
   for (const derived of newDerived) {
     const address = normalizeAddress(derived.address);
@@ -501,6 +521,12 @@ export async function runContractIntegrityStateScan({
     const contract = state.contracts[address] || (state.contracts[address] = { address, getters: {}, slots: {} });
     if ((contract.lastCodeBlock || 0) > scanBlock) continue;
     const codeHash = hashText(code.toLowerCase());
+    if (OWNER_CATALOG[address]) {
+      const delegation = /^0xef0100[a-f0-9]{40}$/i.test(code) ? '0x' + code.slice(8).toLowerCase() : '';
+      compareField(state, changes, address, 'EIP-7702 委托目标', contract.delegation, delegation, 'delegation');
+      contract.delegation = delegation;
+      if (delegation) addCatalogEntry(state, delegation, { kind: 'owner-delegate', label: 'Owner EIP-7702 委托实现（不代表官方）', source: 'onchain-getter', verified: true });
+    }
     const selectors = code === "0x" ? [] : extractBytecodeSelectors(code);
     compareField(state, changes, address, "codeHash", contract.codeHash, codeHash, "code-hash");
     if (Array.isArray(contract.selectors) && contract.selectors.length > 0 && JSON.stringify(contract.selectors) !== JSON.stringify(selectors)) {
@@ -778,7 +804,7 @@ export function buildContractIntegrityContent(changes = [], state = {}) {
       lines.push(`### ⚙️ ${change.field}`, `<font color='red'>− ${shortValue(display(change.previous))}</font>`, `<font color='green'>+ ${shortValue(display(change.current))}</font>`);
     }
   }
-  return lines.join("\n\n");
+  return annotateOwners(lines.join("\n\n"));
 }
 
 export const __testables = {

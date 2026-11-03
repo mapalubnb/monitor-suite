@@ -1,3 +1,4 @@
+import { CORE_PERMISSION_OWNERS, OWNER_CATALOG, NESTED_OWNER_SAFE } from './owner-catalog.mjs';
 // BSC evidence audited 2026-09-25. Roles describe observed activity, not legal identity.
 // Never promote an address solely because it shares a Safe owner or receives a transfer.
 export const CORE_SAFES = Object.freeze([
@@ -21,19 +22,14 @@ export const EXECUTION_WALLETS = [
   // 0xc60e...a66b and received LP NFT #7668265. Business association, not identity proof.
   "0x57d5656b4212af89f0afcc9680a7fb1d08b5c5c9",
 ];
-export const CORE_OWNERS = [
-  "0x25D1BE80daaE074D3FAF7987fb21bdfe791E2BBc",
-  "0x29a64981d327c2B4893F1bB84aa9A6266EFBb491",
-  "0xA85c06f58B6A2F1BF577B15F20F4AA66D8a334Ec",
-  "0x705163Cf642a975d2F0570463BE93AAb7993D1c2",
-];
+export const CORE_OWNERS = CORE_PERMISSION_OWNERS;
 // Read-only BSC verification at block 128109250 (2026-10-17).
 // A funded/actively signed Safe is a financial relation, not Portal authority.
-export const RELATED_SAFES = ["0x65eA398b9EB6b7A75FD5A1018463039374A0b908",
+export const RELATED_SAFES = [NESTED_OWNER_SAFE, "0x65eA398b9EB6b7A75FD5A1018463039374A0b908",
   // 2026-10-21: verified 1/1 Safe; shared owner, not an official execution wallet.
   "0xDFEe42AcB3FCE076033eDcf2084687340b8f2FAB",
 ];
-export const OBSERVATION_WALLETS = [...CORE_OWNERS,
+export const OBSERVATION_WALLETS = [...Object.keys(OWNER_CATALOG),
   "0x01bE21A32c281E98Ef239b89CE9e7b1babA2ABcd",
   "0x0806D3920dAFd50e8cEb189c82D2d3a217e2A045",
   "0x5d9D048471df8961B8E1d2f8bf4332090F1C361a",

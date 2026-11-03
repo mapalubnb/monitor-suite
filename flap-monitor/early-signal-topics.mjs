@@ -1,5 +1,7 @@
 // Event signatures verified against Safe, ERC4626, Pancake and Uniswap interfaces.
 export const EVENT_SIGNATURES = {
+  ChangedGuard: 'ChangedGuard(address)',
+  ChangedFallbackHandler: 'ChangedFallbackHandler(address)',
   "IncreaseLiquidity": "IncreaseLiquidity(uint256,uint128,uint256,uint256)",
   "DecreaseLiquidity": "DecreaseLiquidity(uint256,uint128,uint256,uint256)",
   "Transfer": "Transfer(address,address,uint256)",
@@ -30,6 +32,8 @@ export const EVENT_SIGNATURES = {
   "ChangedThreshold": "ChangedThreshold(uint256)"
 };
 export const TOPICS = {
+  ChangedGuard: '0x1151116914515bc0891ff9047a6cb32cf902546f83066499bcf8ba33d2353fa2',
+  ChangedFallbackHandler: '0x5ac6c46c93c8d0e53714ba3b53db3e7c046da994313d7ed0d192028bc7c228b0',
   "IncreaseLiquidity": "0x3067048beee31b25b2f1681f88dac838c8bba36af25bfb2b7cf7473a5847e35f",
   "DecreaseLiquidity": "0x26f6a048ee9138f2c0ce266f322cb99228e8d619ae2bff30c67f8dcf9d2377b4",
   "Transfer": "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef",

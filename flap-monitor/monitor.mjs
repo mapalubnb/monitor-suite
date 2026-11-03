@@ -1,4 +1,5 @@
 import { fetchSite, migrateSitePages } from './site-domain.mjs';
+import { annotateOwners } from './owner-catalog.mjs';
 import { observedSafeConfig } from './safe-observation.mjs';
 import { createMiniAppMonitor } from './mini-app-monitor.mjs';
 import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.mjs';
@@ -41,7 +42,8 @@ import { hasTokenDecimals, operationalAmountToken } from "./operational-call-cod
 import { decodeRegistryLog, ingestRegistryLog, drainRegistryNotifications, auditRegistryNotifications } from './registry-notifications.mjs';
 import { startPendingRegistryFeed, ingestPendingRegistration, observePendingReplacement,
   checkPendingRegistrations, pendingRegistryContent } from './pending-registry.mjs';
-import { sendCard, sendCardQueued, patchCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
+import { sendCard, sendCardQueued, patchCard as patchRawCard, waitQueueDrain, planCardParts, isMultiPartCard } from "../shared/feishu-client.mjs";
+const patchCard = (id, title, content, ...args) => patchRawCard(id, title, annotateOwners(content), ...args);
 import {
   BNB_QUOTE_TOKEN,
   FACTORY_POOL_STATE_EVENT_TOPICS,
@@ -970,6 +972,7 @@ function closeFeishuAuthCircuit() {
  * 带重试的卡片发送（兼容旧接口 sendFeishu）
  */
 async function sendFeishu(title, content, template = "red", _retries = 2) {
+  content = annotateOwners(content);
   if (!canAttemptFeishuDelivery()) {
     warnFeishuUnavailable(hasUsableFeishuCredentials()
       ? "凭证认证熔断中，本次推送保留等待后续重试"
@@ -1015,6 +1018,7 @@ function isStylePseudoConfigDiff(cd = {}) {
  * 通过 IM API 发送卡片消息到群聊，返回 message_id
  */
 async function sendCardViaApi(title, content, template = "red", diffFilePath, cardOpts = {}) {
+  content = annotateOwners(content);
   if (!canAttemptFeishuDelivery()) {
     const reason = hasUsableFeishuCredentials() ? "飞书凭证认证熔断中" : "飞书凭证缺失或仍为占位值";
     warnFeishuUnavailable(`${reason}，跳过本次发送`);

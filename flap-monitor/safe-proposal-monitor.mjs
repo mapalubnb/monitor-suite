@@ -1,4 +1,5 @@
 import { withDeadline } from '../shared/request-deadline.mjs';
+import { OWNER_MANAGEMENT_CONTRACT, annotateOwners, ownerLink } from './owner-catalog.mjs';
 import { formatBeijingTime } from "../shared/display-format.cjs";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from 'node:timers/promises';
@@ -124,6 +125,30 @@ export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_
   const selector = data.slice(0, 10);
   const operation = Number(transaction?.operation ?? 0);
   if (!to) return [];
+  if (includeOperations && to === OWNER_MANAGEMENT_CONTRACT && selector === '0x69cdc163') {
+    try {
+      if (operation !== 0 || depth >= MAX_MULTISEND_DEPTH) throw Error('管理批量调用类型或嵌套深度无效');
+      const body = data.slice(10), words = hexWords(body);
+      const array = slot => {
+        const offset = Number(BigInt('0x' + words[slot]));
+        if (!Number.isSafeInteger(offset) || offset < 96 || offset % 32 || offset * 2 + 64 > body.length) throw Error('管理数组偏移越界');
+        const count = Number(BigInt('0x' + body.slice(offset * 2, offset * 2 + 64)));
+        if (!Number.isSafeInteger(count) || count < 1 || count > 64 || (offset + 32 + count * 32) * 2 > body.length) throw Error('管理数组数量越界');
+        return { count, offset, body: body.slice(offset * 2 + 64) };
+      };
+      const targets = array(0), values = array(1), calls = array(2);
+      if (targets.count !== values.count || targets.count !== calls.count) throw Error('管理批量数组长度不一致');
+      if (values.offset < targets.offset + 32 + targets.count * 32 || calls.offset < values.offset + 32 + values.count * 32) throw Error('管理批量数组重叠');
+      return Array.from({ length: targets.count }, (_, i) => {
+        const start = Number(BigInt('0x' + calls.body.slice(i * 64, i * 64 + 64)));
+        if (start < calls.count * 32) throw Error('管理调用 bytes 覆盖数组头部');
+        return extractFlapProposalActions({ to: abiAddress(targets.body.slice(i * 64, i * 64 + 64)),
+          value: BigInt('0x' + values.body.slice(i * 64, i * 64 + 64)).toString(),
+          data: abiBytes(calls.body, i), operation: 0 },
+          { factoryAddress, depth: depth + 1, path: `${path}.manager.${i}`, includeOperations, safeAddresses });
+      }).flat();
+    } catch (error) { return [{ to, selector, operation, callPath: path, kind: 'unknown', reason: error.message, rawData: data }]; }
+  }
   if (to === VAULT_PORTAL && [REGISTER_VAULT_FACTORY_SELECTOR, REGISTER_VAULT_FACTORY_CATEGORY_SELECTOR].includes(selector)) {
     const base = { to, selector, operation, callPath: path, quoteToken: "" };
     try {
@@ -339,6 +364,7 @@ function normalizeProposal(proposal, safe, quoteToken, nowText) {
     proposer: normalizeAddress(proposal?.proposer),
     submissionDate: proposal?.submissionDate || "",
     confirmations,
+    confirmationOwners: [...new Set((proposal.confirmations || []).map(c => normalizeAddress(c.owner)).filter(Boolean))],
     required,
     actions: [],
     status: required > 0 && confirmations >= required ? "ready" : "pending",
@@ -910,6 +936,7 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
     if (change.nonceBlocked) lines.push("⏳ 前序 nonce 未执行");
     if (change.executionCheck?.status === "passed") lines.push("✅ 只读执行模拟通过｜" + formatDate(change.executionCheck.checkedAt));
     else if (change.status === "ready") lines.push("⏳ 执行条件未核实");
+    if (change.confirmationOwners?.length) lines.push('已确认 owner（Safe 服务记录）：\n' + change.confirmationOwners.map(ownerLink).join('\n'));
     lines.push("首次观测：" + formatDate(change.firstSeenAt));
     lines.push("确认进度：" + change.confirmations + "/" + (change.required || "未知") + "｜Safe nonce：" + change.nonce);
     lines.push("管理 Safe：[" + change.safe + "](https://app.safe.global/transactions/queue?safe=bnb:" + change.safe + ")");
@@ -919,5 +946,5 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
     if (change.chainVerification) lines.push(change.chainVerification);
     lines.push("");
   }
-  return lines.join("\n");
+  return annotateOwners(lines.join("\n"));
 }

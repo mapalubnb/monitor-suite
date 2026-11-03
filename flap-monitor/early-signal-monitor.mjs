@@ -1,5 +1,6 @@
 import { observedSafeConfig, mergeObservedSafes, SAFE_FACTORIES, PROXY_CREATION, verifySafeDiscoveries, rewindObservedSafes, verifyApiObservedSafe } from './safe-observation.mjs';
 import { ENTRY_POINT_V07, USER_OPERATION_EVENT } from './erc4337-codec.mjs';
+import { annotateOwners, ownerLink, OWNER_MANAGEMENT_CONTRACT } from './owner-catalog.mjs';
 import { formatBeijingTime } from '../shared/display-format.cjs';
 import { withDeadline } from '../shared/request-deadline.mjs';
 import { recoverLiveCursor, activateHistoryGap, readAvailableLogWindow } from "../shared/scan-recovery.mjs";
@@ -150,6 +151,7 @@ export function earlyLogFilters(state, config = {}) {
     { address: watchedWallets(config).filter(a => a !== FEE_SAFE), topics: [TOPICS.SafeReceived] },
     // Module ABI versions may differ. Its low-volume logs are retained and scoped by Safe address.
     { address: ALLOWANCE_MODULE },
+    { address: OWNER_MANAGEMENT_CONTRACT },
     ...(positionIds.length ? [{ address: DEX.v3Positions, topics: [[TOPICS.IncreaseLiquidity, TOPICS.DecreaseLiquidity], positionIds] }] : []),
     { address: [DEX.v4Manager, DEX.clManager, DEX.binManager], topics: [[TOPICS.V4Initialize, TOPICS.CLInitialize, TOPICS.BinInitialize]] },
     ...(Object.values(state.pools).some(p => p.poolId && active(p)) ? [{
@@ -277,13 +279,20 @@ export function decodeEarlyReceipt(receipt, state, { config = {}, nowMs = Date.n
         trackToken(state, a, "ERC4626 事件，待 asset() 复核", nowMs);
         add(l, { kind: t === TOPICS.Deposit ? "wrap" : "redeem", token: a, stage: "observation", detail: `${t === TOPICS.Deposit ? "存入并铸造包装份额" : "赎回包装份额"} ${a}｜原始参数 ${w.map(abiUint).join(" / ")}；asset() 映射待复核` });
       } else if ([TOPICS.ModuleSuccess, TOPICS.ModuleFailure, TOPICS.EnabledModule, TOPICS.DisabledModule,
-        TOPICS.AddedOwner, TOPICS.RemovedOwner, TOPICS.ChangedThreshold, TOPICS.SafeReceived].includes(t) && (wallets.has(a) || observedSafes.has(a))) {
+        TOPICS.AddedOwner, TOPICS.RemovedOwner, TOPICS.ChangedThreshold, TOPICS.ChangedGuard, TOPICS.ChangedFallbackHandler, TOPICS.SafeReceived].includes(t) && (wallets.has(a) || observedSafes.has(a))) {
         if (t === TOPICS.SafeReceived && a === feeSafe && !wallets.has(addressTopic(l.topics[1]))) continue;
-        add(l, { kind: "safeOperation", detail: `Safe ${a}｜${Object.keys(TOPICS).find(k => TOPICS[k] === t)}｜参数 ${JSON.stringify(l.topics.slice(1))} ${l.data}`, raw: l });
+        const ownerEvent = [TOPICS.AddedOwner, TOPICS.RemovedOwner].includes(t);
+        const owner = ownerEvent ? addressTopic(l.topics[1] || '0x' + (w[0] || '')) : '';
+        add(l, { kind: "safeOperation", detail: ownerEvent
+          ? `Safe ${a}｜${t === TOPICS.AddedOwner ? '新增' : '移除'} owner：${ownerLink(owner)}`
+          : `Safe ${a}｜${Object.keys(TOPICS).find(k => TOPICS[k] === t)}｜参数 ${JSON.stringify(l.topics.slice(1))} ${l.data}`, raw: l });
         if ([TOPICS.AddedOwner, TOPICS.RemovedOwner].includes(t)) {
           const owner = addressTopic(l.topics[1] || '0x' + (w[0] || ''));
           candidate(state, owner, `Safe ${t === TOPICS.AddedOwner ? '新增' : '移除'}所有者 ${a} ${receipt.transactionHash}`, nowMs);
         }
+      } else if (a === OWNER_MANAGEMENT_CONTRACT) {
+        add(l, { kind: 'authority', observationOnly: true, actor: a,
+          detail: `合约 owner 事件：${a}｜${t}｜权限及业务含义以 ABI 核验，不自动认定官方操作。`, raw: l });
       } else if (a === ALLOWANCE_MODULE) {
         const known = new Set([...wallets].map(x => x.slice(2)));
         if (![...(l.topics || []), ...w].some(x => known.has(x.replace(/^0x/, "").slice(-40)))) continue;
@@ -490,7 +499,7 @@ export function syncEarlyProposals(state, safeState, nowMs = Date.now()) {
 export async function scanAddressDiscovery(state, config, fetchFn, nowMs, rpcBatch) {
   const base = (config.safeApiBaseUrl || "https://api.safe.global/tx-service/bnb/api/v1").replace(/\/$/, "");
   const opts = { fetchFn, timeoutMs: config.timeoutMs, apiKey: config.safeApiKey || "" };
-  const safes = uniq([...(config.safes || CORE_SAFES.map(([a]) => a)), ...AUXILIARY_SAFES]);
+  const safes = uniq([...(config.safes || CORE_SAFES.map(([a]) => a)), ...AUXILIARY_SAFES, ...(config.relatedSafes ?? RELATED_SAFES)]);
   const progress = state.discoveryProgress ||= { safes: [], owners: [] };
   for (const safe of safes.filter(safe => !progress.safes.includes(safe))) {
     const info = await jsonGet(`${base}/safes/${safe}/`, opts);
@@ -991,7 +1000,7 @@ export function buildEarlySignalContent(changes, state) {
     if (tx.transactionHash) lines.push(`[交易](https://bscscan.com/tx/${tx.transactionHash})｜区块 ${tx.blockNumber}`);
     lines.push("");
   }
-  return lines.join("\n");
+  return annotateOwners(lines.join("\n"));
 }
 function prune(state, nowMs) {
   const protectedIds = new Set(state.pendingChanges.map(e => e.id));

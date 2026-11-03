@@ -2,6 +2,7 @@ import { observationAddresses, RELATED_SAFES, POSITION_MANAGERS } from './early-
 import { extractFlapProposalActions } from './safe-proposal-monitor.mjs';
 import { describeOperationalAction } from './operational-call-codec.mjs';
 import { TOPICS } from './early-signal-topics.mjs';
+import { OWNER_CATALOG, annotateOwners } from './owner-catalog.mjs';
 import { ENTRY_POINT_V07, decodeHandleOps, decodeSafeUserOperation, userOperationResult, operationKey4337, receiptUserOperations } from './erc4337-codec.mjs';
 
 const lower = a => String(a || '').toLowerCase();
@@ -15,13 +16,17 @@ export function establishObservationCoverage(state, config, head) {
 }
 
 export function observeAddressTransaction(receipt, transaction, state, config, trustedWallets) {
-  if (!transaction || Number(receipt.status) !== 1
+  if (!transaction
     || lower(transaction.hash) !== lower(receipt.transactionHash)
     || lower(transaction.blockHash) !== lower(receipt.blockHash)
     || Number(transaction.blockNumber) !== Number(receipt.blockNumber)) return [];
   const from = lower(transaction.from), to = lower(transaction.to);
   const observers = new Set(observationAddresses(config).filter(a =>
     Number(receipt.blockNumber) >= (state.observationCoverage?.[a] ?? Infinity)));
+  const ownerCall = observers.has(to) && Boolean(OWNER_CATALOG[to]) && (transaction.input || '0x').length >= 10;
+  if (Number(receipt.status) !== 1) return observers.has(from) || ownerCall ? [{ kind: 'addressObservation', observationOnly: true,
+    actor: observers.has(from) ? from : to, safeExecutionStatus: 'failed',
+    detail: annotateOwners(`关联 owner 交易执行失败：${link(from)} → ${link(to)}\n选择器：${String(transaction.input || '').slice(0, 10)}\n不作为内部操作成功的证据；EIP-7702 委托状态另行核验。`) }] : [];
   const relatedSafes = new Set((config.relatedSafes ?? RELATED_SAFES).map(lower));
   const receiptOperations = receiptUserOperations(receipt);
   if (to === ENTRY_POINT_V07 || receiptOperations.length) {
@@ -50,7 +55,7 @@ export function observeAddressTransaction(receipt, transaction, state, config, t
     }
   }
   // Existing trusted-wallet paths retain their own classification and noise policy.
-  if (trustedWallets.has(from) || trustedWallets.has(to)) return [];
+  if ((trustedWallets.has(from) || trustedWallets.has(to)) && !ownerCall) return [];
   const safeCall = relatedSafes.has(to) && observers.has(to)
     && transaction.input?.toLowerCase().startsWith('0x6a761202');
   const safeFailure = safeCall && receipt.logs?.some(l => lower(l.address) === to
@@ -65,7 +70,7 @@ export function observeAddressTransaction(receipt, transaction, state, config, t
   const incoming = (receipt.logs || []).filter(l => lower(l.topics?.[0]) === TOPICS.Transfer
     && l.topics.length === 3 && /^0x[a-f0-9]{64}$/i.test(l.data || '')
     && observers.has('0x' + lower(l.topics[2]).slice(-40)));
-  if (!own && !safeExecution && !incomingNative) return incoming.filter(l => BigInt(l.data) > 0n).map(l => ({
+  if (!own && !safeExecution && !incomingNative && !ownerCall) return incoming.filter(l => BigInt(l.data) > 0n).map(l => ({
     kind: 'transfer', observationOnly: true, passiveIncoming: true, token: lower(l.address),
     from: '0x' + lower(l.topics[1]).slice(-40), to: '0x' + lower(l.topics[2]).slice(-40),
     amount: BigInt(l.data).toString(), observationLogIndex: Number(l.logIndex),
@@ -82,7 +87,7 @@ export function observeAddressTransaction(receipt, transaction, state, config, t
     : 'Safe 执行结果待核验；缺少有效执行结果事件，不确认内部操作成功。'}` }];
   if (!to && receipt.contractAddress && own) return [{ ...base,
     detail: `${base.detail}\n部署合约：${link(lower(receipt.contractAddress))}` }];
-  if (!own && !safeExecution) return [{ ...base, detail: `${base.detail}\n${describeOperationalAction({
+  if (!own && !safeExecution && !ownerCall) return [{ ...base, detail: `${base.detail}\n${describeOperationalAction({
     kind: 'funding', asset: 'BNB', recipient: to, amount: BigInt(transaction.value || 0).toString() })}\n来源：${link(from)}` }];
   let actions;
   try { actions = extractFlapProposalActions({ to, data: transaction.input || '0x', value: transaction.value || '0x0' },
