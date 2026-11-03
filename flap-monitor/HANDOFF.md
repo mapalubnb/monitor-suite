@@ -1,5 +1,11 @@
 # Flap 监控交接
 
+## 2026/11/3 22:22 发布验收完成
+
+Suite1.12.74 / Flap1.10.45，业务723b83e及补正1d4a19c已先推GitHub后部署，服务器确认1d4a19c。Flap PID1875667 online；Four.meme192264和机器人1203994未重启。补正后的全量699/699、Flap409/409、服务器专项5/5通过。新增嵌套Safe于22:21:45完成提案基线，currentNonce388、lastError为空，正常进入持续轮询。完整性已读取5个7702委托、嵌套Safe 3/6及guard/fallback/modules；新增manager已建立观察覆盖。根.env逐字一致，14项调度周期和完整性历史放弃记录不变。
+
+验收限制：22:22实时游标131447715/头131448072，仍在补扫；公共RPC存在missing trie node/预算等待等瞬时错误，CoW有429；旧飞书卡超过14天无法编辑为既存问题。本次未清队列或跳游标，未发送测试卡，卡片标注通过本地专项验证；不保证所有内部trace、私有pending或采样间短暂委托变化均可见。备份/root/monitor-suite-backups/flap-owner-1.12.73-20261103。后续仅同步本验收文档，无需重启。
+
 ## 2026/11/3 Owner 监控验收补正（Suite 1.12.74 / Flap 1.10.45）
 
 723b83e 已先推 GitHub 后部署，Flap 单独重启。现场已读到 5 个 7702 委托和嵌套 Safe 3/6、guard、fallback、模块基线；发现新增关联 Safe 传给 API 的小写地址触发 422，改为现有 EIP-55 地址并增加断言。补正后 Flap 409/409、专项 5/5 通过。原环境配置逐字一致，保留状态游标；备份位于 /root/monitor-suite-backups/flap-owner-1.12.73-20261103。最终部署验收另记。
