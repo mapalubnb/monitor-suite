@@ -32,6 +32,8 @@ export const RELATED_SAFES = ["0x1d60bBBEF79Fb9540D271Dbb01925380323A8f66", "0x6
 export const OBSERVATION_WALLETS = [...Object.keys(OWNER_CATALOG),
   // Funded by operating/related Safes; observation only, no LP attribution.
   "0x24160Dfca52F12017338932DEcE5c85c4F971aeB",
+  // 2026-11-04: receives bulk asset transfers from 0x81459...; custody/identity unverified.
+  "0x897168c207f09c7c2d084c5e2e2cfcb236e346ef",
 ];
 export function observationAddresses(config = {}) {
   return [...new Set([...(config.observationWallets ?? OBSERVATION_WALLETS),

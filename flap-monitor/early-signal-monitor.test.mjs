@@ -19,9 +19,9 @@ import { observationAddresses, OBSERVATION_WALLETS, RELATED_SAFES } from './earl
 import { establishObservationCoverage, observeAddressTransaction } from './address-observation.mjs';
 
 const coverageFixture = JSON.parse(readFileSync(new URL('./fixtures/address-coverage-20261017.json', import.meta.url)));
-test('关联覆盖：16 个所有者与资金观察地址有效，真实 Safe 调拨不提升官方准备状态', () => {
-  assert.equal(new Set(OBSERVATION_WALLETS.map(x => x.toLowerCase())).size, 24);
-  assert.equal(observationAddresses().length, 26);
+test('关联覆盖：所有者与资金观察地址有效，真实 Safe 调拨不提升官方准备状态', () => {
+  assert.equal(new Set(OBSERVATION_WALLETS.map(x => x.toLowerCase())).size, 25);
+  assert.equal(observationAddresses().length, 27);
   const sample = coverageFixture.samples[0], state = createEarlySignalState();
   const originalCursor = state.cursor;
   establishObservationCoverage(state, {}, Number(sample.receipt.blockNumber));

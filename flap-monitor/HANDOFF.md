@@ -1,5 +1,11 @@
 # Flap 监控交接
 
+## 2026/11/4 关联资产接收钱包监控（Suite 1.12.77 / Flap 1.10.48）
+
+用户授权加入 `0x897168c207f09c7c2d084c5e2e2cfcb236e346ef`。该地址接收已有执行钱包批量资产调拨，归属与用途仍待核验；仅加入 OBSERVATION_WALLETS，不加入 Safe、owner 或可信执行钱包。复用原链上/WSS 观察、交易解析和被动收币降噪，从首次生效高度建立覆盖，不回放旧入账、不提升官方或流动性准备状态。原频率、Safe Key、历史放弃、Agent Curve 停用及 AI 关闭保持。仅需重启 Flap，根环境无需修改。
+
+验证：npm run check、Flap 414/414 回归、目标地址转出/授权观察及历史不回放定点验证、git diff --check 通过。修改文件为 early-signal-catalog/对应数量断言、根与模块版本、README/MONITORING/HANDOFF。发布仅重启 Flap；实际生效高度与服务器验收待部署后补记。
+
 ## 2026/11/3 Safe 审查修复发布与验收边界
 
 业务3650b6b（Suite1.12.75 / Flap1.10.46）及实时读取补正c1525f047b5ccdce494530417ad563c9e7c1d538（Suite1.12.76 / Flap1.10.47）均先推GitHub再部署，最终服务器已返回确切c1525f0、Flap PID1882156 online；Four.meme192264和机器人1203994未重启。最终代码全项目774/774、Flap431/431通过；服务器owner/域名专项11/11、读取补正4/4通过。
