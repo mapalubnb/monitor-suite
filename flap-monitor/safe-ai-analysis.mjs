@@ -173,6 +173,8 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
         ? `${jobs[0].mode === 'transfer' ? '转账说明' : 'AI解读'}：${jobs[0].summary}`
         : `提案摘要：本卡涉及${jobs.length}笔新提案，包含${jobs.some(j => j.mode === 'ai') ? '机制、权限或组合操作' : '资金转账'}。各笔参数见原卡；提案不等于执行，机制与资金用途须结合验证证据核验。`;
       if (size(brief) > 150) continue;
+      // Apply presentation after the visible-text limit; deterministic templates keep their original style.
+      brief = brief.split('\n').map(line => line.startsWith('AI解读') ? `<font color='green'>${line}</font>` : line).join('\n');
       const body = render(card.changes, card.metadata) + (brief ? '\n\n' + brief : '');
       const digest = createHash('sha256').update(body).digest('hex');
       if (card.lastDigest === digest) { card.dirty = false; continue; }

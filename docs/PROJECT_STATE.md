@@ -85,7 +85,7 @@ Suite 1.12.77 / Flap 1.10.48，业务提交 `9cc45ddbbbc05168f5b26fb12aa82fef17f
 
 - 仓库：`git@github.com:mapalubnb/monitor-suite.git`；默认直接更新 `main`，不强推、不覆盖远程工作。
 - 最新已核验业务提交：`a421ec2c0fefab6fa8c4225d4d33a95a36f4ecc6`（Flap 新域名）；Four.meme业务基线`8366843`，fm-status基线`6fe0272`。
-- 当前版本：Suite `1.12.79`、Four.meme `1.5.25`、Flap `1.10.50`。最新业务为 Safe 专用异步解读；专用Key、真实DeepSeek调用和授权测试卡原卡更新已验证，其他自动分析仍关闭，现场边界见顶部记录。
+- 当前版本：Suite `1.12.80`、Four.meme `1.5.25`、Flap `1.10.51`。最新改动仅Safe AI解读文字绿色；专用Key、真实DeepSeek调用和授权测试卡原卡更新已验证，其他自动分析仍关闭，现场边界见顶部记录。
 - 本次分阶段先更新两套监控，最后节点能力适配仅重启 Flap；机器人未重启。19:37:12 验收全部周期与环境配置不变，CoW恢复、实时扫描追齐、历史补扫继续、队列及历史放弃记录保留。存在公共节点瞬时超时/本地预算等待及独立的旧卡过期问题，详见两模块 HANDOFF；不保证公共服务永久无故障。此验收文档同步无需重启，确切 HEAD 仍需本地/GitHub/服务器三方核对。
 - SSH 别名：`tencent`；服务器仓库：`/root/monitor-suite`；通过已有 SSH 配置连接，必要时 `sudo -n`。不复制或打印私钥、`.env`、API Key、飞书凭证或带凭证 RPC URL。
 - 生产服务：`fourmeme-monitor`、`flap-monitor`、`feishu-bot`。服务器还有其他服务，禁止无范围的 `pm2 restart all`。`flap-vault-monitor` 等其他名称不属于本次两套主进程。

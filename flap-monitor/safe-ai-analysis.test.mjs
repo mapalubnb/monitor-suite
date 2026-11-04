@@ -53,7 +53,7 @@ test('Safe AI: combine split asset rows, pin model and omit calldata/signatures'
     assert.equal(f.calls[0].provider.model, 'deepseek-flash');
     assert.equal(f.calls[0].provider.apiUrl, 'https://api.deepseek.com/chat/completions');
     assert.doesNotMatch(readFileSync(f.settings.file, 'utf8'), /secret-signature|test-only-key/);
-    assert.ok([...f.patches[0][2].split('\n\n')[1]].length <= 150);
+    assert.ok([...f.patches[0][2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 150);
   } finally { f.clean(); }
 });
 test('Safe AI: restart and further signatures reuse completed result without a second model call', async () => {
@@ -129,7 +129,7 @@ test('Safe AI: multi-proposal card total brief stays within 150 characters', asy
   try {
     f.rows.b = proposal({ key: 'b', safeTxHash: '0x' + 'b'.repeat(64), nonce: 2 });
     f.register([change(f.rows.a), change(f.rows.b)]); await f.service.tick(); await f.service.tick();
-    for (const p of f.patches) assert.ok([...p[2].split('\n\n')[1]].length <= 150);
+    for (const p of f.patches) assert.ok([...p[2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 150);
   } finally { f.clean(); }
 });
 
