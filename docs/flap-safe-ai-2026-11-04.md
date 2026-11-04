@@ -1,6 +1,6 @@
 # Flap Safe 专用分析与 Key 配置
 
-Suite 1.12.79 / Flap 1.10.50。仅 Safe 提案解读使用 DeepSeek；页面、机制介绍、其他 AI 仍关闭。
+Suite 1.12.81 / Flap 1.10.52。仅 Safe 提案解读使用 DeepSeek；页面、机制介绍、其他 AI 仍关闭。
 
 2026/11/4 11:16实测：用户已配置专用Key，线上configured=true，真实DeepSeek思考/非思考请求均返回HTTP200及deepseek-flash。经用户授权发送一张合成测试卡，异步更新同一消息，新增93字解读已从飞书完整JSON读回核验。生产新提案任务尚为0，不把测试样本视为自然提案验收；原频率和其他AI关闭均不变。后续若更换Key，仍需重新验证鉴权。
 
@@ -36,12 +36,18 @@ ssh -t tencent "sudo -n bash /root/monitor-suite/flap-monitor/configure-safe-ai-
 普通转账模板不调用模型，撤销授权额度为零、被关闭的审计撤销/查询不会单独触发分析。
 金额未知时明确待核验，不能将 raw wei 当实际数量。
 
-金库/机制模板与升级优先于普通授权：复用已解析参数、当前缓存权限/实现和项目页面自述；
-按固定 Sourcify 端点查询最多4个地址的匹配验证源码/ABI。源码片段与ABI差异仅供解释，不构成完整语义、存储布局或安全审计。
-未解析调用、未获取验证源码及不完整机制仍明确待核验。模型不能执行工具、交易或源码中的指令。
+金库/机制模板与升级优先于普通授权。先保留完整calldata并在本地解码，再补充证据；按用户2026/11/4最新授权，完整调用数据及其中签名可进入DeepSeek请求，不再提前脱敏。配置凭证不进入请求，AI任务状态不重复保存完整输入。
+
+覆盖既有金库注册/开放开关、代理升级、角色/owner/Safe成员/门槛/模块、授权额度、包装资产、资金和流动性组合操作；新增通用有界ABI参数解码与setTester等候选识别。读取EIP-1967实现、beacon或标准EIP-1167克隆的一层实现，按同一区块查询代码/状态；失败时缓存实现仅作为候选，不冒充当前实现。未知函数根据验证ABI或OpenChain/4byte候选匹配；候选必须过参数布局校验，多个候选不擅自消歧。选择器出现于字节码、白名单getter返回仅提供旁证，不等于完整语义证明。
+
+源码优先Sourcify，缺失时复用可选`ETHERSCAN_V2_API_KEY`（兼容`ETHERSCAN_API_KEY`）查询固定Etherscan V2接口。没有该Key时保留候选与链上核验，不假称浏览器源码可用；不会使用DeepSeek Key调用浏览器API。当前支持isTester/isWhitelisted/paused/owner/hasRole/isOwner/getThreshold/isModuleEnabled/allowance/asset等受限只读getter；从不执行提案方法作模拟，不由模型生成RPC。当前状态不冒充提案提交时状态，更不证明提案已执行。
+
+每次取证最多16次逻辑RPC（走原后台预算）、4个源码地址、4个选择器的双来源查询，总截止40秒，单请求也有限时；缓存最多各64项。不得因候选猜测扩展为新金库开放或收益结论。源码片段与ABI差异不构成完整语义、存储布局或安全审计。未知代理类型、超出ABI递归/数组/尺寸边界及来源失败会明确保留缺项。
+
+证据状态分别为resolved/candidate/insufficient；暂时失败且未解析时最多补证一次。仍缺证据则输出简短“核验提示”，不调用模型扩写套话，不标记done。模型输出须保留候选措辞及关键参数；两次不合格时回退事实提示。运行指标safeAi.evidence统计证据状态，任务保留checks、核验区块及请求计数供排查。未取得资料不等于合约未验证。
 
 单个异步消费者运行，原始通知不等模型；任务最多两次尝试、队列/卡片各最多200项。
-机制/升级使用有限思考预算，其余使用非思考模式；仅输出最终短文，不输出推理过程。
+机制/升级及候选解读使用有限思考预算，其余使用非思考模式；仅输出最终短文，不输出推理过程。
 每张卡片的新增解读含标签、标点不超过150字；多笔解读超限时合并为事实摘要。
 分片长卡保持原卡，不额外发送分析卡。正文过长、无法编辑、模型超时或输出校验失败也保留原始通知。
 新卡在首发后补充，原卡金额/名称更新与 AI 共用编辑入口，避免交叉覆盖；不批量修改历史卡。
@@ -49,4 +55,4 @@ ssh -t tencent "sudo -n bash /root/monitor-suite/flap-monitor/configure-safe-ai-
 独立任务状态是运行文件，不提交 Git。不要删除它来“重置”分析；部署备份该文件及所有原有状态。
 原14项任务周期、历史放弃记录、Safe Key策略、降噪和Agent Curve停用保持。
 
-官方接口依据：[DeepSeek Chat API](https://api-docs.deepseek.com/api/create-chat-completion/)、[Sourcify 验证数据](https://docs.sourcify.dev/docs/repository/)。
+官方接口依据：[DeepSeek Chat API](https://api-docs.deepseek.com/api/create-chat-completion/)、[Sourcify 验证数据](https://docs.sourcify.dev/docs/repository/)、[Etherscan验证源码](https://docs.etherscan.io/api-reference/endpoint/getsourcecode)、[Solidity ABI规范](https://docs.soliditylang.org/en/latest/abi-spec.html)。

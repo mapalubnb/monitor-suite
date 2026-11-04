@@ -7246,7 +7246,9 @@ async function startMonitor() {
       getKey: () => process.env.FLAP_SAFE_AI_DEEPSEEK_API_KEY || '',
       getProposals: () => safeProposalState.proposals, getMetadata: aiMetadata,
       collectEvidence: createSafeEvidenceCollector({ getContext: () => ({
-        integrity: contractIntegrityState, snapshot, metadata: aiMetadata() }) }),
+        integrity: contractIntegrityState, snapshot, metadata: aiMetadata() }),
+        rpcCall: (method, params) => bscRpcCall(method, params, { history: true, requireResult: true }),
+        explorerKey: () => process.env.ETHERSCAN_V2_API_KEY || process.env.ETHERSCAN_API_KEY || '' }),
       render: buildSafeProposalContent, patch: patchCard,
       fits: (body, title, color) => !isTooLongForSingleCard(body, title, color), log });
   } catch { log('[Flap Safe AI] 独立队列不可用，保留原始监控；请检查 safe-ai-state.json'); }

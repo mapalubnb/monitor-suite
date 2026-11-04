@@ -42,7 +42,7 @@ test('Safe AI: cutoff/existing/unsigned/terminal/muted are excluded; valid signa
     assert.doesNotMatch(JSON.stringify(f.calls), /signature"|rawData/);
   } finally { f.clean(); }
 });
-test('Safe AI: combine split asset rows, pin model and omit calldata/signatures', async () => {
+test('Safe AI: combine split asset rows, pin model and send authorized calldata/signatures without duplicating state', async () => {
   const f = fixture();
   try {
     f.rows.a = proposal({ actions: [{ ...action, rawData: 'secret-signature' }] });
@@ -50,10 +50,39 @@ test('Safe AI: combine split asset rows, pin model and omit calldata/signatures'
     f.register([change(f.rows.a), change(f.rows.b)]); await f.service.tick();
     assert.equal(f.calls.length, 1);
     assert.equal(JSON.parse(f.calls[0].userMessage).actions.length, 2);
+    assert.equal(JSON.parse(f.calls[0].userMessage).actions[0].rawData, 'secret-signature');
+    assert.equal(JSON.parse(f.calls[0].userMessage).actions[1].signature, 'secret');
     assert.equal(f.calls[0].provider.model, 'deepseek-flash');
     assert.equal(f.calls[0].provider.apiUrl, 'https://api.deepseek.com/chat/completions');
     assert.doesNotMatch(readFileSync(f.settings.file, 'utf8'), /secret-signature|test-only-key/);
     assert.ok([...f.patches[0][2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 150);
+  } finally { f.clean(); }
+});
+
+test('Safe AI: insufficient evidence retries once without model; unresolved is not marked done or green AI', async () => {
+  let collected = 0;
+  const f = fixture({ collectEvidence: async () => { collected++; return { version: 2, evidenceStatus: 'insufficient', retryable: true,
+    actions: [{ kind: 'unknown', call: { status: 'unresolved' } }], checks: [{ status: 'unresolved' }] }; } });
+  try {
+    f.register(); await f.service.tick(); assert.equal(f.calls.length, 0); assert.equal(f.patches.length, 0);
+    f.setNow(start + 61_000); await f.service.tick(); assert.equal(collected, 2); assert.equal(f.calls.length, 0);
+    assert.equal(f.patches.length, 1); assert.match(f.patches[0][2], /核验提示/); assert.doesNotMatch(f.patches[0][2], /<font/);
+    const job = Object.values(JSON.parse(readFileSync(f.settings.file)).jobs)[0]; assert.equal(job.status, 'insufficient');
+    await f.service.tick(); assert.equal(collected, 2);
+  } finally { f.clean(); }
+});
+
+test('Safe AI: candidate language is mandatory; semantic failure gets bounded retry and factual fallback', async () => {
+  const evidence = { version: 2, evidenceStatus: 'candidate', actions: [{ kind: 'unknown', category: 'permission',
+    call: { status: 'corroborated_candidate', signature: 'setTester(address,bool)' }, fact: '候选：拟开启指定地址测试者资格，具体权限待核验。' }],
+    checks: [{ status: 'corroborated_candidate', function: 'setTester(address,bool)' }] };
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '提案调用未验证合约，目的与机制待核验。' }), evidence), null);
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '提案将开放新金库。' }), evidence), null);
+  assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '候选操作为开启测试者资格，具体测试权限待核验。' }), evidence));
+  const f = fixture({ collectEvidence: async () => evidence, complete: async () => JSON.stringify({ summary: '调用未知，收益退出限制待核验。' }) });
+  try { f.register(); await f.service.tick(); assert.equal(f.patches.length, 0);
+    f.setNow(start + 61_000); await f.service.tick(); assert.equal(f.patches.length, 1); assert.match(f.patches[0][2], /核验提示.*候选/);
+    const job = Object.values(JSON.parse(readFileSync(f.settings.file)).jobs)[0]; assert.equal(job.status, 'model_failed');
   } finally { f.clean(); }
 });
 test('Safe AI: restart and further signatures reuse completed result without a second model call', async () => {

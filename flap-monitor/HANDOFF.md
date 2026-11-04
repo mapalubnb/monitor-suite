@@ -1,5 +1,13 @@
 # Flap 监控交接
 
+## 2026/11/4 Safe多类型取证升级（Suite1.12.81 / Flap1.10.52）
+
+用户确认全面修复，且明确允许完整签名进入AI。新增safe-ai-call-codec（有界ABI解码、候选及getter白名单）、safe-ai-sources（固定来源与超时/体积限制）、safe-ai-evidence测试；改造safe-ai-evidence、safe-ai-analysis及其测试、monitor接入原history RPC预算。同步package脚本/版本、README、MONITORING、配置说明及PROJECT_STATE。保留原始calldata直至参数解析后，完整调用及签名可进入模型，运行任务状态不重复保存；凭证不进入输入。
+
+多类型覆盖金库注册/开关、升级、角色/ownership/Safe成员/门槛/模块、授权、包装与流动性组合调用。支持单层EIP1967实现/beacon及标准EIP1167克隆，固定区块只读核验；验证ABI优先，本地/OpenChain/4byte仅候选，严格参数布局和冲突处理。源码优先Sourcify，可选现有Etherscan V2 Key回退；缺Key或资料不等于未验证合约。每次16逻辑RPC/4源码地址/4选择器，总40秒，最多两次任务尝试；原始通知不等待。状态resolved/candidate/insufficient分开，信息不足不调用模型扩写，输出校验失败有界重试后事实回退。绿色仅AI文字，≤150可见字，其他AI关闭、频率/降噪/历史/Key策略不变，不回放旧生产提案。
+
+验证：语法、全项目737/737、专项27/27通过；真实nonce196只读回放5次RPC解析出账户/true、EIP1967实现及isTester当前值，14.2秒完成，标注corroborated_candidate。尚待候选代码在服务器使用真实DeepSeek生成验证后再部署。原生产状态不参与测试写入，不发送新测试卡；只重启Flap，备份.env、状态及分片，保留启用基线。当前线上无Etherscan Key，该可选来源暂不可用，不能宣称所有未知合约均能完整解析。
+
 ## 2026/11/4 Safe AI 绿色文字（Suite 1.12.80 / Flap 1.10.51）
 
 11:23发布验收：业务83912b80e9741b4c273066c267358224e45a4081已先推GitHub后部署；服务器专项12/12通过。仅Flap重启PID2131886，其他两服务PID192264/1203994未变且均online。环境及全局模型哈希、14任务周期、历史放弃记录、Safe AI启用基线保持；deepseek-flash专用Key仍已配置，其他Flap AI关闭。状态完整备份 `/root/monitor-suite-backups/flap-ai-green-20261104-1.12.80`。未发送新测试卡，文档同步无需重启。
