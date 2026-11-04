@@ -208,3 +208,13 @@ test('Safe AI: qualified execution uncertainty passes while an adjacent executio
   }
   assert.equal(check('提案已完成。'), null);
 });
+
+test('Safe AI: parsed vault registration must name the factory and direction even without legacy calldata', async () => {
+  const evidence = await createSafeEvidenceCollector({ sourceReader: async address => ({address, verified:false}) })({
+    safe, actions: [{ kind:'vaultFactory', to:target, vaultFactory:token, enabled:true, official:false, riskLevel:1, category:0 }] });
+  assert.equal(evidence.actions[0].parsedParameters.enabled, true);
+  assert.match(evidence.actions[0].fact, /登记为启用/);
+  const check = summary => validateSafeAiOutput(JSON.stringify({summary}), evidence);
+  assert.equal(check('拟注册金库工厂，但实际工厂地址及参数取值未解析。'), null);
+  assert.ok(check('提案拟登记并启用金库工厂0x2222…2222；不代表金库开放，资金与退出规则待源码核验。'));
+});

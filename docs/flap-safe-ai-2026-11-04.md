@@ -56,3 +56,5 @@ ssh -t tencent "sudo -n bash /root/monitor-suite/flap-monitor/configure-safe-ai-
 原14项任务周期、历史放弃记录、Safe Key策略、降噪和Agent Curve停用保持。
 
 官方接口依据：[DeepSeek Chat API](https://api-docs.deepseek.com/api/create-chat-completion/)、[Sourcify 验证数据](https://docs.sourcify.dev/docs/repository/)、[Etherscan验证源码](https://docs.etherscan.io/api-reference/endpoint/getsourcecode)、[Solidity ABI规范](https://docs.soliditylang.org/en/latest/abi-spec.html)。
+
+本次按用户授权，Safe 原提案状态保留服务返回的完整签名及原始签名调用；金库注册也保留完整 calldata。AI 任务/卡片快照不重复保存这些大字段，通知正文不展示签名。旧记录缺少原始字段时使用已有解析参数，不回放历史提案。

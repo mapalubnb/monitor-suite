@@ -30,6 +30,7 @@ function sourceExcerpt(source, names = []) {
 function actionFact(action) {
   const c = action.call, args = c?.arguments?.map(v => v.value) || [];
   const prefix = c?.status === 'corroborated_candidate' ? '高可信候选：' : c?.status === 'candidate' ? '候选：' : '';
+  if (action.kind === 'vaultFactory') return `拟将金库工厂${short(action.vaultFactory)}登记为${action.enabled ? '启用' : '停用'}；official=${action.official}，riskLevel=${action.riskLevel}，category=${action.category}。登记不等于金库已开放，具体资金规则需核验工厂实现。`;
   if (c?.signature === 'setTester(address,bool)') return `${prefix}拟将${short(args[0])}的测试者资格设为${args[1] ? '开启' : '关闭'}；具体测试权限范围待核验。`;
   if (c?.signature && action.kind === 'unknown') return `${prefix}拟调用${c.signature}，参数已解析；具体业务效果仍需核验。`;
   return describeOperationalAction(action, {});
@@ -98,6 +99,10 @@ export function createSafeEvidenceCollector({ getContext, rpcCall, sourceReader 
     for (const original of (proposal.actions || []).slice(0, 64)) {
       if (signal?.aborted) throw signal.reason;
       const action = safeAiEvidenceData(original);
+      // Existing domain decoders already extracted these parameters, even for older rows without rawData.
+      if (action.kind === 'vaultFactory') action.parsedParameters = { factory: action.vaultFactory,
+        factoryDisplay: short(action.vaultFactory), enabled: action.enabled, official: action.official,
+        riskLevel: action.riskLevel, category: action.category };
       let t = null, entries = [], decoded = [];
       const needsContract = ['unknown', 'vaultFactory', 'vaultCreationEnable', 'upgrade', 'upgradeTarget', 'wrapping'].includes(action.kind);
       if (needsContract) t = await target(action.proxy || action.to || action.vaultFactory);
@@ -172,6 +177,7 @@ export function createSafeEvidenceCollector({ getContext, rpcCall, sourceReader 
     const candidate = checks.some(c => ['candidate', 'corroborated_candidate'].includes(c.status));
     const names = actions.map(a => a.call?.signature?.split('(')[0]).filter(Boolean);
     return { version: 2, chainId: 56, safe: proposal.safe, safeTxHash: proposal.safeTxHash, proposalOnly: true,
+      transaction: safeAiEvidenceData(proposal.transaction),
       signatures: proposal.signatures || proposal.signature,
       evidenceStatus: unresolved ? 'insufficient' : candidate ? 'candidate' : 'resolved', retryable: unresolved && transient,
       actions, checks, upgrades, templates, block, limits: { rpcCount, sourceCount, selectorCount, limited },

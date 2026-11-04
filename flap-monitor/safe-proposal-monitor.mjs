@@ -151,7 +151,7 @@ export function extractFlapProposalActions(transaction, { factoryAddress = FLAP_
     } catch (error) { return [{ to, selector, operation, callPath: path, kind: 'unknown', reason: error.message, rawData: data }]; }
   }
   if (to === VAULT_PORTAL && [REGISTER_VAULT_FACTORY_SELECTOR, REGISTER_VAULT_FACTORY_CATEGORY_SELECTOR].includes(selector)) {
-    const base = { to, selector, operation, callPath: path, quoteToken: "" };
+    const base = { to, selector, operation, callPath: path, quoteToken: "", rawData: data };
     try {
       if (operation !== 0) throw new Error("Vault Portal 非 CALL 操作");
       const hasCategory = selector === REGISTER_VAULT_FACTORY_CATEGORY_SELECTOR;
@@ -366,6 +366,11 @@ function normalizeProposal(proposal, safe, quoteToken, nowText) {
     submissionDate: proposal?.submissionDate || "",
     confirmations,
     confirmationOwners: [...new Set((proposal.confirmations || []).map(c => normalizeAddress(c.owner)).filter(Boolean))],
+    // Preserve the original signed call and complete service signatures for authorized AI evidence.
+    transaction: { to: normalizeAddress(proposal.to), value: String(proposal.value || '0'),
+      operation: Number(proposal.operation || 0), data: proposal.data || '0x' },
+    signatures: (proposal.confirmations || []).filter(c => /^0x(?:[a-f\d]{2})+$/i.test(c.signature || ''))
+      .map(c => ({ owner: normalizeAddress(c.owner), signature: c.signature })),
     required,
     actions: [],
     status: required > 0 && confirmations >= required ? "ready" : "pending",

@@ -366,8 +366,12 @@ test("new proposal and completed confirmations each alert once", async () => {
   };
   await runSafeProposalScan({ ...options, nowMs: 1_000 });
   results = [proposal({ confirmations: 1 })];
+  results[0].confirmations[0].signature = '0x' + '11'.repeat(64) + '1b';
   const proposed = await runSafeProposalScan({ ...options, nowMs: 2_000 });
   assert.deepEqual(proposed.changes.map(item => item.type), ["proposed"]);
+  assert.equal(proposed.changes[0].transaction.data, results[0].data);
+  assert.equal(proposed.changes[0].signatures[0].signature, results[0].confirmations[0].signature);
+  assert.doesNotMatch(buildSafeProposalContent(proposed.changes), new RegExp('11'.repeat(64)));
   const duplicate = await runSafeProposalScan({ ...options, nowMs: 3_000 });
   assert.equal(duplicate.changed, false);
   results = [proposal({ confirmations: 2 })];
@@ -582,6 +586,7 @@ test("historical Vault Factory registration overloads decode only at Vault Porta
   for (const [index, call] of VAULT_CALLS.entries()) {
     const [action] = extractFlapProposalActions(call);
     assert.equal(action.kind, "vaultFactory");
+    assert.equal(action.rawData, call.data);
     assert.equal(action.vaultFactory, `0x${call.data.slice(34, 74)}`);
     assert.equal(action.enabled, true);
     assert.equal(action.category === null, index === 0);
@@ -636,7 +641,7 @@ test("mixed MultiSend keeps each Vault Factory separate from quote tokens, dedup
 });
 
 
-test("EOA signature simulation encodes dynamic arguments without storing or broadcasting signatures", async () => {
+test("EOA simulation is read-only; authorized complete signatures are retained for AI but not card text", async () => {
   const p = proposal({ confirmations: 2 });
   p.confirmations.forEach(c => { c.signature = "0x" + "11".repeat(64) + "1b"; });
   const data = encodeSafeExecutionSimulation(p);
@@ -650,7 +655,8 @@ test("EOA signature simulation encodes dynamic arguments without storing or broa
   } });
   assert.ok(callsSeen.every(c => c.method === "eth_call"));
   assert.equal(Object.values(state.proposals)[0].executionCheck.status, "passed");
-  assert.equal(JSON.stringify(state).includes(p.confirmations[0].signature), false);
+  assert.equal(Object.values(state.proposals)[0].signatures[0].signature, p.confirmations[0].signature);
+  assert.equal(buildSafeProposalContent(state.pendingChanges).includes(p.confirmations[0].signature), false);
   p.confirmations[0].signature = "0x" + "11".repeat(64) + "00";
   assert.equal(encodeSafeExecutionSimulation(p), null);
 });
