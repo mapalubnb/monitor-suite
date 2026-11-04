@@ -1,5 +1,9 @@
 # 项目状态与独立发布
 
+## 2026/11/4 11:23 Safe AI 绿色文字已发布
+
+Suite1.12.80 / Flap1.10.51，业务 `83912b80e9741b4c273066c267358224e45a4081` 先推GitHub后部署。仅AI解读行绿色，正文/转账模板不变。专项本地及服务器均12/12、语法、diff及离线卡片JSON检查通过。仅Flap重启PID2131886，Four.meme192264和机器人1203994不变；环境/全局模型配置哈希、14周期、历史放弃记录、AI启用基线逐项相同，Safe AI仍deepseek-flash且Key有效，其他Flap AI关闭。11:23:52实时游标131550417，未更改游标或积压策略；未发送新测试卡。备份 `/root/monitor-suite-backups/flap-ai-green-20261104-1.12.80`。验收文档同步不重启。
+
 ## 2026/11/4 11:16 Safe DeepSeek Key 与原卡更新实测
 
 用户配置专用Key后，Flap运行指标为safeAi.enabled=true/configured=true/model=deepseek-flash/health为空，其他Flap AI.enabled=false。用户另明确授权一张测试卡；11:13:14发送“【测试｜非真实提案】Flap Safe AI 原卡更新验证”，11:13:18同一消息ID补充93字解读，飞书完整卡片JSON已读回并逐字匹配。真实模型返回HTTP200且response.model=deepseek-flash，机制/升级思考模式与普通授权非思考模式均通过；普通授权首次输出被校验拒绝未编辑，第二次独立测试输出通过。普通转账模板不调用模型，重复唤醒无重复调用/编辑。使用隔离合成数据，不改变生产任务状态或历史提案；当前生产任务/卡片均0，尚无自然新提案样本。
