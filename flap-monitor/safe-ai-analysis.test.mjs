@@ -213,6 +213,9 @@ test('Safe AI: parsed vault registration must name the factory and direction eve
   const evidence = await createSafeEvidenceCollector({ sourceReader: async address => ({address, verified:false}) })({
     safe, actions: [{ kind:'vaultFactory', to:target, vaultFactory:token, enabled:true, official:false, riskLevel:1, category:0 }] });
   assert.equal(evidence.actions[0].parsedParameters.enabled, true);
+  assert.equal(evidence.actions[0].category, 0);
+  assert.equal(evidence.actions[0].analysisCategory, 'vault');
+  assert.match(evidence.actions[0].fact, /category=0/);
   assert.match(evidence.actions[0].fact, /登记为启用/);
   const check = summary => validateSafeAiOutput(JSON.stringify({summary}), evidence);
   assert.equal(check('拟注册金库工厂，但实际工厂地址及参数取值未解析。'), null);
