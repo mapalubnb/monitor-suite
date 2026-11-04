@@ -29,11 +29,26 @@ export const OWNER_CATALOG = Object.freeze(Object.fromEntries([
 export const CORE_PERMISSION_OWNERS = Object.keys(OWNER_CATALOG).filter(a => OWNER_CATALOG[a].priority === 'core');
 export const ownerLabel = address => OWNER_CATALOG[String(address || '').toLowerCase()]?.label || '关联 owner｜角色待核验';
 export const ownerLink = address => `[${address}](https://bscscan.com/address/${address})（${ownerLabel(address)}）`;
-// Do not replace addresses inside Markdown links. Append a deduplicated role legend.
+// Builders and delivery/edit paths may all call this. Keep labels inline and
+// idempotent, without changing link destinations or matching a hash/calldata prefix.
 export function annotateOwners(content) {
-  const text = String(content || '');
-  const lower = text.toLowerCase();
-  const owners = Object.entries(OWNER_CATALOG).filter(([a]) => lower.includes(a.slice(2)));
-  if (!owners.length || text.includes('Owner 标注（权限关系，不代表官方身份）')) return text;
-  return text + '\n\nOwner 标注（权限关系，不代表官方身份）：\n' + owners.map(([a, entry]) => `• [${a}](https://bscscan.com/address/${a})：${entry.label}`).join('\n');
+  let text = String(content || '').replace(
+    /(?:\r?\n){0,2}Owner 标注（权限关系，不代表官方身份）：\r?\n(?:• \[0x[a-f\d]{40}\]\(https:\/\/bscscan\.com\/address\/0x[a-f\d]{40}\)：[^\r\n]*(?:\r?\n|$))+/gi,
+    '\n');
+  // Old queued content can already carry a label; preserve other parentheses.
+  for (const { label } of Object.values(OWNER_CATALOG)) {
+    const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    text = text.replace(new RegExp(`（${escaped}）(?:\\s*（${escaped}）)+`, 'g'), `（${label}）`);
+  }
+  return text.replace(
+    /\[[^\]\n]*\]\(https?:\/\/[^\s)]+\)|https?:\/\/[^\s<>()]+|(?<![\w])0x[a-f\d]{40}(?![a-f\d])/gi,
+    (token, offset) => {
+      // Consume entire Markdown links / bare URLs before looking for addresses.
+      const address = token.startsWith('[') ? token.match(/^\[(0x[a-f\d]{40})\]/i)?.[1]
+        : /^0x[a-f\d]{40}$/i.test(token) ? token : null;
+      const entry = address && OWNER_CATALOG[address.toLowerCase()];
+      if (!entry) return token;
+      const label = `（${entry.label}）`;
+      return text.slice(offset + token.length).trimStart().startsWith(label) ? token : token + label;
+    }).trimEnd();
 }

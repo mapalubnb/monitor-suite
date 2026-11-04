@@ -59,11 +59,44 @@ test('owner card labels preserve links, deduplicate, and label unknown owners', 
   const content = `[${manager}](https://bscscan.com/address/${manager})`;
   const marked = annotateOwners(content);
   assert.ok(marked.startsWith(content)); assert.equal(annotateOwners(marked), marked);
-  assert.equal((marked.match(/Owner 标注/g) || []).length, 1);
+  assert.equal(marked, `${content}（${OWNER_CATALOG[manager].label}）`);
+  assert.doesNotMatch(marked, /Owner 标注/);
   const unknown = '0x' + 'd'.repeat(40);
   const card = buildSafeProposalContent([{ type: 'ready', safe: NESTED_OWNER_SAFE, confirmationOwners: [unknown],
     actions: [{ kind: 'safeOwner', action: '新增', account: manager, threshold: '1' }], confirmations: 1, required: 1 }]);
   assert.match(card, /核心权限/); assert.match(card, /角色待核验/); assert.doesNotMatch(card, /官方 owner/);
+});
+
+test('Safe proposal roles stay next to signer and Safe links through repeated delivery formatting', () => {
+  const signer = '0x949ab4eeef712770861eaaa956d4e3a26ba9a8cf';
+  const card = buildSafeProposalContent([{ type: 'proposed', safe: NESTED_OWNER_SAFE,
+    confirmationOwners: [signer], actions: [], confirmations: 1, required: 3, nonce: 388 }]);
+  for (const a of [signer, NESTED_OWNER_SAFE]) {
+    const label = `（${OWNER_CATALOG[a].label}）`;
+    assert.equal(card.split(label).length - 1, 1);
+    assert.ok(card.includes(`)${label}`));
+  }
+  assert.doesNotMatch(card, /Owner 标注/);
+  assert.equal(annotateOwners(annotateOwners(card)), card);
+});
+
+test('queued legacy legends are removed without deleting following content or duplicating existing roles', () => {
+  const link = `[${manager}](https://bscscan.com/address/${manager})`;
+  const label = `（${OWNER_CATALOG[manager].label}）`;
+  const legacy = `${link}${label}${label}\n\nOwner 标注（权限关系，不代表官方身份）：\n• ${link}：${OWNER_CATALOG[manager].label}\n\n后续交易信息`;
+  const formatted = annotateOwners(legacy);
+  assert.equal(formatted, `${link}${label}\n\n后续交易信息`);
+  assert.equal(annotateOwners(formatted), formatted);
+  assert.doesNotMatch(formatted, /Owner 标注|• /);
+});
+
+test('role annotation leaves URLs, transaction hashes and unknown addresses intact', () => {
+  const url = `https://bscscan.com/address/${manager}`;
+  const hash = manager + 'a'.repeat(24);
+  const unrelated = `原链接 ${url}\n[查看地址](${url})\nSafeTxHash：${hash}\n0x${'f'.repeat(40)}`;
+  assert.equal(annotateOwners(unrelated), unrelated);
+  const plain = `管理入口：${manager.toUpperCase().replace('0X', '0x')}`;
+  assert.equal(annotateOwners(plain), `${plain}（${OWNER_CATALOG[manager].label}）`);
 });
 
 test('owner integrity detects 7702 removal, proxy implementation and nested threshold changes', async () => {
