@@ -1,5 +1,13 @@
 # 项目状态与独立发布
 
+## 2026/11/4 11:16 Safe DeepSeek Key 与原卡更新实测
+
+用户配置专用Key后，Flap运行指标为safeAi.enabled=true/configured=true/model=deepseek-flash/health为空，其他Flap AI.enabled=false。用户另明确授权一张测试卡；11:13:14发送“【测试｜非真实提案】Flap Safe AI 原卡更新验证”，11:13:18同一消息ID补充93字解读，飞书完整卡片JSON已读回并逐字匹配。真实模型返回HTTP200且response.model=deepseek-flash，机制/升级思考模式与普通授权非思考模式均通过；普通授权首次输出被校验拒绝未编辑，第二次独立测试输出通过。普通转账模板不调用模型，重复唤醒无重复调用/编辑。使用隔离合成数据，不改变生产任务状态或历史提案；当前生产任务/卡片均0，尚无自然新提案样本。
+
+14项周期、除专用Key外的根.env、模块.env及全局模型配置、历史放弃记录均保持；Four.meme自动分析代码仍硬关闭，两个其他服务PID不变。用户配置脚本重启后的Flap PID2091711 online，本轮验收未再次重启。11:16:50 Safe轮询成功且错误为空。实时游标131549297→131549757，但旧积压仍增长，11:16:57延迟1586块；频率不变不代表实际扫描无延迟。本次未修改业务代码。
+
+证据存于 `/root/monitor-suite-backups/flap-safe-ai-20261104-1.12.79/live-key-verification.json` 与 `live-key-health.json`，不含凭证。飞书默认消息读取返回2.0卡片兼容占位，验收需带 `card_msg_content_type=user_card_content`；一次读取超时后已成功核验。文档同步不重启。
+
 ## 2026/11/4 11:08 Safe 专用异步解读部署验收
 
 Suite1.12.79 / Flap1.10.50，业务 `a4a531c87fd4f3271a1c86ab66f46920d42d8335` 已先推GitHub后部署。仅重要新Safe提案使用deepseek-flash，机制/升级优先、普通转账模板、原卡异步补充总计≤150字。启用基线北京时间11:07:27.633；既有提案不回放，其他AI仍关闭。当前没有专用Key，线上safeAi为enabled=true/configured=false/health=missing_key，尚未验证真实模型鉴权或生成结果；配置命令见 [配置说明](flap-safe-ai-2026-11-04.md)。
