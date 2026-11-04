@@ -42,8 +42,10 @@ export function validateSafeAiOutput(raw, evidence) {
   try { result = JSON.parse(raw); } catch { return null; }
   if (typeof result?.summary !== 'string') return null;
   let summary = result.summary.trim();
+  // Qualified uncertainty is not an execution claim; keep rejecting any unqualified claim elsewhere.
+  const claims = summary.replace(/(?:是否|并非|不代表|不等于|不能证明|无法证明|不证明|不意味着)(?:该提案|提案)?已(?:执行|完成)/g, '');
   if (!summary || /[\r\n<>\[\]`*]|https?:/i.test(summary)
-    || /已执行|已完成|稳赚|保证收益|保证安全|确定安全|未验证合约|合约未验证|合约未开源/.test(summary)) return null;
+    || /已执行|已完成|稳赚|保证收益|保证安全|确定安全|未验证合约|合约未验证|合约未开源/.test(claims)) return null;
   // AI may explain relationships, but cannot introduce new numeric facts.
   const publicFacts = JSON.stringify(safeAiPublicData(evidence.actions || []));
   const addresses = publicFacts.match(/0x[a-f\d]{40}(?![a-f\d])/gi) || [];

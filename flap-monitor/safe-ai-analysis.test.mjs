@@ -198,3 +198,13 @@ test('Safe key helper changes only dedicated credential, never global provider o
   assert.equal((next.match(/FLAP_SAFE_AI_DEEPSEEK_API_KEY=/g) || []).length, 1);
   assert.throws(() => updateSafeAiKeyEnv(env, 'bad\nOTHER=1'));
 });
+
+test('Safe AI: qualified execution uncertainty passes while an adjacent execution claim fails', () => {
+  const evidence = { version: 2, actions: [], evidenceStatus: 'resolved' };
+  const check = summary => validateSafeAiOutput(JSON.stringify({ summary }), evidence);
+  for (const qualifier of ['是否已执行', '不代表已执行', '不等于提案已完成', '不能证明该提案已执行']) {
+    assert.ok(check(`拟变更权限，${qualifier}，具体状态待核验。`));
+    assert.equal(check(`拟变更权限，${qualifier}，但已执行成功。`), null);
+  }
+  assert.equal(check('提案已完成。'), null);
+});
