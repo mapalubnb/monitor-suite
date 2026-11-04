@@ -1,5 +1,7 @@
 import { fetchSite, migrateSitePages } from './site-domain.mjs';
 import { annotateOwners } from './owner-catalog.mjs';
+import { createSafeAiService } from './safe-ai-analysis.mjs';
+import { createSafeEvidenceCollector } from './safe-ai-evidence.mjs';
 import { observedSafeConfig } from './safe-observation.mjs';
 import { createMiniAppMonitor } from './mini-app-monitor.mjs';
 import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.mjs';
@@ -6731,6 +6733,7 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
   acknowledgeFn = acknowledgeSafeProposalChanges,
   resolveMetadataFn = sendCardFn === sendCardViaApi ? resolveSafeAmountMetadata : null,
   patchCardFn = patchCard,
+  safeAi = null,
 } = {}) {
   const pending = [...(state.pendingChanges || [])];
   if (pending.length === 0) return { sent: false, changes: [] };
@@ -6756,6 +6759,12 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
       ? await sendCardFn(title, content, "yellow")
       : await sendAlertCard(sendCardFn, title, content, "red");
     if (!messageId) continue;
+    let aiOwnsCard = false;
+    try {
+      aiOwnsCard = safeAi?.registerCard({ id: messageId, title, changes, metadata,
+        color: invalidated ? 'yellow' : 'red',
+        patchable: !isTooLongForSingleCard(content, title, invalidated ? 'yellow' : 'red') }) || false;
+    } catch (error) { log('[Flap Safe AI] 卡片登记失败，原始通知继续投递'); }
     await acknowledgeFn(state, changes.map(change => change.id));
     saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
     delivered.push(...changes);
@@ -6776,6 +6785,11 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
         state.tokenMetadata = Object.fromEntries(Object.entries({ ...state.tokenMetadata, ...resolved }).slice(-512));
         saveStateFn(CONFIG.safeProposalMonitor.stateFile, state);
         const enriched = buildSafeProposalContent(changes, { ...metadata, ...resolved });
+        if (aiOwnsCard) {
+          safeAi.updateMetadata(messageId, resolved);
+          void safeAi.tick();
+          return;
+        }
         const color = invalidated ? 'yellow' : 'red';
         if (enriched !== content && !isTooLongForSingleCard(content, title, color) && !isTooLongForSingleCard(enriched, title, color)) {
           await patchCardFn(messageId, title, enriched, invalidated ? "yellow" : "red");
@@ -6783,6 +6797,7 @@ async function deliverFlapSafeProposalChanges(state, factoryPoolState, {
       }).catch(error => log(`[Flap Safe 金额／名称] 补充失败：${error.message}`)));
     }
   }
+  if (safeAi) void safeAi.tick();
   return { sent: delivered.length > 0, changes: delivered, messageIds, enrichmentDone: Promise.all(enrichments) };
 }
 
@@ -7223,6 +7238,18 @@ async function startMonitor() {
     CONFIG.safeProposalMonitor.safes,
   );
   const earlySignalState = loadEarlySignalState(CONFIG.earlySignalMonitor.stateFile);
+  let safeAi = null;
+  try {
+    const aiMetadata = () => ({ ...factoryPoolState.assets, ...safeProposalState.tokenMetadata });
+    safeAi = createSafeAiService({ file: join(__dirname, 'safe-ai-state.json'),
+      enabled: CONFIG.safeProposalMonitor.enabled && process.env.FLAP_SAFE_AI_ENABLED !== 'false',
+      getKey: () => process.env.FLAP_SAFE_AI_DEEPSEEK_API_KEY || '',
+      getProposals: () => safeProposalState.proposals, getMetadata: aiMetadata,
+      collectEvidence: createSafeEvidenceCollector({ getContext: () => ({
+        integrity: contractIntegrityState, snapshot, metadata: aiMetadata() }) }),
+      render: buildSafeProposalContent, patch: patchCard,
+      fits: (body, title, color) => !isTooLongForSingleCard(body, title, color), log });
+  } catch { log('[Flap Safe AI] 独立队列不可用，保留原始监控；请检查 safe-ai-state.json'); }
   const startupChecks = {
     pages: "pending",
     factory: CONFIG.factoryPoolMonitor.enabled ? "pending" : "disabled",
@@ -7253,7 +7280,7 @@ async function startMonitor() {
     writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs,
       registryPending: registryPendingHealth, miniApps: miniAppMonitor?.status(),
       earlyScanTimings: earlySignalState.scanTimings || {}, cowTransport: earlySignalState.cowTransport || {},
-      ai: { enabled: FLAP_AI_ANALYSIS_ENABLED } }));
+      ai: { enabled: FLAP_AI_ANALYSIS_ENABLED }, safeAi: safeAi?.status() || { enabled: false, health: 'unavailable' } }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();
   }
   const rpcMetricsTimer = setInterval(() => {
@@ -7261,6 +7288,7 @@ async function startMonitor() {
     try { saveRpcMetrics(); } catch (error) { log(`[Flap RPC 状态] ${error.message}`); }
     // Drain pending notifications even while every data source is backing off.
     void deliverEarly();
+    if (safeAi) void safeAi.tick();
   }, 10_000);
   rpcMetricsTimer.unref();
   const receiptHints = new Map(), priorityTokens = new Set(), externalJobs = new Map();
@@ -7663,7 +7691,7 @@ async function startMonitor() {
   function scheduleSafeProposalDelivery(titlePrefix = "") {
     if (!CONFIG.safeProposalMonitor.enabled || safeProposalDeliveryPromise) return safeProposalDeliveryPromise;
     if (safeProposalState.pendingChanges.length === 0 || !canAttemptFeishuDelivery()) return null;
-    safeProposalDeliveryPromise = deliverFlapSafeProposalChanges(safeProposalState, factoryPoolState, { titlePrefix })
+    safeProposalDeliveryPromise = deliverFlapSafeProposalChanges(safeProposalState, factoryPoolState, { titlePrefix, safeAi })
       .catch(error => {
         log(`[Flap Safe 提案] 待发送变更已保留：${error.message}`);
         return { sent: false, error };
@@ -7714,6 +7742,7 @@ async function startMonitor() {
   global.__safeProposalDrain = async () => {
     if (safeProposalPollPromise) await safeProposalPollPromise;
     if (safeProposalDeliveryPromise) await safeProposalDeliveryPromise;
+    if (safeAi) await safeAi.stop();
   };
   // failCounts 改为对象结构，记录失败次数、最近错误信息和时间
   const failCounts = {};  // key -> { count, lastMsg, lastFailTime, hourlyErrors }

@@ -1,5 +1,7 @@
 # 环境变量（含密钥）
 .env
+.env.safe-ai-backup-*
+.env.safe-ai-tmp
 
 # 依赖
 node_modules/
@@ -20,6 +22,8 @@ contract-integrity-state.json
 contract-integrity-state.json.tmp
 safe-proposal-state.json
 safe-proposal-state.json.tmp
+safe-ai-state.json
+safe-ai-state.json.tmp
 lastpoll.txt
 history.jsonl
 diffs/

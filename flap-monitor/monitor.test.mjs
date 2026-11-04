@@ -2855,6 +2855,35 @@ test('Safe amount enrichment never delays delivery and reuses saved precision on
   assert.match(cards[1], /金额：1.2345 USD/);
 });
 
+test('Safe AI delivery hooks register original card before acknowledgement and route metadata through one editor', async () => {
+  const token = '0x1111111111111111111111111111111111111111';
+  const item = { id: 'safe-ai-hook', type: 'proposed', actions: [{ kind: 'transfer', asset: token, recipient: token, amount: '1234500' }] };
+  const state = { pendingChanges: [item] }, order = [], updates = [];
+  let finish;
+  const metadata = new Promise(resolve => { finish = resolve; });
+  const safeAi = {
+    registerCard: card => { assert.equal(card.id, 'om_ai'); assert.equal(state.pendingChanges.length, 1); order.push('register'); return true; },
+    updateMetadata: (id, value) => updates.push({ id, value }), tick: async () => { order.push('tick'); },
+  };
+  const sent = await __testables.deliverFlapSafeProposalChanges(state, {}, {
+    safeAi, sendCardFn: async () => { order.push('send'); return 'om_ai'; }, saveStateFn: () => {},
+    resolveMetadataFn: () => metadata, patchCardFn: () => assert.fail('old metadata patch must not overwrite AI'),
+  });
+  assert.equal(sent.sent, true); assert.equal(state.pendingChanges.length, 0);
+  assert.deepEqual(order.slice(0, 2), ['send', 'register']);
+  finish({ metadata: { [token]: { decimals: 6, symbol: 'USD' } } }); await sent.enrichmentDone;
+  assert.equal(updates[0].id, 'om_ai'); assert.equal(updates[0].value[token].symbol, 'USD');
+});
+
+test('Safe AI registration failure cannot block or resend a delivered original alert', async () => {
+  const state = { pendingChanges: [{ id: 'safe-ai-failure', type: 'proposed', actions: [] }] };
+  const sent = await __testables.deliverFlapSafeProposalChanges(state, {}, {
+    safeAi: { registerCard: () => { throw Error('disk failure'); }, tick: async () => {} },
+    sendCardFn: async () => 'om_original', saveStateFn: () => {}, resolveMetadataFn: null,
+  });
+  assert.equal(sent.sent, true); assert.equal(state.pendingChanges.length, 0);
+});
+
 test('Safe BNB and cached token amounts need no metadata request; failed sends retain alerts', async () => {
   const action = { kind: 'funding', recipient: '0x1111111111111111111111111111111111111111', amount: '5000000000000000000' };
   const state = { pendingChanges: [{ id: 'bnb', type: 'ready', actions: [action] }] };

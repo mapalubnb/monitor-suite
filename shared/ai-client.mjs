@@ -328,6 +328,10 @@ export function switchProvider(providerName, modelOverride) {
  * @param {number} [opts.maxTokens=800]
  * @param {number} [opts.timeoutMs] - 超时（默认从配置读取）
  * @param {number} [opts.retries=1] - 重试次数
+ * @param {Object} [opts.provider] - 独立调用提供商配置；显式传入时不使用全局回退
+ * @param {Object} [opts.thinking] - OpenAI兼容协议思考模式
+ * @param {string} [opts.reasoningEffort] - OpenAI兼容协议思考强度
+ * @param {Object} [opts.responseFormat] - OpenAI兼容协议输出格式
  * @returns {Promise<string|null>} AI 回复文本，失败返回 null
  */
 const providerCooldowns = new Map();
@@ -342,8 +346,13 @@ export async function chatCompletion({
   maxTokens = 800,
   timeoutMs,
   retries = 1,
+  provider: explicitProvider,
+  thinking,
+  reasoningEffort,
+  responseFormat,
 } = {}) {
-  const provider = getCurrentProvider();
+  // Explicit per-feature providers never fall back to or mutate the global model.
+  const provider = explicitProvider === undefined ? getCurrentProvider() : { ...explicitProvider };
   if (!provider.apiUrl || !provider.apiKey) {
     log("[AI] 未配置 API Key，跳过");
     return null;
@@ -411,6 +420,9 @@ export async function chatCompletion({
             ],
             temperature,
             max_tokens: maxTokens,
+            ...(thinking ? { thinking } : {}),
+            ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+            ...(responseFormat ? { response_format: responseFormat } : {}),
           }),
           signal: ctrl.signal,
         });
@@ -451,7 +463,7 @@ export async function chatCompletion({
       continue;
     } catch (err) {
       if (err.name === "AbortError") log(`[AI] 请求超时（${timeout}ms）`);
-      else log(`[AI] 调用异常：${err.message}`);
+      else log(`[AI] 调用异常：${explicitProvider === undefined ? err.message : err.name || '请求失败'}`);
       continue;
     } finally {
       clearTimeout(timer);
