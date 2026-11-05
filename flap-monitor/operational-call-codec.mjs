@@ -128,6 +128,11 @@ export function operationalAmountToken(action, metadata = {}) {
 }
 
 export function describeOperationalAction(a, metadata = {}) {
+  if (a.kind === 'unknown' && a.resolvedCall?.status === 'verified_abi') {
+    const args = (a.resolvedCall.arguments || []).map(p => `${p.name}=${typeof p.value === 'string' && /^bytes/.test(p.type) ? '[字节参数]' : JSON.stringify(p.value)}`).join('，');
+    return `拟调用 ${a.to}｜${a.resolvedCall.signature}｜${args}`;
+  }
+
   const token = operationalAmountToken(a, metadata);
   const meta = token === "BNB" ? { decimals: 18, symbol: "BNB" } : metadata[token] || {};
   const unit = plainLabel(meta.symbol || meta.name);

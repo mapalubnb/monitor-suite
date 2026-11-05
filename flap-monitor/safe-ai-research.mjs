@@ -1,0 +1,228 @@
+import { withDeadline } from '../shared/request-deadline.mjs';
+import { abiSelector, categoryFor, decodeCall, fragmentFromSignature, isAddress, selectorOf } from './safe-ai-call-codec.mjs';
+
+const ZERO = '0x' + '0'.repeat(40);
+const IMPL = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
+const BEACON = '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50';
+const lower = a => String(a).toLowerCase();
+const addressWord = x => /^0x0{24}[a-f\d]{40}$/i.test(x || '') && x !== '0x' + '0'.repeat(64) ? '0x' + x.slice(-40).toLowerCase() : null;
+const tool = (name, description, properties, required = Object.keys(properties)) => ({ type: 'function', function: {
+  name, description, parameters: { type: 'object', properties, required, additionalProperties: false },
+} });
+const str = { type: 'string' }, num = { type: 'integer' };
+export const SAFE_RESEARCH_TOOLS = [
+  tool('contract_source', '获取关联地址的完整验证ABI、源码文件清单；path为空返回全部完整源码，指定path返回完整文件。文件过大可用source_lines分段读取，不静默截断。', { address: str, path: str }, ['address']),
+  tool('source_lines', '按明确行范围读取已验证源码，返回总行数；可继续读取剩余部分。', { address: str, path: str, start: num, end: num }),
+  tool('resolve_proxy', '在同一核验区块追踪EIP1967/beacon/1167实现。', { address: str }),
+  tool('read_contract', '只读查询已验证ABI的view/pure函数，或标准token/owner getter。args传十进制整数字符串、完整地址、true/false或bytes；不接受交易或任意RPC。', { address: str, signature: str, args: { type: 'array', items: str } }),
+  tool('recent_events', '查询关联地址最近至多128块的指定topic0事件，返回原始日志，不能视为该Safe提案执行证明。', { address: str, topic0: str, blocks: num }),
+  tool('decode_call', '使用目标或当前实现的验证ABI重新解析指定callPath；不以选择器库候选代替验证ABI。', { callPath: str }),
+  tool('decimal_amount', '精确换算证据中的整数：raw / 10^decimals * multiplier；提供单位依据。程序计算并记录派生事实。', { raw: str, decimals: num, multiplier: str, unitEvidence: str }),
+];
+
+// Only observed addresses and their verified graph may be queried. No arbitrary URL, shell, signing or broadcast tool exists.
+export function createSafeResearchTools(evidence, { rpcCall, sourceReader, signal } = {}) {
+  const allowed = new Set(), contracts = new Map(), proxies = new Map(), cache = new Map();
+  const observations = evidence.observations ||= [], derived = evidence.derivedFacts ||= [];
+  let calls = 0, rpcCount = 0, sourceCount = 0;
+  function discover(value) {
+    for (const a of JSON.stringify(value)?.match(/0x[a-f\d]{40}(?![a-f\d])/gi) || []) if (lower(a) !== ZERO) allowed.add(lower(a));
+  }
+  discover([evidence.safe, evidence.actions, evidence.proxies, evidence.upgrades]);
+  for (const c of evidence.contracts || []) { contracts.set(lower(c.address), c); allowed.add(lower(c.address)); if (c.verified) discover(c.sources); }
+  for (const p of evidence.proxies || []) if (p.implementation) proxies.set(lower(p.address), lower(p.implementation));
+  const check = address => { address = lower(address); if (!isAddress(address) || !allowed.has(address)) throw Error('address_not_in_evidence'); return address; };
+  async function rpc(method, params) {
+    if (!rpcCall || !evidence.block) throw Error('fixed_block_unavailable');
+    if (++rpcCount > 20) throw Error('research_rpc_budget');
+    return withDeadline(() => rpcCall(method, params), 6000, signal);
+  }
+  async function source(address) {
+    address = check(address);
+    let c = contracts.get(address);
+    if (!c?.verified) {
+      if (++sourceCount > 8) throw Error('research_source_budget');
+      c = await sourceReader(address, { signal });
+      if (lower(c?.address) !== address) throw Error('source_address_mismatch');
+      contracts.set(address, c);
+      if (c.verified) discover(c.sources);
+      const i = evidence.contracts.findIndex(x => lower(x.address) === address);
+      if (i < 0) evidence.contracts.push(c); else evidence.contracts[i] = c;
+    }
+    if (!c?.verified) throw Error('verified_source_unavailable');
+    return c;
+  }
+  async function resolve(address) {
+    address = check(address);
+    if (proxies.has(address)) return { address, implementation: proxies.get(address), block: evidence.block };
+    const code = await rpc('eth_getCode', [address, evidence.block]);
+    const clone = code?.match(/^0x363d3d373d3d3d363d73([a-f\d]{40})5af43d82803e903d91602b57fd5bf3$/i);
+    let implementation = clone ? '0x' + clone[1] : addressWord(await rpc('eth_getStorageAt', [address, IMPL, evidence.block]));
+    let beacon;
+    if (!implementation && code !== '0x') {
+      beacon = addressWord(await rpc('eth_getStorageAt', [address, BEACON, evidence.block]));
+      if (beacon) implementation = addressWord(await rpc('eth_call', [{ to: beacon, data: selectorOf('implementation()'), gas: '0x186a0' }, evidence.block]));
+    }
+    if (implementation) { implementation = lower(implementation); allowed.add(implementation); proxies.set(address, implementation); }
+    const result = { address, implementation, beacon, block: evidence.block };
+    observations.push({ tool: 'resolve_proxy', ...result }); return result;
+  }
+  async function abiFunctions(address) {
+    const candidates = [address, proxies.get(address)].filter(Boolean), found = [];
+    for (const a of candidates) { try { found.push(...(await source(a)).functions); } catch {} }
+    return found;
+  }
+  const standard = { 'token()': 'address', 'asset()': 'address', 'owner()': 'address', 'decimals()': 'uint8',
+    'symbol()': 'string', 'name()': 'string', 'balanceOf(address)': 'uint256', 'allowance(address,address)': 'uint256' };
+  function encodeWord(p, value) {
+    if (p.type === 'address' && isAddress(value)) return value.slice(2).toLowerCase().padStart(64, '0');
+    if (p.type === 'bool' && ['true', 'false'].includes(value)) return (value === 'true' ? '1' : '0').padStart(64, '0');
+    if (/^u?int\d+$/.test(p.type) && /^-?\d+$/.test(value)) {
+      let n = BigInt(value), bits = BigInt(p.type.match(/\d+/)[0]), signed = p.type.startsWith('int');
+      if (n < (signed ? -(1n << (bits - 1n)) : 0n) || n >= (1n << (signed ? bits - 1n : bits))) throw Error('integer_range');
+      if (n < 0n) n += 1n << 256n; return n.toString(16).padStart(64, '0');
+    }
+    if (/^bytes\d+$/.test(p.type) && new RegExp(`^0x[a-f\\d]{${Number(p.type.slice(5)) * 2}}$`, 'i').test(value)) return value.slice(2).padEnd(64, '0');
+    throw Error('unsupported_read_argument');
+  }
+  async function execute(name, args = {}) {
+    signal?.throwIfAborted();
+    if (++calls > 24) throw Error('research_tool_budget');
+    const key = JSON.stringify([name, args]); if (cache.has(key)) return cache.get(key);
+    let result;
+    if (name === 'contract_source' || name === 'source_lines') {
+      const c = await source(args.address);
+      const files = c.sources || [], manifest = files.map(f => ({ path: f.path, lines: f.content.split('\n').length }));
+      if (name === 'source_lines') {
+        const file = files.find(f => f.path === args.path); if (!file) throw Error('source_path_not_found');
+        const lines = file.content.split('\n');
+        if (!Number.isInteger(args.start) || !Number.isInteger(args.end) || args.start < 1 || args.end < args.start || args.start > lines.length) throw Error('source_line_range');
+        result = { address: c.address, path: args.path, start: args.start, end: Math.min(args.end, lines.length), totalLines: lines.length, content: lines.slice(args.start - 1, args.end).join('\n') };
+      } else {
+        const sources = args.path ? files.filter(f => f.path === args.path) : files;
+        if (args.path && !sources.length) throw Error('source_path_not_found');
+        result = { ...c, sources, manifest };
+      }
+    } else if (name === 'resolve_proxy') result = await resolve(args.address);
+    else if (name === 'read_contract') {
+      const address = check(args.address), functions = standard[args.signature]
+        ? [contracts.get(address), contracts.get(proxies.get(address))].flatMap(c => c?.verified ? c.functions || [] : [])
+        : await abiFunctions(address);
+      const f = functions.find(f => f.signature === args.signature && ['view', 'pure'].includes(f.mutability));
+      if (!f && !standard[args.signature]) throw Error('read_requires_verified_view_abi');
+      const fragment = f || { ...fragmentFromSignature(args.signature), outputs: [{ type: standard[args.signature] }] };
+      if (!Array.isArray(args.args) || args.args.length !== fragment.inputs.length) throw Error('argument_count');
+      const data = selectorOf(args.signature) + fragment.inputs.map((p, i) => encodeWord(p, args.args[i])).join('');
+      const raw = await rpc('eth_call', [{ to: address, data, gas: '0x493e0' }, evidence.block]);
+      const out = { name: 'readResult', inputs: fragment.outputs || [] };
+      const values = decodeCall(out, abiSelector(out) + raw.slice(2)).map(v => ({ ...v, value: v.type === 'string' ? Buffer.from(v.value.slice(2), 'hex').toString('utf8') : v.value }));
+      result = { address, signature: args.signature, args: args.args, values, block: evidence.block, abi: f ? 'verified' : 'standard_getter_candidate', note: '当前只读结果，不证明提案执行' };
+      discover(values.filter(v => v.type === 'address')); observations.push({ tool: name, ...result });
+    } else if (name === 'recent_events') {
+      const address = check(args.address);
+      if (!/^0x[a-f\d]{64}$/i.test(args.topic0) || !Number.isInteger(args.blocks) || args.blocks < 1 || args.blocks > 128) throw Error('event_range_invalid');
+      const end = BigInt(evidence.block), start = end - BigInt(args.blocks) + 1n;
+      result = { address, fromBlock: '0x' + (start < 0n ? 0n : start).toString(16), toBlock: evidence.block };
+      result.logs = await rpc('eth_getLogs', [{ ...result, topics: [args.topic0] }]);
+      observations.push({ tool: name, ...result });
+    } else if (name === 'decode_call') {
+      const a = evidence.actions.find(a => String(a.callPath) === String(args.callPath));
+      if (!a || Number(a.operation || 0) !== 0) throw Error('call_path_unavailable');
+      const functions = await abiFunctions(check(a.to));
+      const matches = [];
+      for (const f of functions.filter(f => f.selector === a.selector)) {
+        try { const parameters = decodeCall({ ...f, name: f.signature.split('(')[0] }, a.rawData);
+          if (!matches.some(x => x.signature === f.signature)) matches.push({ signature: f.signature, arguments: parameters }); } catch {}
+      }
+      if (matches.length !== 1) throw Error(matches.length ? 'ambiguous_verified_abi' : 'matching_verified_abi_unavailable');
+      a.call = { ...matches[0], status: 'verified_abi' }; discover(a.call.arguments);
+      a.analysisCategory = categoryFor(a.call.signature.split('(')[0]);
+      const checkRow = evidence.checks?.find(c => c.callPath === a.callPath);
+      if (checkRow) Object.assign(checkRow, { status: 'verified_abi', function: a.call.signature });
+      evidence.evidenceStatus = evidence.actions.some(a => ['unresolved', 'ambiguous'].includes(a.call?.status)) ? 'insufficient'
+        : evidence.actions.some(a => ['candidate', 'corroborated_candidate'].includes(a.call?.status)) ? 'candidate' : 'resolved';
+      result = { callPath: a.callPath, ...a.call };
+    } else if (name === 'decimal_amount') {
+      const { raw, decimals, multiplier, unitEvidence } = args;
+      if (!/^-?\d+$/.test(raw) || !/^\d+$/.test(multiplier) || !Number.isInteger(decimals) || decimals < 0 || decimals > 255 || !unitEvidence?.trim()) throw Error('calculation_invalid');
+      const facts = JSON.stringify([evidence.actions, observations]).replace(/0x[a-f\d]+/gi, '').match(/-?\d+(?:\.\d+)?/g) || [];
+      if (!facts.includes(raw)) throw Error('calculation_raw_not_observed');
+      const unitSource = [...contracts.values()].filter(c => c.verified).flatMap(c => (c.sources || []).map(s => ({ ...s, address: c.address })))
+        .find(s => unitEvidence.length >= 8 && s.content.includes(unitEvidence));
+      const unitGetter = observations.find(o => o.signature === 'decimals()' && o.values?.[0]?.value === String(decimals) && unitEvidence === `decimals()=${decimals}`);
+      if (!unitSource && !unitGetter) throw Error('unit_evidence_requires_exact_source_quote_or_decimals_getter');
+      const n = BigInt(raw) * BigInt(multiplier), sign = n < 0n ? '-' : '', digits = (n < 0n ? -n : n).toString().padStart(decimals + 1, '0');
+      const exact = sign + (decimals ? digits.slice(0, -decimals) + '.' + digits.slice(-decimals) : digits);
+      const scale = 10n ** BigInt(decimals), cents = ((n < 0n ? -n : n) * 100n + scale / 2n) / scale;
+      const rounded = sign + cents / 100n + '.' + (cents % 100n).toString().padStart(2, '0');
+      result = { raw, decimals, multiplier, unitEvidence, unitSource: unitSource ? { address: unitSource.address, path: unitSource.path } : { address: unitGetter.address, getter: 'decimals()' }, exact, rounded, roundedDisplay: rounded.replace(/\.00$/, '').replace(/(\.\d)0$/, '$1'),
+        ...(BigInt(multiplier) % 86400n === 0n ? { days: (BigInt(multiplier) / 86400n).toString() } : {}), note: '单位依据须由源码/状态支持；rounded为约数' };
+      derived.push(result);
+    } else throw Error('unknown_research_tool');
+    cache.set(key, result); return result;
+  }
+  evidence.contracts ||= [];
+  return { tools: SAFE_RESEARCH_TOOLS, execute, stats: () => ({ toolCalls: calls, rpcCount, sourceCount }) };
+}
+
+const cooldowns = new Map();
+export async function requestSafeResearch({ provider, messages, tools, signal, fetchFn = fetch }) {
+  const cooldownKey = `${provider.apiUrl}|${provider.apiKey}`;
+  if ((cooldowns.get(cooldownKey) || 0) > Date.now()) throw Error('model_provider_cooldown');
+  return withDeadline(async activeSignal => {
+    const response = await fetchFn(provider.apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.apiKey}` },
+      body: JSON.stringify({ model: provider.model, messages, temperature: 0.1, max_tokens: 4096,
+        thinking: { type: 'disabled' }, ...(tools?.length ? { tools } : { response_format: { type: 'json_object' } }) }), signal: activeSignal });
+    if (!response.ok) {
+      const body = await response.text();
+      if ([401, 402, 403].includes(response.status)) cooldowns.set(cooldownKey, Date.now() + 30 * 60_000);
+      const context = [400, 413, 422].includes(response.status) && /context|tokens|maximum.*length|too.large/i.test(body);
+      const e = Error(context ? 'model_context_limit' : `model_http_${response.status}`); e.status = response.status; throw e;
+    }
+    const json = await response.json(), message = json.choices?.[0]?.message;
+    if (!message || json.choices?.[0]?.finish_reason === 'length') throw Error('model_output_incomplete');
+    return message;
+  }, 45_000, signal);
+}
+
+function manifestEvidence(evidence) {
+  return { ...evidence, sourceDelivery: '接口报告上下文超限；本次只提供完整文件目录，源码未读取部分不能当已审查。请用source_lines分段获取必要内容。',
+    contracts: evidence.contracts?.map(c => ({ ...c, sources: c.sources?.map(s => ({ path: s.path, totalLines: s.content.split('\n').length, contentNotIncluded: true })) })) };
+}
+
+// Full inputs by default; only an explicit provider context error switches to a disclosed, pageable source manifest.
+export async function runSafeResearch({ evidence, session, provider, systemPrompt, validate, diagnose, request = requestSafeResearch, signal, log = () => {} }) {
+  let messages = [{ role: 'system', content: systemPrompt + '\n你可以调用只读工具补齐证据。源码先读实际调用及其内部函数、继承和修饰器；金额单位先核实，使用decimal_amount计算。unitEvidence填写源码中解释精度的原文片段，或已读取的decimals()=数值。组合调用必须逐项识别。证据足够后直接输出summary JSON。最多6轮查询，不能虚构工具结果。' },
+    { role: 'user', content: JSON.stringify(evidence) }];
+  let repairs = 0, manifest = false, requests = 0;
+  for (let round = 0; round < 8; round++) {
+    signal?.throwIfAborted();
+    const tools = round < 6 ? session.tools : [];
+    let message;
+    try { requests++; message = await request({ provider, messages, tools, signal }); }
+    catch (e) {
+      if (e.message === 'model_context_limit' && !manifest) {
+        manifest = true; log('Safe AI 上下文容量不足，明确切换源码目录并按需分段读取');
+        messages = [messages[0], { role: 'user', content: JSON.stringify(manifestEvidence(evidence)) }]; continue;
+      }
+      throw e;
+    }
+    if (message.tool_calls?.length) {
+      if (!tools.length || message.tool_calls.length > 24) throw Error('research_tool_budget');
+      messages.push({ role: 'assistant', content: message.content || null, tool_calls: message.tool_calls });
+      for (const call of message.tool_calls) {
+        let value;
+        try { value = await session.execute(call.function.name, JSON.parse(call.function.arguments)); }
+        catch (e) { value = { error: e.message, evidenceUnavailable: true }; }
+        messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(value) });
+      }
+      continue;
+    }
+    const summary = validate(message.content, evidence);
+    if (summary) return { summary, stats: { ...session.stats(), modelRequests: requests, contextManifest: manifest } };
+    const reason = diagnose(message.content, evidence); log(`Safe AI 输出校验未通过：${reason}`);
+    if (++repairs > 2) throw Error(`output_validation:${reason}`);
+    messages.push({ role: 'assistant', content: message.content || '' }, { role: 'user', content: `输出未通过：${reason}。只修正摘要，保留已确认动作、关键完整地址；正文最多180字符。不要重复查询已有证据。只输出summary JSON。` });
+  }
+  throw Error('research_round_budget');
+}

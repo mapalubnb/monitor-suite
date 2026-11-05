@@ -28,6 +28,39 @@ function fixture(options = {}) {
   return { dir, settings, rows, patches, calls, service, register, setNow: n => { now = n; },
     clean: () => rmSync(dir, { recursive: true, force: true }) };
 }
+
+test('Safe AI: tool research enriches only the registered card and deduplicates subsequent signatures', async () => {
+  let researched = 0;
+  const collectEvidence = async p => ({ version: 2, evidenceStatus: 'insufficient', actions: p.actions, checks: [], contracts: [] });
+  collectEvidence.createResearch = () => ({ tools: [] });
+  const f = fixture({ collectEvidence, research: async ({ evidence }) => {
+    researched++;
+    evidence.actions[0].call = { status: 'verified_abi', signature: 'createStream(address,uint216)', arguments: [{ type: 'address', name: 'to', value: token }] };
+    return { summary: `拟向${token}创建持续付款流。`, stats: { modelRequests: 2, toolCalls: 1 } };
+  } });
+  try {
+    f.rows.a.actions = [{ kind: 'unknown', to: target, selector: '0xc355f343', callPath: '0' }];
+    assert.ok(f.register()); await f.service.tick();
+    assert.equal(f.patches.length, 1); assert.match(f.patches[0][2], /<font color='green'>/);
+    const saved = JSON.parse(readFileSync(f.settings.file));
+    assert.equal(saved.cards.message.changes[0].actions[0].resolvedCall.signature, 'createStream(address,uint216)');
+    assert.equal(Object.values(saved.jobs)[0].research.modelRequests, 2);
+    assert.equal(f.rows.a.actions[0].call, undefined);
+    await f.service.tick(); assert.equal(researched, 1); assert.equal(f.patches.length, 1);
+  } finally { f.clean(); }
+});
+
+test('Safe AI: tool failure records cause and falls back after bounded retries without false missing ABI', async () => {
+  const collectEvidence = async () => ({ version: 2, evidenceStatus: 'resolved', actions: [1, 2].map(() => ({ kind: 'unknown', call: { status: 'verified_abi', signature: 'createStream(address,uint216)' } })), contracts: [] });
+  collectEvidence.createResearch = () => ({});
+  const f = fixture({ collectEvidence, research: async () => { throw Error('model_http_429'); } });
+  try {
+    f.register(); await f.service.tick(); f.setNow(start + 61_000); await f.service.tick();
+    const job = Object.values(JSON.parse(readFileSync(f.settings.file)).jobs)[0];
+    assert.equal(job.lastError, 'model_http_429'); assert.equal(job.status, 'model_failed');
+    assert.match(f.patches[0][2], /2项已解析/); assert.doesNotMatch(f.patches[0][2], /缺少匹配ABI/);
+  } finally { f.clean(); }
+});
 test('Safe AI: new unsigned proposals are eligible; cutoff/existing/terminal/muted stay excluded', async () => {
   const f = fixture();
   try {
@@ -188,7 +221,7 @@ test('Safe AI: vault and upgrade work precedes approvals; no old reanalysis afte
     assert.equal(f.register(), false); assert.equal(f.register([change(f.rows.b)], 'late'), false);
   } finally { f.clean(); }
 });
-test('Safe evidence: bind verification identity, ABI selectors, old/new implementation and source limits', async () => {
+test('Safe evidence: bind verification identity, ABI selectors, old/new implementation and complete sources', async () => {
   const fn = { type: 'function', name: 'transfer', inputs: [{ type: 'address' }, { type: 'uint256' }] };
   assert.equal(abiSelector(fn), '0xa9059cbb');
   let urls = [];
@@ -204,7 +237,7 @@ test('Safe evidence: bind verification identity, ABI selectors, old/new implemen
   const e = await collector(proposal({ actions: [{ kind: 'upgrade', proxy: safe, implementation: token }] }));
   assert.equal(e.upgrades[0].currentCachedImplementation, target);
   assert.deepEqual(e.upgrades[0].abiAdded, ['transfer(address,uint256)']);
-  assert.equal(e.contextIncomplete, true); assert.equal(e.contracts[0].sources[0].truncated, true);
+  assert.equal(e.contextIncomplete, true); assert.equal(e.contracts[0].sources[0].content, 'x'.repeat(5000)); assert.equal(e.contracts[0].sources[0].truncated, undefined);
 });
 test('Safe key helper changes only dedicated credential, never global provider or enabled flags', () => {
   const env = 'AI_MODEL=old\nFLAP_SAFE_AI_ENABLED=false\nFLAP_SAFE_AI_DEEPSEEK_API_KEY=old\nOTHER=123\n';

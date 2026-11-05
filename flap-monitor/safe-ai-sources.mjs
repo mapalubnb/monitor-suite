@@ -12,11 +12,11 @@ export async function boundedJson(url, { fetchFn = fetch, signal, maxBytes = 2_0
   }, timeoutMs, signal);
 }
 function normalized(address, abi, sources, provider, extra = {}) {
-  if (!Array.isArray(abi) || abi.length > 2000) throw Error('abi_invalid');
+  if (!Array.isArray(abi)) throw Error('abi_invalid');
   const functions = abi.filter(f => f.type === 'function').map(f => ({
-    signature: abiSignature(f), selector: abiSelector(f), mutability: f.stateMutability, inputs: f.inputs || [],
+    signature: abiSignature(f), selector: abiSelector(f), mutability: f.stateMutability, inputs: f.inputs || [], outputs: f.outputs || [],
   }));
-  return { address: address.toLowerCase(), verified: true, provider, functions,
+  return { address: address.toLowerCase(), verified: true, provider, functions, abi,
     sources: Object.entries(sources || {}).map(([path, v]) => ({ path, content: typeof v === 'string' ? v : v.content || '' }))
       .sort((a, b) => Number(/openzeppelin|node_modules|interfaces|libraries|\/lib\//i.test(a.path)) - Number(/openzeppelin|node_modules|interfaces|libraries|\/lib\//i.test(b.path))), ...extra };
 }
@@ -26,7 +26,7 @@ export async function fetchVerifiedSafeSource(address, { fetchFn = fetch, signal
   if (!isAddress(address)) return { address, verified: false, reason: '地址无效' };
   const issues = []; let transient = false;
   try {
-    const d = await boundedJson(`https://sourcify.dev/server/v2/contract/56/${address}?fields=abi,sources`, { fetchFn, signal });
+    const d = await boundedJson(`https://sourcify.dev/server/v2/contract/56/${address}?fields=abi,sources`, { fetchFn, signal, maxBytes: Infinity });
     if (String(d.chainId) !== '56' || d.address?.toLowerCase() !== address.toLowerCase() || !['match', 'exact_match'].includes(d.runtimeMatch)) throw Error('verification_mismatch');
     return normalized(address, d.abi, d.sources, 'sourcify', { verifiedAt: d.verifiedAt });
   } catch (e) { transient ||= ![404, 400].includes(e.status); issues.push(e.status === 404 ? 'Sourcify未收录' : 'Sourcify暂不可用或身份不匹配'); }
@@ -34,7 +34,7 @@ export async function fetchVerifiedSafeSource(address, { fetchFn = fetch, signal
     try {
       const url = new URL('https://api.etherscan.io/v2/api');
       for (const [k, v] of Object.entries({ chainid: '56', module: 'contract', action: 'getsourcecode', address, apikey: explorerKey })) url.searchParams.set(k, v);
-      const d = await boundedJson(url.toString(), { fetchFn, signal });
+      const d = await boundedJson(url.toString(), { fetchFn, signal, maxBytes: Infinity });
       const row = d.status === '1' && d.result?.length === 1 ? d.result[0] : null;
       // Similar-match sources are not an exact-address verification.
       if (!row?.SourceCode || row.SimilarMatch) { transient ||= !row; throw Error('explorer_unavailable'); }
