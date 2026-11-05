@@ -49,6 +49,8 @@ function checkSafeAiOutput(raw, evidence) {
   const claims = summary.replace(/(?:是否|并非|不代表|不等于|不能证明|无法证明|不证明|不意味着)(?:该提案|提案)?已(?:执行|完成)/g, '');
   if (!summary || /[\r\n<>\[\]`*]|https?:/i.test(summary)
     || /已执行|已完成|稳赚|保证收益|保证安全|确定安全|未验证合约|合约未验证|合约未开源/.test(claims)) return reject('format_or_unsupported_claim');
+  if (/均无(?:验证)?源码|无验证源码|没有验证源码/.test(summary)) return reject('source_unavailable_is_not_unverified');
+  if (/非官方/.test(summary) && !/平台.*标|official/.test(summary)) return reject('official_flag_is_platform_label_not_identity');
   // AI may explain relationships, but cannot introduce new numeric facts.
   const publicFacts = JSON.stringify(safeAiPublicData([evidence.actions || [], (evidence.observations || []).map(({ args, ...fact }) => fact), (evidence.derivedFacts || []).map(({ unitEvidence, ...fact }) => fact), { callCount: evidence.actions?.length || 0 }]));
   const addresses = publicFacts.match(/0x[a-f\d]{40}(?![a-f\d])/gi) || [];
@@ -108,6 +110,7 @@ summary只写正文，不添加“AI解读”等标题。首句直接说明提�
 1. 金库、机制模板：
 先说明是登记工厂、启用/停用、创建金库还是修改参数，写明关键完整地址与方向。
 结合已验证代码、参数和状态，优先解释此次操作改变的资金进出方式、收益来源、费用、退出条件或管理权限；无关维度不逐项罗列。
+已取得工厂源码时，简述其创建金库的核心资金规则或管理权限，并区分“该工厂支持什么”与“本提案实际改变什么”。优先解释机制，省略原卡已有的official/riskLevel/category或UI绑定细节，不能只重复登记动作和标签。
 登记或启用工厂不等于金库已开放。official仅为平台标记；riskLevel和category没有可靠映射时保留原始编码或省略，不编造含义。analysisCategory只是分析分组。
 
 2. 合约升级：

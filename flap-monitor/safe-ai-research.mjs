@@ -32,7 +32,8 @@ export function missingResearchEvidence(evidence) {
     if (!token) missing.push(`查询${action.to}的token()确定支付资产`);
     else for (const signature of ['symbol()', 'decimals()']) if (!observations.some(o => o.address === token && o.signature === signature)) missing.push(`查询${token}的${signature}`);
     const rate = action.call.arguments?.[1]?.value;
-    if (!(evidence.derivedFacts || []).some(d => d.raw === rate && d.multiplier === '2592000')) missing.push(`使用decimal_amount将原始速率${rate}按源码确认的内部精度换算30天金额，multiplier=2592000`);
+    const quote = source.sources.flatMap(s => s.content.split('\n')).find(line => /amountPerSec.*decimals/.test(line))?.trim();
+    if (!(evidence.derivedFacts || []).some(d => d.raw === rate && d.multiplier === '2592000')) missing.push(`使用decimal_amount将原始速率${rate}按源码确认的内部精度换算30天金额，multiplier=2592000${quote ? '；unitEvidence可直接使用源码原文：' + JSON.stringify(quote) : ''}`);
   }
   return [...new Set(missing)];
 }
@@ -264,7 +265,7 @@ export async function runSafeResearch({ evidence, session, provider, systemPromp
       const readSourceEvidence = manifest ? messages.filter(m => m.role === 'tool').map(m => { try { return JSON.parse(m.content); } catch { return null; } })
         .filter(v => v && (v.sources || typeof v.content === 'string')) : [];
       messages = [messages[0], { role: 'user', content: JSON.stringify({ evidence: manifest ? manifestEvidence(evidence) : evidence,
-        readSourceEvidence, draft: message.content, instruction: '证据采集已结束。独立核对草稿事实：明确提案动作、单位和资金记账/转账区别；金库或升级核对机制与权限变化。草稿不是事实来源，不得沿用其中无证据结论。只输出200字内summary JSON。' }) }];
+        readSourceEvidence, draft: message.content, instruction: '证据采集已结束。独立核对草稿事实：明确提案动作、单位和资金记账/转账区别。描述余额时必须区分钱包余额与存入合约的余额，不添加未查询的余额条件。金库源码充分时，核心资金规则和管理权限比官方标记、风险编号或UI绑定细节优先；升级仅解释有证据的差异。草稿不是事实来源，不得沿用其中无证据结论；资料未取得不能写成没有验证源码，official字段不能断言身份。只输出200字内summary JSON。' }) }];
       summarizing = true; continue;
     }
     const summary = validate(message.content, evidence);

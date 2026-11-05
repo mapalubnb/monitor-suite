@@ -54,6 +54,12 @@ test('多项已解析不再误报缺ABI；部分未知准确区分', () => {
   const e = { actions: [action, action] }; assert.doesNotMatch(evidenceFallback(e), /缺少|0项尚未/); assert.match(evidenceFallback(e), /2项已解析.*createStream/);
   const mixed = evidenceFallback({ actions: [action, { kind: 'unknown', call: { status: 'unresolved' } }] }); assert.match(mixed, /已解析1项，另1项/);
 });
+test('拒绝把源码未取得说成没有验证源码，以及将平台标记当身份', () => {
+  const { evidence } = fixture();
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '新旧均无验证源码，权限变化未知。' }), evidence), null);
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '拟启用非官方工厂。' }), evidence), null);
+  assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '未取得新旧源码，权限变化无法确认。' }), evidence));
+});
 test('新卡通用ABI展示参数区分同selector的不同子调用', () => {
   const first = describeOperationalAction({ ...action, resolvedCall: { ...action.call, arguments: [{ name: 'to', type: 'address', value: recipient }] } });
   assert.match(first, /createStream/); assert.ok(first.includes(recipient)); assert.doesNotMatch(first, /未解析/);
