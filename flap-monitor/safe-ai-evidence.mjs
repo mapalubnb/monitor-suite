@@ -9,7 +9,7 @@ const ZERO = '0x' + '0'.repeat(40);
 const IMPLEMENTATION_SLOT = '0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc';
 const BEACON_SLOT = '0xa3f0ad74e5423aebfd80d3ef4346578335a9a72aeaee59ff6cb3582b35133d50';
 const slotAddress = value => /^0x0{24}[a-f\d]{40}$/i.test(value || '') ? '0x' + value.slice(-40).toLowerCase() : null;
-const short = a => isAddress(a) ? a.slice(0, 6) + '…' + a.slice(-4) : '未知地址';
+const displayAddress = a => isAddress(a) ? a : '未知地址';
 const credentialKey = k => /api.?key|private.?key|password|secret|authorization/i.test(k);
 export function safeAiEvidenceData(value) {
   if (Array.isArray(value)) return value.map(safeAiEvidenceData);
@@ -30,8 +30,8 @@ function sourceExcerpt(source, names = []) {
 function actionFact(action) {
   const c = action.call, args = c?.arguments?.map(v => v.value) || [];
   const prefix = c?.status === 'corroborated_candidate' ? '高可信候选：' : c?.status === 'candidate' ? '候选：' : '';
-  if (action.kind === 'vaultFactory') return `拟将金库工厂${short(action.vaultFactory)}登记为${action.enabled ? '启用' : '停用'}；official=${action.official}，riskLevel=${action.riskLevel}，category=${action.category}。登记不等于金库已开放，具体资金规则需核验工厂实现。`;
-  if (c?.signature === 'setTester(address,bool)') return `${prefix}拟将${short(args[0])}的测试者资格设为${args[1] ? '开启' : '关闭'}；具体测试权限范围待核验。`;
+  if (action.kind === 'vaultFactory') return `拟将金库工厂${displayAddress(action.vaultFactory)}登记为${action.enabled ? '启用' : '停用'}；official=${action.official}，riskLevel=${action.riskLevel}，category=${action.category}。登记不等于金库已开放，具体资金规则需核验工厂实现。`;
+  if (c?.signature === 'setTester(address,bool)') return `${prefix}拟将${displayAddress(args[0])}的测试者资格设为${args[1] ? '开启' : '关闭'}；具体测试权限范围待核验。`;
   if (c?.signature && action.kind === 'unknown') return `${prefix}拟调用${c.signature}，参数已解析；具体业务效果仍需核验。`;
   return describeOperationalAction(action, {});
 }
@@ -101,7 +101,7 @@ export function createSafeEvidenceCollector({ getContext, rpcCall, sourceReader 
       const action = safeAiEvidenceData(original);
       // Existing domain decoders already extracted these parameters, even for older rows without rawData.
       if (action.kind === 'vaultFactory') action.parsedParameters = { factory: action.vaultFactory,
-        factoryDisplay: short(action.vaultFactory), enabled: action.enabled, official: action.official,
+        factoryDisplay: displayAddress(action.vaultFactory), enabled: action.enabled, official: action.official,
         riskLevel: action.riskLevel, category: action.category };
       let t = null, entries = [], decoded = [];
       const needsContract = ['unknown', 'vaultFactory', 'vaultCreationEnable', 'upgrade', 'upgradeTarget', 'wrapping'].includes(action.kind);
@@ -127,7 +127,7 @@ export function createSafeEvidenceCollector({ getContext, rpcCall, sourceReader 
         try {
           const f = entry.inputs ? { ...fragmentFromSignature(entry.signature), inputs: entry.inputs } : fragmentFromSignature(entry.signature);
           if (abiSelector(f) !== action.selector || Number(action.operation || 0) !== 0) continue;
-          const args = decodeCall(f, action.rawData).map(a => ({ ...a, ...(a.type === 'address' ? { displayValue: short(a.value) } : {}) }));
+          const args = decodeCall(f, action.rawData).map(a => ({ ...a, ...(a.type === 'address' ? { displayValue: displayAddress(a.value) } : {}) }));
           if (!decoded.some(d => d.signature === entry.signature)) decoded.push({ signature: entry.signature, arguments: args, verified: entry.verified, provider: entry.provider });
         } catch { /* Do not relax ABI validity to obtain a guessed explanation. */ }
       }

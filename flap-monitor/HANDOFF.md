@@ -1,5 +1,10 @@
 # Flap 监控交接
 
+## 2026/11/5 Safe AI完整地址与200字（Suite1.12.83 / Flap1.10.54）
+
+用户要求AI解读地址不省略、文字上限200字。safe-ai-analysis统一200可见字符常量，提示词要求完整证据地址，拒绝缩写与新地址；保留标签/标点计数，超限不截断。safe-ai-evidence参数displayValue、factoryDisplay、金库及tester事实改为完整地址。同步测试、根/Flap版本、README、MONITORING、配置说明及PROJECT_STATE。只重启Flap；无配置或状态迁移；零签名、普通转账模板、模型、频率/降噪/历史策略、其他AI关闭不变，已生成摘要不回写。31项专项通过（完整地址、编造/缩写拒绝、200/201边界及绿色原卡长度），集成/真实模型/部署验收待补。
+
+
 ## 2026/11/5 11:28 飞书状态命令接收恢复
 
 用户反馈fl-status无输出。11:23的两条fl-status和一条fm-status已在飞书群，但feishu-bot没有任何接收/拒绝日志；服务器直接执行fl-status 1.257秒返回24629字，故障定位在事件接收链路。原PID1203994仍online且TCP连接ESTAB，最近仅08:07 reconnect记录；不能据此断言底层断流原因。

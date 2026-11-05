@@ -1,6 +1,6 @@
 # Flap Safe 专用分析与 Key 配置
 
-Suite 1.12.82 / Flap 1.10.53。仅 Safe 提案解读使用 DeepSeek；页面、机制介绍、其他 AI 仍关闭。
+Suite 1.12.83 / Flap 1.10.54。仅 Safe 提案解读使用 DeepSeek；页面、机制介绍、其他 AI 仍关闭。
 
 2026/11/4 11:16实测：用户已配置专用Key，线上configured=true，真实DeepSeek思考/非思考请求均返回HTTP200及deepseek-flash。经用户授权发送一张合成测试卡，异步更新同一消息，新增93字解读已从飞书完整JSON读回核验。生产新提案任务尚为0，不把测试样本视为自然提案验收；原频率和其他AI关闭均不变。后续若更换Key，仍需重新验证鉴权。
 
@@ -48,7 +48,7 @@ ssh -t tencent "sudo -n bash /root/monitor-suite/flap-monitor/configure-safe-ai-
 
 单个异步消费者运行，原始通知不等模型；任务最多两次尝试、队列/卡片各最多200项。
 机制/升级及候选解读使用有限思考预算，其余使用非思考模式；仅输出最终短文，不输出推理过程。
-每张卡片的新增解读含标签、标点不超过150字；多笔解读超限时合并为事实摘要。
+每张卡片的新增解读含标签、标点不超过200字；多笔解读超限时合并为事实摘要。
 分片长卡保持原卡，不额外发送分析卡。正文过长、无法编辑、模型超时或输出校验失败也保留原始通知。
 新卡在首发后补充，原卡金额/名称更新与 AI 共用编辑入口，避免交叉覆盖；不批量修改历史卡。
 
@@ -58,3 +58,5 @@ ssh -t tencent "sudo -n bash /root/monitor-suite/flap-monitor/configure-safe-ai-
 官方接口依据：[DeepSeek Chat API](https://api-docs.deepseek.com/api/create-chat-completion/)、[Sourcify 验证数据](https://docs.sourcify.dev/docs/repository/)、[Etherscan验证源码](https://docs.etherscan.io/api-reference/endpoint/getsourcecode)、[Solidity ABI规范](https://docs.soliditylang.org/en/latest/abi-spec.html)。
 
 本次按用户授权，Safe 原提案状态保留服务返回的完整签名及原始签名调用；金库注册也保留完整 calldata。AI 任务/卡片快照不重复保存这些大字段，通知正文不展示签名。旧记录缺少原始字段时使用已有解析参数，不回放历史提案。
+
+AI输出中的钱包、合约地址必须为证据内完整42字符地址，省略号/截断地址会被校验拒绝；完整地址逐字符计入200字上限。参数展示、金库工厂与tester事实提示也保留完整地址。普通转账模板保持原规则；已生成的历史分析不重写。

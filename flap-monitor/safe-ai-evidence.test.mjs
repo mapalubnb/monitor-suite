@@ -48,6 +48,9 @@ test('真实nonce196回放：保留68字节参数，追踪实现并核验tester�
   assert.equal(e.proxies[0].proxyType, 'EIP-1967');
   assert.equal(e.actions[0].call.signature, 'setTester(address,bool)');
   assert.deepEqual(e.actions[0].call.arguments.map(x => x.value), [account, true]);
+  assert.equal(e.actions[0].call.arguments[0].displayValue, account);
+  assert.ok(e.actions[0].fact.includes(account));
+  assert.ok(!e.actions[0].fact.includes('…'));
   assert.equal(e.actions[0].currentState.value, false);
   assert.equal(e.actions[0].currentState.block, '0x7d8ade2');
   assert.equal(e.actions[0].call.status, 'corroborated_candidate');

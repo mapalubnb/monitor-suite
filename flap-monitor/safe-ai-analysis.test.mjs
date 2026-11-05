@@ -58,7 +58,7 @@ test('Safe AI: combine split asset rows, pin model and send authorized calldata/
     assert.equal(f.calls[0].provider.model, 'deepseek-flash');
     assert.equal(f.calls[0].provider.apiUrl, 'https://api.deepseek.com/chat/completions');
     assert.doesNotMatch(readFileSync(f.settings.file, 'utf8'), /secret-signature|test-only-key/);
-    assert.ok([...f.patches[0][2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 150);
+    assert.ok([...f.patches[0][2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 200);
   } finally { f.clean(); }
 });
 
@@ -155,17 +155,17 @@ test('Safe AI: metadata arriving during patch is not lost, including when key is
 });
 test('Safe AI: unsafe, oversized, invented numeric or non-JSON output fails closed', () => {
   const check = summary => validateSafeAiOutput(JSON.stringify({ summary }), { contextIncomplete: true });
-  for (const text of ['已执行升级', '保证收益', '收益增加99倍', 'x'.repeat(151), '<at id="all">', '[点击](https://bad)']) assert.equal(check(text), null);
+  for (const text of ['已执行升级', '保证收益', '收益增加99倍', 'x'.repeat(201), '<at id="all">', '[点击](https://bad)']) assert.equal(check(text), null);
   assert.equal(validateSafeAiOutput('not json', {}), null);
   assert.match(check('拟升级实现，权限影响需核验。'), /仍待核验/);
   assert.equal(safeAiPublicData({ signature: 'secret', nested: { rawData: 'secret', amount: '1' } }).nested.amount, '1');
 });
-test('Safe AI: multi-proposal card total brief stays within 150 characters', async () => {
+test('Safe AI: multi-proposal card total brief stays within 200 characters', async () => {
   const f = fixture();
   try {
     f.rows.b = proposal({ key: 'b', safeTxHash: '0x' + 'b'.repeat(64), nonce: 2 });
     f.register([change(f.rows.a), change(f.rows.b)]); await f.service.tick(); await f.service.tick();
-    for (const p of f.patches) assert.ok([...p[2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 150);
+    for (const p of f.patches) assert.ok([...p[2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 200);
   } finally { f.clean(); }
 });
 
@@ -226,5 +226,38 @@ test('Safe AI: parsed vault registration must name the factory and direction eve
   assert.match(evidence.actions[0].fact, /登记为启用/);
   const check = summary => validateSafeAiOutput(JSON.stringify({summary}), evidence);
   assert.equal(check('拟注册金库工厂，但实际工厂地址及参数取值未解析。'), null);
-  assert.ok(check('提案拟登记并启用金库工厂0x2222…2222；不代表金库开放，资金与退出规则待源码核验。'));
+  assert.equal(check('提案拟登记并启用金库工厂0x2222…2222；不代表金库开放。'), null);
+  assert.ok(check(`提案拟登记并启用金库工厂${token}；不代表金库开放，资金与退出规则待源码核验。`));
+  assert.equal(evidence.actions[0].parsedParameters.factoryDisplay, token);
+});
+
+
+test('Safe AI: full addresses required for tester and upgrade; no shortened or invented address', () => {
+  const evidence = { version: 2, evidenceStatus: 'candidate', actions: [{ kind:'unknown', to:target,
+    call:{ signature:'setTester(address,bool)', arguments:[{type:'address',value:token},{type:'bool',value:true}] } }] };
+  const check = summary => validateSafeAiOutput(JSON.stringify({summary}), evidence);
+  assert.ok(check(`候选提案拟通过${target}为${token}开启测试者资格，具体权限待核验。`));
+  for (const address of ['0x2222…2222','0x2222...2222','0x…2222',token.slice(0,-1)+'3']) {
+    assert.equal(check(`候选提案拟为${address}开启测试者资格，具体权限待核验。`), null);
+  }
+  const upgrade = { version:2, evidenceStatus:'resolved', actions:[{kind:'upgrade',analysisCategory:'upgrade',proxy:target,implementation:token}] };
+  assert.ok(validateSafeAiOutput(JSON.stringify({summary:`提案拟将代理${target}升级至实现${token}；存储布局及机制影响待核验。`}),upgrade));
+});
+
+test('Safe AI: exact 200 visible characters pass with full address; 201 fails, card never truncates address', async () => {
+  const prefix = `提案拟调整${target}的权限；`;
+  const summary = prefix + '说明'.repeat(100);
+  const exact = [...summary].slice(0, 200 - [...'AI解读：'].length).join('');
+  const evidence = {version:2,evidenceStatus:'resolved',actions:[{kind:'ownership',to:target}]};
+  assert.equal(validateSafeAiOutput(JSON.stringify({summary:exact}),evidence), exact);
+  assert.equal(validateSafeAiOutput(JSON.stringify({summary:exact+'字'}),evidence), null);
+  const f=fixture({collectEvidence:async()=>evidence,complete:async()=>JSON.stringify({summary:exact})});
+  try {
+    f.register(); await f.service.tick();
+    const brief=f.patches[0][2].split('\n\n')[1];
+    assert.match(brief, /<font color='green'>/);
+    const visible=brief.replace(/<\/?font\b[^>]*>/g,'');
+    assert.equal([...visible].length,200);
+    assert.ok(visible.includes(target)); assert.ok(!visible.includes('…'));
+  } finally { f.clean(); }
 });
