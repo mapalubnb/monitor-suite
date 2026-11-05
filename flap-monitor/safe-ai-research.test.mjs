@@ -70,6 +70,18 @@ test('已验证代码数字支持下划线和科学计数，注释/字符串/未
   assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '拟启用工厂，代码设置池深度门槛30000 USDT。' }), evidence));
   assert.match(diagnoseSafeAiOutput(JSON.stringify({ summary: '拟设置888888 USDT门槛。' }), evidence), /888888/);
 });
+test('摘要阶段缺少派生数值时重新开放计算工具，而非无工具重复失败', async () => {
+  const { evidence, session } = fixture(); evidence.contracts[0].sources.push({ path: 'fee.sol', content: 'uint feeBps = 500; uint denominator = 10000;' });
+  let n = 0;
+  const result = await runSafeResearch({ evidence, session, provider: {}, systemPrompt: '', validate: validateSafeAiOutput, diagnose: diagnoseSafeAiOutput,
+    request: async ({ tools, requireTool, thinking }) => {
+      n++;
+      if (n === 3) { assert.ok(tools.length); assert.equal(requireTool, true); assert.equal(thinking, false);
+        return { tool_calls: [{ id: 'calculate', type: 'function', function: { name: 'decimal_amount', arguments: JSON.stringify({ raw: '500', decimals: 2, multiplier: '1', unitEvidence: 'uint feeBps = 500; uint denominator = 10000;' }) } }] }; }
+      return { content: JSON.stringify({ summary: '拟设置5%的费用。' }) };
+    } });
+  assert.equal(result.summary, '拟设置5%的费用。'); assert.equal(n, 5);
+});
 test('新卡通用ABI展示参数区分同selector的不同子调用', () => {
   const first = describeOperationalAction({ ...action, resolvedCall: { ...action.call, arguments: [{ name: 'to', type: 'address', value: recipient }] } });
   assert.match(first, /createStream/); assert.ok(first.includes(recipient)); assert.doesNotMatch(first, /未解析/);

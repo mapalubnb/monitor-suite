@@ -231,14 +231,14 @@ function manifestEvidence(evidence) {
 export async function runSafeResearch({ evidence, session, provider, systemPrompt, validate, diagnose, request = requestSafeResearch, signal, log = () => {} }) {
   let messages = [{ role: 'system', content: systemPrompt + '\n工作分两阶段：先利用只读工具补齐事实，再压缩为短摘要；不要为了短文而跳过核验。源码先读实际调用及其内部函数、继承和修饰器；资金流须查资产getter和单位，使用decimal_amount计算，摘要只用换算后的金额，不重复原始整数。区分合约内余额记账与钱包真实转账：按秒计提不等于每秒自动转账；核对资金托管位置、实际转账触发及取消结算逻辑再解释。unitEvidence填写源码中解释精度的原文片段，或已读取的decimals()=数值。组合调用逐项识别。同类多收款提案优先保留各收款方完整地址、币种及金额，目标合约地址已在原卡时可以整项省去，不缩写。证据足够后输出summary JSON，正文尽量150字以内，绝不超过180字。最多6轮查询，不能虚构工具结果。' },
     { role: 'user', content: JSON.stringify(evidence) }];
-  let repairs = 0, manifest = false, requests = 0, summarizing = false;
+  let repairs = 0, manifest = false, requests = 0, summarizing = false, calculationNeeded = false;
   for (let round = 0; round < 8; round++) {
     signal?.throwIfAborted();
     const tools = round < 6 && !summarizing ? session.tools : [];
     const missing = missingResearchEvidence(evidence);
     if (missing.length) messages.push({ role: 'user', content: `还缺少关键事实，先调用工具完成：${missing.join('；')}。工具确实返回失败才可明确说明该缺项，不能省略金额直接宣布分析完成。` });
     let message;
-    try { requests++; message = await request({ provider, messages, tools, requireTool: missing.length > 0 && !summarizing, thinking: summarizing, signal }); }
+    try { requests++; message = await request({ provider, messages, tools, requireTool: (missing.length > 0 || calculationNeeded) && !summarizing, thinking: summarizing, signal }); }
     catch (e) {
       if (e.message === 'model_context_limit' && !manifest) {
         manifest = true; log('Safe AI 上下文容量不足，明确切换源码目录并按需分段读取');
@@ -269,6 +269,7 @@ export async function runSafeResearch({ evidence, session, provider, systemPromp
         catch (e) { value = { error: e.message, evidenceUnavailable: true }; (evidence.researchFailures ||= []).push({ tool: call.function.name, reason: e.message }); }
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(value) });
       }
+      calculationNeeded = false;
       continue;
     }
     if (missing.length && !(evidence.researchFailures || []).length) {
@@ -290,6 +291,12 @@ export async function runSafeResearch({ evidence, session, provider, systemPromp
       return { summary, stats: { ...session.stats(), modelRequests: requests, contextManifest: manifest, incomplete: missing.length > 0 } }; }
     const reason = diagnose(message.content, evidence); log(`Safe AI 输出校验未通过：${reason}`);
     if (++repairs > 2) throw Error(`output_validation:${reason}`);
+    if (reason.startsWith('number_not_in_evidence_use_decimal_amount') && round < 6) {
+      // Final verification may discover a necessary calculation. Re-open tools with the ledger instead of asking a tool-less summary call to invent numbers.
+      messages = [messages[0], { role: 'user', content: JSON.stringify({ evidence: manifest ? manifestEvidence(evidence) : evidence,
+        correction: reason, instruction: '该数值需要补充依据。使用decimal_amount从已解析参数、只读结果或验证代码常量计算；需要时先查询getter。数值若无可靠依据则从摘要删除。' }) }];
+      summarizing = false; calculationNeeded = true; continue;
+    }
     let length = 0; try { length = [...JSON.parse(message.content).summary].length; } catch {}
     messages.push({ role: 'assistant', content: message.content || '', ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}) }, { role: 'user', content: `输出未通过：${reason}，当前正文${length}字符。只修正摘要，保留动作、各收款完整地址及换算后的金额，不要原始整数；删除原卡已有的目标合约地址和冗余介绍；正文控制在150字符左右，最多180字符。不要重复查询已有证据。只输出summary JSON。` });
   }
