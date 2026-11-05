@@ -10,6 +10,46 @@ const tool = (name, description, properties, required = Object.keys(properties))
   name, description, parameters: { type: 'object', properties, required, additionalProperties: false },
 } });
 const str = { type: 'string' }, num = { type: 'integer' };
+// Numeric spelling is not a new fact: 9.70 and 9.7 represent the same value.
+export function normalizeNumericFact(value) {
+  const text = String(value);
+  if (!/^-?\d+(?:\.\d+)?$/.test(text)) return text;
+  let out = text.replace(/^(-?)0+(?=\d)/, '$1');
+  if (out.includes('.')) out = out.replace(/0+$/, '').replace(/\.$/, '');
+  return /^-?0$/.test(out) ? '0' : out;
+}
+
+// Known Portal ABI + its verified implementation's actual default-selection code.
+// Do not infer a denominator from a function name or an unrelated contract's constants.
+export function recordFactoryMultiplierFacts(evidence) {
+  const derived = evidence.derivedFacts ||= [];
+  for (const action of evidence.actions || []) {
+    if (action.call?.status !== 'verified_abi' || action.call.signature !== 'setFactoryMultiplier(address,uint16)') continue;
+    const implementation = evidence.proxies?.find(p => lower(p.address) === lower(action.to))?.implementation;
+    let contract;
+    const source = evidence.contracts?.filter(c => c.verified && [lower(action.to), lower(implementation)].includes(lower(c.address)))
+      .flatMap(c => (c.sources || []).map(s => ({ ...s, contract: c }))).find(s => {
+      const code = s.content.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, ' ');
+      return /multiplier\s*=\s*10_000\s*;/.test(code)
+        && /configured\s*=\s*_factoryGraduationMultiplierBps\[vaultFactory\]/.test(code)
+        && /if\s*\(configured\s*!=\s*0\)\s*multiplier\s*=\s*configured/.test(code);
+    });
+    contract = source?.contract;
+    const raw = String(action.call.arguments?.[1]?.value ?? '');
+    if (!source || !/^\d+$/.test(raw) || BigInt(raw) > 10000n) continue;
+    if (derived.some(d => d.kind === 'factory_multiplier_bps' && d.callPath === action.callPath && d.raw === raw)) continue;
+    const effective = BigInt(raw) === 0n ? 10000n : BigInt(raw);
+    const decimal = (n, places) => {
+      const digits = n.toString().padStart(places + 1, '0');
+      return normalizeNumericFact(digits.slice(0, -places) + '.' + digits.slice(-places));
+    };
+    derived.push({ kind: 'factory_multiplier_bps', callPath: action.callPath, raw, denominator: '10000',
+      effectiveBps: effective.toString(), ratio: decimal(effective, 4), percentageOfDefault: decimal(effective, 2),
+      reductionFromDefaultPercent: decimal(10000n - effective, 2),
+      unitSource: { address: contract.address, path: source.path },
+      meaning: '0表示清除配置，恢复默认1倍；百分比相对默认门槛，不是费率、收益率或相对上次配置的变化。Preparation倍率优先。' });
+  }
+}
 // Numeric literals from verified executable source are evidence; comments, strings and addresses are not numeric facts.
 export function sourceNumericFacts(evidence) {
   const facts = new Set();
@@ -57,6 +97,7 @@ export function missingResearchEvidence(evidence) {
 
 // Only observed addresses and their verified graph may be queried. No arbitrary URL, shell, signing or broadcast tool exists.
 export function createSafeResearchTools(evidence, { rpcCall, sourceReader, signal } = {}) {
+  recordFactoryMultiplierFacts(evidence);
   const allowed = new Set(), contracts = new Map(), proxies = new Map(), cache = new Map();
   const observations = evidence.observations ||= [], derived = evidence.derivedFacts ||= [];
   let calls = 0, rpcCount = 0, sourceCount = 0;
@@ -229,6 +270,7 @@ function manifestEvidence(evidence) {
 
 // Full inputs by default; only an explicit provider context error switches to a disclosed, pageable source manifest.
 export async function runSafeResearch({ evidence, session, provider, systemPrompt, validate, diagnose, request = requestSafeResearch, signal, log = () => {} }) {
+  recordFactoryMultiplierFacts(evidence);
   let messages = [{ role: 'system', content: systemPrompt + '\n工作分两阶段：先利用只读工具补齐事实，再压缩为短摘要；不要为了短文而跳过核验。源码先读实际调用及其内部函数、继承和修饰器；资金流须查资产getter和单位，使用decimal_amount计算，摘要只用换算后的金额，不重复原始整数。区分合约内余额记账与钱包真实转账：按秒计提不等于每秒自动转账；核对资金托管位置、实际转账触发及取消结算逻辑再解释。unitEvidence填写源码中解释精度的原文片段，或已读取的decimals()=数值。组合调用逐项识别。同类多收款提案优先保留各收款方完整地址、币种及金额，目标合约地址已在原卡时可以整项省去，不缩写。证据足够后输出summary JSON，正文尽量150字以内，绝不超过180字。最多6轮查询，不能虚构工具结果。' },
     { role: 'user', content: JSON.stringify(evidence) }];
   let repairs = 0, manifest = false, requests = 0, summarizing = false, calculationNeeded = false;
@@ -286,6 +328,7 @@ export async function runSafeResearch({ evidence, session, provider, systemPromp
         readSourceEvidence, draft: message.content, instruction: '证据采集已结束。独立核对草稿事实：明确提案动作、单位和资金记账/转账区别。描述余额时必须区分钱包余额与存入合约的余额，不添加未查询的余额条件。收款人参数不等于调用权限；检查msg.sender及修饰器，无限制时说“调用withdraw时向收款方转账”，不能说“收款方withdraw才转账”。金库源码充分时，核心资金规则和管理权限比官方标记、风险编号或UI绑定细节优先；creatorFee按收取时机解释，收入中支付创建者的比例称创建者分成，不能写成创建时收费。升级仅解释有证据的差异。草稿不是事实来源，不得沿用其中无证据结论；资料未取得不能写成没有验证源码，official字段不能断言身份。只输出200字内summary JSON。' }) }];
       summarizing = true; continue;
     }
+    recordFactoryMultiplierFacts(evidence);
     const summary = validate(message.content, evidence);
     if (summary) { evidence.researchIncomplete = missing;
       return { summary, stats: { ...session.stats(), modelRequests: requests, contextManifest: manifest, incomplete: missing.length > 0 } }; }

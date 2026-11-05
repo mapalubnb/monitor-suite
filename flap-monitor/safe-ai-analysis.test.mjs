@@ -139,7 +139,8 @@ test('Safe AI: unsigned analysis survives restart; first and further signatures 
     for (const confirmations of [1, 2]) {
       f.rows.a.confirmations = confirmations;
       restarted.registerCard({ id: `progress-${confirmations}`, title: '签名进度', changes: [{ ...f.rows.a, type: 'signatures' }], metadata: {}, color: 'red' });
-      await restarted.tick(); assert.equal(f.calls.length, 1); assert.equal(f.patches.at(-1)[0], `progress-${confirmations}`);
+      await restarted.tick(); assert.equal(f.calls.length, 1); assert.equal(f.patches.at(-1)[0], 'message');
+      assert.equal(f.patches.length, 1);
     }
   } finally { f.clean(); }
 });
@@ -201,12 +202,49 @@ test('Safe AI: unsafe, oversized, invented numeric or non-JSON output fails clos
   assert.match(check('拟升级实现，权限影响需核验。'), /仍待核验/);
   assert.equal(safeAiPublicData({ signature: 'secret', nested: { rawData: 'secret', amount: '1' } }).nested.amount, '1');
 });
-test('Safe AI: multi-proposal card total brief stays within 200 characters', async () => {
-  const f = fixture();
+test('Safe AI: 203/204 retain independent green summaries over 200 total and stay on original card', async () => {
+  const summary = `拟调整${target}的配置；` + '完整机制说明。'.repeat(14);
+  const f = fixture({ collectEvidence: async p => ({ actions: p.actions }), complete: async () => JSON.stringify({ summary }) });
   try {
-    f.rows.b = proposal({ key: 'b', safeTxHash: '0x' + 'b'.repeat(64), nonce: 2 });
+    f.rows.a.nonce = 204;
+    f.rows.b = proposal({ key: 'b', safeTxHash: '0x' + 'b'.repeat(64), nonce: 203 });
     f.register([change(f.rows.a), change(f.rows.b)]); await f.service.tick(); await f.service.tick();
-    for (const p of f.patches) assert.ok([...p[2].split('\n\n')[1].replace(/<\/?font\b[^>]*>/g, '')].length <= 200);
+    const lines = f.patches.at(-1)[2].split('\n\n')[1].split('\n');
+    assert.equal(lines.length, 2);
+    assert.ok(lines.join('').length > 200);
+    for (const line of lines) {
+      assert.match(line, /<font color='green'>AI解读（nonce 20[34]）：/);
+      assert.ok([...line.replace(/<\/?font\b[^>]*>/g, '')].length <= 200);
+      assert.ok(line.includes(target));
+    }
+    assert.equal(f.register([{ ...change(f.rows.a), type: 'ready' }], 'ready204'), false);
+    assert.equal(f.register([{ ...change(f.rows.b), type: 'signatures' }], 'sign203'), false);
+    f.rows.a.status = 'executed';
+    f.service.updateMetadata('message', { [token]: { symbol: 'NEW' } });
+    await f.service.tick();
+    assert.match(f.patches.at(-1)[2], /nonce 204/); assert.match(f.patches.at(-1)[2], /nonce 203/);
+    assert.equal(f.patches.at(-1)[0], 'message');
+    assert.equal(Object.values(JSON.parse(readFileSync(f.settings.file)).jobs).every(j => j.cardId === 'message'), true);
+  } finally { f.clean(); }
+});
+
+test('Safe AI: sibling retry updates original card after ready notification and service restart', async () => {
+  let attempts = 0;
+  const f = fixture({ collectEvidence: async p => ({ actions: p.actions }), complete: async () => {
+    if (++attempts === 2) throw Error('temporary');
+    return JSON.stringify({ summary: `拟调整${target}的配置。` });
+  } });
+  try {
+    f.rows.b = proposal({ safeTxHash: '0x' + 'b'.repeat(64), nonce: 203 });
+    f.register([change(f.rows.a), change(f.rows.b)]); await f.service.tick(); await f.service.tick();
+    assert.match(f.patches.at(-1)[2], /nonce 203.*重试中/);
+    assert.equal(f.register([{ ...change(f.rows.b), type: 'ready' }], 'ready'), false);
+    f.setNow(start + 61000);
+    const restarted = createSafeAiService(f.settings);
+    await restarted.tick();
+    assert.equal(f.patches.at(-1)[0], 'message');
+    assert.match(f.patches.at(-1)[2], /AI解读（nonce 203）/);
+    assert.doesNotMatch(f.patches.at(-1)[2], /重试中/);
   } finally { f.clean(); }
 });
 
@@ -290,8 +328,8 @@ test('Safe AI: full addresses required for tester and upgrade; no shortened or i
 test('Safe AI: exact 200 visible characters pass with full address; 201 fails, card never truncates address', async () => {
   const prefix = `提案拟调整${target}的权限；`;
   const summary = prefix + '说明'.repeat(100);
-  const exact = [...summary].slice(0, 200 - [...'AI解读：'].length).join('');
-  const evidence = {version:2,evidenceStatus:'resolved',actions:[{kind:'ownership',to:target}]};
+  const exact = [...summary].slice(0, 200 - [...'AI解读（nonce 1）：'].length).join('');
+  const evidence = {version:2,proposalNonce:1,evidenceStatus:'resolved',actions:[{kind:'ownership',to:target}]};
   assert.equal(validateSafeAiOutput(JSON.stringify({summary:exact}),evidence), exact);
   assert.equal(validateSafeAiOutput(JSON.stringify({summary:exact+'字'}),evidence), null);
   const f=fixture({collectEvidence:async()=>evidence,complete:async()=>JSON.stringify({summary:exact})});

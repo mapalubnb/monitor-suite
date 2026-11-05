@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSafeResearchTools, missingResearchEvidence, sourceNumericFacts, runSafeResearch, requestSafeResearch } from './safe-ai-research.mjs';
+import { createSafeResearchTools, missingResearchEvidence, sourceNumericFacts, recordFactoryMultiplierFacts, runSafeResearch, requestSafeResearch } from './safe-ai-research.mjs';
 import { validateSafeAiOutput, diagnoseSafeAiOutput, evidenceFallback } from './safe-ai-analysis.mjs';
 import { createSafeEvidenceCollector } from './safe-ai-evidence.mjs';
 import { selectorOf, fragmentFromSignature } from './safe-ai-call-codec.mjs';
@@ -10,6 +10,29 @@ const target = '0xa0377ab664fdd368adc3214a947a429f42e10939', safe = '0x670fedb79
 const token = '0x55d398326f99059ff775485246999027b3197955', recipient = '0xf77d97e0397670415a00584857e002e148e0b5ce';
 const w = n => BigInt(n).toString(16).padStart(64, '0');
 const signature = 'createStream(address,uint216)';
+test('nonce203 verified implementation resolves 970 bps, clears to default, rejects unrelated or candidate source', () => {
+  const impl = '0x19a3364c03cf0a03a73f7bbc29b36e4b4e8d9df4';
+  const source = { path: 'src/PortalBase.sol', content: 'multiplier = 10_000; uint16 configured = _factoryGraduationMultiplierBps[vaultFactory]; if (configured != 0) multiplier = configured;' };
+  const evidence = { version: 2, evidenceStatus: 'resolved', actions: [{ to: target, callPath: '0', call: { status: 'verified_abi', signature: 'setFactoryMultiplier(address,uint16)', arguments: [{ value: recipient }, { value: '970' }] } }],
+    proxies: [{ address: target, implementation: impl }], contracts: [{ address: target, verified: true, sources: [] }, { address: impl, verified: true, sources: [source] }] };
+  recordFactoryMultiplierFacts(evidence); recordFactoryMultiplierFacts(evidence);
+  assert.equal(evidence.derivedFacts.length, 1);
+  assert.equal(evidence.derivedFacts[0].ratio, '0.097'); assert.equal(evidence.derivedFacts[0].percentageOfDefault, '9.7');
+  assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '拟将门槛设为默认的9.7%，即0.097倍，较默认降低90.3%。' }), evidence));
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '拟设为0.97倍。' }), evidence), null);
+  for (const mutation of [e => e.contracts[1].verified = false, e => e.proxies = [], e => e.actions[0].call.status = 'candidate',
+    e => e.contracts[1].sources[0].content = '// ' + source.content]) {
+    const wrong = structuredClone(evidence); wrong.derivedFacts = []; mutation(wrong); recordFactoryMultiplierFacts(wrong); assert.equal(wrong.derivedFacts.length, 0);
+  }
+  const clear = structuredClone(evidence); clear.derivedFacts = []; clear.actions[0].call.arguments[1].value = '0'; recordFactoryMultiplierFacts(clear);
+  assert.equal(clear.derivedFacts[0].percentageOfDefault, '100');
+});
+
+test('derived decimal 9.70 validates as 9.7 without allowing new numeric values', () => {
+  const evidence = { derivedFacts: [{ exact: '9.70', raw: '970' }] };
+  assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '倍率为9.7%。' }), evidence));
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '倍率为97%。' }), evidence), null);
+});
 const action = { kind: 'unknown', to: target, operation: 0, selector: selectorOf(signature), callPath: '0',
   rawData: selectorOf(signature) + recipient.slice(2).padStart(64, '0') + w(11574074074074074n),
   call: { status: 'verified_abi', signature, arguments: [{ type: 'address', value: recipient }, { type: 'uint216', value: '11574074074074074' }] } };

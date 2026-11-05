@@ -1,4 +1,4 @@
-import { runSafeResearch, sourceNumericFacts } from './safe-ai-research.mjs';
+import { runSafeResearch, sourceNumericFacts, normalizeNumericFact } from './safe-ai-research.mjs';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { chatCompletion } from '../shared/ai-client.mjs';
@@ -59,8 +59,8 @@ function checkSafeAiOutput(raw, evidence) {
   if ((summary.match(/0x[a-f\d]+(?:…[a-f\d]+)?/gi) || []).some(a => !allowedAddresses.has(a.toLowerCase()))) return reject('address_not_in_evidence');
   const withoutHex = text => text.replace(/0x[a-f\d]+(?:…[a-f\d]+)?/gi, '');
   if ((evidence.derivedFacts || []).some(d => String(d.raw).length > 8 && d.raw !== d.roundedDisplay && new RegExp(`(?<!\\d)${d.raw}(?!\\d)`).test(withoutHex(summary)))) return reject('raw_amount_should_use_converted_value');
-  const facts = new Set([...(withoutHex(publicFacts).match(/\d+(?:\.\d+)?/g) || []), ...sourceNumericFacts(evidence)]);
-  const unsupportedNumbers = (withoutHex(summary).match(/\d+(?:\.\d+)?/g) || []).filter(n => !facts.has(n));
+  const facts = new Set([...(withoutHex(publicFacts).match(/\d+(?:\.\d+)?/g) || []), ...sourceNumericFacts(evidence)].map(normalizeNumericFact));
+  const unsupportedNumbers = (withoutHex(summary).match(/\d+(?:\.\d+)?/g) || []).filter(n => !facts.has(normalizeNumericFact(n)));
   if (unsupportedNumbers.length) return reject('number_not_in_evidence_use_decimal_amount:' + [...new Set(unsupportedNumbers)].join(','));
   if (evidence.version === 2) {
     if (evidence.evidenceStatus === 'insufficient' && evidence.actions.some(a => ['unresolved', 'ambiguous'].includes(a.call?.status))
@@ -84,7 +84,8 @@ function checkSafeAiOutput(raw, evidence) {
       if (enabled === false && !/关闭|禁用|移除|取消|false/.test(summary)) return reject('semantic_evidence_mismatch');
     }
   } else if (evidence.contextIncomplete && !summary.includes('仍待核验')) summary += '机制或升级效果仍待核验。';
-  return size('AI解读：' + summary) <= SAFE_AI_MAX_CHARS ? { summary } : reject('summary_exceeds_200_characters');
+  const label = evidence.proposalNonce == null ? 'AI解读：' : `AI解读（nonce ${evidence.proposalNonce}）：`;
+  return size(label + summary) <= SAFE_AI_MAX_CHARS ? { summary } : reject('summary_exceeds_200_characters');
 }
 export const validateSafeAiOutput = (raw, evidence) => checkSafeAiOutput(raw, evidence).summary || null;
 export const diagnoseSafeAiOutput = (raw, evidence) => checkSafeAiOutput(raw, evidence).error || '';
@@ -205,16 +206,21 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
           priority: p.actions.some(a => /vault|upgrade/i.test(a.kind)) ? 0 : 1,
           safe: p.safe, safeTxHash: p.safeTxHash, nonce: p.nonce };
       }
+      // First eligible notification owns the analysis for its lifetime. Signature/ready
+      // notifications must not steal the job or detach siblings from the original card.
+      if (state.jobs[key].cardId && state.jobs[key].cardId !== id) continue;
       state.jobs[key].cardId = id;
       keys.push(key);
     }
     if (!keys.length) return false;
+    if (state.cards[id]) { save(); return true; }
     if (Object.keys(state.cards).length >= MAX_CARDS) {
       const oldest = Object.entries(state.cards).sort((a, b) => a[1].createdAt - b[1].createdAt)[0]?.[0];
       if (oldest) delete state.cards[oldest];
     }
     state.cards[id] = { title, changes: safeAiPublicData(changes), metadata, color,
-      keys: [...new Set(keys)], createdAt: now(), nextPatchAt: 0, patchAttempts: 0, revision: 0, dirty: false };
+      keys: [...new Set(keys)], createdAt: now(), nextPatchAt: 0, patchAttempts: 0, revision: 0, dirty: false,
+      summaryPolicy: 'per_proposal_original' };
     save(); return true;
   }
   // Metadata and AI share this path; every patch rebuilds from the latest stored inputs.
@@ -248,6 +254,7 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
       let evidence;
       try {
         evidence = safeAiEvidenceData(await withDeadline(signal => collectEvidence(p, { signal, refresh: job.attempts > 1 }), 40_000));
+        evidence.proposalNonce = p.nonce;
         if (stopped || terminal(proposal(id)?.status)) { job.status = 'cancelled'; continue; }
         job.evidenceStatus = evidence.evidenceStatus || 'legacy';
         job.checks = evidence.checks; job.evidenceBlock = evidence.block; job.limits = evidence.limits;
@@ -298,15 +305,17 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
     }
     for (const [id, card] of Object.entries(state.cards)) {
       if (stopped || !enabled || now() < card.nextPatchAt || card.patchAttempts >= 3) continue;
-      const jobs = card.keys.map(k => state.jobs[k]).filter(j => j?.cardId === id && j.summary
-        && !terminal(proposal(keyOf(j))?.status));
-      if (!jobs.length && !card.dirty) continue;
+      const jobs = card.keys.map(k => state.jobs[k]).filter(j => j?.cardId === id
+        && (card.summaryPolicy === 'per_proposal_original' || !terminal(proposal(keyOf(j))?.status)));
+      if (!jobs.some(j => j.summary) && !card.dirty) continue;
       const label = j => j.mode === 'transfer' ? '转账说明' : j.summaryType === 'evidence' ? '核验提示' : 'AI解读';
-      let brief = jobs.map(j => `${label(j)}（nonce ${j.nonce}）：${j.summary}`).join('\n');
-      if (size(brief) > SAFE_AI_MAX_CHARS) brief = jobs.length === 1
-        ? `${label(jobs[0])}：${jobs[0].summary}`
-        : `提案摘要：本卡涉及${jobs.length}笔新提案，包含${jobs.some(j => j.mode === 'ai') ? '机制、权限或组合操作' : '资金转账'}。各笔参数见原卡；提案不等于执行，机制与资金用途须结合验证证据核验。`;
-      if (size(brief) > SAFE_AI_MAX_CHARS) continue;
+      let brief = jobs.map(j => {
+        if (!j.summary) return `分析状态（nonce ${j.nonce}）：${['pending', 'running'].includes(j.status) ? '排队分析或重试中' : '本次未完成分析'}。`;
+        const line = `${label(j)}（nonce ${j.nonce}）：${j.summary}`;
+        // Legacy persisted output may exceed the newly reserved nonce heading budget.
+        // Never truncate an address or replace multiple proposals with one generic summary.
+        return size(line) <= SAFE_AI_MAX_CHARS ? line : `核验提示（nonce ${j.nonce}）：摘要超过单笔200字限制；完整参数见原卡。`;
+      }).join('\n');
       // Apply presentation after the visible-text limit; deterministic templates keep their original style.
       brief = brief.split('\n').map(line => line.startsWith('AI解读') ? `<font color='green'>${line}</font>` : line).join('\n');
       const body = render(card.changes, card.metadata) + (brief ? '\n\n' + brief : '');
