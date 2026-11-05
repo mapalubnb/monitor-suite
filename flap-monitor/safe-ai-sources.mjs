@@ -29,7 +29,8 @@ export async function fetchVerifiedSafeSource(address, { fetchFn = fetch, signal
     const d = await boundedJson(`https://sourcify.dev/server/v2/contract/56/${address}?fields=abi,sources`, { fetchFn, signal, maxBytes: Infinity });
     if (String(d.chainId) !== '56' || d.address?.toLowerCase() !== address.toLowerCase() || !['match', 'exact_match'].includes(d.runtimeMatch)) throw Error('verification_mismatch');
     return normalized(address, d.abi, d.sources, 'sourcify', { verifiedAt: d.verifiedAt });
-  } catch (e) { transient ||= ![404, 400].includes(e.status); issues.push(e.status === 404 ? 'Sourcify未收录' : 'Sourcify暂不可用或身份不匹配'); }
+  } catch (e) { transient ||= ![404, 400].includes(e.status); issues.push(e.status === 404 ? 'Sourcify未收录'
+    : e.status ? `Sourcify HTTP ${e.status}` : e.name === 'TimeoutError' ? 'Sourcify请求超时' : 'Sourcify连接失败或身份不匹配'); }
   if (explorerKey && !signal?.aborted) {
     try {
       const url = new URL('https://api.etherscan.io/v2/api');

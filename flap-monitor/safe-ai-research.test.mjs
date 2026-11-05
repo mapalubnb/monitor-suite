@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSafeResearchTools, runSafeResearch, requestSafeResearch } from './safe-ai-research.mjs';
+import { createSafeResearchTools, missingResearchEvidence, runSafeResearch, requestSafeResearch } from './safe-ai-research.mjs';
 import { validateSafeAiOutput, diagnoseSafeAiOutput, evidenceFallback } from './safe-ai-analysis.mjs';
 import { createSafeEvidenceCollector } from './safe-ai-evidence.mjs';
 import { selectorOf, fragmentFromSignature } from './safe-ai-call-codec.mjs';
@@ -93,4 +93,28 @@ test('初次取证不裁切源码、函数或第65项调用', async () => {
   const collect = createSafeEvidenceCollector({ sourceReader: async address => ({ address, verified: true, functions: [], sources: [{ path: 'full.sol', content: 'x'.repeat(120000) }] }), selectorReader: async () => ({ candidates: [] }) });
   const e = await collect({ safe, actions: Array.from({ length: 65 }, (_, i) => ({ kind: 'unknown', to: target, callPath: String(i), selector: '0x12345678' })) });
   assert.equal(e.actions.length, 65); assert.equal(e.contracts[0].sources[0].content.length, 120000); assert.equal(typeof collect.createResearch, 'function');
+});
+
+test('已验证持续付款必须核验币种、精度及换算，不能有工具却直接跳过关键事实', async () => {
+  const { evidence, session } = fixture(); evidence.contracts[0].sources[0].content += '\ncontract LlamaPay {}';
+  assert.equal(missingResearchEvidence(evidence).length, 2);
+  await session.execute('read_contract', { address: target, signature: 'token()', args: [] });
+  assert.ok(missingResearchEvidence(evidence).some(x => x.includes('symbol()')));
+  await session.execute('read_contract', { address: token, signature: 'decimals()', args: [] });
+  evidence.observations.push({ address: token, signature: 'symbol()', values: [{ type: 'string', value: 'USDT' }] });
+  await session.execute('decimal_amount', { raw: '11574074074074074', decimals: 20, multiplier: '2592000', unitEvidence: 'All amounts use 20 decimals' });
+  assert.deepEqual(missingResearchEvidence(evidence), []);
+});
+
+test('工具返回完整源码仍超限时明确要求更小行范围，不静默截断', async () => {
+  const { session, evidence } = fixture(); let n = 0;
+  const result = await runSafeResearch({ evidence, session, provider: {}, systemPrompt: '', validate: validateSafeAiOutput, diagnose: diagnoseSafeAiOutput,
+    request: async ({ messages }) => {
+      n++;
+      if (n === 1 || n === 3) throw Error('model_context_limit');
+      if (n === 2) return { tool_calls: [{ id: 'full', type: 'function', function: { name: 'contract_source', arguments: JSON.stringify({ address: target }) } }] };
+      assert.ok(messages.some(m => m.role === 'tool' && m.content.includes('source_result_exceeds_model_context')));
+      return { content: JSON.stringify({ summary: '拟创建持续付款流；源码尚未完整读取，具体取消条件未确认。' }) };
+    } });
+  assert.equal(result.stats.contextManifest, true); assert.equal(n, 4);
 });

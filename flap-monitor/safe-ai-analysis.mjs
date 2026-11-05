@@ -56,6 +56,7 @@ function checkSafeAiOutput(raw, evidence) {
   if (/0x[a-f\d]*(?:…|\.{2,})/i.test(summary)) return reject('address_abbreviated');
   if ((summary.match(/0x[a-f\d]+(?:…[a-f\d]+)?/gi) || []).some(a => !allowedAddresses.has(a.toLowerCase()))) return reject('address_not_in_evidence');
   const withoutHex = text => text.replace(/0x[a-f\d]+(?:…[a-f\d]+)?/gi, '');
+  if ((evidence.derivedFacts || []).some(d => String(d.raw).length > 8 && new RegExp(`(?<!\\d)${d.raw}(?!\\d)`).test(withoutHex(summary)))) return reject('raw_amount_should_use_converted_value');
   const facts = new Set(withoutHex(publicFacts).match(/\d+(?:\.\d+)?/g) || []);
   if ((withoutHex(summary).match(/\d+(?:\.\d+)?/g) || []).some(n => !facts.has(n))) return reject('number_not_in_evidence_use_decimal_amount');
   if (evidence.version === 2) {
@@ -245,6 +246,7 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
         if (stopped || terminal(proposal(id)?.status)) { job.status = 'cancelled'; continue; }
         job.evidenceStatus = evidence.evidenceStatus || 'legacy';
         job.checks = evidence.checks; job.evidenceBlock = evidence.block; job.limits = evidence.limits;
+        if (collectEvidence.createResearch && evidence.retryable && job.attempts < 2) throw Error('evidence_source_transient');
         if (evidence.evidenceStatus === 'insufficient' && !collectEvidence.createResearch) {
           if (evidence.retryable && job.attempts < 2) { job.status = 'pending'; job.nextAt = now() + 60_000; state.health = 'evidence_retry'; }
           else { job.summary = evidenceFallback(evidence); job.summaryType = 'evidence'; job.status = 'insufficient'; state.health = 'evidence_incomplete'; }

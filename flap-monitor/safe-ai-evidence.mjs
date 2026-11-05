@@ -169,7 +169,7 @@ export function createSafeEvidenceCollector({ getContext, rpcCall, sourceReader 
     return { version: 2, chainId: 56, safe: proposal.safe, safeTxHash: proposal.safeTxHash, proposalOnly: true,
       transaction: safeAiEvidenceData(proposal.transaction),
       signatures: proposal.signatures || proposal.signature,
-      evidenceStatus: unresolved ? 'insufficient' : candidate ? 'candidate' : 'resolved', retryable: unresolved && transient,
+      evidenceStatus: unresolved ? 'insufficient' : candidate ? 'candidate' : 'resolved', retryable: (unresolved || candidate) && transient,
       actions, checks, upgrades, templates, block, limits: { rpcCount, sourceCount, selectorCount, limited },
       proxies: [...targets.values()].map(({ code, implementationCode, ...t }) => ({ ...t, hasCode: !!code && code !== '0x' })),
       contracts,
@@ -179,7 +179,7 @@ export function createSafeEvidenceCollector({ getContext, rpcCall, sourceReader 
   };
   collect.createResearch = (evidence, options) => createSafeResearchTools(evidence, {
     ...options, rpcCall, sourceReader: (address, opts) => cached(sourceCache, address,
-      () => sourceReader(address, { ...opts, explorerKey: explorerKey() }), false), selectorReader,
+      () => sourceReader(address, { ...opts, explorerKey: explorerKey() }), false),
   });
   return collect;
 }
