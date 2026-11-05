@@ -12,7 +12,7 @@ const hash = '0x' + 'a'.repeat(64);
 const action = { kind: 'vaultFactory', to: target, vaultFactory: token, enabled: true };
 const proposal = (overrides = {}) => ({ key: hash, safeTxHash: hash, safe, nonce: 1, status: 'pending',
   submissionDate: new Date(start + 1).toISOString(), firstSeenAt: new Date(start + 2).toISOString(),
-  confirmations: 1, actions: [action], ...overrides });
+  confirmations: 0, actions: [action], ...overrides });
 const change = p => ({ ...p, type: 'proposed' });
 function fixture(options = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'safe-ai-')); let now = start;
@@ -28,17 +28,20 @@ function fixture(options = {}) {
   return { dir, settings, rows, patches, calls, service, register, setNow: n => { now = n; },
     clean: () => rmSync(dir, { recursive: true, force: true }) };
 }
-test('Safe AI: cutoff/existing/unsigned/terminal/muted are excluded; valid signature is eligible', async () => {
+test('Safe AI: new unsigned proposals are eligible; cutoff/existing/terminal/muted stay excluded', async () => {
   const f = fixture();
   try {
     for (const overrides of [{ submissionDate: new Date(start - 1).toISOString() }, { submissionDate: '' },
-      { confirmations: 0 }, { status: 'executed' }, { actions: [{ kind: 'grantRevoke' }] }]) {
+      { status: 'executed' }, { actions: [{ kind: 'grantRevoke' }] }]) {
       f.rows.a = proposal(overrides); assert.equal(f.register(), false);
     }
     f.rows.a = proposal(); assert.equal(f.register([{ ...change(f.rows.a), type: 'existing' }]), false);
     assert.equal(f.register([{ ...change(f.rows.a), type: 'signatures' }]), false);
     f.rows.a = proposal({ safeTxHash: '0x' + 'c'.repeat(64) });
+    assert.equal(f.rows.a.confirmations, 0);
     assert.equal(f.register(), true); await f.service.tick(); assert.equal(f.calls.length, 1);
+    assert.equal(f.patches[0][0], 'message');
+    assert.match(f.patches[0][2], /<font color='green'>AI解读/);
     assert.doesNotMatch(JSON.stringify(f.calls), /signature"|rawData/);
   } finally { f.clean(); }
 });
@@ -85,14 +88,18 @@ test('Safe AI: candidate language is mandatory; semantic failure gets bounded re
     const job = Object.values(JSON.parse(readFileSync(f.settings.file)).jobs)[0]; assert.equal(job.status, 'model_failed');
   } finally { f.clean(); }
 });
-test('Safe AI: restart and further signatures reuse completed result without a second model call', async () => {
+test('Safe AI: unsigned analysis survives restart; first and further signatures reuse it', async () => {
   const f = fixture();
   try {
+    assert.equal(f.rows.a.confirmations, 0);
     f.register(); await f.service.tick();
+    await f.service.tick(); assert.equal(f.calls.length, 1); assert.equal(f.patches.length, 1);
     const restarted = createSafeAiService(f.settings);
-    f.rows.a.confirmations = 2;
-    restarted.registerCard({ id: 'progress', title: '签名进度', changes: [{ ...f.rows.a, type: 'signatures' }], metadata: {}, color: 'red' });
-    await restarted.tick(); assert.equal(f.calls.length, 1); assert.equal(f.patches.at(-1)[0], 'progress');
+    for (const confirmations of [1, 2]) {
+      f.rows.a.confirmations = confirmations;
+      restarted.registerCard({ id: `progress-${confirmations}`, title: '签名进度', changes: [{ ...f.rows.a, type: 'signatures' }], metadata: {}, color: 'red' });
+      await restarted.tick(); assert.equal(f.calls.length, 1); assert.equal(f.patches.at(-1)[0], `progress-${confirmations}`);
+    }
   } finally { f.clean(); }
 });
 test('Safe AI: ordinary transfers use exact-unit templates without a model request', async () => {

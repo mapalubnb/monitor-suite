@@ -1,5 +1,10 @@
 # Flap 监控交接
 
+## 2026/11/5 取消 Safe AI 首签门槛（Suite1.12.82 / Flap1.10.53）
+
+用户明确要求有提案即分析，移除safe-ai-analysis登记阶段confirmations<1的排除条件。测试默认使用0签名，核验原卡绿色补充、重复唤醒不重复请求、重启后0→1→2签名沿用结果；历史基线/终结/静默操作/提交时间校验不变。同步根及Flap版本、README、MONITORING、配置说明和PROJECT_STATE。普通转账模板、deepseek-flash、30分钟窗口、150字及原监控/降噪/历史策略、其他AI关闭保持。仅Flap需重启，不需配置变更或状态迁移；不批量补分析已发送提案。验证及部署结果待补。
+
+
 ## 2026/11/4 Safe多类型取证升级（Suite1.12.81 / Flap1.10.52）
 
 用户确认全面修复，且明确允许完整签名进入AI。新增safe-ai-call-codec（有界ABI解码、候选及getter白名单）、safe-ai-sources（固定来源与超时/体积限制）、safe-ai-evidence测试；改造safe-ai-evidence、safe-ai-analysis及其测试、safe-proposal-monitor及其测试、monitor接入原history RPC预算。同步package脚本/版本、README、MONITORING、配置说明及PROJECT_STATE。保留原始calldata直至参数解析后，完整调用及签名可进入模型，原提案状态保留完整服务签名及签名调用（AI任务状态不重复保存）；凭证不进入输入。新增字段兼容原schema，无需迁移旧记录。

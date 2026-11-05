@@ -131,7 +131,7 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
       if (!p || terminal(p.status) || key in state.excluded || change.type === 'existing' || terminal(change.type)) continue;
       const submitted = Date.parse(p.submissionDate);
       if (!Number.isFinite(submitted) || submitted < state.activatedAt || now() - submitted > TTL
-        || submitted > now() + 60_000 || p.confirmations < 1) continue;
+        || submitted > now() + 60_000) continue;
       const mode = classifySafeAi(p.actions);
       if (mode === 'skip') continue;
       if (!state.jobs[key]) {
