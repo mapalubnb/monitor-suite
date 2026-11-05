@@ -1,4 +1,4 @@
-import { runSafeResearch } from './safe-ai-research.mjs';
+import { runSafeResearch, sourceNumericFacts } from './safe-ai-research.mjs';
 import { existsSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { chatCompletion } from '../shared/ai-client.mjs';
@@ -58,9 +58,10 @@ function checkSafeAiOutput(raw, evidence) {
   if (/0x[a-f\d]*(?:…|\.{2,})/i.test(summary)) return reject('address_abbreviated');
   if ((summary.match(/0x[a-f\d]+(?:…[a-f\d]+)?/gi) || []).some(a => !allowedAddresses.has(a.toLowerCase()))) return reject('address_not_in_evidence');
   const withoutHex = text => text.replace(/0x[a-f\d]+(?:…[a-f\d]+)?/gi, '');
-  if ((evidence.derivedFacts || []).some(d => String(d.raw).length > 8 && new RegExp(`(?<!\\d)${d.raw}(?!\\d)`).test(withoutHex(summary)))) return reject('raw_amount_should_use_converted_value');
-  const facts = new Set(withoutHex(publicFacts).match(/\d+(?:\.\d+)?/g) || []);
-  if ((withoutHex(summary).match(/\d+(?:\.\d+)?/g) || []).some(n => !facts.has(n))) return reject('number_not_in_evidence_use_decimal_amount');
+  if ((evidence.derivedFacts || []).some(d => String(d.raw).length > 8 && d.raw !== d.roundedDisplay && new RegExp(`(?<!\\d)${d.raw}(?!\\d)`).test(withoutHex(summary)))) return reject('raw_amount_should_use_converted_value');
+  const facts = new Set([...(withoutHex(publicFacts).match(/\d+(?:\.\d+)?/g) || []), ...sourceNumericFacts(evidence)]);
+  const unsupportedNumbers = (withoutHex(summary).match(/\d+(?:\.\d+)?/g) || []).filter(n => !facts.has(n));
+  if (unsupportedNumbers.length) return reject('number_not_in_evidence_use_decimal_amount:' + [...new Set(unsupportedNumbers)].join(','));
   if (evidence.version === 2) {
     if (evidence.evidenceStatus === 'insufficient' && evidence.actions.some(a => ['unresolved', 'ambiguous'].includes(a.call?.status))
       && !/未解析|未识别|未知|歧义|缺少.*ABI|参数.*解析|尚未.*解析/.test(summary)) return reject('unresolved_calls_omitted');
@@ -285,7 +286,7 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
         }
         delete job.lastError; job.summary = summary; job.status = evidence.evidenceStatus === 'candidate' ? 'candidate' : evidence.evidenceStatus === 'insufficient' || evidence.researchIncomplete?.length ? 'partial' : 'done'; state.health = '';
       } catch (error) {
-        job.lastError = /^[a-zA-Z0-9_:]+$/.test(error.message || '') ? error.message : error.name || 'analysis_error';
+        job.lastError = /^[a-zA-Z0-9_:.,-]+$/.test(error.message || '') ? error.message : error.name || 'analysis_error';
         job.status = job.attempts < 2 ? 'pending' : 'failed'; job.nextAt = now() + 60_000;
         if (evidence) enrichCard(state.cards[job.cardId], id, evidence);
         if (job.attempts >= 2 && evidence) { job.summary = evidenceFallback(evidence); job.summaryType = 'evidence'; job.status = 'model_failed'; }

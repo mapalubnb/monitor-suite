@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createSafeResearchTools, missingResearchEvidence, runSafeResearch, requestSafeResearch } from './safe-ai-research.mjs';
+import { createSafeResearchTools, missingResearchEvidence, sourceNumericFacts, runSafeResearch, requestSafeResearch } from './safe-ai-research.mjs';
 import { validateSafeAiOutput, diagnoseSafeAiOutput, evidenceFallback } from './safe-ai-analysis.mjs';
 import { createSafeEvidenceCollector } from './safe-ai-evidence.mjs';
 import { selectorOf, fragmentFromSignature } from './safe-ai-call-codec.mjs';
@@ -59,6 +59,16 @@ test('拒绝把源码未取得说成没有验证源码，以及将平台标记�
   assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '新旧均无验证源码，权限变化未知。' }), evidence), null);
   assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '拟启用非官方工厂。' }), evidence), null);
   assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '未取得新旧源码，权限变化无法确认。' }), evidence));
+});
+test('已验证代码数字支持下划线和科学计数，注释/字符串/未验证来源不能添加数字事实', () => {
+  const { evidence } = fixture();
+  evidence.contracts[0].sources = [{ content: 'uint limit = 30_000 * 1e18; uint fee = 100; // 999999\n string s = "888888"; uint tiny = 1e-3;' }];
+  evidence.contracts.push({ verified: false, sources: [{ content: 'uint fake = 777777;' }] });
+  const facts = sourceNumericFacts(evidence);
+  for (const n of ['30000', '1000000000000000000', '100', '0.001']) assert.ok(facts.has(n), n);
+  for (const n of ['999999', '888888', '777777']) assert.equal(facts.has(n), false);
+  assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '拟启用工厂，代码设置池深度门槛30000 USDT。' }), evidence));
+  assert.match(diagnoseSafeAiOutput(JSON.stringify({ summary: '拟设置888888 USDT门槛。' }), evidence), /888888/);
 });
 test('新卡通用ABI展示参数区分同selector的不同子调用', () => {
   const first = describeOperationalAction({ ...action, resolvedCall: { ...action.call, arguments: [{ name: 'to', type: 'address', value: recipient }] } });

@@ -10,6 +10,23 @@ const tool = (name, description, properties, required = Object.keys(properties))
   name, description, parameters: { type: 'object', properties, required, additionalProperties: false },
 } });
 const str = { type: 'string' }, num = { type: 'integer' };
+// Numeric literals from verified executable source are evidence; comments, strings and addresses are not numeric facts.
+export function sourceNumericFacts(evidence) {
+  const facts = new Set();
+  for (const c of evidence.contracts || []) if (c.verified) for (const source of c.sources || []) {
+    const code = source.content.replace(/"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|\/\/[^\n]*|\/\*[\s\S]*?\*\//g, ' ').replace(/0x[a-f\d_]+/gi, ' ');
+    for (const match of code.matchAll(/(?<![\w.])(\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?[\d_]+)?)(?![\w.])/g)) {
+      const literal = match[1].replaceAll('_', ''), [mantissa, exponent = '0'] = literal.toLowerCase().split('e');
+      facts.add(mantissa);
+      const exp = Number(exponent); if (!Number.isInteger(exp) || Math.abs(exp) > 1000) continue;
+      const [whole, fraction = ''] = mantissa.split('.'), digits = whole + fraction, point = whole.length + exp;
+      let expanded = point <= 0 ? '0.' + '0'.repeat(-point) + digits : point >= digits.length ? digits + '0'.repeat(point - digits.length) : digits.slice(0, point) + '.' + digits.slice(point);
+      expanded = expanded.replace(/^0+(?=\d)/, ''); if (expanded.includes('.')) expanded = expanded.replace(/0+$/, '').replace(/\.$/, '');
+      facts.add(expanded);
+    }
+  }
+  return facts;
+}
 export const SAFE_RESEARCH_TOOLS = [
   tool('contract_source', '获取关联地址的完整验证ABI、源码文件清单；path为空返回全部完整源码，指定path返回完整文件。文件过大可用source_lines分段读取，不静默截断。', { address: str, path: str }, ['address']),
   tool('source_lines', '按明确行范围读取已验证源码，返回总行数；可继续读取剩余部分。', { address: str, path: str, start: num, end: num }),
@@ -163,8 +180,8 @@ export function createSafeResearchTools(evidence, { rpcCall, sourceReader, signa
     } else if (name === 'decimal_amount') {
       const { raw, decimals, multiplier, unitEvidence } = args;
       if (!/^-?\d+$/.test(raw) || !/^\d+$/.test(multiplier) || !Number.isInteger(decimals) || decimals < 0 || decimals > 255 || !unitEvidence?.trim()) throw Error('calculation_invalid');
-      const facts = JSON.stringify([evidence.actions, observations]).replace(/0x[a-f\d]+/gi, '').match(/-?\d+(?:\.\d+)?/g) || [];
-      if (!facts.includes(raw)) throw Error('calculation_raw_not_observed');
+      const facts = new Set([...(JSON.stringify([evidence.actions, observations]).replace(/0x[a-f\d]+/gi, '').match(/-?\d+(?:\.\d+)?/g) || []), ...sourceNumericFacts(evidence)]);
+      if (!facts.has(raw)) throw Error('calculation_raw_not_observed');
       const unitSource = [...contracts.values()].filter(c => c.verified).flatMap(c => (c.sources || []).map(s => ({ ...s, address: c.address })))
         .find(s => unitEvidence.length >= 8 && s.content.includes(unitEvidence));
       const unitGetter = observations.find(o => o.signature === 'decimals()' && o.values?.[0]?.value === String(decimals) && unitEvidence === `decimals()=${decimals}`);

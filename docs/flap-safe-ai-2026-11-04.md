@@ -12,7 +12,7 @@ Suite 1.12.85 / Flap 1.10.56。仅 Safe 提案解读使用 DeepSeek；页面、�
 
 每个分析任务仍最多两次尝试；单次初步取证40秒，模型/补查总截止150秒、最多8次模型请求（前6轮可查询）、24工具调用、20次补充RPC、8个源码读取预算。接口/预算失败保留准确事实提示，不能保证未公开源码或任意新机制均能完整识别。源码无字符上限会增加内存/输入费用，接口容量仍是实际边界。Key沿用，无配置/状态迁移；发布只重启Flap。
 
-验证：本地全项目755/755、专项45/45通过，语法检查通过；真实模型隔离回放和部署验收待执行。修改文件：safe-ai-analysis/evidence/sources、operational-call-codec、新safe-ai-research及测试、根/模块版本和说明。
+验证：本地全项目755/755、专项46/46通过，语法检查通过；真实模型隔离回放和部署验收待执行。修改文件：safe-ai-analysis/evidence/sources、operational-call-codec、新safe-ai-research及测试、根/模块版本和说明。
 
 
 ## 配置 Key
