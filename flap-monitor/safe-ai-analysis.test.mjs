@@ -237,6 +237,8 @@ test('Safe AI: full addresses required for tester and upgrade; no shortened or i
     call:{ signature:'setTester(address,bool)', arguments:[{type:'address',value:token},{type:'bool',value:true}] } }] };
   const check = summary => validateSafeAiOutput(JSON.stringify({summary}), evidence);
   assert.ok(check(`候选提案拟通过${target}为${token}开启测试者资格，具体权限待核验。`));
+  assert.equal(check(`AI解读：提案解读：候选提案拟通过${target}为${token}开启测试者资格，具体权限待核验。`),
+    check(`候选提案拟通过${target}为${token}开启测试者资格，具体权限待核验。`));
   for (const address of ['0x2222…2222','0x2222...2222','0x…2222',token.slice(0,-1)+'3']) {
     assert.equal(check(`候选提案拟为${address}开启测试者资格，具体权限待核验。`), null);
   }
