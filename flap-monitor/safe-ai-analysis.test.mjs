@@ -82,6 +82,14 @@ test('Safe AI: candidate language is mandatory; semantic failure gets bounded re
   assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '提案调用未验证合约，目的与机制待核验。' }), evidence), null);
   assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '提案将开放新金库。' }), evidence), null);
   assert.ok(validateSafeAiOutput(JSON.stringify({ summary: '候选操作为开启测试者资格，具体测试权限待核验。' }), evidence));
+  for (const summary of ['按当前证据判断，拟开启测试者资格；具体权限范围尚缺实现代码。',
+    '拟开启测试者资格，函数识别尚待ABI确认。']) {
+    assert.equal(validateSafeAiOutput(JSON.stringify({ summary }), evidence), summary);
+  }
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '拟开启测试者资格，具体权限范围待核验。' }), evidence), null);
+  const resolved = { ...evidence, evidenceStatus: 'resolved' };
+  assert.equal(validateSafeAiOutput(JSON.stringify({ summary: '拟开启测试者资格。' }), resolved), '拟开启测试者资格。');
+
   const f = fixture({ collectEvidence: async () => evidence, complete: async () => JSON.stringify({ summary: '调用未知，收益退出限制待核验。' }) });
   try { f.register(); await f.service.tick(); assert.equal(f.patches.length, 0);
     f.setNow(start + 61_000); await f.service.tick(); assert.equal(f.patches.length, 1); assert.match(f.patches[0][2], /核验提示.*候选/);
