@@ -20,6 +20,23 @@ export const SAFE_RESEARCH_TOOLS = [
   tool('decimal_amount', '精确换算证据中的整数：raw / 10^decimals * multiplier；提供单位依据。程序计算并记录派生事实。', { raw: str, decimals: num, multiplier: str, unitEvidence: str }),
 ];
 
+export function missingResearchEvidence(evidence) {
+  const missing = [], observations = evidence.observations || [];
+  for (const action of evidence.actions || []) {
+    // A verified LlamaPay ABI/source gives enough semantics to require these facts. Other contracts still use general research tools.
+    if (action.call?.signature !== 'createStream(address,uint216)' || action.call.status !== 'verified_abi') continue;
+    const source = evidence.contracts?.find(c => c.verified && (c.address === action.to || evidence.proxies?.some(p => p.address === action.to && p.implementation === c.address)));
+    if (!source?.sources?.some(s => /contract\s+LlamaPay\b/.test(s.content))) continue;
+    const tokenResult = observations.find(o => o.address === action.to && o.signature === 'token()');
+    const token = tokenResult?.values?.[0]?.value;
+    if (!token) missing.push(`查询${action.to}的token()确定支付资产`);
+    else for (const signature of ['symbol()', 'decimals()']) if (!observations.some(o => o.address === token && o.signature === signature)) missing.push(`查询${token}的${signature}`);
+    const rate = action.call.arguments?.[1]?.value;
+    if (!(evidence.derivedFacts || []).some(d => d.raw === rate && d.multiplier === '2592000')) missing.push(`使用decimal_amount将原始速率${rate}按源码确认的内部精度换算30天金额，multiplier=2592000`);
+  }
+  return [...new Set(missing)];
+}
+
 // Only observed addresses and their verified graph may be queried. No arbitrary URL, shell, signing or broadcast tool exists.
 export function createSafeResearchTools(evidence, { rpcCall, sourceReader, signal } = {}) {
   const allowed = new Set(), contracts = new Map(), proxies = new Map(), cache = new Map();
@@ -166,13 +183,13 @@ export function createSafeResearchTools(evidence, { rpcCall, sourceReader, signa
 }
 
 const cooldowns = new Map();
-export async function requestSafeResearch({ provider, messages, tools, signal, fetchFn = fetch }) {
+export async function requestSafeResearch({ provider, messages, tools, requireTool = false, signal, fetchFn = fetch }) {
   const cooldownKey = `${provider.apiUrl}|${provider.apiKey}`;
   if ((cooldowns.get(cooldownKey) || 0) > Date.now()) throw Error('model_provider_cooldown');
   return withDeadline(async activeSignal => {
     const response = await fetchFn(provider.apiUrl, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${provider.apiKey}` },
       body: JSON.stringify({ model: provider.model, messages, temperature: 0.1, max_tokens: 4096,
-        thinking: { type: 'disabled' }, ...(tools?.length ? { tools } : { response_format: { type: 'json_object' } }) }), signal: activeSignal });
+        thinking: { type: 'disabled' }, ...(tools?.length ? { tools, ...(requireTool ? { tool_choice: 'required' } : {}) } : { response_format: { type: 'json_object' } }) }), signal: activeSignal });
     if (!response.ok) {
       const body = await response.text();
       if ([401, 402, 403].includes(response.status)) cooldowns.set(cooldownKey, Date.now() + 30 * 60_000);
@@ -192,14 +209,16 @@ function manifestEvidence(evidence) {
 
 // Full inputs by default; only an explicit provider context error switches to a disclosed, pageable source manifest.
 export async function runSafeResearch({ evidence, session, provider, systemPrompt, validate, diagnose, request = requestSafeResearch, signal, log = () => {} }) {
-  let messages = [{ role: 'system', content: systemPrompt + '\n你可以调用只读工具补齐证据。源码先读实际调用及其内部函数、继承和修饰器；金额单位先核实，使用decimal_amount计算。unitEvidence填写源码中解释精度的原文片段，或已读取的decimals()=数值。组合调用必须逐项识别。证据足够后直接输出summary JSON。最多6轮查询，不能虚构工具结果。' },
+  let messages = [{ role: 'system', content: systemPrompt + '\n工作分两阶段：先利用只读工具补齐事实，再压缩为短摘要；不要为了短文而跳过核验。源码先读实际调用及其内部函数、继承和修饰器；资金流须查资产getter和单位，使用decimal_amount计算，不能仅复述函数名。unitEvidence填写源码中解释精度的原文片段，或已读取的decimals()=数值。组合调用逐项识别。同类多收款提案优先保留各收款方完整地址、币种及金额，目标合约地址已在原卡时可以整项省去，不缩写。证据足够后输出summary JSON，正文尽量150字以内，绝不超过180字。最多6轮查询，不能虚构工具结果。' },
     { role: 'user', content: JSON.stringify(evidence) }];
   let repairs = 0, manifest = false, requests = 0;
   for (let round = 0; round < 8; round++) {
     signal?.throwIfAborted();
     const tools = round < 6 ? session.tools : [];
+    const missing = missingResearchEvidence(evidence);
+    if (missing.length) messages.push({ role: 'user', content: `还缺少关键事实，先调用工具完成：${missing.join('；')}。工具确实返回失败才可明确说明该缺项，不能省略金额直接宣布分析完成。` });
     let message;
-    try { requests++; message = await request({ provider, messages, tools, signal }); }
+    try { requests++; message = await request({ provider, messages, tools, requireTool: missing.length > 0, signal }); }
     catch (e) {
       if (e.message === 'model_context_limit' && !manifest) {
         manifest = true; log('Safe AI 上下文容量不足，明确切换源码目录并按需分段读取');
@@ -213,16 +232,24 @@ export async function runSafeResearch({ evidence, session, provider, systemPromp
       for (const call of message.tool_calls) {
         let value;
         try { value = await session.execute(call.function.name, JSON.parse(call.function.arguments)); }
-        catch (e) { value = { error: e.message, evidenceUnavailable: true }; }
+        catch (e) { value = { error: e.message, evidenceUnavailable: true }; (evidence.researchFailures ||= []).push({ tool: call.function.name, reason: e.message }); }
         messages.push({ role: 'tool', tool_call_id: call.id, content: JSON.stringify(value) });
       }
       continue;
     }
+    if (missing.length && !(evidence.researchFailures || []).length) {
+      messages.push({ role: 'assistant', content: message.content || '' }); continue;
+    }
+    if (missing.length && !/未能|未取得|尚缺|缺少|未确认|无法确认/.test(message.content || '')) {
+      messages.push({ role: 'assistant', content: message.content || '' }, { role: 'user', content: '工具查询失败，摘要必须明确尚缺的币种或金额事实，不能忽略后当作完整分析。' }); continue;
+    }
     const summary = validate(message.content, evidence);
-    if (summary) return { summary, stats: { ...session.stats(), modelRequests: requests, contextManifest: manifest } };
+    if (summary) { evidence.researchIncomplete = missing;
+      return { summary, stats: { ...session.stats(), modelRequests: requests, contextManifest: manifest, incomplete: missing.length > 0 } }; }
     const reason = diagnose(message.content, evidence); log(`Safe AI 输出校验未通过：${reason}`);
     if (++repairs > 2) throw Error(`output_validation:${reason}`);
-    messages.push({ role: 'assistant', content: message.content || '' }, { role: 'user', content: `输出未通过：${reason}。只修正摘要，保留已确认动作、关键完整地址；正文最多180字符。不要重复查询已有证据。只输出summary JSON。` });
+    let length = 0; try { length = [...JSON.parse(message.content).summary].length; } catch {}
+    messages.push({ role: 'assistant', content: message.content || '' }, { role: 'user', content: `输出未通过：${reason}，当前正文${length}字符。只修正摘要，保留动作、各收款完整地址及金额，删除原卡已有的目标合约地址和冗余介绍；正文控制在150字符左右，最多180字符。不要重复查询已有证据。只输出summary JSON。` });
   }
   throw Error('research_round_budget');
 }

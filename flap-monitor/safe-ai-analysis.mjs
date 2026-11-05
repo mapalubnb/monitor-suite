@@ -277,7 +277,7 @@ export function createSafeAiService({ file, enabled = true, getKey, getProposals
           }
           throw Error(diagnoseSafeAiOutput(raw, evidence) || 'response_unavailable_or_invalid');
         }
-        job.summary = summary; job.status = evidence.evidenceStatus === 'candidate' ? 'candidate' : evidence.evidenceStatus === 'insufficient' ? 'partial' : 'done'; state.health = '';
+        delete job.lastError; job.summary = summary; job.status = evidence.evidenceStatus === 'candidate' ? 'candidate' : evidence.evidenceStatus === 'insufficient' || evidence.researchIncomplete?.length ? 'partial' : 'done'; state.health = '';
       } catch (error) {
         job.lastError = /^[a-zA-Z0-9_:]+$/.test(error.message || '') ? error.message : error.name || 'analysis_error';
         job.status = job.attempts < 2 ? 'pending' : 'failed'; job.nextAt = now() + 60_000;
