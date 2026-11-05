@@ -64,11 +64,11 @@ test('工具循环获得币种后返回摘要，超长按具体原因修复且�
     request: async ({ messages }) => {
       n++;
       if (n === 1) { assert.ok(messages[1].content.includes('FULL_END')); return { tool_calls: [{ id: 'a', type: 'function', function: { name: 'read_contract', arguments: JSON.stringify({ address: target, signature: 'token()', args: [] }) } }] }; }
-      if (n === 2) { assert.ok(messages.some(m => m.role === 'tool' && m.content.includes(token))); return { content: JSON.stringify({ summary: '拟创建付款流。' + '说明'.repeat(120) }) }; }
+      if (n === 2 || n === 3) { if (n === 2) assert.ok(messages.some(m => m.role === 'tool' && m.content.includes(token))); else assert.equal(messages.length, 2); return { content: JSON.stringify({ summary: '拟创建付款流。' + '说明'.repeat(120) }) }; }
       assert.match(messages.at(-1).content, /summary_exceeds_200/);
       return { content: JSON.stringify({ summary: `拟为${recipient}创建持续付款流，执行后按秒计提，提取时转账。` }) };
     } });
-  assert.equal(result.stats.modelRequests, 3); assert.equal(result.stats.rpcCount, 1); assert.ok(result.summary.includes(recipient));
+  assert.equal(result.stats.modelRequests, 4); assert.equal(result.stats.rpcCount, 1); assert.ok(result.summary.includes(recipient));
 });
 test('上下文真实超限才切换显式文件目录，不预先按字符截断', async () => {
   const { session, evidence } = fixture(); let n = 0;
@@ -113,8 +113,8 @@ test('工具返回完整源码仍超限时明确要求更小行范围，不静�
       n++;
       if (n === 1 || n === 3) throw Error('model_context_limit');
       if (n === 2) return { tool_calls: [{ id: 'full', type: 'function', function: { name: 'contract_source', arguments: JSON.stringify({ address: target }) } }] };
-      assert.ok(messages.some(m => m.role === 'tool' && m.content.includes('source_result_exceeds_model_context')));
+      if (n === 4) assert.ok(messages.some(m => m.role === 'tool' && m.content.includes('source_result_exceeds_model_context')));
       return { content: JSON.stringify({ summary: '拟创建持续付款流；源码尚未完整读取，具体取消条件未确认。' }) };
     } });
-  assert.equal(result.stats.contextManifest, true); assert.equal(n, 4);
+  assert.equal(result.stats.contextManifest, true); assert.equal(n, 5);
 });

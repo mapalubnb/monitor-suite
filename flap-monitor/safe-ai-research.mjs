@@ -195,7 +195,8 @@ export async function requestSafeResearch({ provider, messages, tools, requireTo
       const body = await response.text();
       if ([401, 402, 403].includes(response.status)) cooldowns.set(cooldownKey, Date.now() + 30 * 60_000);
       const context = [400, 413, 422].includes(response.status) && /context|tokens|maximum.*length|too.large/i.test(body);
-      const e = Error(context ? 'model_context_limit' : `model_http_${response.status}`); e.status = response.status; throw e;
+      const reason = /reasoning_content/i.test(body) ? 'reasoning_context_invalid' : /tool_choice/i.test(body) ? 'tool_choice_invalid' : '';
+      const e = Error(context ? 'model_context_limit' : `model_http_${response.status}${reason ? ':' + reason : ''}`); e.status = response.status; throw e;
     }
     const json = await response.json(), message = json.choices?.[0]?.message;
     if (!message || json.choices?.[0]?.finish_reason === 'length') throw Error('model_output_incomplete');
@@ -212,18 +213,18 @@ function manifestEvidence(evidence) {
 export async function runSafeResearch({ evidence, session, provider, systemPrompt, validate, diagnose, request = requestSafeResearch, signal, log = () => {} }) {
   let messages = [{ role: 'system', content: systemPrompt + '\n工作分两阶段：先利用只读工具补齐事实，再压缩为短摘要；不要为了短文而跳过核验。源码先读实际调用及其内部函数、继承和修饰器；资金流须查资产getter和单位，使用decimal_amount计算，摘要只用换算后的金额，不重复原始整数。区分合约内余额记账与钱包真实转账：按秒计提不等于每秒自动转账；核对资金托管位置、实际转账触发及取消结算逻辑再解释。unitEvidence填写源码中解释精度的原文片段，或已读取的decimals()=数值。组合调用逐项识别。同类多收款提案优先保留各收款方完整地址、币种及金额，目标合约地址已在原卡时可以整项省去，不缩写。证据足够后输出summary JSON，正文尽量150字以内，绝不超过180字。最多6轮查询，不能虚构工具结果。' },
     { role: 'user', content: JSON.stringify(evidence) }];
-  let repairs = 0, manifest = false, requests = 0;
+  let repairs = 0, manifest = false, requests = 0, summarizing = false;
   for (let round = 0; round < 8; round++) {
     signal?.throwIfAborted();
-    const tools = round < 6 ? session.tools : [];
+    const tools = round < 6 && !summarizing ? session.tools : [];
     const missing = missingResearchEvidence(evidence);
     if (missing.length) messages.push({ role: 'user', content: `还缺少关键事实，先调用工具完成：${missing.join('；')}。工具确实返回失败才可明确说明该缺项，不能省略金额直接宣布分析完成。` });
     let message;
-    try { requests++; message = await request({ provider, messages, tools, requireTool: missing.length > 0, thinking: !missing.length, signal }); }
+    try { requests++; message = await request({ provider, messages, tools, requireTool: missing.length > 0 && !summarizing, thinking: summarizing, signal }); }
     catch (e) {
       if (e.message === 'model_context_limit' && !manifest) {
         manifest = true; log('Safe AI 上下文容量不足，明确切换源码目录并按需分段读取');
-        messages = [messages[0], { role: 'user', content: JSON.stringify(manifestEvidence(evidence)) }]; continue;
+        messages = [messages[0], { role: 'user', content: JSON.stringify(manifestEvidence(evidence)) }]; summarizing = false; continue;
       }
       if (e.message === 'model_context_limit' && manifest) {
         // A requested full file can itself exceed the provider window. Replace its delivery with an explicit error, never an undisclosed prefix.
@@ -257,6 +258,14 @@ export async function runSafeResearch({ evidence, session, provider, systemPromp
     }
     if (missing.length && !/未能|未取得|尚缺|缺少|未确认|无法确认/.test(message.content || '')) {
       messages.push({ role: 'assistant', content: message.content || '', ...(message.reasoning_content ? { reasoning_content: message.reasoning_content } : {}) }, { role: 'user', content: '工具查询失败，摘要必须明确尚缺的币种或金额事实，不能忽略后当作完整分析。' }); continue;
+    }
+    if (!summarizing) {
+      // Thinking starts a clean conversation with the complete evidence ledger. Never mix non-thinking tool messages into a thinking tool history.
+      const readSourceEvidence = manifest ? messages.filter(m => m.role === 'tool').map(m => { try { return JSON.parse(m.content); } catch { return null; } })
+        .filter(v => v && (v.sources || typeof v.content === 'string')) : [];
+      messages = [messages[0], { role: 'user', content: JSON.stringify({ evidence: manifest ? manifestEvidence(evidence) : evidence,
+        readSourceEvidence, draft: message.content, instruction: '证据采集已结束。独立核对草稿事实：明确提案动作、单位和资金记账/转账区别；金库或升级核对机制与权限变化。草稿不是事实来源，不得沿用其中无证据结论。只输出200字内summary JSON。' }) }];
+      summarizing = true; continue;
     }
     const summary = validate(message.content, evidence);
     if (summary) { evidence.researchIncomplete = missing;
