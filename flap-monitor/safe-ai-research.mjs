@@ -265,7 +265,7 @@ export async function runSafeResearch({ evidence, session, provider, systemPromp
       const readSourceEvidence = manifest ? messages.filter(m => m.role === 'tool').map(m => { try { return JSON.parse(m.content); } catch { return null; } })
         .filter(v => v && (v.sources || typeof v.content === 'string')) : [];
       messages = [messages[0], { role: 'user', content: JSON.stringify({ evidence: manifest ? manifestEvidence(evidence) : evidence,
-        readSourceEvidence, draft: message.content, instruction: '证据采集已结束。独立核对草稿事实：明确提案动作、单位和资金记账/转账区别。描述余额时必须区分钱包余额与存入合约的余额，不添加未查询的余额条件。金库源码充分时，核心资金规则和管理权限比官方标记、风险编号或UI绑定细节优先；升级仅解释有证据的差异。草稿不是事实来源，不得沿用其中无证据结论；资料未取得不能写成没有验证源码，official字段不能断言身份。只输出200字内summary JSON。' }) }];
+        readSourceEvidence, draft: message.content, instruction: '证据采集已结束。独立核对草稿事实：明确提案动作、单位和资金记账/转账区别。描述余额时必须区分钱包余额与存入合约的余额，不添加未查询的余额条件。收款人参数不等于调用权限；检查msg.sender及修饰器，无限制时说“调用withdraw时向收款方转账”，不能说“收款方withdraw才转账”。金库源码充分时，核心资金规则和管理权限比官方标记、风险编号或UI绑定细节优先；creatorFee按收取时机解释，收入中支付创建者的比例称创建者分成，不能写成创建时收费。升级仅解释有证据的差异。草稿不是事实来源，不得沿用其中无证据结论；资料未取得不能写成没有验证源码，official字段不能断言身份。只输出200字内summary JSON。' }) }];
       summarizing = true; continue;
     }
     const summary = validate(message.content, evidence);
