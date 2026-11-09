@@ -1,7 +1,8 @@
 import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
 import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs";
-import { recoverLiveCursor, activateHistoryGap } from "../shared/scan-recovery.mjs";
+import { recoverLiveCursor } from "../shared/scan-recovery.mjs";
+import { createActorStateCoordinator } from './actor-state.mjs';
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
 import { createGithubApi, createGithubMonitor } from "./github-monitor.mjs";
 import { discoverCreators } from "./creator-discovery.mjs";
@@ -8184,16 +8185,6 @@ const ACTOR_SELECTOR_INFO = {
   "0x610b5925": { name: "execTransactionFromModule(address,uint256,bytes,uint8)", risk: "high" },
 };
 
-function ensureActorMonitorState() {
-  if (!snapshot) snapshot = {};
-  if (!snapshot.chainActorMonitor) snapshot.chainActorMonitor = {};
-  const state = snapshot.chainActorMonitor;
-  if (!state.creators) state.creators = {};
-  if (!Array.isArray(state.seenTxs)) state.seenTxs = [];
-  if (!state.actors) state.actors = {};
-  return state;
-}
-
 function blockTag(n) {
   return "0x" + BigInt(n).toString(16);
 }
@@ -9065,7 +9056,7 @@ function shouldLogActorCatchup(state, lagBefore, lagAfter) {
 }
 
 async function runActorCheck() {
-  await runActorLane(true);
+  await runActorScan(true);
 }
 function deferActorHistory(history, error, now = Date.now()) {
   history.historyError = error.rpcBudget ? `本地 RPC 预算等待：${error.message}` : error.message;
@@ -9073,27 +9064,48 @@ function deferActorHistory(history, error, now = Date.now()) {
   history.historyNextAt = now + (error.rpcBudget ? 10_000 : Math.max(60_000, Number(error.retryAfterMs) || 0));
 }
 async function runActorHistoryCheck() {
-  const root = ensureActorMonitorState();
-  if (root.historyEndBlock == null) return;
-  const history = snapshot.chainActorHistory ||= { ...structuredClone(root), realtime: undefined };
-  history.historyEndBlock ??= root.historyEndBlock;
-  if (activateHistoryGap(history, root.realtime || {}, 'lastBlock', 'historyEndBlock')) history.lastBlockHash = '';
-  if (Date.now() < (history.historyNextAt || 0)) return;
+  await runActorScan(false);
+}
+function buildActorNotification(actions, realtime, toBlock) {
+  const highCount = actions.filter(a => a.risk === 'high').length;
+  return {
+    title: `链上创建者动作${realtime ? '' : ' · 历史补扫'}（${actions.length}项）`,
+    content: formatActorActions(actions, { historical: !realtime }),
+    template: highCount > 0 ? 'red' : actions.some(a => a.risk === 'medium') ? 'yellow' : 'blue',
+    moduleContext: 'Four.meme 合约创建者动作', url: `https://bscscan.com/block/${toBlock}`,
+  };
+}
+async function runActorScan(realtime) {
+  if (!CONFIG.actorMonitor.enabled || monitorStopping) return;
+  const work = await actorState.prepare(realtime);
+  if (!work) return;
+  const history = work.snapshot.chainActorHistory;
   try {
-    await runActorLane(false);
-    history.historyError = "";
-    history.historyNextAt = Date.now() + 10_000;
+    await runActorLane(work);
+    if (!realtime) {
+      history.historyError = '';
+      history.historyNextAt = Date.now() + 10_000;
+    }
   } catch (error) {
+    if (realtime) throw error;
     deferActorHistory(history, error);
-    log("[创建者补扫] " + history.historyError);
+    log('[创建者补扫] ' + history.historyError);
+  }
+  const notifications = await actorState.commit(work);
+  for (const payload of notifications) appendHistory('actor', payload.title, payload.content.slice(0, 300), payload.content);
+  if (notifications.length) {
+    log('[创建者] 创建者动作已提交，立即复查合约状态');
+    // Reuse the contract runner's transaction and no-reentry guard.
+    await modules.find(module => module.name === 'contract').run();
   }
 }
-async function runActorLane(realtime) {
+async function runActorLane(work) {
   if (!CONFIG.actorMonitor.enabled) return;
-  const root = ensureActorMonitorState();
-  const state = realtime ? (root.realtime ||= { creators: root.creators || {}, creatorLookup: root.creatorLookup || {}, seenTxs: [] }) : snapshot.chainActorHistory;
-  if (realtime) state.creators = { ...state.creators, ...snapshot.chainActorHistory?.creators };
-  state.creators = { ...state.creators, ...snapshot.creatorDiscovery?.creators };
+  const { realtime, snapshot: target } = work;
+  const root = target.chainActorMonitor;
+  const state = realtime ? root.realtime : target.chainActorHistory;
+  if (realtime) state.creators = { ...state.creators, ...target.chainActorHistory?.creators };
+  state.creators = { ...state.creators, ...target.creatorDiscovery?.creators };
   const contractEntries = buildWatchedContractEntries();
   if (contractEntries.length === 0) {
     log("[创建者] 尚无合约指纹，等待合约模块建立基线");
@@ -9102,7 +9114,9 @@ async function runActorLane(realtime) {
 
   const latest = await fetchLatestBlockForActorCheck();
   const safeLatest = Math.min(Math.max(0, latest - CONFIG.actorMonitor.confirmations), realtime ? Infinity : state.historyEndBlock ?? root.historyEndBlock ?? Infinity);
+  const previousBlock = state.lastBlock;
   if (realtime && recoverLiveCursor(state, {head: safeLatest, cursorKey: 'lastBlock', hashKey: 'lastBlockHash'})) {
+    work.addedGaps.push({ from: previousBlock + 1, to: state.lastBlock });
     state.lastBlockTimestamp = 0;
     log('[创建者] 已保留积压区间，恢复近期实时扫描');
   }
@@ -9152,8 +9166,7 @@ async function runActorLane(realtime) {
   let remainingBlocks = maxBlocksThisRun;
   let scannedBlocks = 0;
   let scannedBatches = 0;
-  let anyActions = false;
-  const notificationLedger = ensureActorNotificationLedger(snapshot);
+  const notificationLedger = ensureActorNotificationLedger(target);
 
   while (state.lastBlock < safeLatest && remainingBlocks > 0) {
     const fromBlock = state.lastBlock + 1;
@@ -9184,22 +9197,16 @@ async function runActorLane(realtime) {
     state.lastRunBatches = scannedBatches + 1;
     state.lastRunAt = ts();
     rememberActorTxs(state, actions);
-    rememberActorNotifications(snapshot, actions);
+    rememberActorNotifications(target, actions);
+    work.batches.push({ actions, toBlock });
 
     scannedBlocks += batchSize;
     scannedBatches++;
     remainingBlocks -= batchSize;
 
     if (actions.length > 0) {
-      anyActions = true;
       const highCount = actions.filter(a => a.risk === "high").length;
       log(`[创建者${realtime ? '实时' : '补扫'}] 捕获 ${actions.length} 条创建者动作（高风险 ${highCount} 条），区块 ${fromBlock}-${toBlock}`);
-      const content = formatActorActions(actions, { historical: !realtime });
-      const title = `链上创建者动作${realtime ? '' : ' · 历史补扫'}（${actions.length}项）`;
-      appendHistory("actor", title, content.slice(0, 300), content);
-      const color = highCount > 0 ? "red" : actions.some(a => a.risk === 'medium') ? "yellow" : "blue";
-      await sendNotificationMaybeAi({ title, content, template: color, moduleContext: "Four.meme 合约创建者动作", url: `https://bscscan.com/block/${toBlock}` });
-      await saveSnapshot(snapshot);
     }
 
     if (Date.now() - runStart >= CONFIG.actorMonitor.maxRunMs && state.lastBlock < safeLatest) {
@@ -9223,14 +9230,6 @@ async function runActorLane(realtime) {
     }
   }
 
-  if (anyActions) {
-    try {
-      log("[创建者] 创建者动作已触发，立即复查合约状态");
-      await runContractCheck();
-    } catch (err) {
-      log(`[创建者] 触发合约复查失败：${err.message}`);
-    }
-  }
 }
 
 function stopActorBlockFeed() {
@@ -9358,6 +9357,9 @@ const monitorStore = createTransactionalOutbox({
   onError: err => log(`[待发送] 发送失败，已保留并退避重试：${err.message}`),
 });
 let snapshot = monitorStore.state;
+const actorState = createActorStateCoordinator({ store: monitorStore,
+  ensureLedger: ensureActorNotificationLedger, rememberNotifications: rememberActorNotifications,
+  buildNotification: buildActorNotification, isStopping: () => monitorStopping });
 let outboxTimer = null;
 let startupNotifier = null;
 let monitorStopping = false;
@@ -10262,9 +10264,9 @@ const modules = [
   createModuleRunner("githubDetails", githubMonitor.enrich, 1000, false),
   createModuleRunner("contract", runContractCheck,  CONFIG.intervals.contract),
   createModuleRunner("onchain",  runOnchainCheck,   CONFIG.intervals.onchain),
-  createModuleRunner("actor",    runActorCheck,     CONFIG.actorMonitor.wsEnabled ? CONFIG.actorMonitor.httpFallbackMs : CONFIG.intervals.actor),
+  createModuleRunner("actor",    runActorCheck,     CONFIG.actorMonitor.wsEnabled ? CONFIG.actorMonitor.httpFallbackMs : CONFIG.intervals.actor, false),
 ];
-modules.push(createModuleRunner("actorHistory", runActorHistoryCheck, 10_000));
+modules.push(createModuleRunner("actorHistory", runActorHistoryCheck, 10_000, false));
 const actorRunner = modules.find(m => m.name === "actor");
 const openFourDiscoveryRunner = createModuleRunner("openfourDiscovery", () => CONFIG.openFourRegistryLogMonitor.enabled ? runOpenFourModuleDiscoveryCheck() : undefined, 30_000);
 modules.push(openFourDiscoveryRunner);

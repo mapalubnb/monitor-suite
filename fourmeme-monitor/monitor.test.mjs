@@ -6,10 +6,151 @@ import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
+import { createActorStateCoordinator } from './actor-state.mjs';
 
 process.env.FOURMEME_MONITOR_TEST = "1";
 
 const { __testables } = await import("./monitor.mjs");
+
+function actorStateFixture(initial, options = {}) {
+  let disk = structuredClone(initial), fail = false;
+  const store = createTransactionalOutbox({ initial: structuredClone(initial),
+    persist: next => { if (fail) throw Error('disk full'); disk = structuredClone(next); },
+    deliver: async () => { throw Error('隔离测试禁止发送'); } });
+  const coordinator = createActorStateCoordinator({ store,
+    ensureLedger: __testables.ensureActorNotificationLedger,
+    rememberNotifications: __testables.rememberActorNotifications,
+    buildNotification: (actions, realtime) => ({ title: realtime ? 'live' : 'history', hashes: actions.map(a => a.hash) }), ...options });
+  return { store, coordinator, disk: () => disk, fail: value => { fail = value; } };
+}
+const actorInitial = () => ({
+  chainActorMonitor: { historyEndBlock: 100, realtime: { lastBlock: 3000, lastBlockHash: 'live', realtimeGaps: [{ from: 101, to: 2000 }] } },
+  chainActorHistory: { lastBlock: 100, lastBlockHash: 'history', historyEndBlock: 100 },
+  actorNotificationLedger: { entries: {} },
+});
+
+test('补扫接管先持久化，慢RPC期间实时持续提交且两通道游标均保留', async () => {
+  const f = actorStateFixture(actorInitial());
+  const history = await f.coordinator.prepare(false);
+  assert.deepEqual(f.disk().chainActorMonitor.realtime.realtimeGaps, []);
+  assert.equal(f.disk().chainActorHistory.historyEndBlock, 2000);
+  assert.equal(f.disk().chainActorHistory.lastBlockHash, '');
+  for (let i = 0; i < 5; i++) {
+    const live = await f.coordinator.prepare(true);
+    live.snapshot.chainActorMonitor.realtime.lastBlock++;
+    await f.coordinator.commit(live);
+  }
+  history.snapshot.chainActorHistory.lastBlock = 180;
+  await f.coordinator.commit(history);
+  assert.equal(f.disk().chainActorHistory.lastBlock, 180);
+  assert.equal(f.disk().chainActorMonitor.realtime.lastBlock, 3005);
+});
+
+test('实时采集中历史接管缺口，实时提交不复活旧缺口并保留新缺口', async () => {
+  const f = actorStateFixture(actorInitial());
+  const live = await f.coordinator.prepare(true);
+  const history = await f.coordinator.prepare(false);
+  live.snapshot.chainActorMonitor.realtime.lastBlock = 6000;
+  live.addedGaps.push({ from: 3001, to: 5980 });
+  history.snapshot.chainActorHistory.lastBlock = 180;
+  await Promise.all([f.coordinator.commit(live), f.coordinator.commit(history)]);
+  assert.deepEqual(f.disk().chainActorMonitor.realtime.realtimeGaps, [{ from: 3001, to: 5980 }]);
+  assert.equal(f.disk().chainActorHistory.lastBlock, 180);
+});
+
+test('补扫失败和重启保留已接管区间及未处理队列，不重复接管', async () => {
+  const initial = actorInitial();
+  initial.chainActorMonitor.realtime.realtimeGaps.push({ from: 2101, to: 2200 });
+  const f = actorStateFixture(initial);
+  const work = await f.coordinator.prepare(false);
+  __testables.deferActorHistory(work.snapshot.chainActorHistory, Object.assign(Error('budget'), { rpcBudget: true }), 1000);
+  await f.coordinator.commit(work);
+  const restarted = actorStateFixture(f.disk());
+  assert.equal(await restarted.coordinator.prepare(false, 2000), null);
+  const resumed = await restarted.coordinator.prepare(false, 12000);
+  assert.equal(resumed.snapshot.chainActorHistory.lastBlock, 100);
+  assert.equal(resumed.snapshot.chainActorHistory.historyEndBlock, 2000);
+  assert.deepEqual(resumed.snapshot.chainActorMonitor.realtime.realtimeGaps, [{ from: 2101, to: 2200 }]);
+});
+
+test('实时与补扫同时发现同一交易，提交时重新去重且仅入队一次', async () => {
+  const initial = actorInitial();
+  initial.chainActorHistory.lastBlock = 0;
+  const f = actorStateFixture(initial);
+  const live = await f.coordinator.prepare(true), history = await f.coordinator.prepare(false);
+  const action = { hash: actorHash(1), blockHash: actorHash(10), blockNumber: 10 };
+  live.batches.push({ toBlock: 10, actions: [action] });
+  history.batches.push({ toBlock: 10, actions: [action] });
+  live.snapshot.chainActorMonitor.realtime.lastBlock++;
+  history.snapshot.chainActorHistory.lastBlock = 10;
+  await Promise.all([f.coordinator.commit(history), f.coordinator.commit(live)]);
+  assert.equal(f.disk()._notificationOutbox.length, 1);
+  assert.ok(`${action.hash}:${action.blockHash}` in f.disk().actorNotificationLedger.entries);
+  assert.equal(f.disk().chainActorMonitor.realtime.lastBlock, 3001);
+  assert.equal(f.disk().chainActorHistory.lastBlock, 10);
+  const restarted = actorStateFixture(f.disk());
+  const again = await restarted.coordinator.prepare(true);
+  again.batches.push({ toBlock: 10, actions: [action] });
+  await restarted.coordinator.commit(again);
+  assert.equal(restarted.disk()._notificationOutbox.length, 1);
+  const reorg = await restarted.coordinator.prepare(true);
+  reorg.batches.push({ toBlock: 10, actions: [{ ...action, blockHash: actorHash(11) }] });
+  await restarted.coordinator.commit(reorg);
+  assert.equal(restarted.disk()._notificationOutbox.length, 2);
+});
+
+test('写盘失败时游标、去重、通知一起回滚，重试成功且不丢缺口', async () => {
+  const f = actorStateFixture(actorInitial());
+  const work = await f.coordinator.prepare(false), before = structuredClone(f.disk());
+  const action = { hash: actorHash(1), blockHash: actorHash(150), blockNumber: 150 };
+  work.snapshot.chainActorHistory.lastBlock = 180;
+  work.batches.push({ toBlock: 180, actions: [action] });
+  f.fail(true);
+  await assert.rejects(f.coordinator.commit(work), /disk full/);
+  assert.deepEqual(f.disk(), before);
+  assert.equal(f.store.state.chainActorHistory.lastBlock, 100);
+  f.fail(false);
+  await f.coordinator.commit(work);
+  assert.equal(f.disk().chainActorHistory.lastBlock, 180);
+  assert.equal(f.disk()._notificationOutbox.length, 1);
+});
+
+test('过期扫描结果不能覆盖较新游标，失败提交不阻塞后续提交', async () => {
+  const f = actorStateFixture(actorInitial());
+  const stale = await f.coordinator.prepare(true), current = await f.coordinator.prepare(true);
+  current.snapshot.chainActorMonitor.realtime.lastBlock = 3002;
+  await f.coordinator.commit(current);
+  stale.snapshot.chainActorMonitor.realtime.lastBlock = 3001;
+  await assert.rejects(f.coordinator.commit(stale), /基线已变化/);
+  const next = await f.coordinator.prepare(true);
+  next.snapshot.chainActorMonitor.realtime.lastBlock = 3003;
+  await f.coordinator.commit(next);
+  assert.equal(f.disk().chainActorMonitor.realtime.lastBlock, 3003);
+});
+
+test('停止期间晚到RPC结果不能修改状态或入队通知', async () => {
+  let stopped = false;
+  const f = actorStateFixture(actorInitial(), { isStopping: () => stopped });
+  const work = await f.coordinator.prepare(true), before = structuredClone(f.disk());
+  work.snapshot.chainActorMonitor.realtime.lastBlock++;
+  stopped = true;
+  await assert.rejects(f.coordinator.commit(work), /正在停止/);
+  assert.deepEqual(f.disk(), before);
+});
+
+test('缺口接管写盘失败保留原队列；接管后重启从同一区间继续', async () => {
+  const initial = actorInitial(), f = actorStateFixture(initial);
+  f.fail(true);
+  await assert.rejects(f.coordinator.prepare(false), /disk full/);
+  assert.deepEqual(f.disk(), initial);
+  f.fail(false);
+  await f.coordinator.prepare(false);
+  const restarted = actorStateFixture(f.disk());
+  const work = await restarted.coordinator.prepare(false);
+  assert.equal(work.snapshot.chainActorHistory.lastBlock, 100);
+  assert.equal(work.snapshot.chainActorHistory.historyEndBlock, 2000);
+  assert.deepEqual(work.snapshot.chainActorMonitor.realtime.realtimeGaps, []);
+});
 
 const actorHash = n => `0x${n.toString(16).padStart(64, '0')}`;
 function actorFixture() {
