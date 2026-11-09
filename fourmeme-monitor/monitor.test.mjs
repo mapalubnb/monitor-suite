@@ -410,11 +410,15 @@ test('GitHub 网络错误合并重复日志，冷却与恢复不误标为风控'
     const runner = __testables.createModuleRunner('github', async () => {
       if (mode === 'failure') throw Object.assign(new Error('网络超时'), { code: 'GITHUB_REQUEST_FAILED', kind: 'timeout' });
       if (mode === 'cooldown') throw Object.assign(new Error('[退避中] 网络恢复等待'), { code: 'GITHUB_COOLDOWN' });
+      return { checked: mode === 'success' ? 8 : 0, failed: 0 };
     }, 2000, false);
     await runner.run();
     await runner.run();
     mode = 'cooldown';
     for (let index = 0; index < 4; index++) await runner.run();
+    mode = 'isolated';
+    await runner.run();
+    assert.doesNotMatch(logs.join('\n'), /请求恢复/);
     mode = 'success';
     await runner.run();
     assert.equal(runner.intervalMs, 2000);

@@ -436,3 +436,8 @@ test('fm-status newly discovered repository remains pending until its first succ
   const text = renderFourmemeStatus({ githubMonitor: { repos: { 'new/pending': { name: 'new/pending', branch: '', head: '' } }, jobs: [] } }).split('08｜📦 GitHub')[1];
   assert.match(text, /默认分支：待同步｜最新提交：待同步/);
 });
+
+test('fm-status isolates unavailable GitHub repositories and displays retained detail gaps',()=>{
+  const text=renderFourmemeStatus({githubMonitor:{repos:{'flap-sh/missing':{name:'flap-sh/missing',head:'a'.repeat(40),branch:'main',availability:'unavailable',lastHeadError:'仓库不可访问',headRetryAt:1800000000000,checkedAt:1799999000000}},jobs:[{repo:'flap-sh/missing',lastError:'HTTP 404',blockedReason:'base_unavailable',attempts:353}]}}).split('08｜📦 GitHub')[1];
+  assert.match(text,/异常仓库：1/);assert.match(text,/仓库不可访问/);assert.match(text,/最近检查/);assert.match(text,/原提交不可访问/);assert.match(text,/等待仓库恢复/);
+});

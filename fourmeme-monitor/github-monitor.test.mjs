@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createTransactionalOutbox } from "../shared/transactional-outbox.mjs";
-import { createGithubApi, createGithubMonitor, GITHUB_REPOSITORIES, buildHeadQuery } from "./github-monitor.mjs";
+import { createGithubApi, createGithubMonitor, createGithubTransport, GITHUB_REPOSITORIES, buildHeadQuery } from "./github-monitor.mjs";
 
 function fixture(initial = {}) {
   let timestamp = 1_800_000_000_000;
@@ -130,7 +130,7 @@ test("GitHub GraphQL 局部错误不推进失败仓库，成功仓库仍提醒",
   context.change();
   const getHeads = context.api.heads;
   context.api.heads = async names => ({ ...await getHeads(names), errors: [{ path: ["repo1"], message: "unavailable" }] });
-  await assert.rejects(context.monitor.pollHeads(), /GraphQL/);
+  assert.deepEqual(await context.monitor.pollHeads(), { checked: 7, failed: 1 });
   assert.equal(context.persisted._notificationOutbox.length, 1);
   assert.equal(context.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[1]].head, "old");
 });
@@ -494,4 +494,152 @@ test("GitHub 探测网络中断不推进游标，恢复后仍推送新提交并�
   await context.monitor.pollHeads();
   assert.equal(context.persisted._notificationOutbox.length, 1);
   assert.equal(context.persisted.githubMonitor.jobs.length, 1);
+});
+
+test('GitHub 404/409/410/422不冻结正常REST，也不扩大网络失败计数', async () => {
+  for (const status of [404,409,410,422]) {
+    let calls=0;
+    const api=createGithubApi({token:'test',now:()=>1000,fetchImpl:async()=>new Response('{}',{status:++calls===1?status:200})});
+    await assert.rejects(api.rest('/missing'), e=>e.code==='GITHUB_RESOURCE_UNAVAILABLE');
+    await api.rest('/healthy');
+    assert.equal(calls,2);
+    assert.equal(api.summary().retryAt.rest,0);
+    assert.equal(api.summary().diagnostics.rest.consecutiveFailures,0);
+  }
+});
+
+test('GitHub 资源404仍遵守服务端Retry-After和额度保护', async () => {
+  const api=createGithubApi({token:'test',now:()=>1000,fetchImpl:async()=>new Response('{}',{status:404,headers:{'retry-after':'60'}})});
+  await assert.rejects(api.rest('/missing'));
+  await assert.rejects(api.heads(GITHUB_REPOSITORIES),e=>e.code==='GITHUB_COOLDOWN'&&e.retryAt===61000);
+});
+
+test('GitHub 不可见仓库隔离后正常仓库继续更新，恢复从旧基线补齐且故障仅通知一次', async () => {
+  const c=await changedFixture();await c.store.drain();
+  const bad=GITHUB_REPOSITORIES[0], original=structuredClone(c.persisted.githubMonitor.jobs);
+  const heads=c.api.heads;let missing=true;
+  c.api.heads=async names=>{const r=await heads(names);const i=names.indexOf(bad);if(missing&&i>=0){r.data['repo'+i]=null;r.errors=[{type:'NOT_FOUND',path:['repo'+i]}];}return r;};
+  await c.monitor.pollHeads();await c.monitor.pollHeads();
+  assert.equal(c.persisted.githubMonitor.repos[bad].availability,'unavailable');
+  assert.equal(await c.monitor.enrich(),false);
+  assert.deepEqual(c.persisted.githubMonitor.jobs,original);
+  c.change(GITHUB_REPOSITORIES[1],'healthy-new');await c.monitor.pollHeads();
+  assert.ok(!c.requests.at(-1).includes(bad));
+  assert.equal(c.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[1]].head,'healthy-new');
+  assert.equal(c.persisted._notificationOutbox.filter(e=>e.payload.title==='GitHub 单仓库监控异常').length,1);
+  c.advance(60000);await c.monitor.pollHeads();
+  assert.equal(c.persisted._notificationOutbox.filter(e=>e.payload.title==='GitHub 单仓库监控异常').length,1);
+  missing=false;c.change(bad,'after-recovery');c.advance(60000);await c.monitor.pollHeads();
+  assert.equal(c.persisted.githubMonitor.repos[bad].availability,'healthy');
+  assert.equal(c.persisted.githubMonitor.jobs.find(j=>j.head==='after-recovery').base,'new');
+  assert.equal(c.persisted._notificationOutbox.filter(e=>e.payload.title==='GitHub 单仓库监控恢复').length,1);
+  await c.monitor.pollHeads();
+  assert.equal(c.persisted.githubMonitor.jobs.filter(j=>j.head==='after-recovery').length,1);
+});
+
+test('GitHub 仓库隔离及历史详情重启保留，全部不可见时不伪造成功检查',async()=>{
+  const c=await changedFixture();await c.store.drain();
+  c.api.heads=async names=>({data:Object.fromEntries(names.map((_,i)=>['repo'+i,null]))});
+  await c.monitor.pollHeads();await c.monitor.pollHeads();
+  const last=c.persisted.githubMonitor.lastHeadAt;
+  const resumed=fixture(c.persisted);resumed.advance(2000);
+  assert.deepEqual(await resumed.monitor.pollHeads(),{checked:0,failed:0});
+  assert.equal(resumed.persisted.githubMonitor.lastHeadAt,last);
+  assert.deepEqual(resumed.persisted.githubMonitor.jobs,c.persisted.githubMonitor.jobs);
+});
+
+test('GitHub 完整目录重现立即恢复探测，持续目录不反复清除隔离',async()=>{
+  const c=fixture();await c.monitor.pollHeads();
+  const bad=GITHUB_REPOSITORIES[0];
+  c.api.rest=async path=>({data:GITHUB_REPOSITORIES.filter(n=>n.startsWith(path.includes('flap-sh')?'flap-sh/':'four-meme-community/')).map(n=>({full_name:n,node_id:c.heads.get(n).id}))});
+  await c.monitor.discover();
+  c.api.heads=async names=>({data:Object.fromEntries(names.map((n,i)=>['repo'+i,n===bad?null:c.heads.get(n)]))});
+  await c.monitor.pollHeads();await c.monitor.pollHeads();
+  const retry=c.persisted.githubMonitor.repos[bad].headRetryAt;
+  await c.monitor.discover();assert.equal(c.persisted.githubMonitor.repos[bad].headRetryAt,retry);
+  const list=c.api.rest;c.api.rest=async path=>{const r=await list(path);r.data=r.data.filter(x=>x.full_name!==bad);return r;};
+  await c.monitor.discover();c.api.rest=list;await c.monitor.discover();
+  assert.equal(c.persisted.githubMonitor.repos[bad].headRetryAt,0);
+});
+
+test('GitHub 更名同步迁移已排队详情，保留原始SHA和进度',async()=>{
+  const c=await changedFixture();const before=structuredClone(c.persisted.githubMonitor.jobs[0]);
+  const name=GITHUB_REPOSITORIES[0];c.heads.get(name).nameWithOwner='four-meme-community/renamed';
+  await c.monitor.pollHeads();
+  assert.deepEqual(c.persisted.githubMonitor.jobs[0],{...before,repo:'four-meme-community/renamed'});
+});
+
+const resourceFailure=()=>Object.assign(new Error('HTTP 404'),{code:'GITHUB_RESOURCE_UNAVAILABLE',status:404});
+test('GitHub 缺失compare保留任务，分步区分仓库及旧提交缺口，不阻塞其他任务',async()=>{
+  const c=await changedFixture();await c.store.drain();
+  const original=structuredClone(c.persisted.githubMonitor.jobs[0]);
+  c.api.rest=async()=>{throw resourceFailure();};assert.equal(await c.monitor.enrich(),false);
+  let j=c.persisted.githubMonitor.jobs[0];assert.equal(j.base,original.base);assert.equal(j.stage,'compare');assert.equal(j.recoveryProbe,'repo');
+  c.change(GITHUB_REPOSITORIES[1],'another');await c.monitor.pollHeads();await c.store.drain();
+  c.api.rest=async()=>({data:{status:'ahead',commits:[{sha:'another'}]}});
+  assert.equal(await c.monitor.enrich(),true);
+  c.advance(300000);
+  c.api.rest=async path=>{if(path.endsWith('/commits/old'))throw resourceFailure();return {data:{full_name:original.repo}};};
+  assert.equal(await c.monitor.enrich(),true); // repository can be accessed
+  // Another job has a turn; keep focus on the blocked comparison without losing it.
+  await c.store.transaction(()=>{c.store.state.githubMonitor.jobs.find(x=>x.repo!==original.repo).retryAt=Number.MAX_SAFE_INTEGER;});
+  assert.equal(await c.monitor.enrich(),false);
+  j=c.persisted.githubMonitor.jobs.find(x=>x.id===original.id);
+  assert.equal(j.blockedReason,'base_unavailable');assert.equal(j.base,original.base);assert.deepEqual(j.commits,[]);
+  assert.equal(c.sent.filter(x=>x.title==='GitHub 文件 diff 补全受阻').length,1);
+});
+
+test('GitHub 404任务重启后恢复仓库和提交验证，继续原compare并生成diff',async()=>{
+  const c=await changedFixture();await c.store.drain();c.api.rest=async()=>{throw resourceFailure();};await c.monitor.enrich();
+  const r=fixture(c.persisted);r.advance(300000);
+  const paths=[];r.api.rest=async path=>{paths.push(path);if(path.includes('/compare/'))return {data:{status:'ahead',commits:[{sha:'new'}]}};if(path.endsWith('/commits/old'))return {data:{sha:'old'}};if(path.endsWith('/commits/new'))return {data:{sha:'new'}};if(path.includes('/commits/new?'))return {data:{sha:'new',files:[{filename:'a',patch:'+a'}]}};return {data:{full_name:GITHUB_REPOSITORIES[0]}};};
+  for(let i=0;i<5;i++)await r.monitor.enrich();
+  assert.equal(r.persisted.githubMonitor.jobs.length,0);
+  assert.equal(paths.length,5);
+  assert.equal(r.persisted._notificationOutbox.filter(e=>e.payload.title.startsWith('GitHub 文件 diff：')).length,1);
+});
+
+test('GitHub 隔离写盘失败不提交健康状态或通知',async()=>{
+  const c=fixture();await c.monitor.pollHeads();c.api.heads=async()=>({data:{}});await c.monitor.pollHeads();
+  const before=structuredClone(c.persisted);c.failPersist=true;
+  await assert.rejects(c.monitor.pollHeads(),/disk full/);assert.deepEqual(c.persisted,before);
+});
+
+test('GitHub 超时只重建故障通道连接，不产生额外重试且下轮仍复用健康通道',async()=>{
+  const made=[],used=[];let fail=false,t=1000;
+  const transport=createGithubTransport({makeAgent:()=>{const a={destroyed:false,destroy:async()=>{a.destroyed=true;}};made.push(a);return a;},fetchImpl:async(_url,opts)=>{used.push(opts.dispatcher);if(fail&&opts.method==='POST'){t+=10000;throw Object.assign(new Error('timeout'),{name:'TimeoutError'});}return new Response('{}');}});
+  const api=createGithubApi({token:'test',now:()=>t,transport});
+  await api.heads([]);await api.rest('/test');fail=true;await assert.rejects(api.heads([]));
+  assert.equal(used.length,3);assert.equal(made[0].destroyed,true);assert.equal(made[1].destroyed,false);
+  await api.rest('/test');assert.equal(used.at(-1),made[1]);fail=false;await api.heads([]);
+  assert.notEqual(used.at(-1),made[0]);assert.equal(api.summary().connectionResets.graphql,1);
+  await transport.close();assert.ok(made.every(x=>x.destroyed));
+});
+
+test('GitHub 响应体断连也重建对应连接并记录阶段耗时',async()=>{
+  let t=1000,resets=[];
+  const api=createGithubApi({token:'test',now:()=>t,transport:{fetch:async()=>{t+=300;return {ok:true,status:200,headers:new Headers(),json:async()=>{t+=700;throw Object.assign(new Error('socket'),{code:'UND_ERR_SOCKET'});}};},reset:lane=>resets.push(lane),summary:()=>({})}});
+  await assert.rejects(api.heads([]));assert.deepEqual(resets,['graphql']);
+  const d=api.summary().diagnostics.graphql;assert.equal(d.headersMs,300);assert.equal(d.bodyMs,700);assert.equal(d.phase,'body');
+});
+
+test('GitHub 检查间隔与发现至送达分别统计，首条不等详情及AI',async()=>{
+  const c=fixture();await c.monitor.pollHeads();c.advance(2000);c.change();await c.monitor.pollHeads();
+  const payload=c.persisted._notificationOutbox[0].payload;assert.equal(payload.skipAi,true);assert.equal(payload.github.kind,'head');
+  assert.equal(c.monitor.summary().delivery.pending,1);c.advance(450);c.monitor.recordDelivery(payload);await c.store.drain();
+  assert.equal(c.monitor.summary().delivery.pending,0);assert.equal(c.monitor.summary().delivery.last.delayMs,450);assert.equal(c.monitor.summary().headIntervals.p95Ms,2000);
+});
+
+test('GitHub 详情请求进行中更名不会被旧任务覆盖',async()=>{
+  const c=await changedFixture();await c.store.drain();let release;
+  c.api.rest=()=>new Promise(resolve=>{release=resolve;});
+  const work=c.monitor.enrich();await new Promise(resolve=>setImmediate(resolve));
+  c.heads.get(GITHUB_REPOSITORIES[0]).nameWithOwner='four-meme-community/renamed';await c.monitor.pollHeads();
+  release({data:{status:'ahead',commits:[{sha:'new'}]}});await work;
+  assert.equal(c.persisted.githubMonitor.jobs[0].repo,'four-meme-community/renamed');assert.equal(c.persisted.githubMonitor.jobs[0].stage,'files');
+});
+
+test('GitHub 缺失字段响应不误判仓库已不可见，不推进有效SHA',async()=>{
+  const c=fixture();await c.monitor.pollHeads();c.api.heads=async()=>({data:{repo0:{id:'node0',nameWithOwner:GITHUB_REPOSITORIES[0]}}});
+  const result=await c.monitor.pollHeads();assert.equal(result.checked,0);assert.equal(c.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]].head,'old');assert.equal(c.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]].availability,'degraded');
 });

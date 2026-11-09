@@ -4,7 +4,7 @@ import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs"
 import { recoverLiveCursor } from "../shared/scan-recovery.mjs";
 import { createActorStateCoordinator } from './actor-state.mjs';
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
-import { createGithubApi, createGithubMonitor } from "./github-monitor.mjs";
+import { createGithubApi, createGithubMonitor, createGithubTransport } from "./github-monitor.mjs";
 import { discoverCreators } from "./creator-discovery.mjs";
 import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
 import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
@@ -9353,7 +9353,14 @@ function startActorBlockFeed(actorRunner) {
 const monitorStore = createTransactionalOutbox({
   initial: loadSnapshot() || {},
   persist: persistMonitorSnapshot,
-  deliver: (payload, deliveryOptions) => deliverNotification({ ...payload, cardOpts: { ...payload.cardOpts, ...deliveryOptions } }),
+  deliver: async (payload, deliveryOptions) => {
+    const id = await deliverNotification({ ...payload, cardOpts: { ...payload.cardOpts, ...deliveryOptions } });
+    if (id && payload.github) {
+      githubMonitor.recordDelivery(payload);
+      log(`[GitHub 送达] ${payload.github.repo} ${payload.github.kind}｜发现至送达 ${Date.now() - payload.github.detectedAt}ms`);
+    }
+    return id;
+  },
   onError: err => log(`[待发送] 发送失败，已保留并退避重试：${err.message}`),
 });
 let snapshot = monitorStore.state;
@@ -9581,7 +9588,8 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
           if (firstRunStatus === "pending") firstRunStatus = "complete";
           metricSample.durationMs = Date.now() - startedAt;
           recordModuleMetric(moduleMetrics, name, metricSample);
-          if (githubTask && githubFailures > 0 && (name !== "githubDetails" || result === true)) {
+          const githubCompleted = name === "github" ? result?.checked > 0 : name === "githubDetails" ? result === true : true;
+          if (githubTask && githubFailures > 0 && githubCompleted) {
             log(`[${name}] 请求恢复：此前 ${githubLastFailureKind} 失败 ${githubFailures} 次，本轮检查完成；详情完成情况以队列为准`);
             githubFailures = 0;
             githubCooldownLogAt = 0;
@@ -9600,7 +9608,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
               ).catch(err => { log(`[飞书] 退避恢复推送失败：${err.message}`); });
             }
           }
-          if (name !== "githubDetails" || result === true) clearModuleError(name);
+          if (githubCompleted) clearModuleError(name);
           if (!IS_TEST_MODE) {
             try { writeFileSync(join(__dirname, "lastpoll.txt"), ts(), "utf-8"); } catch (_) {}
           }
@@ -10237,8 +10245,10 @@ async function runOnchainCheck() {
    启动 & 信号处理
    ══════════════════════════════════════════ */
 
+const githubTransport = createGithubTransport();
 const githubApi = createGithubApi({
   token: CONFIG.githubToken,
+  transport: githubTransport,
   onRequest: () => {
     const sample = moduleMetricContext.getStore();
     if (sample) sample.requestCount++;
@@ -10409,6 +10419,7 @@ async function gracefulShutdown(signal) {
   }
   startupNotifier?.stop();
   if (outboxTimer) clearInterval(outboxTimer);
+  await githubTransport.close();
   // 等待消息队列排空（最多等 30s）
   await waitQueueDrain(30_000);
   // 保存最终快照
