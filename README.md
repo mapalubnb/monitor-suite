@@ -8,7 +8,7 @@
 
 观察状态、基线和通知沿用原原子事务；RPC或写盘失败保留旧状态，重启保留候选和去重，不清理旧队列、补扫缺口或历史。合约线上1000ms调度及其他任务周期、环境、AI关闭策略不变，只需重启Four.meme。旧快照首次自动继承已有地址基线，不回放全部合约历史。已观测地址持续保留会随真实地址新增增加RPC负载，沿用现有限额，不绕过预算。
 
-文件：fourmeme-monitor/contract-observation.mjs及测试、monitor.mjs及测试、根/模块package.json、README、HANDOFF、PROJECT_STATE。本地全量799/799（新增16项）与语法检查通过；服务器隔离测试及部署验收随后记录。短时检查不能保证公共接口/RPC永无故障，也无法捕获两次成功采样之间已发生且撤回的所有变化。
+文件：fourmeme-monitor/contract-observation.mjs及测试、monitor.mjs及测试、根/模块package.json、README、HANDOFF、PROJECT_STATE。本地全量799/799（新增16项）与语法检查通过；服务器隔离220/220通过，14:51已部署；10分钟采样97次地址往返、合约错误/退避0，部署后飞书5条状态消息且无跨地址Bytecode误报，详见Four.meme HANDOFF顶部验收。短时检查不能保证公共接口/RPC永无故障，也无法捕获两次成功采样之间已发生且撤回的所有变化。
 
 
 ## 2026/11/9 GitHub 故障隔离与恢复升级（Suite 1.12.88 / Four.meme 1.5.27）
