@@ -1,6 +1,7 @@
 import test from "node:test";
 import "./github-monitor.test.mjs";
 import "./creator-discovery.test.mjs";
+import "./contract-observation.test.mjs";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';

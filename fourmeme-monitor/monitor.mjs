@@ -33,6 +33,7 @@ import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStag
 
 import { createStartupNotifier, buildStartupCard } from "../shared/startup-notifier.mjs";
 import { createTransactionalOutbox } from "../shared/transactional-outbox.mjs";
+import { prepareContractObservations, contractObservationTargets, reconcileContractObservations } from "./contract-observation.mjs";
 import { createHash } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, writeFileSync, existsSync, appendFileSync, renameSync, mkdirSync, readdirSync, unlinkSync, statSync } from "node:fs";
@@ -7913,10 +7914,6 @@ async function fetchContractFingerprintsForTargets(bscContracts, rpcBatchFn = bs
   return result;
 }
 
-async function fetchContractFingerprints() {
-  return fetchContractFingerprintsForTargets(await buildContractTargets());
-}
-
 function diffContractFingerprints(oldFp, newFp) {
   const changes = [];
   if (!oldFp || !newFp) return changes;
@@ -7957,6 +7954,7 @@ function diffContractFingerprints(oldFp, newFp) {
         address: newData.address,
         source: newData.source,
       }, newData));
+      continue; // Different addresses are different code baselines, not upgrades.
     }
     if (oldData.codeHash !== newData.codeHash) {
       const entry = withContractMeta({
@@ -7968,11 +7966,11 @@ function diffContractFingerprints(oldFp, newFp) {
       }, newData);
       changes.push(entry);
     }
-    if (oldData.implAddress && newData.implAddress && oldData.implAddress !== newData.implAddress) {
+    if ((oldData.implAddress || ZERO_ADDRESS) !== (newData.implAddress || ZERO_ADDRESS)) {
       changes.push(withContractMeta({
         type: "代理升级（Implementation 变更）", label, address: newData.address,
         source: newData.source,
-        oldImpl: oldData.implAddress, newImpl: newData.implAddress,
+        oldImpl: oldData.implAddress || ZERO_ADDRESS, newImpl: newData.implAddress || ZERO_ADDRESS,
         oldSize: oldData.implCodeSize, newSize: newData.implCodeSize,
         selectorDiff: selectorDiff(oldData.implSelectors, newData.implSelectors),
       }, newData));
@@ -8025,6 +8023,7 @@ function formatContractChanges(changes) {
       lines.push(formatAddressLine("address", c.address));
     }
     if (c.source) lines.push(`- source: ${diffSnippet(c.source)}`);
+    if (c.note) lines.push(c.note);
     if (c.discoveredVia) lines.push(`- via: ${diffSnippet(c.discoveredVia)}`);
     if (c.oldRelation && c.relation) {
       lines.push(formatAddressChangeLine(c.relationField, c.oldRelation, c.relation));
@@ -8044,7 +8043,7 @@ function formatContractChanges(changes) {
     if (c.selectorDiff) {
       const sd = c.selectorDiff;
       if (sd.added.length > 0 || sd.removed.length > 0) {
-        lines.push("**接口变更（函数选择器 diff）：**");
+        lines.push("**候选选择器差异（字节码扫描，未验证 ABI，可能包含常量或元数据）：**");
         for (const s of sd.added) {
           const name = KNOWN_SELECTORS[s.toLowerCase()];
           lines.push(formatAddedLine(s, name || ""));
@@ -8056,13 +8055,13 @@ function formatContractChanges(changes) {
         // 生成可读摘要供 AI 分析
         const addedNames = sd.added.map(s => KNOWN_SELECTORS[s.toLowerCase()]).filter(Boolean);
         const removedNames = sd.removed.map(s => KNOWN_SELECTORS[s.toLowerCase()]).filter(Boolean);
-        if (addedNames.length > 0) lines.push(`**新增功能：** ${addedNames.join("、")}`);
-        if (removedNames.length > 0) lines.push(`**移除功能：** ${removedNames.join("、")}`);
+        if (addedNames.length > 0) lines.push(`**新增候选签名（不代表已确认新增功能）：** ${addedNames.join("、")}`);
+        if (removedNames.length > 0) lines.push(`**移除候选签名（不代表已确认移除功能）：** ${removedNames.join("、")}`);
         if (sd.added.length > addedNames.length) {
-          lines.push(`**未识别的新增选择器：** ${sd.added.length - addedNames.length} 个（可能是业务自定义函数）`);
+          lines.push(`**未识别的候选值：** ${sd.added.length - addedNames.length} 个（需 ABI 或分发逻辑核验）`);
         }
       } else {
-        lines.push("接口不变（函数选择器一致），仅内部逻辑修改");
+        lines.push("候选选择器集合一致；不能据此判断接口或内部逻辑是否不变");
       }
     }
     lines.push("---");
@@ -10183,10 +10182,18 @@ async function runApiCheck() {
 }
 
 
-async function runContractCheck() {
-  const newFp = await fetchContractFingerprints();
+async function runContractCheck({ buildTargets = buildContractTargets, fetchFingerprints = fetchContractFingerprintsForTargets,
+  now = Date.now, history = appendHistory } = {}) {
+  const selected = await buildTargets();
+  const oldFp = snapshot?.contractFingerprints;
+  const previous = snapshot?.contractObservations;
+  const state = prepareContractObservations(previous, oldFp);
+  const sampled = await fetchFingerprints(contractObservationTargets(selected, state));
+  const result = reconcileContractObservations({ previous, oldFp, selected, sampled, now: now(), diff: diffContractFingerprints });
+  const newFp = result.selectedFp;
   if (!snapshot) snapshot = {};
-  if (!snapshot.contractFingerprints) {
+  snapshot.contractObservations = result.state;
+  if (!oldFp) {
     snapshot.contractFingerprints = newFp;
     await saveSnapshot(snapshot);
     const labels = Object.entries(newFp).map(([label, data]) =>
@@ -10195,13 +10202,13 @@ async function runContractCheck() {
     log(`[合约] 首次记录：${Object.keys(newFp).length} 个合约\n${labels.join("\n")}`);
     return;
   }
-  const contractChanges = diffContractFingerprints(snapshot.contractFingerprints, newFp);
+  const contractChanges = result.changes;
   if (contractChanges.length > 0) {
     log(`[合约] 检测到 ${contractChanges.length} 项变化！`);
     const content = formatContractChanges(contractChanges);
     snapshot.contractFingerprints = newFp;
     await saveSnapshot(snapshot);
-    appendHistory("contract", `合约变更（${contractChanges.length}项）`, content.slice(0, 300), content);
+    history("contract", `合约变更（${contractChanges.length}项）`, content.slice(0, 300), content);
     await sendNotificationMaybeAi({ title: `合约变更（${contractChanges.length}项）`, content, template: "red", moduleContext: "Four.meme 智能合约变更", url: CONFIG.siteUrl });
   } else {
     if (!jsonEqual(snapshot.contractFingerprints, newFp)) {
@@ -10456,6 +10463,8 @@ export const __testables = {
   findCreatorsInRange,
   loadSnapshot,
   cachedContractBatch,
+  diffContractFingerprints,
+  runContractCheck,
   validateActorBlocks,
   checkGithub,
   fetchWithTimeout,
