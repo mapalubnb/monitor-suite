@@ -10,7 +10,7 @@
 
 GitHub提交探测2000ms、发现15000ms、详情1000ms及其余轮询、AI关闭、合约地址往返降噪均不变。不清生产任务/队列/历史，新增字段向后兼容，无必填配置；只重启Four.meme并定向更新fm-status。新增请求与总轮次上限可能让极慢响应或超大账号发现先失败后重试，但不会发布半份目录；断网、磁盘失败和上游资源不可见仍可能阻碍补齐，不承诺永久无延迟。
 
-修改文件：github-monitor.mjs及测试、monitor.mjs、install.sh及测试、根/模块package.json、README、GITHUB_MONITORING、HANDOFF、PROJECT_STATE。专项94/94、本地全量814/814（新增15项）、语法与diff检查通过；服务器隔离测试及部署验收随后记录。
+修改文件：github-monitor.mjs及测试、monitor.mjs、install.sh及测试、根/模块package.json、README、GITHUB_MONITORING、HANDOFF、PROJECT_STATE。专项94/94、本地全量814/814（新增15项）、服务器隔离261/261、语法与diff检查通过。15:30已部署；默认10秒请求/30秒轮次故障回放分别10008ms/30008ms退出，迟到结果隔离、其他仓库推进和恢复去重通过。线上6分钟观察三个GitHub运行器错误/退避0、待发0，两项历史404缺口和392条去重保留；9仓库正常读取。无自然新提交，未声称实测端到端推送时延。验收详情见fourmeme-monitor/HANDOFF.md。
 
 
 ## 2026/11/17 Four.meme 合约地址往返告警修复（Suite1.12.89 / Four.meme1.5.28）
