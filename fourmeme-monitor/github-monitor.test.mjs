@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createTransactionalOutbox } from "../shared/transactional-outbox.mjs";
 import { createGithubApi, createGithubMonitor, createGithubTransport, GITHUB_REPOSITORIES, buildHeadQuery } from "./github-monitor.mjs";
 
-function fixture(initial = {}) {
+function fixture(initial = {}, options = {}) {
   let timestamp = 1_800_000_000_000;
   let failPersist = false;
   let persisted = structuredClone(initial);
@@ -19,12 +19,12 @@ function fixture(initial = {}) {
     summary: () => ({}),
   };
   const store = createTransactionalOutbox({ initial, persist: value => { if (failPersist) throw new Error("disk full"); persisted = structuredClone(value); }, deliver: async payload => { sent.push(payload); return "message-id"; } });
-  const monitor = createGithubMonitor({ store, api, now: () => timestamp, saveDiff: () => "test.diff" });
+  const monitor = createGithubMonitor({ store, api, now: () => timestamp, saveDiff: () => "test.diff", ...options });
   return { monitor, api, store, heads, requests, sent, get persisted() { return persisted; }, set failPersist(value) { failPersist = value; }, advance: value => { timestamp += value; }, change: (name = GITHUB_REPOSITORIES[0], sha = "new") => { heads.get(name).defaultBranchRef.target.oid = sha; } };
 }
 
-async function changedFixture() {
-  const context = fixture();
+async function changedFixture(options = {}) {
+  const context = fixture({}, options);
   await context.monitor.pollHeads();
   context.change();
   await context.monitor.pollHeads();
@@ -473,7 +473,7 @@ test("GitHub 详情冷却只调整就绪时间，不累加请求失败或丢失�
   const retryAt = original.createdAt + 120000;
   context.api.rest = async () => { throw Object.assign(new Error("冷却"), { code: "GITHUB_COOLDOWN", retryAt }); };
   await assert.rejects(context.monitor.enrich());
-  assert.deepEqual(context.persisted.githubMonitor.jobs[0], { ...original, retryAt });
+  assert.deepEqual(context.persisted.githubMonitor.jobs[0], { ...original, retryAt, lastAttemptAt: original.createdAt });
   assert.equal(await context.monitor.enrich(), false);
   context.advance(120000);
   context.api.rest = async () => ({ data: { status: "ahead", commits: [{ sha: "new" }], total_commits: 1 } });
@@ -642,4 +642,177 @@ test('GitHub 详情请求进行中更名不会被旧任务覆盖',async()=>{
 test('GitHub 缺失字段响应不误判仓库已不可见，不推进有效SHA',async()=>{
   const c=fixture();await c.monitor.pollHeads();c.api.heads=async()=>({data:{repo0:{id:'node0',nameWithOwner:GITHUB_REPOSITORIES[0]}}});
   const result=await c.monitor.pollHeads();assert.equal(result.checked,0);assert.equal(c.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]].head,'old');assert.equal(c.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]].availability,'degraded');
+});
+
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
+
+test('GitHub 不响应abort的fetch仍强制结束，REST队列释放且GraphQL独立', { timeout: 2000 }, async () => {
+  let t = 1000, blocked = true, aborted = false;
+  const api = createGithubApi({ token: 'fixture', now: () => t, requestTimeoutMs: 20, queueTimeoutMs: 200,
+    fetchImpl: async (_url, options) => {
+      if (options.method === 'GET' && blocked) { options.signal.addEventListener('abort', () => { aborted = true; }); return new Promise(() => {}); }
+      return new Response('{}');
+    } });
+  const first = assert.rejects(api.rest('/stuck'), e => e.kind === 'timeout');
+  const second = assert.rejects(api.rest('/following'), e => e.code === 'GITHUB_COOLDOWN');
+  await api.heads([]); await Promise.all([first, second]);
+  assert.equal(aborted, true); assert.equal(api.summary().requests.restPending, 0);
+  blocked = false; t = api.summary().retryAt.rest; await api.rest('/recovered');
+  assert.equal(api.summary().requests.hardTimeouts, 1);
+});
+
+test('GitHub HTTP404的body.cancel永不返回也不阻塞，保留资源错误与限流头', { timeout: 2000 }, async () => {
+  let calls = 0, t = 1000, resets = 0;
+  const api = createGithubApi({ token: 'fixture', now: () => t, requestTimeoutMs: 20,
+    transport: { reset: () => { resets++; }, fetch: async () => {
+      calls++; return calls === 1 ? { status: 404, ok: false, headers: new Headers({ 'retry-after': '2' }), body: { cancel: () => new Promise(() => {}) } } : new Response('{}');
+    } } });
+  await assert.rejects(api.rest('/gone'), e => e.code === 'GITHUB_RESOURCE_UNAVAILABLE');
+  await assert.rejects(api.rest('/waiting'), e => e.code === 'GITHUB_COOLDOWN');
+  assert.equal(calls, 1); assert.equal(resets, 1);
+  t = 3000; await api.rest('/healthy'); assert.equal(calls, 2);
+});
+
+test('GitHub迟到响应体不能改写新请求额度、成功时间和诊断', { timeout: 2000 }, async () => {
+  const late = deferred(); let first = true, t = 1000;
+  const api = createGithubApi({ token: 'fixture', requestTimeoutMs: 20, now: () => t, fetchImpl: async () => {
+    if (first) { first = false; return { ok: true, status: 200, headers: new Headers(), json: () => late.promise }; }
+    return new Response(JSON.stringify({ data: { rateLimit: { cost: 1, remaining: 4900, resetAt: new Date(3600000).toISOString() } } }));
+  } });
+  await assert.rejects(api.heads([]), e => e.kind === 'timeout' && e.phase === 'body');
+  t = api.summary().retryAt.graphql; await api.heads([]);
+  const before = api.summary();
+  late.resolve({ data: { rateLimit: { remaining: 0, resetAt: new Date(999999999).toISOString() } } }); await tick();
+  assert.deepEqual(api.summary(), before);
+});
+
+test('GitHub未开始的排队超时任务不会偷偷发请求', { timeout: 2000 }, async () => {
+  const response = deferred(); const started = deferred(); const paths = [];
+  const api = createGithubApi({ token: 'fixture', requestTimeoutMs: 1000, queueTimeoutMs: 20, fetchImpl: async url => {
+    paths.push(url); if (url.endsWith('/first')) { started.resolve(); return response.promise; } return new Response('{}');
+  } });
+  const first = api.rest('/first'); await started.promise;
+  await assert.rejects(api.rest('/cancelled'), e => e.code === 'GITHUB_QUEUE_TIMEOUT');
+  response.resolve(new Response('{}')); await first; await api.rest('/third');
+  assert.equal(paths.length, 2); assert.ok(paths.every(p => !p.endsWith('/cancelled')));
+  assert.equal(api.summary().requests.queueTimeouts, 1); assert.equal(api.summary().requests.restPending, 0);
+});
+
+test('GitHub迟到响应头不能发布旧额度或覆盖新请求诊断', { timeout: 2000 }, async () => {
+  const late = deferred(); let first = true, t = 1000;
+  const api = createGithubApi({ token: 'fixture', requestTimeoutMs: 20, now: () => t, fetchImpl: async () => {
+    if (first) { first = false; return late.promise; } return new Response('{}', { headers: { 'x-ratelimit-remaining': '4900', 'x-ratelimit-reset': '3600' } });
+  } });
+  await assert.rejects(api.rest('/old'), e => e.kind === 'timeout'); t = api.summary().retryAt.rest;
+  await api.rest('/new'); const before = api.summary();
+  late.resolve(new Response('{}', { headers: { 'x-ratelimit-remaining': '0', 'x-ratelimit-reset': '9999999' } })); await tick();
+  assert.deepEqual(api.summary(), before);
+});
+
+test('GitHub工作轮次取消能够释放实际REST请求，销毁连接永不返回也不阻塞', { timeout: 2000 }, async () => {
+  const started = deferred(); const controller = new AbortController(); let t = 1000, fail = true, made = 0;
+  const transport = createGithubTransport({ makeAgent: () => { made++; return { destroy: () => new Promise(() => {}) }; }, fetchImpl: async () => {
+    if (fail) { started.resolve(); return new Promise(() => {}); } return new Response('{}');
+  } });
+  const api = createGithubApi({ token: 'fixture', transport, now: () => t });
+  const work = assert.rejects(api.rest('/stuck', { signal: controller.signal }), e => e.kind === 'timeout');
+  await started.promise; controller.abort(new DOMException('task deadline', 'TimeoutError')); await work;
+  fail = false; t = api.summary().retryAt.rest; await api.rest('/healthy');
+  assert.equal(made, 2); assert.equal(api.summary().requests.restPending, 0);
+});
+
+test('GitHub详情单轮强制取消保留原进度；另一仓库可继续，旧响应不能落盘或发卡', { timeout: 2000 }, async () => {
+  const c = fixture({}, { taskTimeouts: { details: 20 } }); await c.monitor.pollHeads();
+  c.change(GITHUB_REPOSITORIES[0]); c.change(GITHUB_REPOSITORIES[1]); await c.monitor.pollHeads(); await c.store.drain();
+  const original = structuredClone(c.persisted.githubMonitor.jobs[0]); const late = deferred();
+  c.api.rest = () => late.promise;
+  await assert.rejects(c.monitor.enrich(), e => e.code === 'GITHUB_TASK_TIMEOUT');
+  const retained = c.persisted.githubMonitor.jobs.find(j => j.id === original.id);
+  for (const k of ['id', 'base', 'head', 'stage', 'page', 'index', 'noticeId']) assert.equal(retained[k], original[k]);
+  assert.equal(c.persisted.githubMonitor.health.details.active, true);
+  c.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } });
+  await c.monitor.enrich(); // first job is cooling; second repo progresses now
+  assert.equal(c.persisted.githubMonitor.jobs.find(j => j.repo === GITHUB_REPOSITORIES[1]).stage, 'files');
+  const after = structuredClone(c.persisted); late.resolve({ data: { status: 'ahead', commits: [{ sha: 'stale' }] } }); await tick();
+  assert.deepEqual(c.persisted, after);
+  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.title.includes('停滞')).length, 1);
+  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.title.includes('通道恢复')).length, 1);
+});
+
+test('GitHub迟到的文件详情不会写diff或重复通知，成功重试只发布一次', { timeout: 2000 }, async () => {
+  let saved = 0; const c = await changedFixture({ taskTimeouts: { details: 20 }, saveDiff: () => { saved++; return 'fixture.diff'; } });
+  await c.store.drain(); c.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } }); await c.monitor.enrich();
+  const late = deferred(); c.api.rest = () => late.promise;
+  await assert.rejects(c.monitor.enrich(), e => e.code === 'GITHUB_TASK_TIMEOUT');
+  c.advance(2000); c.api.rest = async () => ({ data: { sha: 'new', files: [] } }); await c.monitor.enrich();
+  late.resolve({ data: { sha: 'new', files: [{ filename: 'stale', patch: 'late' }] } }); await tick();
+  assert.equal(saved, 1); assert.equal(c.persisted.githubMonitor.jobs.length, 0);
+  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.github?.kind === 'detail').length, 1);
+});
+
+test('GitHub仓库发现超时不能发布半份目录，下一轮可恢复且迟到目录不覆盖', { timeout: 2000 }, async () => {
+  const c = fixture({}, { taskTimeouts: { discovery: 20 } }); await c.monitor.pollHeads();
+  const late = deferred(); c.api.rest = path => path.includes('flap-sh') ? late.promise : Promise.resolve({ data: [] });
+  const repos = structuredClone(c.persisted.githubMonitor.repos);
+  await assert.rejects(c.monitor.discover(), e => e.code === 'GITHUB_TASK_TIMEOUT');
+  assert.deepEqual(c.persisted.githubMonitor.repos, repos);
+  c.api.rest = async () => ({ data: [] }); await c.monitor.discover();
+  const after = structuredClone(c.persisted); late.resolve({ data: [{ full_name: 'flap-sh/late', node_id: 'late' }] }); await tick();
+  assert.deepEqual(c.persisted, after); assert.equal(c.persisted.githubMonitor.health.discovery.active, false);
+});
+
+test('GitHub有可处理任务却无进展会告警并唤醒，重复检查和重启不重复告警', async () => {
+  let resumes = 0; const c = await changedFixture({ resume: () => { resumes++; } }); await c.store.drain();
+  await c.monitor.checkHealth(); c.advance(60000); await c.monitor.checkHealth(); await c.monitor.checkHealth();
+  assert.equal(resumes, 1); assert.equal(c.persisted.githubMonitor.health.details.active, true);
+  const restarted = fixture(structuredClone(c.persisted)); await restarted.monitor.checkHealth(); restarted.advance(60000); await restarted.monitor.checkHealth();
+  assert.equal(restarted.persisted._notificationOutbox.filter(n => n.payload.title.includes('停滞')).length, 1);
+  restarted.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } }); await restarted.monitor.enrich();
+  assert.equal(restarted.persisted._notificationOutbox.filter(n => n.payload.title.includes('通道恢复')).length, 1);
+});
+
+test('GitHub历史404缺口、首条待送及服务端冷却不是可处理停滞，不清记录或绕过限制', async () => {
+  for (const mode of ['gap', 'notice', 'cooldown', 'retry', 'unavailable']) {
+    const c = await changedFixture(); if (mode !== 'notice') await c.store.drain();
+    const job = c.store.state.githubMonitor.jobs[0];
+    if (mode === 'gap') { job.blockedReason = 'base_unavailable'; job.gapNotified = true; job.attempts = 356; }
+    if (mode === 'cooldown') c.api.summary = () => ({ sharedRetryAt: job.createdAt + 1000000 });
+    if (mode === 'retry') job.retryAt = job.createdAt + 1000000;
+    if (mode === 'unavailable') c.store.state.githubMonitor.repos[job.repo].availability = 'unavailable';
+    const before = structuredClone(c.store.state.githubMonitor);
+    await c.monitor.checkHealth(); c.advance(60000); await c.monitor.checkHealth();
+    assert.deepEqual(c.store.state.githubMonitor, before, mode);
+    assert.equal(c.monitor.summary().health.readyDetails, 0);
+  }
+});
+
+test('GitHub健康告警写盘失败不丢告警资格，重试与恢复都原子保存', async () => {
+  const c = await changedFixture(); await c.store.drain(); await c.monitor.checkHealth(); c.advance(60000); c.failPersist = true;
+  await assert.rejects(c.monitor.checkHealth(), /disk full/); assert.equal(c.store.state.githubMonitor.health, undefined);
+  c.failPersist = false; await c.monitor.checkHealth();
+  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.title.includes('停滞')).length, 1);
+  const before = structuredClone(c.persisted.githubMonitor.jobs[0]); c.failPersist = true;
+  await assert.rejects(c.monitor.enrich(), /disk full/); assert.deepEqual(c.persisted.githubMonitor.jobs[0], before);
+});
+
+test('GitHub持续分页推进不误报停滞，空闲不触发恢复', async () => {
+  let resumes = 0; const c = await changedFixture({ resume: () => resumes++ }); await c.store.drain();
+  c.api.rest = async () => ({ data: { status: 'ahead', commits: [] }, hasNext: true });
+  for (let i = 0; i < 5; i++) { await c.monitor.enrich(); await c.monitor.checkHealth(); c.advance(30000); }
+  assert.equal(c.persisted.githubMonitor.health, undefined); assert.equal(resumes, 0);
+  assert.equal(c.persisted.githubMonitor.jobs[0].page, 6);
+  const idle = fixture({}, { resume: () => resumes++ }); await idle.monitor.checkHealth(); idle.advance(100000); await idle.monitor.checkHealth(); assert.equal(resumes, 0);
+});
+
+test('GitHub诊断展示活动阶段与截止时间，进程重启不复用旧轮次锁', { timeout: 2000 }, async () => {
+  const c = await changedFixture({ taskTimeouts: { details: 20 } }); await c.store.drain();
+  const started = deferred(); c.api.rest = async () => { started.resolve(); return new Promise(() => {}); };
+  const work = assert.rejects(c.monitor.enrich(), e => e.code === 'GITHUB_TASK_TIMEOUT'); await started.promise;
+  const active = c.monitor.summary().health.activeTasks.details;
+  assert.equal(active.stage, 'compare'); assert.equal(active.repo, GITHUB_REPOSITORIES[0]); assert.equal(active.deadlineAt - active.startedAt, 20);
+  await work; assert.deepEqual(c.monitor.summary().health.activeTasks, {});
+  const restarted = fixture(structuredClone(c.persisted)); restarted.advance(2000);
+  restarted.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } }); await restarted.monitor.enrich();
+  assert.equal(restarted.persisted.githubMonitor.jobs[0].stage, 'files'); assert.equal(restarted.persisted.githubMonitor.jobs[0].workId, undefined);
 });

@@ -29,7 +29,7 @@ function extractNodeEvalScripts(source) {
   return [...source.matchAll(/node -e "([\s\S]*?)"(?:\s+2>\/dev\/null)?/g)].map(match => match[1].replaceAll("'/root/monitor-suite/shared/display-format.cjs'", JSON.stringify(join(process.cwd(), 'shared/display-format.cjs'))));
 }
 
-function renderFourmemeStatus(snapshot) {
+function renderFourmemeStatus(snapshot, runtime = {}) {
   const source = extractHeredoc("fm-status");
   const script = extractNodeEvalScripts(source).find(item => item.includes("openFourTemplates"));
   assert.ok(script, "未找到 Four.meme 快照状态渲染器");
@@ -37,7 +37,8 @@ function renderFourmemeStatus(snapshot) {
   const snapshotPath = join(dir, "snapshot.json");
   try {
     writeFileSync(snapshotPath, JSON.stringify(snapshot), "utf-8");
-    const runnable = script.replace("'$SNAP'", JSON.stringify(snapshotPath));
+    writeFileSync(join(dir, "runtime-metrics.json"), JSON.stringify(runtime), "utf-8");
+    const runnable = script.replaceAll("'$SNAP'", JSON.stringify(snapshotPath));
     const result = spawnSync(process.execPath, ["-e", runnable], { encoding: "utf-8" });
     assert.equal(result.status, 0, result.stderr);
     return result.stdout;
@@ -440,4 +441,15 @@ test('fm-status newly discovered repository remains pending until its first succ
 test('fm-status isolates unavailable GitHub repositories and displays retained detail gaps',()=>{
   const text=renderFourmemeStatus({githubMonitor:{repos:{'flap-sh/missing':{name:'flap-sh/missing',head:'a'.repeat(40),branch:'main',availability:'unavailable',lastHeadError:'仓库不可访问',headRetryAt:1800000000000,checkedAt:1799999000000}},jobs:[{repo:'flap-sh/missing',lastError:'HTTP 404',blockedReason:'base_unavailable',attempts:353}]}}).split('08｜📦 GitHub')[1];
   assert.match(text,/异常仓库：1/);assert.match(text,/仓库不可访问/);assert.match(text,/最近检查/);assert.match(text,/原提交不可访问/);assert.match(text,/等待仓库恢复/);
+});
+
+test('fm-status distinguishes GitHub detail stalls, active deadlines and retained resource waits', () => {
+  const runtime = { github: { health: { detailsStatus: 'waiting', readyDetails: 0, lastProgressAt: 1794898172889,
+    details: { active: true, reason: '详情单轮超时', recoveries: 2 },
+    activeTasks: { discovery: { startedAt: 1794898172889, deadlineAt: 1794898232889 } } },
+    requests: { restPending: 1, hardTimeouts: 3, queueTimeouts: 1 } } };
+  const text = renderFourmemeStatus({ githubMonitor: { repos: {}, jobs: [] } }, runtime).split('08｜📦 GitHub')[1];
+  assert.match(text, /等待首条送达、重试或历史资源恢复/);
+  assert.match(text, /详情停滞告警/); assert.match(text, /已触发恢复 2 次/); assert.match(text, /强制截止/);
+  assert.match(text, /请求强制超时：3/); assert.match(text, /排队超时：1/);
 });

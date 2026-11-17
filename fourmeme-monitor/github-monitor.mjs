@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { Agent } from "undici";
 import { formatBeijingTime } from "../shared/display-format.cjs";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { createDeadlineSignal, withAbortSignal, withDeadline } from "../shared/request-deadline.mjs";
 
 export const GITHUB_DISCOVERY_OWNERS = ["four-meme-community", "flap-sh"];
 
@@ -40,14 +42,14 @@ export function createGithubTransport({ fetchImpl = fetch, makeAgent = () => new
       if (!pool) return;
       pools.delete(lane);
       resets[lane]++;
-      void Promise.resolve(pool.destroy()).catch(() => {});
+      void Promise.resolve().then(() => pool.destroy()).catch(() => {});
     },
     summary: () => ({ connectionResets: { ...resets } }),
-    async close() { const all = [...pools.values()]; pools.clear(); await Promise.allSettled(all.map(pool => pool.destroy())); },
+    async close() { const all = [...pools.values()]; pools.clear(); await Promise.allSettled(all.map(pool => withDeadline(() => pool.destroy(), 2000))); },
   };
 }
 
-export function createGithubApi({ token, fetchImpl = fetch, transport, now = Date.now, onRequest = () => {} }) {
+export function createGithubApi({ token, fetchImpl = fetch, transport, now = Date.now, onRequest = () => {}, requestTimeoutMs = 10_000, queueTimeoutMs = 15_000 }) {
   const budgets = {};
   const retryAt = { graphql: 0, rest: 0 };
   const failures = { graphql: 0, rest: 0 };
@@ -58,6 +60,8 @@ export function createGithubApi({ token, fetchImpl = fetch, transport, now = Dat
   const cooldownReasons = { graphql: "", rest: "", shared: "" };
   const diagnostics = {};
   const durations = { graphql: [], rest: [] };
+  const active = {};
+  let queuedRest = 0, queueTimeouts = 0, hardTimeouts = 0;
 
   function pause(lane, until, reason) {
     if (!Number.isFinite(until)) return;
@@ -69,7 +73,8 @@ export function createGithubApi({ token, fetchImpl = fetch, transport, now = Dat
     }
   }
 
-  async function request(path, query, queuedAt = now()) {
+  async function request(path, query, queuedAt = now(), parentSignal) {
+    parentSignal?.throwIfAborted();
     const lane = query ? "graphql" : "rest";
     if (!token?.trim()) throw new Error("GitHub 2秒监控需要 GITHUB_TOKEN；未发送匿名请求");
     const readyAt = Math.max(sharedRetryAt, retryAt[lane]);
@@ -86,49 +91,63 @@ export function createGithubApi({ token, fetchImpl = fetch, transport, now = Dat
     let status = 0;
     let phase = "connect-or-headers";
     let kind = "network";
+    const deadline = createDeadlineSignal(requestTimeoutMs, parentSignal, "GitHub 请求超过强制截止时间");
+    const attempt = { path, startedAt, queuedAt, deadlineAt: startedAt + requestTimeoutMs, phase };
+    active[lane] = attempt;
     try {
-      onRequest();
-      const response = await (transport ? transport.fetch : fetchImpl)(`https://api.github.com${path}`, {
-        method: query ? "POST" : "GET",
-        headers: { Authorization: `Bearer ${token.trim()}`, Accept: "application/vnd.github+json", "User-Agent": "fourmeme-monitor", "X-GitHub-Api-Version": "2022-11-28", ...(query ? { "Content-Type": "application/json" } : {}) },
-        ...(query ? { body: JSON.stringify({ query }) } : {}),
-        signal: AbortSignal.timeout(10_000),
-      });
-      status = response.status;
-      headersAt = now();
-      phase = "body";
-      const remaining = response.headers.get("x-ratelimit-remaining");
-      const reset = response.headers.get("x-ratelimit-reset");
-      if (remaining !== null && reset !== null) budgets[lane] = { remaining: Number(remaining), resetAt: Number(reset) * 1000 };
-      if (budgets[lane]?.remaining <= 100) pause(lane, budgets[lane].resetAt + 1000, "主额度保留等待");
-      const retryAfter = response.headers.get("retry-after");
-      if (retryAfter !== null) pause("shared", now() + (Number.isFinite(Number(retryAfter)) ? Math.max(0, Number(retryAfter)) * 1000 : Math.max(0, Date.parse(retryAfter) - now())), "服务端 Retry-After");
-      const pollInterval = Number(response.headers.get("x-poll-interval"));
-      if (pollInterval > 0) pause(lane, now() + pollInterval * 1000, "服务端 X-Poll-Interval");
-      if (!response.ok) {
-        kind = response.status === 429 ? "rate-limit" : response.status === 403 ? "forbidden" : response.status === 401 ? "auth" : response.status >= 500 ? "server" : "http";
-        await response.body?.cancel();
-        throw new Error(`GitHub ${lane} HTTP ${response.status}`);
-      }
-      const data = await response.json();
-      if (query && data.data?.rateLimit) {
-        const rate = data.data.rateLimit;
-        budgets.graphql = { cost: rate.cost, remaining: rate.remaining, resetAt: Date.parse(rate.resetAt) };
-        if (rate.remaining <= 100) pause("graphql", Date.parse(rate.resetAt) + 1000, "主额度保留等待");
-        else budgetReadyAt = startedAt + Math.ceil(rate.cost * Math.max(0, Date.parse(rate.resetAt) - startedAt) / (rate.remaining - 100));
-      }
-      if (query && data.errors?.some(error => error.type === "RATE_LIMITED" || /rate limit|abuse|secondary/i.test(error.message))) {
-        kind = "rate-limit";
-        throw new Error("GitHub GraphQL 限流，保留游标");
-      }
-      failures[lane] = 0;
-      const durationMs = Math.max(0, now() - startedAt);
-      durations[lane].push(durationMs);
-      if (durations[lane].length > 120) durations[lane].shift();
-      const ordered = [...durations[lane]].sort((left, right) => left - right);
-      diagnostics[lane] = { ...diagnostics[lane], lastSuccessAt: now(), lastDurationMs: durationMs, queueMs: startedAt - queuedAt, headersMs: headersAt - startedAt, bodyMs: now() - headersAt, consecutiveFailures: 0, successSamples: ordered.length, successP95Ms: ordered[Math.ceil(ordered.length * 0.95) - 1], successMaxMs: ordered.at(-1) };
-      return { data, hasNext: /rel="next"/.test(response.headers.get("link") || "") };
+      return await withAbortSignal(async signal => {
+        onRequest();
+        const response = await (transport ? transport.fetch : fetchImpl)(`https://api.github.com${path}`, {
+          method: query ? "POST" : "GET",
+          headers: { Authorization: `Bearer ${token.trim()}`, Accept: "application/vnd.github+json", "User-Agent": "fourmeme-monitor", "X-GitHub-Api-Version": "2022-11-28", ...(query ? { "Content-Type": "application/json" } : {}) },
+          ...(query ? { body: JSON.stringify({ query }) } : {}),
+          signal,
+        });
+        signal.throwIfAborted();
+        status = response.status;
+        headersAt = now();
+        phase = "body";
+        attempt.phase = phase;
+        const remaining = response.headers.get("x-ratelimit-remaining");
+        const reset = response.headers.get("x-ratelimit-reset");
+        if (remaining !== null && reset !== null) budgets[lane] = { remaining: Number(remaining), resetAt: Number(reset) * 1000 };
+        if (budgets[lane]?.remaining <= 100) pause(lane, budgets[lane].resetAt + 1000, "主额度保留等待");
+        const retryAfter = response.headers.get("retry-after");
+        if (retryAfter !== null) pause("shared", now() + (Number.isFinite(Number(retryAfter)) ? Math.max(0, Number(retryAfter)) * 1000 : Math.max(0, Date.parse(retryAfter) - now())), "服务端 Retry-After");
+        const pollInterval = Number(response.headers.get("x-poll-interval"));
+        if (pollInterval > 0) pause(lane, now() + pollInterval * 1000, "服务端 X-Poll-Interval");
+        if (!response.ok) {
+          kind = response.status === 429 ? "rate-limit" : response.status === 403 ? "forbidden" : response.status === 401 ? "auth" : response.status >= 500 ? "server" : "http";
+          // Cleanup is advisory; an uncooperative stream must not hold the queue.
+          void Promise.resolve().then(() => response.body?.cancel()).catch(() => {});
+          transport?.reset(lane);
+          throw new Error(`GitHub ${lane} HTTP ${response.status}`);
+        }
+        const data = await response.json();
+        signal.throwIfAborted(); // Late bodies must not overwrite fresh budgets/health.
+        if (query && data.data?.rateLimit) {
+          const rate = data.data.rateLimit;
+          budgets.graphql = { cost: rate.cost, remaining: rate.remaining, resetAt: Date.parse(rate.resetAt) };
+          if (rate.remaining <= 100) pause("graphql", Date.parse(rate.resetAt) + 1000, "主额度保留等待");
+          else budgetReadyAt = startedAt + Math.ceil(rate.cost * Math.max(0, Date.parse(rate.resetAt) - startedAt) / (rate.remaining - 100));
+        }
+        if (query && data.errors?.some(error => error.type === "RATE_LIMITED" || /rate limit|abuse|secondary/i.test(error.message))) {
+          kind = "rate-limit";
+          throw new Error("GitHub GraphQL 限流，保留游标");
+        }
+        failures[lane] = 0;
+        const durationMs = Math.max(0, now() - startedAt);
+        durations[lane].push(durationMs);
+        if (durations[lane].length > 120) durations[lane].shift();
+        const ordered = [...durations[lane]].sort((left, right) => left - right);
+        diagnostics[lane] = { ...diagnostics[lane], lastSuccessAt: now(), lastDurationMs: durationMs, queueMs: startedAt - queuedAt, headersMs: headersAt - startedAt, bodyMs: now() - headersAt, consecutiveFailures: 0, successSamples: ordered.length, successP95Ms: ordered[Math.ceil(ordered.length * 0.95) - 1], successMaxMs: ordered.at(-1) };
+        return { data, hasNext: /rel="next"/.test(response.headers.get("link") || "") };
+      }, deadline.signal);
     } catch (error) {
+      if (deadline.signal.aborted && /TimeoutError/.test(deadline.signal.reason?.name || "")) {
+        kind = "timeout";
+        hardTimeouts++;
+      }
       // A missing comparison/repository is not a failure of the REST lane.
       const resourceError = kind === "http" && [404, 409, 410, 422].includes(status);
       if (!resourceError) failures[lane]++;
@@ -147,18 +166,36 @@ export function createGithubApi({ token, fetchImpl = fetch, transport, now = Dat
       diagnostics[lane] = { ...diagnostics[lane], ...detail, failureCount: (diagnostics[lane]?.failureCount || 0) + 1 };
       const label = kind === "rate-limit" ? "限流" : kind;
       throw Object.assign(new Error(`GitHub ${lane} ${label}${status ? ` HTTP ${status}` : ""}，阶段 ${phase}，错误码 ${errorCode}，耗时 ${detail.durationMs}ms${resourceError ? "，仅影响当前资源" : `，最早恢复 ${formatBeijingTime(detail.retryAt)}`}`), { code: resourceError ? "GITHUB_RESOURCE_UNAVAILABLE" : "GITHUB_REQUEST_FAILED", ...detail });
+    } finally {
+      deadline.dispose();
+      if (active[lane] === attempt) delete active[lane];
     }
   }
 
   return {
-    heads: async names => (await request("/graphql", buildHeadQuery(names))).data,
-    rest(path) {
+    heads: async (names, { signal } = {}) => (await request("/graphql", buildHeadQuery(names), now(), signal)).data,
+    async rest(path, { signal } = {}) {
       const queuedAt = now();
-      const result = restQueue.then(() => request(path, undefined, queuedAt));
+      const waiting = createDeadlineSignal(queueTimeoutMs, signal, "GitHub REST 排队超过截止时间");
+      let started = false;
+      queuedRest++;
+      const result = restQueue.then(() => {
+        waiting.signal.throwIfAborted();
+        started = true;
+        waiting.dispose();
+        return request(path, undefined, queuedAt, signal);
+      });
       restQueue = result.catch(() => {});
-      return result;
+      try { return await withAbortSignal(() => result, waiting.signal); }
+      catch (error) {
+        if (!started && waiting.signal.aborted && !signal?.aborted) {
+          queueTimeouts++;
+          throw Object.assign(new Error("GitHub REST 排队超时，已取消未开始的请求"), { code: "GITHUB_QUEUE_TIMEOUT", kind: "timeout", phase: "queue", retryAt: now() + 2000 });
+        }
+        throw error;
+      } finally { queuedRest--; waiting.dispose(); }
     },
-    summary: () => ({ budgets: structuredClone(budgets), retryAt: { ...retryAt }, sharedRetryAt, budgetReadyAt, budgetWaits, cooldownReasons: { ...cooldownReasons }, diagnostics: structuredClone(diagnostics), ...transport?.summary() }),
+    summary: () => ({ budgets: structuredClone(budgets), retryAt: { ...retryAt }, sharedRetryAt, budgetReadyAt, budgetWaits, cooldownReasons: { ...cooldownReasons }, diagnostics: structuredClone(diagnostics), requests: { active: structuredClone(active), restPending: queuedRest, queueTimeouts, hardTimeouts }, ...transport?.summary() }),
   };
 }
 
@@ -170,31 +207,106 @@ function freshState(snapshot) {
   return { version: 1, repos, jobs: [], lastHeadAt: 0, lastDiscoveryAt: 0, lastDetailAt: 0 };
 }
 
-export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () => undefined, wake = () => {}, stopped = () => false }) {
+export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () => undefined, wake = () => {}, stopped = () => false,
+  taskTimeouts = {}, stallMs = 60_000, resume = () => {} }) {
   let commits = Promise.resolve();
-  const running = new Set();
+  const running = new Map();
+  const taskContext = new AsyncLocalStorage();
+  const timeouts = { heads: 20_000, details: 30_000, discovery: 60_000, ...taskTimeouts };
+  let checkingHealth = false, eligibleSince = null, observedProgress = 0, lastRecoveryAt = 0;
   const headGaps = [];
   let lastDelivery = null;
   const view = () => store.state.githubMonitor || freshState(store.state);
+  function assertActive(attempt = taskContext.getStore()) {
+    if (!attempt) return;
+    attempt.signal.throwIfAborted();
+    if (stopped() || running.get(attempt.lane) !== attempt) throw Object.assign(new Error("GitHub 过期任务结果已隔离"), { code: "GITHUB_STALE_TASK" });
+  }
   function change(fn) {
+    const attempt = taskContext.getStore();
     const result = commits.then(() => {
+      assertActive(attempt);
       if (stopped()) return;
       return store.transaction(async () => {
+        assertActive(attempt);
         store.state.githubMonitor ||= freshState(store.state);
         await fn(store.state.githubMonitor);
-      });
+        assertActive(attempt);
+      }, { signal: attempt?.signal });
     });
     commits = result.catch(() => {});
     return result;
   }
+  const laneName = lane => ({ details: "详情", discovery: "仓库发现", heads: "提交探测" })[lane];
+  async function incident(state, lane, reason) {
+    state.health ||= {};
+    const previous = state.health[lane] || {};
+    state.health[lane] = { ...previous, active: true, since: previous.active ? previous.since : now(), lastRecoveryAt: now(), recoveries: (previous.recoveries || 0) + 1, reason };
+    if (!previous.active) await store.enqueue({ title: `GitHub ${laneName(lane)}通道停滞`, content: `${reason}\n已隔离失效工作并恢复调度；提交基线、历史缺口、分页进度和待发记录均保留。\n恢复请求仍遵守服务端限流。`, template: "yellow", skipAi: true });
+  }
+  async function recovered(state, lane) {
+    const health = state.health?.[lane];
+    if (!health?.active) return;
+    await store.enqueue({ title: `GitHub ${laneName(lane)}通道恢复`, content: "已完成实际采集并成功保存进度；继续处理保留的任务。历史404等缺口仍单独保留，不表示全部详情已补齐。", template: "green", skipAi: true });
+    Object.assign(health, { active: false, recoveredAt: now() });
+  }
   async function guarded(lane, fn) {
     if (running.has(lane) || stopped()) return;
-    running.add(lane);
-    try { return await fn(); } finally { running.delete(lane); }
+    const deadline = createDeadlineSignal(timeouts[lane], undefined, `GitHub ${laneName(lane)}单轮超过截止时间`);
+    const attempt = { id: randomUUID(), lane, signal: deadline.signal, startedAt: now(), deadlineAt: now() + timeouts[lane] };
+    running.set(lane, attempt);
+    try { return await withAbortSignal(() => taskContext.run(attempt, () => fn(attempt.signal)), attempt.signal); }
+    catch (error) {
+      if (attempt.signal.aborted && !stopped()) {
+        const reason = `GitHub ${laneName(lane)}单轮超过${timeouts[lane] / 1000}秒，已取消本轮`;
+        await taskContext.run(undefined, () => change(async state => {
+          const job = state.jobs.find(item => item.id === attempt.jobId && item.workId === attempt.id);
+          if (job) {
+            delete job.workId;
+            job.attempts = (job.attempts || 0) + 1;
+            job.lastError = reason;
+            job.retryAt = Math.max(job.retryAt || 0, now() + 2000);
+          }
+          await incident(state, lane, reason);
+        }));
+        wake();
+        throw Object.assign(new Error(reason), { code: "GITHUB_TASK_TIMEOUT", kind: "timeout" });
+      }
+      throw error;
+    } finally {
+      deadline.dispose();
+      if (running.get(lane) === attempt) running.delete(lane);
+    }
+  }
+
+  function detailHealth() {
+    const state = view(), pending = new Set((store.state._notificationOutbox || []).map(entry => entry.id));
+    const ready = state.jobs.filter(job => !job.blockedReason && (job.retryAt || 0) <= now() && !pending.has(job.noticeId) && state.repos[job.repo]?.availability !== "unavailable");
+    const apiState = api.summary();
+    const cooldownUntil = Math.max(apiState.retryAt?.rest || 0, apiState.sharedRetryAt || 0);
+    const active = running.get("details");
+    return { ready: cooldownUntil > now() ? [] : ready, status: cooldownUntil > now() ? "cooldown" : active ? "running" : ready.length ? "pending" : state.jobs.length ? "waiting" : "idle", cooldownUntil, lastProgressAt: state.lastDetailAt || 0 };
+  }
+  // Reuses the independent 1s outbox tick; does not await a scan Promise.
+  async function checkHealth() {
+    if (checkingHealth || stopped()) return;
+    checkingHealth = true;
+    try {
+      const health = detailHealth();
+      if (!health.ready.length) { eligibleSince = null; return; }
+      if (health.lastProgressAt !== observedProgress) { observedProgress = health.lastProgressAt; eligibleSince = now(); }
+      eligibleSince ??= now();
+      if (now() - eligibleSince < stallMs || (lastRecoveryAt && now() - lastRecoveryAt < stallMs)) return;
+      await change(state => incident(state, "details", `有${health.ready.length}项可处理详情，连续${Math.floor((now() - eligibleSince) / 1000)}秒没有成功保存进度`));
+      lastRecoveryAt = now();
+      wake();
+      // Active tasks have their own hard deadline. Only resume idle work.
+      if (!running.has("details")) resume("details");
+    } finally { checkingHealth = false; }
   }
 
   async function pollHeads() {
-    return guarded("heads", async () => {
+    return guarded("heads", async signal => {
       const names = Object.keys(view().repos).filter(name => !(view().repos[name].headRetryAt > now()));
       if (!names.length) return { checked: 0, failed: 0 };
       const errors = [];
@@ -203,7 +315,8 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
       const offset = savedOffset < names.length ? savedOffset : 0;
       {
         const batch = names.slice(offset, offset + 25);
-        const response = await api.heads(batch);
+        const response = await api.heads(batch, { signal });
+        assertActive();
         await change(async state => {
           for (const [index, name] of batch.entries()) {
             const previous = state.repos[name];
@@ -251,6 +364,7 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
           }
           if (checked) {
             state.lastHeadAt = now();
+            await recovered(state, "heads");
           }
           state.lastHeadAttemptAt = now();
           state.headOffset = offset + 25 >= names.length ? 0 : offset + 25;
@@ -269,14 +383,15 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
   }
 
   async function discover() {
-    return guarded("discovery", async () => {
+    return guarded("discovery", async signal => {
       const found = new Map();
       // Publish only after both accounts are fully read. A failed account/page
       // must not make its previous repositories look deleted. Existing v1
       // snapshots acquire the new account through this same discovery path.
       for (const owner of GITHUB_DISCOVERY_OWNERS) {
         for (let page = 1; ; page++) {
-          const response = await api.rest(`/users/${owner}/repos?per_page=100&sort=full_name&direction=asc&page=${page}`);
+          const response = await api.rest(`/users/${owner}/repos?per_page=100&sort=full_name&direction=asc&page=${page}`, { signal });
+          assertActive();
           if (!Array.isArray(response.data) || response.data.some(repo => !repo.full_name || !repo.node_id || repo.full_name.split("/")[0].toLowerCase() !== owner.toLowerCase())) throw new Error("GitHub 仓库列表响应不完整或账号不匹配");
           for (const repo of response.data) found.set(repo.node_id, repo);
           if (!response.hasNext) break;
@@ -308,27 +423,36 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
         }
         state.catalog = catalog;
         state.lastDiscoveryAt = now();
+        await recovered(state, "discovery");
       });
       wake();
     });
   }
 
   async function enrich() {
-    return guarded("details", async () => {
+    return guarded("details", async signal => {
       const pending = new Set((store.state._notificationOutbox || []).map(entry => entry.id));
       const job = structuredClone(view().jobs.find(item => item.retryAt <= now() && !pending.has(item.noticeId) && view().repos[item.repo]?.availability !== "unavailable"));
       if (!job) return false;
+      const attempt = taskContext.getStore();
+      attempt.jobId = job.id; attempt.repo = job.repo; attempt.stage = job.stage;
+      await change(state => {
+        const current = state.jobs.find(item => item.id === job.id);
+        if (current) { current.workId = attempt.id; current.lastAttemptAt = now(); }
+      });
       try {
         if (job.recoveryProbe) {
           const probe = job.recoveryProbe;
           const probeSha = probe === "base" ? job.base : probe === "commit" ? job.commits[job.index]?.sha || job.head : job.head;
           const path = probe === "repo" ? `/repos/${job.repo}` : `/repos/${job.repo}/commits/${probeSha}`;
-          const result = await api.rest(path);
+          const result = await api.rest(path, { signal });
+          assertActive();
           if (probe === "repo" ? !result.data.full_name : result.data.sha !== probeSha) throw new Error("GitHub 恢复探测响应不完整");
           job.recoveryProbe = probe === "repo" ? (job.stage === "compare" && job.base ? "base" : "commit") : probe === "base" ? "head" : "";
           if (!job.recoveryProbe) job.blockedReason = "";
         } else if (job.stage === "compare") {
-          const result = await api.rest(`/repos/${job.repo}/compare/${job.base}...${job.head}?per_page=100&page=${job.page}`);
+          const result = await api.rest(`/repos/${job.repo}/compare/${job.base}...${job.head}?per_page=100&page=${job.page}`, { signal });
+          assertActive();
           if (!Array.isArray(result.data.commits) || !["ahead", "behind", "diverged", "identical"].includes(result.data.status)) throw new Error("GitHub compare 响应不完整");
           job.status = result.data.status;
           for (const commit of result.data.commits) {
@@ -343,7 +467,8 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
           }
         } else if (job.index < job.commits.length) {
           const sha = job.commits[job.index].sha;
-          const result = await api.rest(`/repos/${job.repo}/commits/${sha}?per_page=100&page=${job.page}`);
+          const result = await api.rest(`/repos/${job.repo}/commits/${sha}?per_page=100&page=${job.page}`, { signal });
+          assertActive();
           if (result.data.sha !== sha || !Array.isArray(result.data.files)) throw new Error("GitHub commit 文件响应不完整");
           job.message = result.data.commit?.message || sha;
           job.committedAt = result.data.commit?.committer?.date || "";
@@ -367,9 +492,12 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
         await change(async state => {
           const index = state.jobs.findIndex(item => item.id === job.id);
           if (index < 0) return;
+          if (state.jobs[index].workId !== attempt.id) throw Object.assign(new Error("GitHub 详情任务已由新轮次接管"), { code: "GITHUB_STALE_TASK" });
           // Discovery/head polling may have renamed this repository while REST
           // was in flight. Never restore the stale name from the detached job.
           job.repo = state.jobs[index].repo;
+          job.lastAttemptAt = state.jobs[index].lastAttemptAt;
+          delete job.workId;
           if (job.notification) {
             await store.enqueue(job.notification);
             delete job.notification;
@@ -382,13 +510,16 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
             state.jobs.push({ ...job, attempts: job.recoveryProbe ? job.attempts : 0, retryAt: 0, lastError: job.recoveryProbe ? job.lastError : "" });
           }
           state.lastDetailAt = now();
+          await recovered(state, "details");
         });
         wake();
         return true;
       } catch (error) {
+        assertActive(); // Expired workers cannot overwrite a newer lease.
         await change(async state => {
           const original = state.jobs.find(item => item.id === job.id);
-          if (!original) return;
+          if (!original || original.workId !== attempt.id) return;
+          delete original.workId;
           if (error.code === "GITHUB_COOLDOWN" || error.code === "GITHUB_BUDGET_WAIT") {
             original.retryAt = error.retryAt;
             return;
@@ -414,7 +545,7 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
   }
 
   return {
-    pollHeads, discover, enrich,
+    pollHeads, discover, enrich, checkHealth,
     recordDelivery(payload) {
       if (payload.github) lastDelivery = { ...payload.github, sentAt: now(), delayMs: Math.max(0, now() - payload.github.detectedAt) };
     },
@@ -422,7 +553,9 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
       const state = view();
       const gaps = headGaps.map(item => item.gap).filter(value => value > 0).sort((a,b) => a-b);
       const pending = (store.state._notificationOutbox || []).filter(entry => entry.payload?.github || entry.payload?.title?.startsWith("GitHub"));
-      return { repositories: Object.values(state.repos).map(({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs }) => ({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs })), lastHeadAt: state.lastHeadAt, headErrors: state.headErrors || [], lastDiscoveryAt: state.lastDiscoveryAt, lastDetailAt: state.lastDetailAt, pendingDetails: state.jobs.length, oldestDetailAt: state.jobs.length ? Math.min(...state.jobs.map(job => job.createdAt)) : 0, detailErrors: state.jobs.filter(job => job.lastError).map(({ repo, lastError, retryAt, blockedReason }) => ({ repo, lastError, retryAt, blockedReason })), headIntervals: { samples: gaps.length, p95Ms: gaps[Math.ceil(gaps.length * .95)-1] || 0, maxMs: gaps.at(-1) || 0 }, delivery: { pending: pending.length, oldestAt: pending.length ? Math.min(...pending.map(item=>item.createdAt)) : 0, last: lastDelivery ? { ...lastDelivery } : null }, ...api.summary() };
+      const health = detailHealth();
+      const taskStatus = Object.fromEntries([...running].map(([lane, { id, startedAt, deadlineAt, jobId, repo, stage }]) => [lane, { id, startedAt, deadlineAt, jobId, repo, stage }]));
+      return { health: { ...structuredClone(state.health || {}), detailsStatus: health.status, readyDetails: health.ready.length, lastProgressAt: health.lastProgressAt, eligibleSince, activeTasks: taskStatus }, repositories: Object.values(state.repos).map(({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs }) => ({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs })), lastHeadAt: state.lastHeadAt, headErrors: state.headErrors || [], lastDiscoveryAt: state.lastDiscoveryAt, lastDetailAt: state.lastDetailAt, pendingDetails: state.jobs.length, oldestDetailAt: state.jobs.length ? Math.min(...state.jobs.map(job => job.createdAt)) : 0, detailErrors: state.jobs.filter(job => job.lastError).map(({ repo, lastError, retryAt, blockedReason }) => ({ repo, lastError, retryAt, blockedReason })), headIntervals: { samples: gaps.length, p95Ms: gaps[Math.ceil(gaps.length * .95)-1] || 0, maxMs: gaps.at(-1) || 0 }, delivery: { pending: pending.length, oldestAt: pending.length ? Math.min(...pending.map(item=>item.createdAt)) : 0, last: lastDelivery ? { ...lastDelivery } : null }, ...api.summary() };
     },
   };
 }

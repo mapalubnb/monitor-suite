@@ -10266,6 +10266,9 @@ const githubMonitor = createGithubMonitor({
   api: githubApi,
   saveDiff: saveDiffLocally,
   stopped: () => monitorStopping,
+  resume: lane => {
+    if (lane === "details" && !monitorStopping) void modules.find(module => module.name === "githubDetails")?.run().catch(error => log(`[GitHub 详情恢复] ${error.message}`));
+  },
   wake: () => {
     if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[GitHub 推送] ${error.message}`));
   },
@@ -10327,7 +10330,10 @@ async function startAllModules() {
     onError: error => log(`[启动通知] 发送／更新状态：${error.message}`),
   });
   void startupNotifier.refresh();
-  outboxTimer = setInterval(() => monitorStore.drain().catch(err => log(`[待发送] 落盘失败：${err.message}`)), 1_000);
+  outboxTimer = setInterval(() => {
+    void monitorStore.drain().catch(err => log(`[待发送] 落盘失败：${err.message}`));
+    void githubMonitor.checkHealth().catch(err => log(`[GitHub 健康检查] ${err.message}`));
+  }, 1_000);
   void monitorStore.drain().catch(err => log(err.message));
   if (actorRunner && CONFIG.actorMonitor.enabled) global.__actorBlockFeed = startActorBlockFeed(actorRunner);
   if (CONFIG.openFourRegistryLogMonitor.enabled) global.__openFourRegistryLogFeed = startOpenFourRegistryLogFeed();

@@ -463,6 +463,15 @@ if [ -f "$SNAP" ]; then
     section('08｜📦 GitHub');
     console.log('仓库：'+repoEntries.length+' 个｜待补详情：'+(hasNewGithub?githubJobs.length+' 项':'旧版未记录'));
     const ghRuntime=runtime.github||{};
+    const ghHealth=ghRuntime.health||{};
+    const ghHealthNames={idle:'无待处理任务',pending:'等待处理',running:'处理中',waiting:'等待首条送达、重试或历史资源恢复',cooldown:'遵守服务端冷却'};
+    if(ghHealth.detailsStatus) console.log('详情通道：'+(ghHealthNames[ghHealth.detailsStatus]||ghHealth.detailsStatus)+'｜可处理 '+(ghHealth.readyDetails||0)+' 项｜最近成功推进 '+fmtTime(ghHealth.lastProgressAt));
+    for(const [lane,label] of [['details','详情'],['discovery','仓库发现'],['heads','提交探测']]){
+      const health=ghHealth[lane],task=(ghHealth.activeTasks||{})[lane];
+      if(health&&health.active) console.log(label+'停滞告警：'+warn(cleanLabel(health.reason))+'｜已触发恢复 '+health.recoveries+' 次');
+      if(task) console.log(label+'正在执行：'+cleanLabel(task.repo||lane)+'｜开始 '+fmtTime(task.startedAt)+'｜强制截止 '+fmtTime(task.deadlineAt));
+    }
+    if(ghRuntime.requests) console.log('REST待完成：'+ghRuntime.requests.restPending+'｜请求强制超时：'+ghRuntime.requests.hardTimeouts+'｜排队超时：'+ghRuntime.requests.queueTimeouts);
     const unhealthy=repoEntries.filter(repo=>repo.availability&&repo.availability!=='healthy').length;
     console.log('异常仓库：'+unhealthy+' 个（独立恢复探测，保留基线）');
     if(ghRuntime.headIntervals) console.log('最近成功检查间隔：P95 '+(ghRuntime.headIntervals.p95Ms/1000).toFixed(2)+'s｜最大 '+(ghRuntime.headIntervals.maxMs/1000).toFixed(2)+'s');
