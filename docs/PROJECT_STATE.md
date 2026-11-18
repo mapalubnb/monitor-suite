@@ -1,5 +1,13 @@
 # 项目状态与独立发布
 
+## 2026/11/18 Four.meme Safe 已独立上线
+
+Suite1.12.91 / Four.meme1.5.30，业务提交4b3a566d0e396523245a456df0af9d5696fffd86先GitHub后服务器；14:48仅Four.meme重启为169693，Flap1799/机器人1792及其余服务不变。fm-status新增09栏，3/7核心Safe，普通10秒/活跃5秒、身份60秒复核，AI关闭。原13项Four.meme及14项Flap周期、环境指纹不变。
+
+本地和服务器全量828/828、专项78/78通过。nonce150/151真实合并首卡已从飞书完整读回，金额/成员标签正确、无AI或重复首报，生成到发送1005ms。364.425秒/365样本捕获74个提案成功检查时间，间隔P50 5000ms/P95 5317ms/最大6132ms；一次身份复核失败保留旧值且提案读取继续，下一轮恢复。Flap持续成功；原2项GitHub历史详情、393条创建者去重、23个合约观察地址、历史游标及Flap11个Safe/311个提案保留。
+
+Safe账户额度仍共用，部分原账户已耗尽；另有既有公共API502和磁盘仅约185MiB，未扩大修改范围，不保证公网或推送长期零延迟。备份/root/monitor-suite-backups/fourmeme-safe-20261118-1.12.91，完整证据与限制见Four.meme HANDOFF顶部。此次验收文档同步无需重启。
+
 ## 2026/11/18 Four.meme 独立 Safe 监控（Suite1.12.91 / Four.meme1.5.30）
 
 将BSC核心Safe 0x161dd0CfDb0aa25E2504F725655ef9b799375b71接入Four.meme自身进程、snapshot.fourmemeSafe及原子待发队列，fm-status新增09栏。普通10秒、存在pending/ready/confirming提案时5秒；每60秒固定区块复核owners、threshold和singleton。GitHub2秒、合约1秒及其余原13项调度、Flap进程/状态、历史缺口和去重均不变，Four.meme AI始终关闭。

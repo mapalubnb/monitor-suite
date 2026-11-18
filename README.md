@@ -12,7 +12,7 @@ RPC/API有界请求、单轮30秒硬截止，采集在隔离副本进行；状�
 
 配置：FOURMEME_SAFE_MONITOR默认true；FOURMEME_SAFE_API_KEYS或FOURMEME_SAFE_API_KEY优先，留空复用现有FLAP_SAFE_API_KEYS/FLAP_SAFE_API_KEY。两进程状态和冷却独立但共用账户总额度，不意味着配额增加；无凭证不发匿名请求。现有Flap Key配置不改，服务器既有部分账户已额度冷却，新流量仍服从Retry-After/额度。5秒仅为调度，不保证API索引和实际推送5秒内完成。
 
-改动：fourmeme-monitor/safe-monitor及测试、monitor及测试、根/模块package.json、.env.example、install及测试；Flap safe-proposal-monitor/operational-call-codec仅兼容扩展，根README、两模块HANDOFF及PROJECT_STATE同步。独立安装先复制纯函数依赖后启动Four.meme；生产只定向更新fm-status并重启Four.meme。本地全量828/828、Safe及面板专项78/78、语法与diff检查通过；服务器隔离测试和部署验收另记。磁盘约223MB，需要压缩状态备份，不删除现有用户文件。
+改动：fourmeme-monitor/safe-monitor及测试、monitor及测试、根/模块package.json、.env.example、install及测试；Flap safe-proposal-monitor/operational-call-codec仅兼容扩展，根README、两模块HANDOFF及PROJECT_STATE同步。独立安装先复制纯函数依赖后启动Four.meme；生产只定向更新fm-status并重启Four.meme。本地和服务器全量828/828、Safe及面板专项78/78、语法与diff检查通过，2026/11/18 14:48已部署。两项当前提案合并首报已完整读回，通知生成到发送1005ms、AI关闭；6分钟采样提案成功检查间隔P95 5317ms，一次身份复核失败下一轮恢复，Flap持续成功。原频率/历史/去重保留；共用API额度及磁盘约185MiB仍为运行限制，详见fourmeme-monitor/HANDOFF.md。
 
 ## 2026/11/17 GitHub详情通道强制截止与恢复（Suite1.12.90 / Four.meme1.5.29）
 
