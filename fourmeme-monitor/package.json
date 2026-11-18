@@ -1,12 +1,12 @@
 {
   "name": "fourmeme-monitor",
-  "version": "1.5.30",
-  "description": "Four.meme 全面监控（底池/前端/API/GitHub/合约/链上参数/Safe）",
+  "version": "1.5.31",
+  "description": "Four.meme 全面监控（底池/前端/API/GitHub/合约/链上参数/Safe/独立地址）",
   "type": "module",
   "private": true,
   "scripts": {
     "start": "node monitor.mjs",
     "bot": "node feishu-bot.mjs",
-    "check": "node --check monitor.mjs && node --check github-monitor.mjs && node --check creator-discovery.mjs && node --check actor-state.mjs && node --check contract-observation.mjs && node --check safe-monitor.mjs"
+    "check": "node --check monitor.mjs && node --check github-monitor.mjs && node --check creator-discovery.mjs && node --check actor-state.mjs && node --check contract-observation.mjs && node --check safe-monitor.mjs && node --check address-monitor.mjs && node --check address-catalog.mjs"
   }
 }

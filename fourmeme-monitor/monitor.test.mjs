@@ -3,7 +3,20 @@ import "./github-monitor.test.mjs";
 import "./creator-discovery.test.mjs";
 import "./contract-observation.test.mjs";
 import "./safe-monitor.test.mjs";
+import "./address-monitor.test.mjs";
 import assert from "node:assert/strict";
+
+test('地址日志RPC兼容性筛选仅影响新增模块，其他读写路由不变', () => {
+  const pools = __testables.CONFIG.rpcPools, previous = pools.logs;
+  try {
+    pools.logs = ['https://bsc-rpc.publicnode.com', 'https://rpc.48.club'];
+    const calls = [{ method: 'eth_getLogs', params: [{}] }];
+    assert.deepEqual(__testables.rpcLaneUrls(calls, 'addresses'), ['https://rpc.48.club']);
+    assert.deepEqual(__testables.rpcLaneUrls(calls, 'onchain'), pools.logs);
+    pools.logs = ['https://bsc-rpc.publicnode.com'];
+    assert.throws(() => __testables.rpcLaneUrls(calls, 'addresses'), /钱包topic/);
+  } finally { pools.logs = previous; }
+});
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -814,7 +827,7 @@ test("restart card reports process and baseline separately within one card", () 
   assert.equal(card.title, "Four.meme 监控已启动");
   assert.match(card.content, /进程已启动/);
   assert.match(card.content, /前端：每 7 秒｜API：每 10 秒/);
-  assert.match(card.content, /首轮检查：完成 0\/14/);
+  assert.match(card.content, /首轮检查：完成 0\/15/);
   assert.doesNotMatch(card.content, /全部模块首轮检查完成|监控启动中/);
   assert.ok(card.content.length < 460);
 });

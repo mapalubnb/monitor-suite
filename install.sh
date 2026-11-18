@@ -163,7 +163,7 @@ if [ "$(cd fourmeme-monitor && pwd)" != "$(cd "$FOURMEME_DIR" 2>/dev/null && pwd
   # Four.meme Safe imports only these side-effect-free Flap libraries.
   # Install them before starting Four.meme, even on the separate layout.
   mkdir -p "$FLAP_DIR"
-  for source in safe-proposal-monitor operational-call-codec safe-api-address owner-catalog early-signal-catalog vault-links factory-pool-monitor quote-token-codec vault-portal-v116; do
+  for source in safe-proposal-monitor operational-call-codec erc4337-codec safe-api-address owner-catalog early-signal-catalog vault-links factory-pool-monitor quote-token-codec vault-portal-v116; do
     cp "flap-monitor/$source.mjs" "$FLAP_DIR/"
   done
   cp fourmeme-monitor/package.json "$FOURMEME_DIR/"
@@ -518,6 +518,17 @@ if [ -f "$SNAP" ]; then
     if(safeRuntime.identityError||safeState.identityError) console.log('签名配置复核异常：'+warn(cleanLabel(safeRuntime.identityError||safeState.identityError)));
     if(safeRuntime.apiNextAttemptAt>Date.now()) console.log('重试时间：'+fmtTime(safeRuntime.apiNextAttemptAt));
     if(safeRuntime.activeTask) console.log('本轮开始：'+fmtTime(safeRuntime.activeTask.startedAt)+'｜截止：'+fmtTime(safeRuntime.activeTask.deadlineAt));
+    section('10｜👛 Four.meme 独立地址');
+    const addr=runtime.addresses||{},addrState=s.fourmemeAddresses||{},addrCatalog=addr.catalog||addrState.catalog||[];
+    console.log('监控：'+(addr.enabled===false?'已关闭':addr.enabled?'已启用':'等待首次运行')+'｜地址 '+addrCatalog.length+' 个｜AI：关闭');
+    console.log('触发：WSS 新区块＋1s HTTP 补扫｜延后 '+(addr.confirmations??1)+' 块核验｜WSS：'+(addr.feed?.connected?'已连接':'HTTP 兜底'));
+    console.log('扫描游标：'+value(addr.cursor??addrState.cursor)+'｜最新区块：'+value(addr.head??addrState.head)+'｜落后 '+value(addr.lagBlocks)+' 块');
+    console.log('启用区块：'+value(addr.activationBlock??addrState.activationBlock)+'｜启用时间：'+fmtTime(addr.activatedAt||addrState.activatedAt));
+    console.log('最近推进：'+fmtTime(addr.lastProgressAt||addrState.lastProgressAt)+'｜最近成功：'+fmtTime(addr.health?.lastSuccessAt||addrState.health?.lastSuccessAt)+'｜待发 '+(addr.pendingNotifications||0)+' 条');
+    console.log('未知资产被动事件：静默留存最近 '+(addr.passiveRecords??addrState.passive?.length??0)+' 条交易｜不含完整内部 BNB trace');
+    for(const a of addrCatalog) console.log(cleanLabel(a.label)+'｜'+bscAddress(a.address)+'｜'+cleanLabel(a.evidence));
+    if(addr.health?.lastError||addrState.health?.lastError) console.log('地址监控异常：'+warn(cleanLabel(addr.health?.lastError||addrState.health.lastError)));
+    if(addr.activeTask) console.log('本轮开始：'+fmtTime(addr.activeTask.startedAt)+'｜截止：'+fmtTime(addr.activeTask.deadlineAt));
     console.log('---');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null

@@ -1,5 +1,15 @@
 # Four.meme 监控交接
 
+## 2026/11/19 Four.meme 独立18地址监控（Suite1.12.92 / Four.meme1.5.31）
+
+用户已确认实现并部署。新增独立 addresses 模块：共享新区块WSS触发＋1000ms HTTP补扫，延后1块，最多32块/轮；RPC12秒及单轮25秒硬截止，失败保留缺口、重组核验与更正、状态及通知原子落盘。初始18地址包含用户2地址、当前公开钱包、核心Safe、Treasury/Rebate、旧钱包、4创建者和7权限关联签名人；完整目录和归属证据见 fourmeme-monitor/ADDRESS_MONITORING.md。首次从确认块启用，不灌入旧历史；个人签名人活动不等于官方行为。
+
+复用Flap纯调用/ERC4337解码和现有RPC/outbox，不改Flap状态或AI。覆盖直接BNB、主动调用、委托账户被调用、部署、Transfer/Approval及EntryPoint v0.7事件；未知资产被动日志静默留存，不能替代完整内部BNB trace。已有创建者纯部署/调用由原通道报告，地址通道补资金资产。fm-status新增10栏，原08/09及其他模块周期、历史和AI关闭状态不变。
+
+只对新模块日志请求排除不支持钱包topic查询的PublicNode；48.club/bloXroute真实只读核验通过。新模块区块/日志并行读取，遵守现有RPC预算。真实只读回放已捕获活动但未发测试卡；首次PublicNode测试暴露能力限制后修正路由。原Safe详情404退避问题未纳入本次修改。
+
+修改：address-catalog/address-monitor及测试、Four.meme入口及测试、install及面板测试、根/模块package版本、.env.example、README/目录说明/HANDOFF/PROJECT_STATE。专项279项、全量844项和语法检查已通过；后续增加的路由隔离测试及服务器部署验收另记。仅Four.meme需重启，fm-status定向替换；先GitHub再服务器、停服完整快照及parts备份，保留原环境、历史缺口和去重。短时验收不保证公网长期无延迟。
+
 ## 2026/11/18 14:55 Four.meme Safe 独立接入部署验收
 
 Suite1.12.91 / Four.meme1.5.30，业务提交4b3a566d0e396523245a456df0af9d5696fffd86先推GitHub核对SHA，再服务器快进。14:48:31仅Four.meme启动为PID169693；Flap1799、机器人1792及其他服务进程/状态不变。根/模块环境及AI配置指纹相同，原13项Four.meme和14项Flap周期逐项相同；Four.meme AI关闭。仅定向替换fm-status，09栏已实际读回Safe地址、3/7门槛、5秒周期、两项提案和待发0。

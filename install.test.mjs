@@ -454,6 +454,14 @@ test('fm-status distinguishes GitHub detail stalls, active deadlines and retaine
   assert.match(text, /请求强制超时：3/); assert.match(text, /排队超时：1/);
 });
 
+test('fm-status独立地址包含1秒补扫、目录、缺口和安装依赖', () => {
+  const text = renderFourmemeStatus({}, { addresses: { enabled: true, cursor: 100, head: 104, lagBlocks: 3, confirmations: 1,
+    catalog: [{ label: '用户指定关注地址', address: '0x088b79aaeb498d30dd32589681ac4e9b00e96f04', evidence: '归属待独立核验' }], health: { lastError: 'RPC故障，保留缺口' } } });
+  assert.match(text, /10｜👛 Four.meme 独立地址/); assert.match(text, /1s HTTP 补扫/); assert.match(text, /落后 3 块/);
+  assert.match(text, /归属待独立核验/); assert.match(text, /RPC故障，保留缺口/); assert.match(text, /08｜📦 GitHub/);
+  assert.match(installSource, /for source in safe-proposal-monitor operational-call-codec erc4337-codec/);
+});
+
 test('fm-status独立显示Four.meme Safe状态，兼容旧快照并保持GitHub栏', () => {
   const safe = { enabled: true, configured: true, intervalMs: 5000, safe: '0x161dd0cfdb0aa25e2504f725655ef9b799375b71', currentNonce: 150,
     identity: { threshold: 3, owners: Array(7).fill('owner'), block: 134262303, checkedAt: 1794982780000 },

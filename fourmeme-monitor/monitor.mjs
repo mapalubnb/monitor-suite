@@ -6,6 +6,8 @@ import { createActorStateCoordinator } from './actor-state.mjs';
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
 import { createGithubApi, createGithubMonitor, createGithubTransport } from "./github-monitor.mjs";
 import { createFourmemeSafeMonitor, readFourmemeSafeConfig } from "./safe-monitor.mjs";
+import { createFourmemeAddressMonitor } from './address-monitor.mjs';
+import { readFourmemeAddressConfig } from './address-catalog.mjs';
 import { discoverCreators } from "./creator-discovery.mjs";
 import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
 import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
@@ -672,6 +674,7 @@ function scheduleRuntimeMetricsWrite() {
       http: fourmemeHttp.snapshot(),
       github: githubMonitor.summary(),
       safe: fourmemeSafeMonitor.summary(),
+      addresses: fourmemeAddressMonitor.summary(),
       ai: { enabled: FOURMEME_AI_ANALYSIS_ENABLED },
       creatorDiscovery: {
         lastRunAt: snapshot?.creatorDiscovery?.lastRunAt || 0,
@@ -1586,6 +1589,13 @@ function rpcLaneUrls(payload, moduleName = moduleMetricContext.getStore()?.modul
   const configured = history ? CONFIG.rpcPools['history' + base] : null;
   const fallback = CONFIG.rpcPools[base]?.length ? CONFIG.rpcPools[base] : base === 'block' ? CONFIG.rpcPools.read : [];
   const urls = configured?.length ? configured : fallback?.length ? fallback : CONFIG.bscRpcUrls;
+  // Wallet-only log topics are unsupported by PublicNode. Keep this capability
+  // filter local to the new module, without cooling down other users of RPC.
+  if (moduleName === 'addresses' && base === 'logs') {
+    const compatible = urls.filter(url => !/(^|\.)publicnode\.com$/.test(new URL(url).hostname));
+    if (!compatible.length) throw Error('地址监控需要支持钱包topic查询的日志RPC，当前节点要求指定合约地址');
+    return compatible;
+  }
   // This public endpoint returns null for old blocks. Keep it available to the live lane.
   return history && base === 'block' && !configured?.length
     ? urls.filter(url => new URL(url).hostname !== 'bsc.rpc.blxrbdn.com') : urls;
@@ -9280,6 +9290,7 @@ function handleActorBlockFeedMessage(actorRunner, raw) {
   actorBlockFeedState.latestHeadBlock = headBlock;
   actorBlockFeedState.lastHeadAt = Date.now();
   actorBlockFeedState.reconnectAttempts = 0;
+  addressRunner?.run().catch(err => log(`[Four.meme 地址 WSS] ${err.message}`));
   actorRunner.run().catch(err => {
     log(`[创建者] WebSocket 触发检测异常：${err.message}`);
   });
@@ -9361,6 +9372,7 @@ const monitorStore = createTransactionalOutbox({
       log(`[GitHub 送达] ${payload.github.repo} ${payload.github.kind}｜发现至送达 ${Date.now() - payload.github.detectedAt}ms`);
     }
     if (id && payload.fourmemeSafe) log(`[Four.meme Safe 送达] 发现至送达 ${Date.now() - payload.fourmemeSafe.detectedAt}ms`);
+    if (id && payload.fourmemeAddress) log(`[Four.meme 地址 送达] ${payload.fourmemeAddress.txHash || '状态通知'}｜发现至送达 ${Date.now() - payload.fourmemeAddress.detectedAt}ms`);
     return id;
   },
   onError: err => log(`[待发送] 发送失败，已保留并退避重试：${err.message}`),
@@ -9653,7 +9665,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
             }
             // Safe owns a persisted, atomic incident/recovery notification pair.
             // Keep runtime error metrics without a second generic alert stream.
-            if (name !== 'safe') recordModuleError(name, err.message);
+            if (!['safe', 'addresses'].includes(name)) recordModuleError(name, err.message);
           }
         } finally {
           // A first pass is complete even if WSS has already queued another pass.
@@ -10287,6 +10299,14 @@ const fourmemeSafeMonitor = createFourmemeSafeMonitor({
   wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[Four.meme Safe 推送] ${error.message}`)); },
 });
 
+const fourmemeAddressConfig = readFourmemeAddressConfig();
+const fourmemeAddressMonitor = createFourmemeAddressMonitor({
+  ...fourmemeAddressConfig, store: monitorStore, rpcBatch: bscRpcBatch,
+  stopped: () => monitorStopping,
+  actorCovered: () => CONFIG.actorMonitor.enabled ? Object.keys(snapshot.chainActorMonitor?.realtime?.actors || {}).filter(a => snapshot.chainActorMonitor.realtime.actors[a]?.roles?.includes('creator')) : [],
+  feed: () => ({ connected: actorBlockFeedState.connected, lastHeadAt: actorBlockFeedState.lastHeadAt, latestHeadBlock: actorBlockFeedState.latestHeadBlock, mode: actorBlockFeedMode() }),
+  wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[Four.meme 地址 推送] ${error.message}`)); },
+});
 const modules = [
   createModuleRunner("pool",     runPoolCheck,     CONFIG.intervals.pool),
   createModuleRunner("frontend", runFrontendCheck,  CONFIG.intervals.frontend),
@@ -10309,6 +10329,8 @@ if (fourmemeSafeConfig.enabled) modules.push(createModuleRunner("safe", async ()
   if (!completed && fourmemeSafeMonitor.summary().lastError) throw Error(fourmemeSafeMonitor.summary().lastError);
   return completed;
 }, fourmemeSafeConfig.intervalMs, false, { interval: fourmemeSafeMonitor.interval }));
+const addressRunner = fourmemeAddressConfig.enabled ? createModuleRunner('addresses', fourmemeAddressMonitor.poll, 1000, false) : null;
+if (addressRunner) modules.push(addressRunner);
 
 function calculateNextModuleDueAt(nextDueAt, intervalMs, now = Date.now()) {
   let next = nextDueAt + intervalMs;
@@ -10353,7 +10375,7 @@ async function startAllModules() {
     void githubMonitor.checkHealth().catch(err => log(`[GitHub 健康检查] ${err.message}`));
   }, 1_000);
   void monitorStore.drain().catch(err => log(err.message));
-  if (actorRunner && CONFIG.actorMonitor.enabled) global.__actorBlockFeed = startActorBlockFeed(actorRunner);
+  if (actorRunner && (CONFIG.actorMonitor.enabled || fourmemeAddressConfig.enabled)) global.__actorBlockFeed = startActorBlockFeed(actorRunner);
   if (CONFIG.openFourRegistryLogMonitor.enabled) global.__openFourRegistryLogFeed = startOpenFourRegistryLogFeed();
   startModuleTimers();
   for (const [index, module] of modules.entries()) {
