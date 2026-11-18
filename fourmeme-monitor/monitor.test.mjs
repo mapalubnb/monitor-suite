@@ -4,6 +4,7 @@ import "./creator-discovery.test.mjs";
 import "./contract-observation.test.mjs";
 import "./safe-monitor.test.mjs";
 import "./address-monitor.test.mjs";
+import "./address-rpc.test.mjs";
 import assert from "node:assert/strict";
 
 test('地址日志RPC兼容性筛选仅影响新增模块，其他读写路由不变', () => {

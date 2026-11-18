@@ -83,7 +83,7 @@ export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = 
   return { lines: passiveIncoming ? [] : lines, touched: [...touched], silent: passiveIncoming ? tokenEvents : silent, failed, passiveIncoming };
 }
 
-export function createFourmemeAddressMonitor({ store, rpcBatch, now = Date.now, wake = () => {}, stopped = () => false,
+export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now = Date.now, wake = () => {}, stopped = () => false,
   enabled = true, catalog = FOURMEME_ADDRESS_CATALOG, actorCovered = () => [], feed = () => ({}),
   maxBlocks = 32, confirmations = 0, timeoutMs = 12000, roundTimeoutMs = 25000 } = {}) {
   if (catalog.length === 0 || catalog.some(a => !addressOK(a.address)) || new Set(catalog.map(a => a.address)).size !== catalog.length) throw Error('地址目录无效或重复');
@@ -95,11 +95,13 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, now = Date.now, 
     if (!enabled || stopped() || task) return false;
     const deadline = createDeadlineSignal(roundTimeoutMs, undefined, '地址监控单轮超时，保留游标，下轮恢复');
     const current = { signal: deadline.signal, startedAt: now(), deadlineAt: now() + roundTimeoutMs }; task = current;
+    let roundRpc = rpcBatch;
     const assertActive = () => { current.signal.throwIfAborted(); if (task !== current || stopped()) throw Error('地址监控过期轮次已隔离'); };
-    const call = calls => withDeadline(async () => { assertActive(); const values = await rpcBatch(calls); assertActive(); if (!Array.isArray(values) || values.length !== calls.length) throw Error('地址监控 RPC 批次不完整'); return values; }, timeoutMs, current.signal);
+    const call = calls => withDeadline(async () => { assertActive(); const values = await roundRpc(calls); assertActive(); if (!Array.isArray(values) || values.length !== calls.length) throw Error('地址监控 RPC 批次不完整'); return values; }, timeoutMs, current.signal);
     const blocks = async (numbers, full = false) => (await call(numbers.map(n => ({ method: 'eth_getBlockByNumber', params: [hex(n), full] })))).map((b, i) => validBlock(b, numbers[i], full));
     runtime.lastAttemptAt = now();
     try {
+      roundRpc = rpcFactory ? rpcFactory(current) : rpcBatch;
       return await withAbortSignal(async () => {
         const draft = structuredClone(read()), notices = [];
         const [headHex, savedAnchor] = await call([{ method: 'eth_blockNumber', params: [] },

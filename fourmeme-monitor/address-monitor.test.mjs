@@ -51,6 +51,13 @@ test('默认不延后区块，头块交易立即进入扫描；旧游标和去�
   await m.poll(); assert.equal(f.disk.fourmemeAddresses.cursor, 101); assert.equal(f.disk._notificationOutbox.length, 1);
 });
 
+test('RPC轮次初始化失败也释放任务，后续轮次可恢复', async () => {
+  const f = fixture(); let first = true;
+  const m = createFourmemeAddressMonitor({ ...f.opts, rpcFactory: () => { if (first) { first = false; throw Error('no eligible RPC'); } return f.opts.rpcBatch; } });
+  await assert.rejects(m.poll(), /eligible RPC/); assert.equal(m.summary().activeTask, null);
+  await m.poll(); assert.equal(f.disk.fourmemeAddresses.cursor, 100);
+});
+
 test('地址通知采用Flap操作、观察、时间和交易链接顺序，不输出延后核验行', () => {
   const text = renderFourmemeAddressContent({ result: { lines: ['直接转移 1 BNB'], touched: [A] }, catalog: cat, txHash: h(1), block: 123, observedAt: 1795000000000 });
   assert.match(text, /^💸 资金变动\n• 关联地址观察：/);

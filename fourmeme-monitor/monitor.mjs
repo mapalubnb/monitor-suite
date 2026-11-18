@@ -8,6 +8,7 @@ import { createGithubApi, createGithubMonitor, createGithubTransport } from "./g
 import { createFourmemeSafeMonitor, readFourmemeSafeConfig } from "./safe-monitor.mjs";
 import { createFourmemeAddressMonitor } from './address-monitor.mjs';
 import { readFourmemeAddressConfig } from './address-catalog.mjs';
+import { createAddressRoundRpc } from './address-rpc.mjs';
 import { discoverCreators } from "./creator-discovery.mjs";
 import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
 import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
@@ -10302,6 +10303,10 @@ const fourmemeSafeMonitor = createFourmemeSafeMonitor({
 const fourmemeAddressConfig = readFourmemeAddressConfig();
 const fourmemeAddressMonitor = createFourmemeAddressMonitor({
   ...fourmemeAddressConfig, store: monitorStore, rpcBatch: bscRpcBatch,
+  rpcFactory: round => createAddressRoundRpc({ signal: round.signal, id: round.startedAt, batchSize: RPC_BATCH_SIZE,
+    pool: rpcPoolFor([{ method: 'eth_getLogs', params: [{}] }]), request: requestBscRpcPayload,
+    makePool: urls => createRpcEndpointPool(urls, { isBackedOff: url => Boolean(currentBackoffState(getDomain(url))) || Boolean(rpcControl.cooldown(url)) }),
+  }),
   stopped: () => monitorStopping,
   actorCovered: () => CONFIG.actorMonitor.enabled ? Object.keys(snapshot.chainActorMonitor?.realtime?.actors || {}).filter(a => snapshot.chainActorMonitor.realtime.actors[a]?.roles?.includes('creator')) : [],
   feed: () => ({ connected: actorBlockFeedState.connected, lastHeadAt: actorBlockFeedState.lastHeadAt, latestHeadBlock: actorBlockFeedState.latestHeadBlock, mode: actorBlockFeedMode() }),
