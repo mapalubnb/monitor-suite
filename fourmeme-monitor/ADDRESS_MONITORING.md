@@ -55,3 +55,5 @@ Suite 1.12.94 / Four.meme 1.5.33，用户于2026/11/18确认18地址接入并部
 ## 发布和验证
 
 新增address-catalog/address-monitor及专项测试；修改Four.meme入口、install/status及测试、根/模块版本和说明。原共享解码实现不修改，分目录安装补齐erc4337-codec依赖。生产仅重启Four.meme、定向更新fm-status，不运行全量安装。先验证、GitHub推送、确认确切提交，再服务器快进；停服后备份完整snapshot与parts，不清旧状态。上线窗口及最终测试数据记于HANDOFF。
+
+最终于2026/11/19 00:32上线Suite1.12.94 / Four.meme1.5.33，853项本地及288项服务器专项通过；120秒零确认观测无错误/退避，18笔新增静默记录、没有新增地址推送，原状态和周期保留。详细验收见HANDOFF顶部。
