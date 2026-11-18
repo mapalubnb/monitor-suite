@@ -1,5 +1,19 @@
 # Monitor Suite 📡
 
+## 2026/11/18 Four.meme 独立 Safe 监控（Suite1.12.91 / Four.meme1.5.30）
+
+将BSC核心Safe 0x161dd0CfDb0aa25E2504F725655ef9b799375b71接入Four.meme自身进程、snapshot.fourmemeSafe及原子待发队列，fm-status新增09栏。普通10秒、存在pending/ready/confirming提案时5秒；每60秒固定区块复核owners、threshold和singleton。GitHub2秒、合约1秒及其余原13项调度、Flap进程/状态、历史缺口和去重均不变，Four.meme AI始终关闭。
+
+复用Flap的Safe API凭证池/服务端限流、状态机、MultiSend和通用调用解码，不启动Flap进程或调用其AI。共享纯函数新增可选owner格式化参数，默认保持Flap行为；执行补查可选开关默认关闭，仅Four.meme开启。Four.meme成员标签以该Safe读取结果为准，不套用Flap权限标签。未知ABI保持未知；转账decimals最多等待1.5秒，失败明确金额待确认，不猜单位。
+
+首次仅报告当前有效待执行提案，从首次链上nonce建立已执行补查起点；之后覆盖签名进度、门槛满足、已知提案成功/失败/替换，以及轮询之间已执行的新交易。按nonce连续推进执行补查，每轮至多一页100项，索引缺口保留并展示，不补发启用前全部历史。原始calldata与服务返回的签名仅在状态内保留，通知不展示签名。执行状态来源于Safe服务，未知调用语义和当前getter不冒充历史执行效果；模块绕过execTransaction且不推进nonce的交易不在此提案监控覆盖内。
+
+RPC/API有界请求、单轮30秒硬截止，采集在隔离副本进行；状态与通知短事务原子提交。迟到结果不能落盘，超时释放并自动重试，普通连续5次失败/轮次超时告警、实际成功后恢复各一条并持久化。写盘失败不将任务当完成，不清除旧队列。
+
+配置：FOURMEME_SAFE_MONITOR默认true；FOURMEME_SAFE_API_KEYS或FOURMEME_SAFE_API_KEY优先，留空复用现有FLAP_SAFE_API_KEYS/FLAP_SAFE_API_KEY。两进程状态和冷却独立但共用账户总额度，不意味着配额增加；无凭证不发匿名请求。现有Flap Key配置不改，服务器既有部分账户已额度冷却，新流量仍服从Retry-After/额度。5秒仅为调度，不保证API索引和实际推送5秒内完成。
+
+改动：fourmeme-monitor/safe-monitor及测试、monitor及测试、根/模块package.json、.env.example、install及测试；Flap safe-proposal-monitor/operational-call-codec仅兼容扩展，根README、两模块HANDOFF及PROJECT_STATE同步。独立安装先复制纯函数依赖后启动Four.meme；生产只定向更新fm-status并重启Four.meme。本地全量828/828、Safe及面板专项78/78、语法与diff检查通过；服务器隔离测试和部署验收另记。磁盘约223MB，需要压缩状态备份，不删除现有用户文件。
+
 ## 2026/11/17 GitHub详情通道强制截止与恢复（Suite1.12.90 / Four.meme1.5.29）
 
 修复REST挂起请求阻塞仓库发现和详情队列：请求/正文10秒强制截止，REST排队15秒截止，未开始的过期请求不会继续发出；错误响应取消改为尽力清理，不等待永久挂起的cancel。故障连接只重建对应通道，旧响应不得覆盖新额度/诊断，所有主额度、Retry-After、403/429和资源404保护保留。

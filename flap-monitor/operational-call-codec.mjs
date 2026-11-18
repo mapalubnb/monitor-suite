@@ -127,7 +127,7 @@ export function operationalAmountToken(action, metadata = {}) {
   return ["0x94bf804d", "0xba087652"].includes(action.selector) ? token : underlying;
 }
 
-export function describeOperationalAction(a, metadata = {}) {
+export function describeOperationalAction(a, metadata = {}, { formatOwner = ownerLink } = {}) {
   if (a.kind === 'unknown' && a.resolvedCall?.status === 'verified_abi') {
     const args = (a.resolvedCall.arguments || []).map(p => `${p.name}=${typeof p.value === 'string' && /^bytes/.test(p.type) ? '[字节参数]' : JSON.stringify(p.value)}`).join('，');
     return `拟调用 ${a.to}｜${a.resolvedCall.signature}｜${args}`;
@@ -156,7 +156,7 @@ export function describeOperationalAction(a, metadata = {}) {
     auditGrantSubmit: `📝 通过签名授权提交审计报告\n代币：${addressLink(a.token)}\n授权绑定代币：${addressLink(a.grantToken)}\n工厂：${addressLink(a.factory)}\n指定提交者：${addressLink(a.deployer)}\n风险等级：${a.riskLevel}\n报告 CID：${plainLabel(a.ipfsCid)}\nUI 标识：${plainLabel(a.artifactId)}\n授权 nonce：${a.nonce}\n授权有效性仍需链上核验。`,
     ownership: `管理员变更 → ${a.account}`,
     module: `${a.enabled ? "启用" : "停用"} Safe 模块 ${a.module}`,
-    safeOwner: `Safe 所有者${a.action}：${ownerLink(a.account)}${a.newOwner ? ` → ${ownerLink(a.newOwner)}` : ''}${a.threshold ? `\n签名阈值：${a.threshold}` : ''}`,
+    safeOwner: `Safe 所有者${a.action}：${formatOwner(a.account)}${a.newOwner ? ` → ${formatOwner(a.newOwner)}` : ''}${a.threshold ? `\n签名阈值：${a.threshold}` : ''}`,
     vaultCreationEnable: `开启信号奖励金库创建\n工厂：${addressLink(a.to)}\n执行结果以链上开关为准。`,
     dividendExclude: `排除地址分红资格\n代币：${addressLink(a.token)}\n被排除地址：${addressLink(a.account)}`,
     upgradeTarget: `实现升级调用 ${a.to} → ${a.implementation}\n实际升级对象以 Upgraded 事件核验。`,

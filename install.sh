@@ -156,7 +156,16 @@ echo "[4/6] 部署 fourmeme-monitor → ${FOURMEME_DIR}"
 mkdir -p "$FOURMEME_DIR"
 # 如果源目录和目标不同才复制
 if [ "$(cd fourmeme-monitor && pwd)" != "$(cd "$FOURMEME_DIR" 2>/dev/null && pwd)" ]; then
-  cp fourmeme-monitor/monitor.mjs "$FOURMEME_DIR/"
+  for source in fourmeme-monitor/*.mjs; do
+    case "$source" in *.test.mjs) continue ;; esac
+    cp "$source" "$FOURMEME_DIR/"
+  done
+  # Four.meme Safe imports only these side-effect-free Flap libraries.
+  # Install them before starting Four.meme, even on the separate layout.
+  mkdir -p "$FLAP_DIR"
+  for source in safe-proposal-monitor operational-call-codec safe-api-address owner-catalog early-signal-catalog vault-links factory-pool-monitor quote-token-codec vault-portal-v116; do
+    cp "flap-monitor/$source.mjs" "$FLAP_DIR/"
+  done
   cp fourmeme-monitor/package.json "$FOURMEME_DIR/"
   cp fourmeme-monitor/feishu-bot.mjs "$FOURMEME_DIR/"
   # 创建 shared 软链接（让 import "../shared/..." 能正确解析）
@@ -490,6 +499,25 @@ if [ -f "$SNAP" ]; then
       if(repo.lastHeadError) console.log('状态：'+warn(cleanLabel(repo.lastHeadError))+'｜下次恢复探测：'+fmtTime(repo.headRetryAt));
       for(const job of githubJobs.filter(job=>job.repo===repo.name&&job.lastError)) console.log('详情缺口：'+cleanLabel(({repository_unavailable:'仓库不可访问',base_unavailable:'原提交不可访问',head_unavailable:'目标提交不可访问',commit_unavailable:'待补提交不可访问',comparison_or_commit_unavailable:'比较或提交不可访问'})[job.blockedReason]||job.lastError)+'｜已尝试 '+(job.attempts||0)+' 次｜'+(repo.availability==='unavailable'?'等待仓库恢复':'下次补全 '+fmtTime(job.retryAt)));
     }
+    section('09｜🔐 Four.meme Safe');
+    const safeRuntime=runtime.safe||{},safeState=s.fourmemeSafe||{};
+    const safeAddress=safeRuntime.safe||'0x161dd0cfdb0aa25e2504f725655ef9b799375b71';
+    const identity=safeRuntime.identity||safeState.identity;
+    console.log('管理 Safe：'+bscAddress(safeAddress));
+    console.log('监控：'+(safeRuntime.enabled===false?'已关闭':safeRuntime.configured===false?'缺少 API 凭证':safeRuntime.enabled?'已启用':'等待首次运行')+'｜AI：关闭');
+    console.log('提案轮询：'+((safeRuntime.intervalMs||10000)/1000)+'s｜签名配置复核：60s');
+    if(identity) console.log('签名门槛：'+identity.threshold+'/'+identity.owners.length+'｜核验区块 '+identity.block+'｜'+fmtTime(identity.checkedAt));
+    console.log('当前 nonce：'+value(safeRuntime.currentNonce??(safeState.safes||{})[safeAddress]?.currentNonce));
+    console.log('最近成功：'+fmtTime(safeRuntime.lastSuccessAt||safeState.lastSuccessAt)+'｜待发 '+(safeRuntime.pendingNotifications||0)+' 条');
+    const safeActive=safeRuntime.activeProposals||Object.values(safeState.proposals||{}).filter(p=>['pending','ready','confirming'].includes(p.status));
+    console.log('待执行／待核验：'+safeActive.length+' 项');
+    const executionGap=safeRuntime.executionGap||(safeState.safes||{})[safeAddress]?.executionGap;
+    if(executionGap) console.log('执行补查缺口：nonce '+executionGap.from+'—'+executionGap.to+'（等待索引或重试，未跳过）');
+    for(const p of safeActive) console.log('nonce '+p.nonce+'｜确认 '+p.confirmations+'/'+p.required+'｜'+cleanLabel(p.status)+'｜'+(p.hash||p.safeTxHash));
+    if(safeRuntime.lastError||safeState.health?.lastError) console.log('异常：'+warn(cleanLabel(safeRuntime.lastError||safeState.health.lastError)));
+    if(safeRuntime.identityError||safeState.identityError) console.log('签名配置复核异常：'+warn(cleanLabel(safeRuntime.identityError||safeState.identityError)));
+    if(safeRuntime.apiNextAttemptAt>Date.now()) console.log('重试时间：'+fmtTime(safeRuntime.apiNextAttemptAt));
+    if(safeRuntime.activeTask) console.log('本轮开始：'+fmtTime(safeRuntime.activeTask.startedAt)+'｜截止：'+fmtTime(safeRuntime.activeTask.deadlineAt));
     console.log('---');
     console.log('更新时间：'+fmtTime(new Date()));
   " 2>/dev/null

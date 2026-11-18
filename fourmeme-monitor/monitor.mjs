@@ -5,6 +5,7 @@ import { recoverLiveCursor } from "../shared/scan-recovery.mjs";
 import { createActorStateCoordinator } from './actor-state.mjs';
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
 import { createGithubApi, createGithubMonitor, createGithubTransport } from "./github-monitor.mjs";
+import { createFourmemeSafeMonitor, readFourmemeSafeConfig } from "./safe-monitor.mjs";
 import { discoverCreators } from "./creator-discovery.mjs";
 import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
 import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
@@ -670,6 +671,7 @@ function scheduleRuntimeMetricsWrite() {
       rpc: rpcControl.summary(),
       http: fourmemeHttp.snapshot(),
       github: githubMonitor.summary(),
+      safe: fourmemeSafeMonitor.summary(),
       ai: { enabled: FOURMEME_AI_ANALYSIS_ENABLED },
       creatorDiscovery: {
         lastRunAt: snapshot?.creatorDiscovery?.lastRunAt || 0,
@@ -9358,6 +9360,7 @@ const monitorStore = createTransactionalOutbox({
       githubMonitor.recordDelivery(payload);
       log(`[GitHub 送达] ${payload.github.repo} ${payload.github.kind}｜发现至送达 ${Date.now() - payload.github.detectedAt}ms`);
     }
+    if (id && payload.fourmemeSafe) log(`[Four.meme Safe 送达] 发现至送达 ${Date.now() - payload.fourmemeSafe.detectedAt}ms`);
     return id;
   },
   onError: err => log(`[待发送] 发送失败，已保留并退避重试：${err.message}`),
@@ -9648,7 +9651,9 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
               }
               githubLastFailureKind = err.kind;
             }
-            recordModuleError(name, err.message);
+            // Safe owns a persisted, atomic incident/recovery notification pair.
+            // Keep runtime error metrics without a second generic alert stream.
+            if (name !== 'safe') recordModuleError(name, err.message);
           }
         } finally {
           // A first pass is complete even if WSS has already queued another pass.
@@ -9659,7 +9664,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
       running = false;
     }
   };
-  return { name, run, intervalMs, firstRun, health: () => guard?.snapshot(), checkHealth: () => guard?.check(), get firstRunStatus() { return firstRunStatus; } };
+  return { name, run, get intervalMs() { return options.interval?.() ?? intervalMs; }, firstRun, health: () => guard?.snapshot(), checkHealth: () => guard?.check(), get firstRunStatus() { return firstRunStatus; } };
 }
 
 /* ══════════════════════════════════════════
@@ -10274,6 +10279,14 @@ const githubMonitor = createGithubMonitor({
   },
 });
 
+const fourmemeSafeConfig = readFourmemeSafeConfig();
+const fourmemeSafeMonitor = createFourmemeSafeMonitor({
+  ...fourmemeSafeConfig, store: monitorStore, rpcBatch: bscRpcBatch,
+  stopped: () => monitorStopping,
+  onRequest: () => { const sample = moduleMetricContext.getStore(); if (sample) sample.requestCount++; },
+  wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[Four.meme Safe 推送] ${error.message}`)); },
+});
+
 const modules = [
   createModuleRunner("pool",     runPoolCheck,     CONFIG.intervals.pool),
   createModuleRunner("frontend", runFrontendCheck,  CONFIG.intervals.frontend),
@@ -10291,6 +10304,11 @@ const actorRunner = modules.find(m => m.name === "actor");
 const openFourDiscoveryRunner = createModuleRunner("openfourDiscovery", () => CONFIG.openFourRegistryLogMonitor.enabled ? runOpenFourModuleDiscoveryCheck() : undefined, 30_000);
 modules.push(openFourDiscoveryRunner);
 modules.push(createModuleRunner("creatorDiscovery", runCreatorDiscoveryCheck, 30_000, false));
+if (fourmemeSafeConfig.enabled) modules.push(createModuleRunner("safe", async () => {
+  const completed = await fourmemeSafeMonitor.poll();
+  if (!completed && fourmemeSafeMonitor.summary().lastError) throw Error(fourmemeSafeMonitor.summary().lastError);
+  return completed;
+}, fourmemeSafeConfig.intervalMs, false, { interval: fourmemeSafeMonitor.interval }));
 
 function calculateNextModuleDueAt(nextDueAt, intervalMs, now = Date.now()) {
   let next = nextDueAt + intervalMs;

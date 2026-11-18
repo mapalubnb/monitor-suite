@@ -1,5 +1,9 @@
 # Flap 监控交接
 
+## 2026/11/18 Four.meme复用Safe纯函数兼容扩展
+
+Four.meme1.5.30独立接入其Safe。safe-proposal-monitor新增可选captureUnseenExecutions（默认false）及owner格式化回调；operational-call-codec支持同样的可选回调，默认保留原Flap角色与行为。Flap入口不启用执行补查、不改配置/频率/Key池/AI/状态，不重启Flap。专项和全量回归、部署结果见Four.meme HANDOFF。新增流量复用账户时共同消耗Safe额度；未增加配额或改变Flap已有服务端冷却状态。
+
 ## 2026/11/5 20:19 倍率与同卡逐笔摘要部署验收
 
 Suite1.12.86 / Flap1.10.57，业务提交12bf554e08be4ecd9ea7c40030149170985fe5e6先推GitHub再快进服务器，20:18仅Flap重启（PID2671575）；Four.meme192264、机器人2519949未变且online。配置指纹、14项任务周期、历史放弃记录、Safe AI激活时间逐项不变，deepseek-flash启用且其他AI关闭。20:19:09.106 Safe新轮询成功、lastError为空；小程序20:19:17.326成功，模板23/apps2，待发0。实时游标131815507/头131815606，正常推进但现场有99块积压，不跳游标。

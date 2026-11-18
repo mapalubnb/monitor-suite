@@ -642,6 +642,7 @@ export async function runSafeProposalScan({
   includeOperations = true,
   maxSafesPerRun = Infinity,
   requestIntervalMs = 0,
+  captureUnseenExecutions = false,
   nowMs = Date.now(),
 } = {}) {
   if (!state || typeof state !== "object") throw new Error("缺少 Safe 提案状态");
@@ -715,6 +716,7 @@ export async function runSafeProposalScan({
     }
     safeState.lastNonceError = '';
     safeState.currentNonce = currentNonce;
+    if (captureUnseenExecutions && !Number.isInteger(safeState.executionNextNonce)) safeState.executionNextNonce = currentNonce;
     safeState.lastNonceAt = runAt;
     if (!selected.has(safe) || state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs) return { safe, skipped: true, currentNonce };
     if (Number(safeState.nextAttemptAtMs) > nowMs) return { safe, skipped: true, currentNonce };
@@ -885,6 +887,38 @@ export async function runSafeProposalScan({
     }
   }
 
+  // Optional nonce-bounded catch-up for a standalone Safe monitor without an
+  // accompanying chain scanner. Never replay transactions before activation.
+  if (captureUnseenExecutions) for (const safe of normalizedSafes) {
+    const health = state.safes[safe], currentNonce = currentNonces.get(safe);
+    if (!Number.isInteger(currentNonce) || !Number.isInteger(health.executionNextNonce) || health.executionNextNonce >= currentNonce) continue;
+    if (health.nextAttemptAtMs > nowMs) continue;
+    try {
+      const query = new URLSearchParams({ executed: 'true', nonce__gte: String(health.executionNextNonce), nonce__lt: String(currentNonce), ordering: 'nonce', limit: '100' });
+      const page = await fetchSafeJson(String(apiBaseUrl).replace(/\/+$/, '') + '/safes/' + safeApiAddress(safe) + '/multisig-transactions/?' + query, { apiKey, timeoutMs, fetchFn });
+      if (!Array.isArray(page.results)) throw Error('Safe 执行补查响应无效');
+      for (const proposal of [...page.results].sort((a, b) => Number(a.nonce) - Number(b.nonce))) {
+        const nonce = Number(proposal.nonce), hash = normalizeHash(proposal.safeTxHash), tx = normalizeHash(proposal.transactionHash);
+        if (nonce < health.executionNextNonce) continue;
+        if (nonce !== health.executionNextNonce || nonce >= currentNonce || normalizeAddress(proposal.safe) !== safe
+          || !hash || !tx || proposal.isExecuted !== true || ![true, false].includes(proposal.isSuccessful)) break;
+        const status = proposal.isSuccessful ? 'executed' : 'failed';
+        if (!Object.values(state.proposals).some(p => p.safe === safe && p.safeTxHash === hash && p.status === status)) {
+          const record = normalizeProposal(proposal, safe, '', runAt);
+          record.actions = extractFlapProposalActions(proposal, { factoryAddress: factory, includeOperations, safeAddresses: safes });
+          Object.assign(record, { status, transactionHash: tx, chainVerification: 'Safe 服务确认执行；此提案在首次观察时已上链', currentNonce, nonceBlocked: false });
+          state.proposals[record.key] = record;
+          if (!suppressNotifications) changes.push(appendPendingChange(state, status, record, runAt));
+        }
+        health.executionNextNonce++;
+      }
+      health.executionGap = health.executionNextNonce < currentNonce ? { from: health.executionNextNonce, to: currentNonce - 1 } : null;
+    } catch (error) {
+      health.executionGap = { from: health.executionNextNonce, to: currentNonce - 1 };
+      errors.push('Safe 执行补查保留缺口：' + error.message);
+    }
+  }
+
   state.lastRunAt = runAt;
   if (successfulSafes > 0) state.lastSuccessAt = runAt;
   const safeErrors = normalizedSafes
@@ -908,7 +942,7 @@ function formatDate(value) {
   return formatBeijingTime(value);
 }
 
-export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
+export function buildSafeProposalContent(changes = [], factoryAssets = {}, { formatOwner = ownerLink, annotate = annotateOwners } = {}) {
   const lines = [];
   for (const change of changes) {
     const asset = factoryAssets?.[change.quoteToken] || {};
@@ -938,12 +972,12 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
           + "｜兑换类型 " + c.nativeToQuoteSwapType + "｜DEX ID " + c.dexId);
       } else if (action.kind === "route") lines.push(...formatQuoteRoute(action.hops));
       else if (action.kind === "creation") lines.push("创建开关：" + (action.disabled ? "暂停创建" : "解除暂停创建"));
-      else lines.push(describeOperationalAction(action, factoryAssets));
+      else lines.push(describeOperationalAction(action, factoryAssets, { formatOwner }));
     }
     if (change.nonceBlocked) lines.push("⏳ 前序 nonce 未执行");
     if (change.executionCheck?.status === "passed") lines.push("✅ 只读执行模拟通过｜" + formatDate(change.executionCheck.checkedAt));
     else if (change.status === "ready") lines.push("⏳ 执行条件未核实");
-    if (change.confirmationOwners?.length) lines.push('已确认 owner（Safe 服务记录）：\n' + change.confirmationOwners.map(ownerLink).join('\n'));
+    if (change.confirmationOwners?.length) lines.push('已确认 owner（Safe 服务记录）：\n' + change.confirmationOwners.map(formatOwner).join('\n'));
     lines.push("首次观测：" + formatDate(change.firstSeenAt));
     lines.push("确认进度：" + change.confirmations + "/" + (change.required || "未知") + "｜Safe nonce：" + change.nonce);
     lines.push("管理 Safe：[" + change.safe + "](https://app.safe.global/transactions/queue?safe=bnb:" + change.safe + ")");
@@ -953,5 +987,5 @@ export function buildSafeProposalContent(changes = [], factoryAssets = {}) {
     if (change.chainVerification) lines.push(change.chainVerification);
     lines.push("");
   }
-  return annotateOwners(lines.join("\n"));
+  return annotate(lines.join("\n"));
 }

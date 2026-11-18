@@ -453,3 +453,13 @@ test('fm-status distinguishes GitHub detail stalls, active deadlines and retaine
   assert.match(text, /详情停滞告警/); assert.match(text, /已触发恢复 2 次/); assert.match(text, /强制截止/);
   assert.match(text, /请求强制超时：3/); assert.match(text, /排队超时：1/);
 });
+
+test('fm-status独立显示Four.meme Safe状态，兼容旧快照并保持GitHub栏', () => {
+  const safe = { enabled: true, configured: true, intervalMs: 5000, safe: '0x161dd0cfdb0aa25e2504f725655ef9b799375b71', currentNonce: 150,
+    identity: { threshold: 3, owners: Array(7).fill('owner'), block: 134262303, checkedAt: 1794982780000 },
+    activeProposals: [{ nonce: 150, confirmations: 1, required: 3, status: 'pending', hash: '0xabc' }], pendingNotifications: 1 };
+  const text = renderFourmemeStatus({}, { safe });
+  assert.match(text, /08｜📦 GitHub/); assert.match(text, /09｜🔐 Four.meme Safe/);
+  assert.match(text, /签名门槛：3\/7/); assert.match(text, /nonce 150｜确认 1\/3/); assert.match(text, /提案轮询：5s/); assert.match(text, /AI：关闭/);
+  assert.match(renderFourmemeStatus({}), /等待首次运行/);
+});
