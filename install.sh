@@ -521,11 +521,12 @@ if [ -f "$SNAP" ]; then
     section('10｜👛 Four.meme 独立地址');
     const addr=runtime.addresses||{},addrState=s.fourmemeAddresses||{},addrCatalog=addr.catalog||addrState.catalog||[];
     console.log('监控：'+(addr.enabled===false?'已关闭':addr.enabled?'已启用':'等待首次运行')+'｜地址 '+addrCatalog.length+' 个｜AI：关闭');
-    console.log('触发：WSS 新区块＋1s HTTP 补扫｜延后 '+(addr.confirmations??1)+' 块核验｜WSS：'+(addr.feed?.connected?'已连接':'HTTP 兜底'));
+    console.log('触发：WSS 新区块＋1s HTTP 补扫｜'+((addr.confirmations??0)===0?'头块即扫，不延后':('延后 '+addr.confirmations+' 块核验'))+'｜WSS：'+(addr.feed?.connected?'已连接':'HTTP 兜底'));
     console.log('扫描游标：'+value(addr.cursor??addrState.cursor)+'｜最新区块：'+value(addr.head??addrState.head)+'｜落后 '+value(addr.lagBlocks)+' 块');
     console.log('启用区块：'+value(addr.activationBlock??addrState.activationBlock)+'｜启用时间：'+fmtTime(addr.activatedAt||addrState.activatedAt));
     console.log('最近推进：'+fmtTime(addr.lastProgressAt||addrState.lastProgressAt)+'｜最近成功：'+fmtTime(addr.health?.lastSuccessAt||addrState.health?.lastSuccessAt)+'｜待发 '+(addr.pendingNotifications||0)+' 条');
-    console.log('未知资产被动事件：静默留存最近 '+(addr.passiveRecords??addrState.passive?.length??0)+' 条交易｜不含完整内部 BNB trace');
+    console.log('降噪：纯被动代币收款只记录、不推送（同Flap）｜静默累计 '+(addr.silentTransactions??addrState.silentTransactions??0)+' 笔｜保留最近 '+(addr.passiveRecords??addrState.passive?.length??0)+' 条记录');
+    console.log('主动转出、调用、授权、直接BNB转移继续推送｜不含完整内部 BNB trace');
     for(const a of addrCatalog) console.log(cleanLabel(a.label)+'｜'+bscAddress(a.address)+'｜'+cleanLabel(a.evidence));
     if(addr.health?.lastError||addrState.health?.lastError) console.log('地址监控异常：'+warn(cleanLabel(addr.health?.lastError||addrState.health.lastError)));
     if(addr.activeTask) console.log('本轮开始：'+fmtTime(addr.activeTask.startedAt)+'｜截止：'+fmtTime(addr.activeTask.deadlineAt));

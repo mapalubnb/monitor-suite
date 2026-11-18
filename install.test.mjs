@@ -459,6 +459,8 @@ test('fm-status独立地址包含1秒补扫、目录、缺口和安装依赖', (
     catalog: [{ label: '用户指定关注地址', address: '0x088b79aaeb498d30dd32589681ac4e9b00e96f04', evidence: '归属待独立核验' }], health: { lastError: 'RPC故障，保留缺口' } } });
   assert.match(text, /10｜👛 Four.meme 独立地址/); assert.match(text, /1s HTTP 补扫/); assert.match(text, /落后 3 块/);
   assert.match(text, /归属待独立核验/); assert.match(text, /RPC故障，保留缺口/); assert.match(text, /08｜📦 GitHub/);
+  const latest = renderFourmemeStatus({}, { addresses: { enabled: true, confirmations: 0 } });
+  assert.match(latest, /头块即扫，不延后/); assert.match(latest, /纯被动代币收款只记录、不推送/);
   assert.match(installSource, /for source in safe-proposal-monitor operational-call-codec erc4337-codec/);
 });
 

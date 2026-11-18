@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
-import { createFourmemeAddressMonitor, observeFourmemeAddressTx, addressLogFilters, TRANSFER, APPROVAL } from './address-monitor.mjs';
+import { createFourmemeAddressMonitor, observeFourmemeAddressTx, renderFourmemeAddressContent, addressLogFilters, TRANSFER, APPROVAL } from './address-monitor.mjs';
 import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS, readFourmemeAddressConfig } from './address-catalog.mjs';
 import { ENTRY_POINT_V07, USER_OPERATION_EVENT } from '../flap-monitor/erc4337-codec.mjs';
 import { keccak_256 } from '@noble/hashes/sha3';
@@ -25,7 +25,7 @@ function fixture(initial = {}, options = {}) {
       throw Error(c.method);
     });
   };
-  const opts = { store, rpcBatch, catalog: cat, timeoutMs: 50, roundTimeoutMs: 200, ...options };
+  const opts = { store, rpcBatch, catalog: cat, confirmations: 1, timeoutMs: 50, roundTimeoutMs: 200, ...options };
   const monitor = createFourmemeAddressMonitor(opts);
   function add(n, { from = A, to = X, value = '0xde0b6b3a7640000', input = '0x', logs = [], status = '0x1' } = {}) {
     const b = data.chain.get(n), tx = { hash: h(n + 9000 + b.transactions.length), blockHash: b.hash, blockNumber: b.number, from, to, value, input };
@@ -42,6 +42,20 @@ test('18地址目录、归属边界、固定1秒及日志topic正确，不含Fla
   assert.equal(readFourmemeAddressConfig({}).intervalMs, 1000); assert.equal(readFourmemeAddressConfig({ FOURMEME_ADDRESS_MONITOR: 'false' }).enabled, false);
   for (const [sig, hash] of [['Transfer(address,address,uint256)', TRANSFER], ['Approval(address,address,uint256)', APPROVAL]]) assert.equal('0x' + Buffer.from(keccak_256(sig)).toString('hex'), hash);
   assert.equal(addressLogFilters([A], 1, 2)[0].topics[1][0], topic(A));
+});
+
+test('默认不延后区块，头块交易立即进入扫描；旧游标和去重连续保留', async () => {
+  const f = fixture(); await f.monitor.poll(); f.add(101);
+  const opts = { ...f.opts }; delete opts.confirmations;
+  const m = createFourmemeAddressMonitor(opts); assert.equal(m.summary().confirmations, 0);
+  await m.poll(); assert.equal(f.disk.fourmemeAddresses.cursor, 101); assert.equal(f.disk._notificationOutbox.length, 1);
+});
+
+test('地址通知采用Flap操作、观察、时间和交易链接顺序，不输出延后核验行', () => {
+  const text = renderFourmemeAddressContent({ result: { lines: ['直接转移 1 BNB'], touched: [A] }, catalog: cat, txHash: h(1), block: 123, observedAt: 1795000000000 });
+  assert.match(text, /^💸 资金变动\n• 关联地址观察：/);
+  assert.match(text, /🕒 2026\/11\/18 .*\n\[交易\]\(https:\/\/bscscan.com\/tx\/0x[a-f0-9]{64}\)｜区块 123\n$/);
+  assert.doesNotMatch(text, /延后|发现时间：|交易：\[0x|\*\*/);
 });
 test('首次只建立基线；重启去重、独立字段与AI关闭', async () => {
   const old = { chainActorMonitor: { history: { cursor: 12 } }, actorNotificationLedger: { entries: { old: true } }, githubMonitor: { gap: true }, fourmemeSafe: { old: true } };
@@ -62,12 +76,34 @@ test('被调用的EIP7702账户无需作为tx.from也被捕获，签名人标识
   const f = fixture(); await f.monitor.poll(); f.add(101, { from: X, to: A, value: '0x0', input: '0x12345678' }); f.data.head = 102; await f.monitor.poll();
   assert.match(f.disk._notificationOutbox[0].payload.content, /未解析调用.*0x12345678/);
 });
-test('已知资产被动收入推送；未知资产被动收入静默记录；一笔多地址仅一条', async () => {
+test('监控地址间资产转移推送；未知资产被动收入静默记录；一笔多地址仅一条', async () => {
   const f = fixture(); await f.monitor.poll();
   f.add(101, { from: X, to: X, value: '0x0', logs: [{ address: token, topics: [TRANSFER, topic(A), topic(B)], data: h(1000000000000000000n) }] });
   f.add(101, { from: X, to: X, value: '0x0', logs: [{ address: X, topics: [TRANSFER, topic(X), topic(B)], data: h(123) }] });
   f.data.head = 102; await f.monitor.poll(); assert.equal(f.disk._notificationOutbox.length, 1); assert.equal(f.disk.fourmemeAddresses.passive.length, 1);
   assert.match(f.disk._notificationOutbox[0].payload.content, /1 USDT/);
+});
+
+test('与Flap一致：纯被动代币收款无论金额只记录，重启不补发', async () => {
+  const f = fixture(); await f.monitor.poll();
+  for (const raw of [168714895711991n, 1000000n * 10n ** 18n]) f.add(101, { from: X, to: X, value: '0x0', logs: [{ address: token, topics: [TRANSFER, topic(X), topic(B)], data: h(raw) }] });
+  f.data.head = 102; await f.monitor.poll();
+  assert.equal(f.disk._notificationOutbox, undefined); assert.equal(f.disk.fourmemeAddresses.silentTransactions, 2);
+  assert.equal(f.disk.fourmemeAddresses.passive[0].reason, 'passive_token_income');
+  assert.equal(BigInt(f.disk.fourmemeAddresses.passive[0].events[0].rawAmount), 168714895711991n);
+  await createFourmemeAddressMonitor(f.opts).poll(); assert.equal(f.disk._notificationOutbox, undefined);
+  assert.equal(f.disk.fourmemeAddresses.silentTransactions, 2);
+});
+
+test('小额主动转出、被调用、授权、直接BNB与混合操作不因降噪消失', async () => {
+  const f = fixture(); await f.monitor.poll();
+  const income = { address: token, topics: [TRANSFER, topic(X), topic(B)], data: h(1) };
+  f.add(101, { from: A, to: X, value: '0x0', input: '0x12345678', logs: [income] });
+  f.add(101, { from: X, to: B, value: '0x1' });
+  f.add(101, { from: X, to: X, value: '0x0', logs: [income, { address: token, topics: [APPROVAL, topic(B), topic(X)], data: h(1) }] });
+  f.add(101, { from: A, to: X, value: '0x1' });
+  f.data.head = 102; await f.monitor.poll(); assert.equal(f.disk._notificationOutbox.length, 4);
+  assert.equal(f.disk.fourmemeAddresses.silentTransactions || 0, 0);
 });
 test('主动授权/转移未知资产保留精度未知；失败调用不声称生效', () => {
   const f = fixture(); const { tx, r } = f.add(101, { input: '0x12345678', status: '0x0' });

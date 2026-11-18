@@ -14,6 +14,17 @@ const num = x => { if (!/^0x[0-9a-f]+$/i.test(x || '')) throw Error('地址监�
 const topicAddress = t => /^0x0{24}[a-f0-9]{40}$/i.test(t || '') ? lower('0x' + t.slice(-40)) : '';
 const link = a => `[${a}](https://bscscan.com/address/${a})`;
 const amount = (n, decimals) => { const v = BigInt(n).toString().padStart(decimals + 1, '0'); return decimals ? (v.slice(0, -decimals) + '.' + v.slice(-decimals)).replace(/\.?0+$/, '') : v; };
+
+// Match Flap's address-observation card: action, one grouped observation,
+// observation time, then a compact transaction/block footer. No raw tx hash row.
+export function renderFourmemeAddressContent({ result, catalog, txHash, block, observedAt }) {
+  const action = result.failed ? '🔎 关联操作｜交易失败'
+    : result.lines.some(l => /资产转移|直接转移/.test(l)) ? '💸 资金变动'
+    : result.lines.some(l => /授权/.test(l)) ? '🔑 代币授权' : '🔎 关联操作';
+  const labels = result.touched.map(a => { const info = catalog.find(c => c.address === a); return `${info.label}：${link(a)}（${info.evidence}）`; });
+  return [action, `• 关联地址观察：\n${labels.join('\n')}\n${result.lines.join('\n')}`,
+    `🕒 ${formatBeijingTime(observedAt)}`, `[交易](https://bscscan.com/tx/${txHash})｜区块 ${block}`, ''].join('\n');
+}
 function validBlock(b, n, full = false) {
   if (!b || num(b.number) !== n || !hashOK(b.hash) || !hashOK(b.parentHash) || (full && (!Array.isArray(b.transactions) || b.transactions.some(t => !t || typeof t !== 'object' || !hashOK(t.hash) || num(t.blockNumber) !== n || lower(t.blockHash) !== lower(b.hash))))) throw Error(`地址监控区块 ${n} 不完整，保留缺口`);
   return b;
@@ -24,8 +35,8 @@ export function addressLogFilters(addresses, from, to) {
     .map(t => ({ fromBlock: hex(from), toBlock: hex(to), topics: t }));
 }
 
-// One receipt becomes one address card. Unknown passive assets are recorded but
-// do not turn arbitrary token logs into official activity or an AI inference.
+// Flap policy: pure passive token receipts stay recorded, never promoted to a
+// purchase/official operation. Native transfers and mixed active calls stay urgent.
 export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = [], assets = KNOWN_ASSETS } = {}) {
   const watched = new Map(catalog.map(a => [a.address, a]));
   const from = lower(tx.from), to = lower(tx.to), touched = new Set();
@@ -35,7 +46,7 @@ export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = 
   const operations = receiptUserOperations(receipt).filter(o => watched.has(o.sender));
   for (const op of operations) touched.add(op.sender);
   const active = direct || operations.length > 0;
-  const lines = [], silent = [];
+  const lines = [], silent = [], tokenEvents = [];
   for (const l of receipt.logs || []) {
     const topic = lower(l.topics?.[0]);
     if (![TRANSFER, APPROVAL].includes(topic)) continue;
@@ -43,10 +54,12 @@ export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = 
     if (!watched.has(a) && !(topic === TRANSFER && watched.has(b))) continue;
     if (![3, 4].includes(l.topics.length)) continue;
     const token = lower(l.address), meta = assets[token];
-    if (!active && !meta) { silent.push({ token, from: a, to: b, kind: topic === TRANSFER ? 'transfer' : 'approval' }); continue; }
-    if (watched.has(a)) touched.add(a); if (watched.has(b)) touched.add(b);
     const raw = l.topics.length === 4 ? l.topics[3] : l.data;
     if (!/^0x[a-f0-9]{64}$/i.test(raw || '')) continue;
+    const event = { token, from: a, to: b, kind: topic === TRANSFER ? 'transfer' : 'approval', rawAmount: raw, logIndex: l.logIndex, nft: l.topics.length === 4 };
+    tokenEvents.push(event);
+    if (!active && !meta) { silent.push(event); continue; }
+    if (watched.has(a)) touched.add(a); if (watched.has(b)) touched.add(b);
     const quantity = l.topics.length === 4 ? `NFT ID ${BigInt(raw)}` : meta ? `${amount(raw, meta.decimals)} ${meta.symbol}` : `数量原始整数 ${BigInt(raw)}（精度未知）`;
     lines.push(`${topic === TRANSFER ? '资产转移' : '授权变更'}：${link(token)}｜${quantity}\n${link(a)} → ${link(b)}`);
   }
@@ -65,12 +78,14 @@ export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = 
     const result = userOperationResult(receipt, op);
     lines.push(`ERC-4337 账户操作：${link(op.sender)}｜nonce ${op.userOpNonce}｜${({ executed: '执行成功', failed: '执行失败', unverified: '账户执行待核验' })[result.status]}${result.reason ? `（${result.reason}）` : ''}`);
   }
-  return { lines, touched: [...touched], silent, failed };
+  const passiveIncoming = !active && tokenEvents.length > 0
+    && tokenEvents.every(e => e.kind === 'transfer' && !watched.has(e.from) && watched.has(e.to));
+  return { lines: passiveIncoming ? [] : lines, touched: [...touched], silent: passiveIncoming ? tokenEvents : silent, failed, passiveIncoming };
 }
 
 export function createFourmemeAddressMonitor({ store, rpcBatch, now = Date.now, wake = () => {}, stopped = () => false,
   enabled = true, catalog = FOURMEME_ADDRESS_CATALOG, actorCovered = () => [], feed = () => ({}),
-  maxBlocks = 32, confirmations = 1, timeoutMs = 12000, roundTimeoutMs = 25000 } = {}) {
+  maxBlocks = 32, confirmations = 0, timeoutMs = 12000, roundTimeoutMs = 25000 } = {}) {
   if (catalog.length === 0 || catalog.some(a => !addressOK(a.address)) || new Set(catalog.map(a => a.address)).size !== catalog.length) throw Error('地址目录无效或重复');
   let task = null, runtime = { head: 0, lastAttemptAt: 0 };
   const read = () => store.state.fourmemeAddresses || { anchors: [], seen: {}, passive: [], health: {}, catalog: [] };
@@ -144,13 +159,15 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, now = Date.now, 
               const eligible = draft.catalog.filter(a => n > a.activationBlock);
               const result = observeFourmemeAddressTx(tx, r, eligible, { actorCovered: actorCovered() });
               const id = `${lower(b.hash)}:${lower(tx.hash)}`;
-              if (result.silent.length) draft.passive.push({ id, block: n, tx: tx.hash, events: result.silent.slice(0, 20) });
+              if (result.silent.length) {
+                draft.passive.push({ id, block: n, tx: tx.hash, observedAt: now(), reason: result.passiveIncoming ? 'passive_token_income' : 'unknown_asset', eventCount: result.silent.length, events: result.silent.slice(0, 100) });
+                draft.silentTransactions = (draft.silentTransactions || 0) + 1;
+              }
               if (!result.lines.length || draft.seen[id]) continue;
-              const labels = result.touched.map(a => { const info = eligible.find(c => c.address === a); return `${info.label}：${link(a)}（${info.evidence}）`; });
               const detectedAt = now();
-              notices.push(notice(result.failed ? '交易失败' : '链上活动', [...labels, ...result.lines,
-                `交易：[${tx.hash}](https://bscscan.com/tx/${tx.hash})`, `区块：${n}｜延后 ${confirmations} 块核验`,
-                `链上时间：${formatBeijingTime(num(b.timestamp) * 1000)}`, `发现时间：${formatBeijingTime(detectedAt)}`].join('\n'), { txHash: tx.hash, block: n, chainAt: num(b.timestamp) * 1000 }));
+              notices.push({ ...notice('关联地址观察', renderFourmemeAddressContent({ result, catalog: eligible,
+                txHash: tx.hash, block: n, observedAt: detectedAt }), { txHash: tx.hash, block: n, chainAt: num(b.timestamp) * 1000 }),
+                title: result.failed ? 'Four.meme 关联地址观察｜交易失败' : 'Four.meme 关联地址观察' });
               draft.seen[id] = { tx: tx.hash, block: n, detectedAt };
             }
           }
@@ -184,7 +201,7 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, now = Date.now, 
     const s = read(), currentFeed = feed(), observedHead = Math.max(runtime.head || s.head || 0, currentFeed.latestHeadBlock || 0);
     return { enabled, intervalMs: 1000, confirmations, aiEnabled: false, catalog: s.catalog.length ? s.catalog : catalog,
       cursor: s.cursor, head: observedHead, lagBlocks: s.cursor === undefined ? null : Math.max(0, observedHead - confirmations - s.cursor),
-      activatedAt: s.activatedAt, activationBlock: s.activationBlock, lastProgressAt: s.lastProgressAt, health: s.health, passiveRecords: s.passive.length,
+      activatedAt: s.activatedAt, activationBlock: s.activationBlock, lastProgressAt: s.lastProgressAt, health: s.health, passiveRecords: s.passive.length, silentTransactions: s.silentTransactions || 0, passivePolicy: 'flap-passive-token-silent',
       lastAttemptAt: runtime.lastAttemptAt, reorgs: s.reorgs || 0, feed: currentFeed,
       pendingNotifications: (store.state._notificationOutbox || []).filter(n => n.payload?.fourmemeAddress).length,
       activeTask: task ? { startedAt: task.startedAt, deadlineAt: task.deadlineAt } : null };
