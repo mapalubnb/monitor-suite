@@ -191,6 +191,29 @@ test('同批双语栏目匹配为一个变更，两页入口都保留', async ()
   assert.equal((event.content.match(/暂停\/继续更新/g) || []).length, 1);
 });
 
+test('筛选面板超时独立保留字段，栏目其他变化仍然入队', async () => {
+  const u = 'https://four.meme/en/advanced';
+  const columns = [{ label: 'Hot', controls: ['Filters'], filter: { labels: ['Market Cap(USD)'], controls: [], fields: [] } }];
+  const data = raw({ url: u, captureVersion: 2, advancedBoardReady: true, headings: ['Hot'], columns,
+    navigation: ['4stock', 'advanced', 'contract', 'agentic'].map(path => ({ text: path, href: `/en/${path}` })) });
+  const h = harness(u, data);
+  await h.monitor.poll();
+  h.result([{ url: u, data: { ...data, headings: ['Hot', 'New layout'], filterUnverified: ['Hot'],
+    columns: [{ label: 'Hot', controls: ['Filters'] }] } }]);
+  await h.monitor.poll();
+  await h.monitor.poll();
+  assert.equal(h.notices().length, 2);
+  assert.match(h.notices()[1].payload.content, /New layout/);
+  assert.ok(h.store.state._frontendRendered.pages[u].signals.includes('筛选字段：Hot / Market Cap(USD)'));
+  assert.deepEqual(h.monitor.summary().pages[u].filterUnverified, ['Hot']);
+  h.result([{ url: u, data: { ...data, headings: ['Hot', 'New layout'],
+    columns: [{ ...columns[0], filter: { ...columns[0].filter, labels: ['Liquidity'] } }] } }]);
+  await h.monitor.poll();
+  await h.monitor.poll();
+  assert.equal(h.notices().length, 3);
+  assert.match(h.notices()[2].payload.content, /Liquidity/);
+});
+
 test('活动基线静默建立，详情按实际语言路由跳转，公告保留列表地址', async () => {
   const target = 'https://four.meme/zh-TW/campaign';
   const detail = 'https://four.meme/zh-TW/presale/102364633';

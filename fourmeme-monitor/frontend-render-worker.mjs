@@ -34,23 +34,15 @@ async function readInteractiveDetails(page, data, url, deadline) {
     data.openMode = { selectedTab, headings, tabs, labels, buttons, detailFields, switches };
   }
   if (/\/advanced$/.test(url)) {
-    const panels = page.locator(`${ADVANCED_PANEL}:visible`);
-    for (const [index, column] of data.columns.entries()) {
-      if (!column.controls.some(name => ADVANCED_FILTER.test(name))) continue;
-      const filter = panels.nth(index).getByRole('button', { name: ADVANCED_FILTER });
-      // The column can be outside the horizontal viewport. Only open the
-      // verified filters popover, without altering its settings or inputs.
-      await filter.dispatchEvent('click', {}, timeLeft());
-      const open = filter.and(page.locator('[aria-expanded="true"]'));
-      await open.waitFor(timeLeft());
-      const filterId = await open.getAttribute('aria-controls', timeLeft());
-      column.filter = await page.evaluate(collectRenderedDom, { layer: 'filter', filterId });
-      if (!column.filter) throw Error(`Advanced 筛选面板未完成渲染：${column.label}`);
-      await open.dispatchEvent('click', {}, timeLeft());
-      await filter.and(page.locator('[aria-expanded="false"]')).waitFor(timeLeft());
+    const timeoutMs = Math.max(0, Math.min(4200, deadline - Date.now()));
+    const result = await page.evaluate(collectRenderedDom, { layer: 'advanced-filters', panelSelector: ADVANCED_PANEL, timeoutMs });
+    const labels = data.columns.map(column => column.label).join('\n');
+    if (labels !== result.labelsAfter.join('\n') || labels !== result.columns.map(column => column.label).join('\n')) {
+      throw Error('Advanced 市场栏目仍在加载');
     }
-    const verified = await page.evaluate(collectRenderedDom, { layer: 'columns' });
-    if (data.columns.map(column => column.label).join('\n') !== verified.join('\n')) throw Error('Advanced 市场栏目仍在加载');
+    data.columns = result.columns;
+    data.filterUnverified = result.columns.filter(column => !column.filter && column.controls.some(name => ADVANCED_FILTER.test(name)))
+      .map(column => column.label);
   }
   data.captureVersion = 2;
 }

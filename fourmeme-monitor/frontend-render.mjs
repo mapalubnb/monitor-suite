@@ -28,7 +28,7 @@ export function pageContentQuality(url, text = '') {
 
 // This function is serialized into an anonymous browser context. It only reads
 // visible public DOM; no wallet, account, storage, framework internals or trades.
-export function collectRenderedDom({ panelSelector, layer, filterId } = {}) {
+export function collectRenderedDom({ panelSelector, layer, timeoutMs } = {}) {
   const visible = el => !!el && !el.closest('[hidden],[aria-hidden="true"]')
     && (typeof el.getClientRects !== 'function' || el.getClientRects().length > 0);
   const text = el => (el.innerText || el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
@@ -46,7 +46,7 @@ export function collectRenderedDom({ panelSelector, layer, filterId } = {}) {
     name: el.getAttribute('name') || '',
     label: el.labels?.[0] ? text(el.labels[0]) : el.getAttribute('aria-label') || el.getAttribute('placeholder') || '',
   }));
-  if (layer === 'filter') {
+  const readFilter = filterId => {
     // The column filter is portalled out of <main>. Read only its own subtree.
     let popover = filterId && document.getElementById(filterId);
     if (!popover) {
@@ -57,18 +57,52 @@ export function collectRenderedDom({ panelSelector, layer, filterId } = {}) {
     }
     if (!visible(popover)) return null;
     const scope = selector => [...popover.querySelectorAll(selector)].filter(visible);
-    return { labels: scope(headings + ',label,legend').map(text), fields: fields(scope(inputSelector)), controls: scope('button').map(controlLabel) };
-  }
-  const panels = advanced ? read(panelSelector || '.no-scrollbar > .flex-h > .glass-panel') : [];
+    const data = { labels: scope(headings + ',label,legend').map(text), fields: fields(scope(inputSelector)), controls: scope('button').map(controlLabel) };
+    return data.labels.length || data.fields.length || data.controls.length ? data : null;
+  };
+  const panels = advanced ? read(panelSelector || '.no-scrollbar > .flex-h > .glass-panel').filter(panel => visible(panel.firstElementChild)) : [];
   // The quick-buy input renders before the asynchronous market columns.
   // Verify the panel structure independently of its names and controls.
-  const advancedBoardReady = panels.some(panel => panel.children.length >= 2 && visible(panel.firstElementChild));
-  const columns = panels.filter(panel => visible(panel.firstElementChild)).map(panel => {
+  const advancedBoardReady = panels.some(panel => panel.children.length >= 2);
+  const columns = panels.map(panel => {
     const header = panel.firstElementChild;
     return { label: text(header.querySelector(headings) || header).slice(0, 100),
       controls: [...header.querySelectorAll('button')].filter(visible).map(controlLabel) };
   });
-  if (layer === 'columns') return columns.map(column => column.label);
+  if (layer === 'advanced-filters') {
+    // The browser updates Headless UI state asynchronously. Work against the
+    // same verified header elements and use their ARIA-owned popup containers
+    // so off-screen columns do not wait on pointer actionability or scrolling.
+    return (async () => {
+      const end = Date.now() + timeoutMs;
+      const waitFor = async (probe, until) => {
+        do {
+          const value = probe();
+          if (value) return value;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        } while (Date.now() < until);
+        return null;
+      };
+      const filterButton = /^(?:篩選|筛选|Filters?)$/i;
+      for (const [index, panel] of panels.entries()) {
+        const column = columns[index];
+        if (!column) continue;
+        const button = [...panel.firstElementChild.querySelectorAll('button[aria-expanded]')]
+          .find(el => visible(el) && filterButton.test(controlLabel(el)));
+        if (!button) continue;
+        const until = Math.min(end, Date.now() + 800);
+        if (Date.now() >= until) break;
+        button.click();
+        column.filter = await waitFor(() => button.getAttribute('aria-expanded') === 'true'
+          && readFilter(button.getAttribute('aria-controls')), until);
+        if (button.getAttribute('aria-expanded') === 'true') button.click();
+        await waitFor(() => button.getAttribute('aria-expanded') === 'false', until);
+      }
+      return { columns, labelsAfter: read(panelSelector || '.no-scrollbar > .flex-h > .glass-panel')
+        .filter(panel => visible(panel.firstElementChild))
+        .map(panel => text(panel.firstElementChild.querySelector(headings) || panel.firstElementChild).slice(0, 100)) };
+    })();
+  }
   const stockSelector = stock && read('button[id^="headlessui-popover-button"]').find(el => el.hasAttribute('aria-expanded'));
   const buttons = read('button');
   return {
@@ -109,6 +143,7 @@ function stableLabel(value, allowNumbers = false) {
 const transientSignal = signal => /^按钮：(打開聊天|關閉聊天|打开聊天|关闭聊天|Open chat|Close chat)$/i.test(signal);
 const signalHash = signals => createHash('sha256').update(JSON.stringify(signals)).digest('hex');
 const detailSignal = /^(?:页面控件|栏目控件|筛选字段|筛选控件|模式结构|表单字段|面板字段)：/;
+const isColumnFilterSignal = (column, signal) => signal.startsWith(`筛选字段：${column} / `) || signal.startsWith(`筛选控件：${column} / `);
 const publicProfile = /^(?:contract|agentic|campaign|announcement|bridge)$/;
 const knownAdvancedButton = /^(?:Filters?|篩選|筛选|Pause updates|Resume updates|暫停更新|繼續更新|暂停更新|继续更新|Drag to reorder|拖曳排序|拖动排序)$/i;
 const dragOrPause = /(?:Pause updates|Resume updates|暫停更新|繼續更新|暂停更新|继续更新)/i;
@@ -285,7 +320,7 @@ export function normalizeRenderedDom(raw, url) {
   }
   if (type === 'home') {
     for (const label of raw.homeControls || raw.buttons || []) {
-      if (/^(?:搜尋|Search|篩選|Filters?|Refresh token list|Toggle sort direction|Grid layout|List layout|全部代幣|普通代幣|Tax 代幣|Open Four|All Tokens?|Normal Tokens?|Tax Tokens?|精選|Featured|已畢業|Graduated)$/i.test(label)) signals.push(`页面控件：${label}`);
+      if (/^(?:搜尋|Search|篩選|Filters?|Refresh token list|Toggle sort direction|Grid layout|List layout|全部代幣|普通代幣|Tax 代幣|Open Four|All Tokens?|Normal Tokens?|Tax Tokens?|精選|Featured)$/i.test(label)) signals.push(`页面控件：${label}`);
     }
   }
   if (type === 'advanced') {
@@ -313,6 +348,7 @@ export function normalizeRenderedDom(raw, url) {
   const normalized = [...new Set(signals)].filter(s => !transientSignal(s)).sort();
   if (normalized.length < 5) throw Error('渲染结构信息不足，保留旧基线');
   return { url, signals: normalized, hash: signalHash(normalized), kind: type,
+    ...(raw.filterUnverified?.length ? { filterUnverified: raw.filterUnverified } : {}),
     ...(raw.captureVersion === 2 ? { captureVersion: 2 } : {}),
     ...(type === 'advanced' ? { advancedBoardVerified: true } : {}) };
 }
@@ -402,6 +438,11 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
           let data;
           try { data = normalizeRenderedDom(result.data, url); }
           catch (error) { state.pages[url] = { ...old, lastAttemptAt: startedAt, lastError: error.message }; errors.push(`${new URL(url).pathname}：${error.message}`); continue; }
+          if (old?.signals && data.filterUnverified?.length) {
+            const retained = old.signals.filter(signal => data.filterUnverified.some(column => isColumnFilterSignal(column, signal)));
+            data.signals = [...new Set([...data.signals, ...retained])].sort();
+            data.hash = signalHash(data.signals);
+          }
           // Migrate only an observed valid page. A support widget appearing late
           // is not a launch feature; don't emit a removal for old widget labels.
           if (old?.signals?.some(transientSignal)) {
@@ -421,6 +462,14 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
             const signals = [...new Set([...old.signals, ...data.signals.filter(signal =>
               detailSignal.test(signal) || (data.kind === 'advanced' && signal === '按钮：Filters'))])].sort();
             old = { ...old, signals, hash: signalHash(signals), candidateHash: undefined };
+          }
+          if (old?.hash && old.filterUnverified?.length) {
+            const uninitialized = old.filterUnverified.filter(column => !old.signals.some(signal => isColumnFilterSignal(column, signal)));
+            const backfill = data.signals.filter(signal => uninitialized.some(column => isColumnFilterSignal(column, signal)));
+            if (backfill.length) {
+              const signals = [...new Set([...old.signals, ...backfill])].sort();
+              old = { ...old, signals, hash: signalHash(signals), candidateHash: undefined };
+            }
           }
           if (!old?.hash) {
             if (!optionalUrls.includes(url)) initialized.push(data);
@@ -469,5 +518,13 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
       return true;
     } finally { running = false; }
   }
-  return { poll, close: () => { closed = true; client.close(); }, summary: () => ({ ...read().health, running, targetPages: urls.length, pages: Object.fromEntries([...urls, ...optionalUrls].map(url => [url, { lastSuccessAt: read().pages[url]?.lastSuccessAt || 0, lastError: read().pages[url]?.lastError || '', initialized: !!read().pages[url]?.hash }])) }) };
+  return { poll, close: () => { closed = true; client.close(); }, summary: () => {
+    const state = read();
+    const pages = [...urls, ...optionalUrls].map(url => {
+      const item = state.pages[url];
+      return [url, { lastSuccessAt: item?.lastSuccessAt || 0, lastError: item?.lastError || '',
+        initialized: !!item?.hash, ...(item?.filterUnverified?.length ? { filterUnverified: item.filterUnverified } : {}) }];
+    });
+    return { ...state.health, running, targetPages: urls.length, pages: Object.fromEntries(pages) };
+  } };
 }
