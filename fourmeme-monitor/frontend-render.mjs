@@ -33,7 +33,10 @@ export function collectRenderedDom({ panelSelector, layer, timeoutMs } = {}) {
     && (typeof el.getClientRects !== 'function' || el.getClientRects().length > 0);
   const text = el => (el.innerText || el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
   const main = document.querySelector('main');
-  const read = selector => [...(main?.querySelectorAll(selector) || [])].filter(visible);
+  const read = selector => [...(main?.querySelectorAll(selector) || [])].filter(el => visible(el)
+    // This overview and the amount/tax extensions depend on which template
+    // the site selected. Compare the shared form under the create-page URL.
+    && (layer !== 'open-form' || !el.closest('section[class*="_overview"],.space-y-5[class*="empty"]')));
   const path = location.pathname || location.href.replace(/^https?:\/\/[^/]+/, '').split(/[?#]/)[0];
   const advanced = /\/advanced\/?$/.test(path);
   const stock = /\/4stock\/?$/.test(path);

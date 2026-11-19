@@ -25,6 +25,19 @@ test('提取可见表单与导航，不读取输入值和账户区', () => {
   assert.ok(!JSON.stringify(data).includes('9999'));
   assert.ok(!JSON.stringify(data).includes('secret'));
 });
+
+test('开放模式共享表单的基线不受默认模板说明及附加税务区块影响', () => {
+  const base = `<main><h2>輸入代幣參數</h2><form><p>發射選項</p><input name="name"></form>EXTRA</main>`;
+  const extension = `<section class="_Example_overview"><h2>Binance Agent ID · 模式特點</h2><button>如何交易</button></section>
+    <div class="space-y-5 [&:empty]:hidden"><section><h3>買入與賣出稅費</h3><button role="switch"></button><input name="tax"></section></div>`;
+  const capture = extra => {
+    const { document } = parseHTML(base.replace('EXTRA', extra));
+    return vm.runInNewContext(`(${collectRenderedDom.toString()})({ layer: 'open-form' })`, { document, location: { href: url } });
+  };
+  const original = capture('');
+  const chosen = capture(extension);
+  for (const key of ['headings', 'labels', 'buttons', 'detailFields', 'switches']) assert.equal(JSON.stringify(chosen[key]), JSON.stringify(original[key]));
+});
 test('稳定DOM指纹排除价格余额和动态代币列表', () => {
   const a = normalizeRenderedDom(raw(), url);
   const b = normalizeRenderedDom(raw({ buttons: ['創建代幣', 'NEW NEW 33', 'Wallet 900', 'Active Orders 3'], mainText: raw().mainText + ' price $5 Wallet 99' }), url);

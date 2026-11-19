@@ -26,7 +26,7 @@ async function readInteractiveDetails(page, data, url, deadline) {
     const tab = page.locator('main').getByRole('tab', { name: CREATE_OPEN_MODE });
     await tab.dispatchEvent('click', {}, timeLeft());
     await tab.and(page.locator('[aria-selected="true"]')).waitFor(timeLeft());
-    const openMode = await page.evaluate(collectRenderedDom);
+    const openMode = await page.evaluate(collectRenderedDom, { layer: 'open-form' });
     if (!CREATE_OPEN_MODE.test(openMode.selectedTab) || openMode.detailFields.length < 3 || !openMode.headings.length) {
       throw Error('创建页开放模式尚未完整渲染');
     }
