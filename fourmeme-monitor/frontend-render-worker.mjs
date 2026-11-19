@@ -34,8 +34,9 @@ async function readInteractiveDetails(page, data, url, deadline) {
     data.openMode = { selectedTab, headings, tabs, labels, buttons, detailFields, switches };
   }
   if (/\/advanced$/.test(url)) {
-    const timeoutMs = Math.max(0, Math.min(4200, deadline - Date.now()));
-    const result = await page.evaluate(collectRenderedDom, { layer: 'advanced-filters', panelSelector: ADVANCED_PANEL, timeoutMs });
+    // Additional popup checks have their own small budget. The original
+    // navigation, page readiness and client-wide deadline still apply.
+    const result = await page.evaluate(collectRenderedDom, { layer: 'advanced-filters', panelSelector: ADVANCED_PANEL, timeoutMs: 10000 });
     const labels = data.columns.map(column => column.label).join('\n');
     if (labels !== result.labelsAfter.join('\n') || labels !== result.columns.map(column => column.label).join('\n')) {
       throw Error('Advanced 市场栏目仍在加载');

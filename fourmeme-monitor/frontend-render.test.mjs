@@ -169,6 +169,8 @@ test('升级只补齐已知结构维度，两个创建模式与同名字段各�
   }
   assert.match(h.notices()[1].payload.content, /真实新增/);
   assert.doesNotMatch(h.notices()[1].payload.content, /選擇認證合約|\[webUrl\]/);
+  const lateChat = { ...updated, openMode: { ...updated.openMode, buttons: [...updated.openMode.buttons, '打開聊天'] } };
+  assert.equal(normalizeRenderedDom(lateChat, url).hash, normalizeRenderedDom(updated, url).hash);
 });
 
 test('同批双语栏目匹配为一个变更，两页入口都保留', async () => {

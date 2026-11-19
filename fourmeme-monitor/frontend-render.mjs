@@ -47,15 +47,9 @@ export function collectRenderedDom({ panelSelector, layer, timeoutMs } = {}) {
     label: el.labels?.[0] ? text(el.labels[0]) : el.getAttribute('aria-label') || el.getAttribute('placeholder') || '',
   }));
   const readFilter = filterId => {
-    // The column filter is portalled out of <main>. Read only its own subtree.
-    let popover = filterId && document.getElementById(filterId);
-    if (!popover) {
-      const anchor = [...document.querySelectorAll('h3')].find(el => visible(el)
-        && /^(?:Market Cap(?:\s*\(USD\))?|市值(?:\s*\(USD\))?)$/i.test(text(el)));
-      popover = anchor?.closest('[data-radix-popper-content-wrapper],[role="dialog"],[data-headlessui-state="open"]')
-        || anchor?.parentElement?.parentElement?.parentElement;
-    }
-    if (!visible(popover)) return null;
+    // The button's aria-controls points to the filter portal outside <main>.
+    const popover = filterId && document.getElementById(filterId);
+    if (!popover || popover.closest('[hidden],[aria-hidden="true"]')) return null;
     const scope = selector => [...popover.querySelectorAll(selector)].filter(visible);
     const data = { labels: scope(headings + ',label,legend').map(text), fields: fields(scope(inputSelector)), controls: scope('button').map(controlLabel) };
     return data.labels.length || data.fields.length || data.controls.length ? data : null;
@@ -75,13 +69,25 @@ export function collectRenderedDom({ panelSelector, layer, timeoutMs } = {}) {
     // so off-screen columns do not wait on pointer actionability or scrolling.
     return (async () => {
       const end = Date.now() + timeoutMs;
-      const waitFor = async (probe, until) => {
-        do {
-          const value = probe();
-          if (value) return value;
-          await new Promise(resolve => setTimeout(resolve, 20));
-        } while (Date.now() < until);
-        return null;
+      const toggle = (button, probe, until) => {
+        return new Promise(resolve => {
+          const finish = value => {
+            observer.disconnect();
+            clearTimeout(timer);
+            resolve(value || null);
+          };
+          const check = () => {
+            const value = probe();
+            if (value) finish(value);
+          };
+          const observer = new MutationObserver(check);
+          const timer = setTimeout(() => finish(probe()), Math.max(1, until - Date.now()));
+          observer.observe(button, { attributes: true, attributeFilter: ['aria-expanded', 'aria-controls'] });
+          const portalRoot = document.getElementById('headlessui-portal-root');
+          if (portalRoot) observer.observe(portalRoot, { childList: true, subtree: true });
+          button.click();
+          check();
+        });
       };
       const filterButton = /^(?:篩選|筛选|Filters?)$/i;
       for (const [index, panel] of panels.entries()) {
@@ -90,13 +96,13 @@ export function collectRenderedDom({ panelSelector, layer, timeoutMs } = {}) {
         const button = [...panel.firstElementChild.querySelectorAll('button[aria-expanded]')]
           .find(el => visible(el) && filterButton.test(controlLabel(el)));
         if (!button) continue;
-        const until = Math.min(end, Date.now() + 800);
+        const until = Math.min(end, Date.now() + 2500);
         if (Date.now() >= until) break;
-        button.click();
-        column.filter = await waitFor(() => button.getAttribute('aria-expanded') === 'true'
-          && readFilter(button.getAttribute('aria-controls')), until);
-        if (button.getAttribute('aria-expanded') === 'true') button.click();
-        await waitFor(() => button.getAttribute('aria-expanded') === 'false', until);
+        const opened = () => button.getAttribute('aria-expanded') === 'true' && readFilter(button.getAttribute('aria-controls'));
+        column.filter = opened() || await toggle(button, opened, until);
+        if (button.getAttribute('aria-expanded') === 'true') {
+          await toggle(button, () => button.getAttribute('aria-expanded') === 'false', until);
+        }
       }
       return { columns, labelsAfter: read(panelSelector || '.no-scrollbar > .flex-h > .glass-panel')
         .filter(panel => visible(panel.firstElementChild))
@@ -309,7 +315,7 @@ export function normalizeRenderedDom(raw, url) {
       }
       for (const value of buttons) {
         const label = stableLabel(value);
-        if (label) signals.push(`模式结构：${openLabel} / 按钮 ${label}`);
+        if (label && !transientSignal(`按钮：${label}`)) signals.push(`模式结构：${openLabel} / 按钮 ${label}`);
       }
       if (tabs.length) signals.push(`模式结构：${openLabel} / 开关数量 ${switches}`);
       addFields(signals, `表单字段：${openLabel} / `, detailFields);
