@@ -48,6 +48,7 @@ export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, pro
   staticFingerprint = () => '', autoRun = true }) {
   let checking = false, running = false, closed = false, timer, writes = Promise.resolve();
   let lastCheckAt = 0, lastCheckDurationMs = 0, checkCount = 0, lastError = '', nextStartAt = 0;
+  const recentChecks = [];
   const read = () => store.state._frontendRenderSchedule || { pages: {} };
   const mutate = fn => {
     const work = writes.then(() => store.transaction(async () => {
@@ -105,6 +106,8 @@ export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, pro
         if (title) await store.enqueue({ title, content: errors.length ? errors.map(([url, p]) => `${new URL(url).pathname}：${p.probeError}`).join('\n') + '\n旧基线、待核验任务保留，独立渲染兜底继续。' : '轻量检测已连续正常30秒，按需核验继续。', template: errors.length ? 'yellow' : 'green', skipAi: true, moduleContext: 'Four.meme 前端轻量检测' });
       });
       lastCheckAt = now(); lastCheckDurationMs = now() - start; checkCount++;
+      recentChecks.push({ startedAt: start, finishedAt: lastCheckAt, durationMs: lastCheckDurationMs });
+      if (recentChecks.length > 120) recentChecks.shift();
       lastError = results.filter(x => x.error).map(x => `${new URL(x.url).pathname}: ${x.error}`).join('；');
       wake(); arm(); return true;
     } finally { checking = false; }
@@ -146,7 +149,7 @@ export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, pro
     summary() {
       const pages = Object.values(read().pages);
       const rendered = renderer.summary();
-      return { ...rendered, running, checking, mode: 'on-demand', fallbackMs, minGapMs, lastCheckAt, lastCheckDurationMs, checkCount,
+      return { ...rendered, running, checking, mode: 'on-demand', fallbackMs, minGapMs, lastCheckAt, lastCheckDurationMs, checkCount, recentChecks: [...recentChecks],
         probeError: lastError, pendingPages: pages.filter(p => p.pending).length,
         oldestQueuedAt: pages.some(p => p.pending) ? Math.min(...pages.filter(p => p.pending).map(p => p.queuedAt)) : 0,
         maxQueueDelayMs: Math.max(0, ...pages.map(p => p.lastQueueDelayMs || 0)),

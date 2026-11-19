@@ -41,6 +41,7 @@ test('5秒未变化探测不重复渲染，60秒兜底按页面错开', async ()
   assert.deepEqual(h.calls, [[urls[0]]]);
   for (const t of [6000, 11000, 16000, 21000, 26000]) { h.time(t); await h.scheduler.poll(); await h.scheduler.runNext(); }
   assert.equal(h.calls.length, 1);
+  assert.deepEqual(h.scheduler.summary().recentChecks.map(p => p.startedAt), [1000, 6000, 11000, 16000, 21000, 26000]);
   h.time(31000); await h.scheduler.poll(); await h.scheduler.runNext(); assert.deepEqual(h.calls[1], [urls[1]]);
   h.time(61000); await h.scheduler.poll(); await h.scheduler.runNext(); assert.deepEqual(h.calls[2], [urls[0]]);
   assert.deepEqual(h.store.state.history, { gaps: [1], dedupe: ['old'] });
