@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { fork, execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { formatBeijingTime } from '../shared/display-format.cjs';
+import { cardStatus, cardTime } from './card-style.mjs';
 
 export const RENDER_URLS = ['zh-TW', 'en'].flatMap(locale =>
   ['create-token', 'advanced', '4stock', ''].map(path => `https://four.meme/${locale}${path ? '/' + path : ''}`));
@@ -523,7 +524,19 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
           }
           state.pages[url] = { ...data, lastAttemptAt: startedAt, lastSuccessAt: now(), lastError: '' };
         }
-        if (initialized.length) notices.push(notice('Four.meme 页面渲染覆盖已补齐', `首次建立以下页面的渲染基线（不代表这些功能刚刚上线）：\n${initialized.map(p => `${new URL(p.url).pathname}：${p.signals.filter(s => /标题：|选项卡：|功能：|按钮：(?:鑄造|贖回|兌換|Mint|Redeem|Convert)/.test(s)).slice(0, 10).join('；') || '导航与功能控件'}`).join('\n')}\n时间：${formatBeijingTime(now())}`));
+        if (initialized.length) notices.push({
+          ...notice('Four.meme 页面渲染覆盖已补齐', [
+            cardStatus('healthy', `建立 ${initialized.length} 个页面基线`),
+            '本卡记录首次基线，功能变更将在后续比较时报告。',
+            ...initialized.map(p => {
+              const path = new URL(p.url).pathname;
+              const summary = p.signals.filter(s => /标题：|选项卡：|功能：|按钮：(?:鑄造|贖回|兌換|Mint|Redeem|Convert)/.test(s)).slice(0, 10);
+              return `[${path}](${p.url}) · ${summary.join(' / ') || '导航与功能控件'}`;
+            }),
+            cardTime(now()),
+          ].join('\n'), 'green'),
+          cardOpts: { showDetailLink: false },
+        });
         if (changes.length) {
           const { content, url } = formatRenderedChanges(changes);
           const template = changes.some(change => change.removed.length) ? 'orange' : 'green';
@@ -543,13 +556,16 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
           health.firstFailureAt ??= startedAt; health.healthySince = 0;
           if (now() - health.firstFailureAt >= 60000 && !health.alerted) {
             health.alerted = true;
-            notices.push(notice('Four.meme 页面渲染核验异常', `${health.lastError}\n旧有效基线保留；静态抓取继续，渲染工作器按原调度重试。`, 'yellow'));
+            notices.push(notice('Four.meme 页面渲染核验异常', `${cardStatus('warning', `渲染核验异常 / 影响 ${errors.length} 页`)}\n${health.lastError}\n保留旧基线，静态抓取和渲染重试继续。\n${cardTime(now())}`, 'yellow'));
           }
         } else {
           health.lastSuccessAt = now(); health.firstFailureAt = null;
           if (health.alerted) {
             health.healthySince ||= now();
-            if (now() - health.healthySince >= 30000) { health.alerted = false; notices.push(notice('Four.meme 页面渲染核验恢复', '核心页面已持续完整采集30秒，继续比较旧基线。', 'green')); }
+            if (now() - health.healthySince >= 30000) {
+              health.alerted = false;
+              notices.push(notice('Four.meme 页面渲染核验恢复', `${cardStatus('healthy', '核心页面已持续完整采集30秒')}\n继续比较旧基线。\n${cardTime(now())}`, 'green'));
+            }
           }
         }
         store.state._frontendRendered = state;

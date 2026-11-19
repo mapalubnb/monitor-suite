@@ -4,6 +4,7 @@ import { USER_OPERATION_EVENT, receiptUserOperations, userOperationResult } from
 import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS } from './address-catalog.mjs';
 import { formatBeijingTime } from '../shared/display-format.cjs';
 import { addressRpcFailure } from './address-rpc.mjs';
+import { cardStatus, cardTime } from './card-style.mjs';
 
 export const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 export const APPROVAL = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
@@ -16,15 +17,13 @@ const topicAddress = t => /^0x0{24}[a-f0-9]{40}$/i.test(t || '') ? lower('0x' + 
 const link = a => `[${a}](https://bscscan.com/address/${a})`;
 const amount = (n, decimals) => { const v = BigInt(n).toString().padStart(decimals + 1, '0'); return decimals ? (v.slice(0, -decimals) + '.' + v.slice(-decimals)).replace(/\.?0+$/, '') : v; };
 
-// Match Flap's address-observation card: action, one grouped observation,
-// observation time, then a compact transaction/block footer. No raw tx hash row.
-export function renderFourmemeAddressContent({ result, catalog, txHash, block, observedAt }) {
-  const action = result.failed ? '🔎 关联操作｜交易失败'
+export function renderFourmemeAddressContent({ result, catalog, txHash, block, observedAt, chainAt }) {
+  const action = result.failed ? cardStatus('failed', '关联操作 / 交易失败')
     : result.lines.some(l => /资产转移|直接转移/.test(l)) ? '💸 资金变动'
     : result.lines.some(l => /授权/.test(l)) ? '🔑 代币授权' : '🔎 关联操作';
   const labels = result.touched.map(a => { const info = catalog.find(c => c.address === a); return `${info.label}：${link(a)}（${info.evidence}）`; });
-  return [action, `• 关联地址观察：\n${labels.join('\n')}\n${result.lines.join('\n')}`,
-    `🕒 ${formatBeijingTime(observedAt)}`, `[交易](https://bscscan.com/tx/${txHash})｜区块 ${block}`, ''].join('\n');
+  return [action, ...labels, ...result.lines, `[交易](https://bscscan.com/tx/${txHash}) / [区块 ${block}](https://bscscan.com/block/${block})`,
+    ...(chainAt ? [`链上时间：${formatBeijingTime(chainAt)}`] : []), `${cardTime(observedAt)}（监控发现）`].join('\n');
 }
 function validBlock(b, n, full = false) {
   if (!b || num(b.number) !== n || !hashOK(b.hash) || !hashOK(b.parentHash) || (full && (!Array.isArray(b.transactions) || b.transactions.some(t => !t || typeof t !== 'object' || !hashOK(t.hash) || num(t.blockNumber) !== n || lower(t.blockHash) !== lower(b.hash))))) throw Error(`地址监控区块 ${n} 不完整，保留缺口`);
@@ -109,7 +108,7 @@ export function updateAddressHealth(state, { at, head, error, stallMs = 60000, r
     h.alerted = true; h.incidentAt = at; h.incidentCursor = state.cursor ?? null;
     h.healthySince = null; h.healthyChecks = 0; h.status = 'stalled';
     const lagging = h.lagSince != null && at - h.lagSince >= stallMs;
-    return { title: '监控异常', content: `${error ? h.lastError : lagging ? '扫描持续落后超过32块' : '链上扫描持续未推进'}\n已持续 ${Math.floor((at - (lagging ? h.lagSince : since)) / 1000)} 秒。游标：${state.cursor ?? '待建立'}｜观测头块：${head || '未知'}｜落后：${lag} 块。\n失败区块未跳过；原缺口与去重保留，WSS＋1秒调度继续补扫。` };
+    return { title: '监控异常', content: `${cardStatus('warning', `地址扫描异常 / 持续 ${Math.floor((at - (lagging ? h.lagSince : since)) / 1000)} 秒`)}\n${error ? h.lastError : lagging ? '扫描持续落后超过32块' : '链上扫描持续未推进'}\n游标：${state.cursor ?? '待建立'} / 头块：${head || '未知'} / 落后 ${lag} 块\n失败区块未跳过，原缺口与去重保留，WSS＋1秒调度继续补扫。` };
   }
   const caughtUp = !error && !stalled && lag <= 2 && (h.incidentCursor == null || state.cursor > h.incidentCursor);
   if (h.alerted && caughtUp) {
@@ -117,7 +116,7 @@ export function updateAddressHealth(state, { at, head, error, stallMs = 60000, r
     if (at - h.healthySince >= recoveryMs && h.healthyChecks >= 3) {
       h.alerted = false; h.status = 'healthy'; h.lastError = ''; h.failureKind = ''; h.failureSince = null;
       h.recoveredAt = at; h.healthySince = null; h.healthyChecks = 0;
-      return { title: '监控恢复', content: `已连续稳定核验至少 ${Math.floor(recoveryMs / 1000)} 秒并推进游标。\n当前游标：${state.cursor}｜观测头块：${head}｜落后：${lag} 块。\n历史缺口及去重记录保留；连续补扫已恢复。` };
+      return { title: '监控恢复', content: `${cardStatus('healthy', `稳定核验至少 ${Math.floor(recoveryMs / 1000)} 秒 / 游标已推进`)}\n当前游标：${state.cursor} / 头块：${head} / 落后 ${lag} 块\n历史缺口及去重记录保留，连续补扫已恢复。` };
     }
     h.status = 'recovering';
   } else {
@@ -134,7 +133,7 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
   if (catalog.length === 0 || catalog.some(a => !addressOK(a.address)) || new Set(catalog.map(a => a.address)).size !== catalog.length) throw Error('地址目录无效或重复');
   let task = null, runtime = { head: 0, lastAttemptAt: 0 };
   const read = () => store.state.fourmemeAddresses || { anchors: [], seen: {}, passive: [], health: {}, catalog: [] };
-  const notice = (title, content, detail = {}) => ({ title: `Four.meme 地址 ${title}`, content, template: 'orange', skipAi: true,
+  const notice = (title, content, detail = {}) => ({ title: `Four.meme 地址 ${title}`, content, template: title === '监控恢复' ? 'green' : title === '监控异常' ? 'yellow' : 'orange', skipAi: true,
     moduleContext: 'Four.meme 独立地址监控', fourmemeAddress: { detectedAt: now(), ...detail } });
   async function poll() {
     if (!enabled || stopped() || task) return false;
@@ -213,8 +212,10 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
               }
               if (!result.lines.length || draft.seen[id]) continue;
               const detectedAt = now();
+              const chainAt = num(b.timestamp) * 1000;
               notices.push({ ...notice('关联地址观察', renderFourmemeAddressContent({ result, catalog: eligible,
-                txHash: tx.hash, block: n, observedAt: detectedAt }), { txHash: tx.hash, block: n, chainAt: num(b.timestamp) * 1000 }),
+                txHash: tx.hash, block: n, observedAt: detectedAt, chainAt }), { txHash: tx.hash, block: n, chainAt }),
+                ...(result.failed ? { template: 'red' } : {}),
                 title: result.failed ? 'Four.meme 关联地址观察｜交易失败' : 'Four.meme 关联地址观察' });
               draft.seen[id] = { tx: tx.hash, block: n, detectedAt };
             }

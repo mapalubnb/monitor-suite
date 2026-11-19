@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { cardStatus, cardTime } from './card-style.mjs';
 import { RENDER_URLS } from './frontend-render.mjs';
 import { withDeadline } from '../shared/request-deadline.mjs';
 
@@ -130,7 +131,15 @@ export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, pro
           health.healthySince ||= now();
           if (now() - health.healthySince >= 30000) { health.alerted = false; title = 'Four.meme 前端轻量检测恢复'; }
         }
-        if (title) await store.enqueue({ title, content: errors.length ? errors.map(([url, p]) => `${new URL(url).pathname}：${p.probeError}`).join('\n') + '\n旧基线、待核验任务保留，独立渲染兜底继续。' : '轻量检测已连续正常30秒，按需核验继续。', template: errors.length ? 'yellow' : 'green', skipAi: true, moduleContext: 'Four.meme 前端轻量检测' });
+        if (title) {
+          const content = errors.length
+            ? [cardStatus('warning', `轻量检测异常 / 影响 ${errors.length} 页`),
+              ...errors.map(([url, p]) => `[${new URL(url).pathname}](${url})：${p.probeError}`),
+              '旧基线和待核验任务保留，独立渲染兜底继续。']
+            : [cardStatus('healthy', '轻量检测已连续正常30秒'), '按需核验继续。'];
+          await store.enqueue({ title, content: [...content, cardTime(now())].join('\n'),
+            template: errors.length ? 'yellow' : 'green', skipAi: true, moduleContext: 'Four.meme 前端轻量检测' });
+        }
       });
       lastCheckAt = now(); lastCheckDurationMs = now() - start; checkCount++;
       recentChecks.push({ startedAt: start, finishedAt: lastCheckAt, durationMs: lastCheckDurationMs });

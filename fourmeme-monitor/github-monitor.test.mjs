@@ -171,7 +171,8 @@ test("GitHub 更名按 node ID 迁移，不丢失基线", async () => {
 });
 
 test("GitHub compare 分页去重，逐提交文件分页，首条送达后才补详情", async () => {
-  const context = await changedFixture();
+  const saved = [];
+  const context = await changedFixture({ saveDiff: (_, text) => { saved.push(text); return "test.diff"; } });
   await context.store.drain();
   let call = 0;
   context.api.rest = async () => {
@@ -185,8 +186,13 @@ test("GitHub compare 分页去重，逐提交文件分页，首条送达后才�
   for (let count = 0; count < 5; count++) await context.monitor.enrich();
   assert.equal(context.persisted.githubMonitor.jobs.length, 0);
   assert.equal(context.persisted._notificationOutbox.length, 2);
-  assert.match(context.persisted._notificationOutbox[0].payload.content, /未提供 patch/);
-  assert.equal(context.persisted._notificationOutbox[0].payload.diffFilePath, "test.diff");
+  const first = context.persisted._notificationOutbox[0].payload;
+  assert.match(first.content, /未提供 1 个文件的 patch/);
+  assert.match(first.content, /文件 2 个/);
+  assert.doesNotMatch(first.content, /\+a/);
+  assert.equal(first.diffFilePath, "test.diff");
+  assert.equal((saved[0].match(/\+a/g) || []).length, 1);
+  assert.match(saved[0], /GitHub 未提供 patch/);
 });
 
 test("GitHub 详情失败保留任务和分页进度，重启后重试", async () => {

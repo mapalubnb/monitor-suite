@@ -25,6 +25,7 @@ import {
   lark, isAuthorizedSender,
 } from "../shared/feishu-client.mjs";
 import { AI, chatCompletion, listProviders, listRemoteModels, switchProvider } from "../shared/ai-client.mjs";
+import { cardStatus, formatCommandReply } from "./card-style.mjs";
 
 const execAsync = promisify(execCb);
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -223,14 +224,14 @@ async function handleMessage(messageId, rawText) {
         if (["model", "模型", "switch", "切换", "list", "列表", "models", "remote", "远程"].includes(aiSubCmd)) {
           reply = await cmdAiModel(aiSubCmd, args.slice(1));
           if (reply) {
-            await replyCard(messageId, "AI 模型", reply, "purple");
+            await replyCard(messageId, "AI 模型", `## 模型配置\n${reply}`, "purple");
             return;
           }
           // reply === null 意味着非模型管理指令，继续当做 AI 问题处理
         }
         if (!reply) {
           reply = await cmdAi(args.join(" "));
-          await replyCard(messageId, "AI 助手", reply, "blue");
+          await replyCard(messageId, "AI 助手", `## 查询结果\n${reply}`, "blue");
         }
         return;
       }
@@ -242,10 +243,10 @@ async function handleMessage(messageId, rawText) {
         if (records.length === 0) {
           reply = "暂无变更记录";
         } else {
-          const lines = [`**最近 ${records.length} 条变更记录：**`, ""];
+          const lines = [`## 最近 ${records.length} 条变更`];
           for (const r of records) {
             const time = formatBeijingTime(r.ts);
-            lines.push(`\`${time}\` **[${r.module}]** ${r.title}`);
+            lines.push(`${r.module} · ${r.title} / \`${time}\``);
           }
           reply = lines.join("\n");
         }
@@ -264,7 +265,7 @@ async function handleMessage(messageId, rawText) {
       case "$": {
         const command = args.join(" ");
         if (willRestartSelf(command)) {
-          await replyCard(messageId, "重启", `即将执行：\`${command}\`\n机器人将短暂离线...`, "yellow");
+          await replyCard(messageId, "重启", `${cardStatus('warning', '命令即将执行 / 机器人将短暂离线')}\n\`${command}\``, "yellow");
           setTimeout(() => { execAsync(command, { timeout: CONFIG.execTimeout, cwd: CONFIG.monitorDir, env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }).catch(() => {}); }, 1_000);
           return;
         }
@@ -279,7 +280,7 @@ async function handleMessage(messageId, rawText) {
 
       default: {
         if (willRestartSelf(text)) {
-          await replyCard(messageId, "重启", `即将执行：\`${text}\`\n机器人将短暂离线...`, "yellow");
+          await replyCard(messageId, "重启", `${cardStatus('warning', '命令即将执行 / 机器人将短暂离线')}\n\`${text}\``, "yellow");
           setTimeout(() => { execAsync(text, { timeout: CONFIG.execTimeout, cwd: CONFIG.monitorDir, env: { ...process.env, PATH: `/usr/local/bin:/usr/bin:/bin:${process.env.PATH || ""}` } }).catch(() => {}); }, 1_000);
           return;
         }
@@ -637,25 +638,20 @@ function isDangerous(cmd) {
 // ── help ──
 function cmdHelp() {
   return [
-    "**内置指令：**",
+    "## 查询",
     "`help`　　　　显示此帮助",
     "`ai <问题>`　 AI 助手（别名：问、ask）",
-    "`ai model`　　查看当前 AI 提供商和模型",
-    "`ai switch <提供商> [模型]` 切换提供商/模型",
-    "`ai list`　　 列出所有可用提供商及模型",
-    "`ai models [提供商]` 从 API 获取远程模型列表",
-    "`history [N]` 最近变更记录（默认 10）",
+    "模型管理：`ai model` / `ai switch <提供商> [模型]` / `ai list` / `ai models [提供商]`（远程列表）",
+    "变更记录：`history [N]`（默认 10）",
+    "## 路由审批",
     "`route list`　查看待确认的新路由",
     "`route add <完整URL>`　加入前端监控",
     "`route ignore <完整URL>`　忽略新路由",
     "",
-    "**Shell 命令：**",
-    "直接输入任意命令执行，如 `fm-status`、`fl-status`、`mon-status`",
-    "输入 `mon-help` 查看所有快捷命令",
-    "",
-    "**日志下载：**",
-    "执行 `fm-log`、`fl-log`、`bot-log`、`mon-log` 时",
-    "自动附带可下载的完整日志文件",
+    "## 状态与日志",
+    "状态：`fm-status` / `fl-status` / `mon-status`",
+    "日志：`fm-log` / `fl-log` / `bot-log` / `mon-log`（附完整文件）",
+    "直接输入命令执行，`mon-help` 可查全部快捷命令。",
   ].join("\n");
 }
 
@@ -776,13 +772,14 @@ const CMD_CARD_MAP = [
 function inferCard(command) {
   const bin = command.split(/\s+/)[0];
   for (const m of CMD_CARD_MAP) {
-    if (m.re.test(bin)) return { title: m.title, color: m.color, markdown: m.markdown };
+    if (m.re.test(bin)) return { title: m.title, color: m.color, markdown: m.markdown, summary: bin.startsWith('fm-') };
   }
   return { title: `$ ${bin}`, color: "grey", markdown: false };
 }
 
 /** 将 exec 结果格式化为卡片正文 */
 function formatExecBody(result, card) {
+  if (card.summary) return formatCommandReply(result, card);
   if (!result.ok) {
     const errBody = result.code != null
       ? `**退出码：${result.code}**\n\`\`\`\n${result.text}\n\`\`\``
@@ -1043,8 +1040,8 @@ async function cmdFrontendRoute(args = []) {
     const pending = Object.values({ ...snap._frontendPendingRoutes, ...decisions._frontendPendingRoutes })
       .filter(item => item?.status === "pending" && item?.url)
       .sort((a, b) => String(a.url).localeCompare(String(b.url)));
-    if (pending.length === 0) return "当前没有待确认的新路由。";
-    return ["**待确认的新路由**", ...pending.map((item, index) => `${String(index + 1).padStart(2, "0")}　[${item.url}](${item.url})`)].join("\n");
+    if (pending.length === 0) return cardStatus('healthy', '当前没有待确认的新路由');
+    return [cardStatus('warning', `待确认 ${pending.length} 条`), ...pending.map(item => `- [${item.url}](${item.url})`)].join("\n");
   }
 
   const action = ["add", "加入", "批准"].includes(subcommand)
@@ -1072,8 +1069,8 @@ async function cmdFrontendRoute(args = []) {
     throw new Error(`路由状态未更新为 ${expectedStatus}`);
   }
   return action === "frontend_add_route"
-    ? `已加入前端监控：\n[${canonical}](${canonical})\n下一轮检查将建立基线。`
-    : `已忽略新路由：\n[${canonical}](${canonical})\n后续不会重复提醒。`;
+    ? `${cardStatus('healthy', '已加入前端监控')}\n[${canonical}](${canonical})\n下一轮检查将建立基线。`
+    : `${cardStatus('changed', '已忽略新路由')}\n[${canonical}](${canonical})\n后续不会重复提醒。`;
 }
 
 /**

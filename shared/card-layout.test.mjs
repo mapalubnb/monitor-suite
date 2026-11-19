@@ -6,6 +6,8 @@ import { buildStartupCard } from './startup-notifier.mjs';
 import { buildSafeProposalContent } from '../flap-monitor/safe-proposal-monitor.mjs';
 import { buildContractIntegrityContent } from '../flap-monitor/contract-integrity-monitor.mjs';
 import { buildEarlySignalContent } from '../flap-monitor/early-signal-monitor.mjs';
+import { renderFourmemeSafe } from '../fourmeme-monitor/safe-monitor.mjs';
+import { formatCommandReply } from '../fourmeme-monitor/card-style.mjs';
 
 process.env.FOURMEME_MONITOR_TEST = '1';
 process.env.FLAP_MONITOR_TEST = '1';
@@ -14,6 +16,29 @@ const { __testables: fl } = await import('../flap-monitor/monitor.mjs');
 const address = '0x' + '1'.repeat(40);
 const hash = '0x' + '2'.repeat(64);
 const timestamp = '2026-09-26T06:00:00.000Z';
+
+test('Four.meme Safe 进度靠前且保留原始提案、执行和观测证据', () => {
+  const content = renderFourmemeSafe([{
+    type: 'ready', status: 'ready', safe: address, safeTxHash: hash, confirmations: 2,
+    required: 2, nonce: 42, actions: [], confirmationOwners: [address],
+    submissionDate: timestamp, firstSeenAt: timestamp,
+  }], {}, { owners: [address] });
+  const rendered = bodyText(buildCardBodyElements(content, { showUpdatedAt: false }));
+  assert.match(rendered, /签名已满足，等待执行<\/font>\n确认进度：2\/2｜Safe nonce：42/);
+  assert.match(rendered, /执行条件未核实/);
+  for (const evidence of ['首次观测', '提案时间', 'SafeTxHash', hash, 'Four.meme Safe 签名人']) assert.ok(rendered.includes(evidence));
+  assert.doesNotMatch(rendered, /更新时间：/);
+  assert.match(bodyText(buildCardBodyElements(content)), /更新时间：/);
+});
+
+test('Four.meme 命令卡保留完整原始输出，包括代码围栏及退出码', () => {
+  const sample = 'raw output\n```\n' + '**保留原样**' + '\n```';
+  const body = formatCommandReply({ ok: false, code: 7, text: sample }, { summary: true });
+  assert.match(body, /退出码 7/);
+  assert.ok(body.endsWith('````\n' + sample + '\n````'));
+  const rendered = buildCardBodyElements(body).find(element => element.element_id?.startsWith('code_'));
+  assert.equal(rendered.content, formatDisplayText('````\n' + sample + '\n````'));
+});
 
 function bodyText(elements) {
   return elements.flatMap(element => {

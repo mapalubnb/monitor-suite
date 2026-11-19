@@ -58,10 +58,11 @@ test('RPC轮次初始化失败也释放任务，后续轮次可恢复', async ()
   await m.poll(); assert.equal(f.disk.fourmemeAddresses.cursor, 100);
 });
 
-test('地址通知采用Flap操作、观察、时间和交易链接顺序，不输出延后核验行', () => {
-  const text = renderFourmemeAddressContent({ result: { lines: ['直接转移 1 BNB'], touched: [A] }, catalog: cat, txHash: h(1), block: 123, observedAt: 1795000000000 });
-  assert.match(text, /^💸 资金变动\n• 关联地址观察：/);
-  assert.match(text, /🕒 2026\/11\/18 .*\n\[交易\]\(https:\/\/bscscan.com\/tx\/0x[a-f0-9]{64}\)｜区块 123\n$/);
+test('地址通知保留动作、归属、交易及区块，并区分链上与发现时间', () => {
+  const text = renderFourmemeAddressContent({ result: { lines: ['直接转移 1 BNB'], touched: [A] }, catalog: cat, txHash: h(1), block: 123, observedAt: 1795000000000, chainAt: 1794999990000 });
+  assert.match(text, /^💸 资金变动\n/);
+  assert.match(text, /\[交易\]\(https:\/\/bscscan.com\/tx\/0x[a-f0-9]{64}\) \/ \[区块 123\]\(https:\/\/bscscan.com\/block\/123\)/);
+  assert.match(text, /链上时间：2026\/11\/18 .*\n更新时间：2026\/11\/18 .*（监控发现）$/);
   assert.doesNotMatch(text, /延后|发现时间：|交易：\[0x|\*\*/);
 });
 test('首次只建立基线；重启去重、独立字段与AI关闭', async () => {

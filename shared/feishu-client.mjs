@@ -449,14 +449,15 @@ export function buildCardBodyElements(content, opts = {}) {
     elements.push({ tag: "hr", element_id: nextId("divider"), margin: "6px 0" });
     elements.push(diffButton);
   }
-  if (opts.footerText || !contentHasTimestamp) {
+  const showTimestamp = !contentHasTimestamp && opts.showUpdatedAt !== false;
+  if (opts.footerText || showTimestamp) {
     elements.push({ tag: "hr", element_id: nextId("divider"), margin: "6px 0 2px 0" });
     elements.push({
       tag: "div",
       element_id: nextId("footer"),
       text: {
         tag: "plain_text",
-        content: [opts.footerText, contentHasTimestamp ? "" : `更新时间：${ts()}`].filter(Boolean).join("｜"),
+        content: [opts.footerText, showTimestamp ? `更新时间：${ts()}` : ""].filter(Boolean).join("｜"),
         text_size: "notation",
         text_color: "grey",
         text_align: "left",

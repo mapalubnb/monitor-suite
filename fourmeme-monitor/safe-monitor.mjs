@@ -1,6 +1,7 @@
 import { createSafeProposalState, runSafeProposalScan, acknowledgeSafeProposalChanges,
   buildSafeProposalContent, normalizeSafeApiKeys } from '../flap-monitor/safe-proposal-monitor.mjs';
 import { createDeadlineSignal, withAbortSignal, withDeadline } from '../shared/request-deadline.mjs';
+import { cardStatus } from './card-style.mjs';
 
 export const FOURMEME_SAFE = '0x161dd0cfdb0aa25e2504f725655ef9b799375b71';
 const ACTIVE = new Set(['pending', 'ready', 'confirming']);
@@ -29,11 +30,17 @@ function decodeIdentity(values, block, at) {
   return { owners, threshold, singleton, block: Number(BigInt(block)), checkedAt: at };
 }
 
-export function renderFourmemeSafe(changes, metadata = {}, identity) {
-  return buildSafeProposalContent(changes, metadata, {
+export function renderFourmemeSafe(changes = [], metadata = {}, identity) {
+  const options = {
     formatOwner: owner => /^0x[a-f0-9]{40}$/i.test(owner || '') ? `[${owner}](https://bscscan.com/address/${owner})（${identity?.owners?.includes(owner.toLowerCase()) ? 'Four.meme Safe 签名人' : '成员身份待核验'}）` : '未知地址',
     annotate: text => text.replaceAll('**', ''),
-  });
+  };
+  return changes.map(change => {
+    const [heading, status, ...details] = buildSafeProposalContent([change], metadata, options).trimEnd().split('\n');
+    const index = details.findIndex(line => line.startsWith('确认进度：'));
+    const progress = index === -1 ? [] : details.splice(index, 1);
+    return [`## ${heading}`, status, ...progress, ...details].join('\n');
+  }).join('\n\n');
 }
 
 // The reused engine is pure state + injected I/O. Never import Flap's process,
@@ -54,6 +61,7 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
     title: `Four.meme Safe ${title}`, content, template, skipAi: true,
     moduleContext: 'Four.meme Safe 资金与管理提案',
     url: `https://app.safe.global/transactions/queue?safe=bnb:${FOURMEME_SAFE}`,
+    ...(detail.changes ? { cardOpts: { showDetailLink: false, showUpdatedAt: false } } : {}),
     fourmemeSafe: { safe: FOURMEME_SAFE, detectedAt: now(), ...detail },
   });
 
@@ -85,7 +93,7 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
             ]);
             const identity = decodeIdentity(values, block, now());
             if (draft.identity && JSON.stringify([draft.identity.owners, draft.identity.threshold, draft.identity.singleton]) !== JSON.stringify([identity.owners, identity.threshold, identity.singleton])) {
-              notices.push(notification('签名配置变更', `管理 Safe：${FOURMEME_SAFE}\n门槛：${draft.identity.threshold}/${draft.identity.owners.length} → ${identity.threshold}/${identity.owners.length}\n当前成员：\n${identity.owners.join('\n')}\n实现：${draft.identity.singleton} → ${identity.singleton}\n核验区块：${identity.block}`, 'red'));
+              notices.push(notification('签名配置变更', `${cardStatus('changed', '签名配置已核验')}\n管理 Safe：${FOURMEME_SAFE}\n门槛：${draft.identity.threshold}/${draft.identity.owners.length} → ${identity.threshold}/${identity.owners.length}\n当前成员：\n${identity.owners.join('\n')}\n实现：${draft.identity.singleton} → ${identity.singleton}\n核验区块：${identity.block}`, 'red'));
             }
             draft.identity = identity;
             draft.identityError = '';
@@ -135,11 +143,11 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
           failures: problem ? (oldHealth.failures || 0) + Number(failedAttempt) : scanned.successfulSafes > 0 ? 0 : oldHealth.failures || 0 };
         if (!problem && scanned.successfulSafes > 0) {
           draft.health.lastSuccessAt = now();
-          if (oldHealth.alerted) notices.push(notification('监控恢复', '已成功读取提案并保存进度；未清除历史提案或去重记录。', 'green'));
+          if (oldHealth.alerted) notices.push(notification('监控恢复', `${cardStatus('healthy', '提案读取恢复 / 进度已保存')}\n历史提案和去重记录保留。`, 'green'));
           draft.health.alerted = false;
         } else if (draft.health.failures >= 5 && !oldHealth.alerted) {
           draft.health.alerted = true;
-          notices.push(notification('监控异常', `连续失败：${draft.health.failures} 次\n${problem}\n原状态与通知已保留，按现有限流规则自动重试。`, 'yellow'));
+          notices.push(notification('监控异常', `${cardStatus('warning', `提案检查异常 / 连续 ${draft.health.failures} 次`)}\n${problem}\n保留原状态与通知，按现有限流规则重试。`, 'yellow'));
         }
         // Execution failures retain their own incident, deadlines and retries.
         // A skipped execution job is neither another failure nor a recovery.
@@ -154,10 +162,10 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
             ...(safeHealth.executionGap ? [safeHealth.executionHistoryError || '执行索引缺口待补齐'] : [])])].join('；');
           if (!eh.alerted && (eh.failures >= 5 || now() - eh.pendingSince >= 60000)) {
             eh.alerted = true;
-            notices.push(notification('执行补查异常', `${eh.lastError}\n缺口与旧提案保留，补查独立重试；新提案和签名监控继续运行。`, 'yellow'));
+            notices.push(notification('执行补查异常', `${cardStatus('warning', '执行补查异常 / 独立重试')}\n${eh.lastError}\n保留缺口与旧提案，新提案和签名监控继续运行。`, 'yellow'));
           }
         } else {
-          if (eh.alerted) notices.push(notification('执行补查恢复', '待核验的旧提案及执行缺口已处理，原提案与去重记录保留。', 'green'));
+          if (eh.alerted) notices.push(notification('执行补查恢复', `${cardStatus('healthy', '执行补查已恢复')}\n旧提案及执行缺口已处理，原提案与去重记录保留。`, 'green'));
           Object.assign(eh, { failures: 0, alerted: false, pendingSince: 0, lastError: '' });
         }
         await store.transaction(async () => {
@@ -181,7 +189,7 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
           health.failures = (health.failures || 0) + 1;
           if ((task.signal.aborted || health.failures >= 5) && !health.alerted) {
             health.alerted = true;
-            await store.enqueue(notification('监控异常', `${error.message}\n本轮未提交，原提案及去重记录保留，后续轮次自动恢复。`, 'yellow'));
+            await store.enqueue(notification('监控异常', `${cardStatus('warning', '本轮检查失败 / 原进度保留')}\n${error.message}\n原提案及去重记录保留，后续轮次自动重试。`, 'yellow'));
           }
         });
         wake();

@@ -1252,8 +1252,8 @@ test("frontend text change card content is readable without code block scrolling
   ]);
 
   assert.doesNotMatch(content, /```/);
-  assert.match(content, /\*\*新增：\*\*/);
-  assert.match(content, /\*\*移除：\*\*/);
+  assert.match(content, /🟢 新增 1/);
+  assert.match(content, /🔴 移除 1/);
   assert.match(content, /原：<font color="red">Latest announcements<\/font>/);
   assert.match(content, /新：<font color="green">Live feed<\/font>/);
   assert.match(content, /<font color="green">Create Token Loading/);
@@ -1431,7 +1431,7 @@ test("openfour new module card includes current presetIds", () => {
   ], {
     presetIds: ["1778027615725", "1778027615730"],
   });
-  assert.match(content, /本轮链上 presetIds：\*\* 1778027615725, 1778027615730/);
+  assert.match(content, /本轮链上 presetIds：1778027615725 \/ 1778027615730/);
   assert.match(content, /presetIds/);
   assert.match(content, /1778027615730/);
   assert.doesNotMatch(content, /unknown/);
@@ -2369,5 +2369,39 @@ test('静态单页卡只精简标题中已有的第一行页名，保留技术�
     const input = { title: `前端文案变更：${pageLabel}`, pageLabel, content: `${heading}\n\n${evidence}` };
     assert.equal(__testables.compactFrontendPageCard(input), evidence);
     assert.equal(__testables.compactFrontendPageCard({ ...input, title: '前端变更（影响 2 页）' }), input.content);
+  }
+});
+
+test('同一 API 的结构和值用同一个入口，保留字段类型与 falsy 值', () => {
+  const content = __testables.formatApiCard(
+    [{ endpoint: 'public_config', type: '结构变更', changed: ['data.flag: number → boolean'] }],
+    [{ endpoint: 'public_config', fieldChanges: [{ action: 'changed', key: 'data.flag', old: 0, new: false },
+      { action: 'added', key: 'data.optional', value: null }] }],
+    {},
+  );
+  assert.equal((content.match(/^## 📡/gm) || []).length, 1);
+  assert.equal((content.match(/https:\/\//g) || []).length, 1);
+  assert.match(content, /结构 \/ 结构变更/);
+  assert.match(content, /响应值变更/);
+  for (const evidence of ['data.flag', 'number', 'boolean', '>0<', '>false<', '>null<']) assert.ok(content.includes(evidence), evidence);
+});
+
+test('前端标题保留覆盖范围、恢复和上线确认的语义', () => {
+  const page = 'https://four.meme/en/advanced';
+  for (const title of ['前端变更（影响 2 页）', '前端功能上线确认：community', '前端抓取恢复：four.meme']) {
+    assert.equal(__testables.normalizeFrontendNotificationTitle(title, page), title);
+  }
+});
+
+test('双语待确认卡保留真实页面链接、审批命令和旧去重身份', () => {
+  const urls = ['https://four.meme/zh-TW/presale/102364633', 'https://four.meme/en/presale/102364633'];
+  const notices = urls.map(originalUrl => __testables.buildFrontendNewPageNotification({ originalUrl }));
+  const [merged] = __testables.groupActivityRouteNotifications(notices);
+  assert.equal(merged.dedupeKey, notices[0].dedupeKey);
+  for (const url of urls) {
+    assert.match(merged.compactContent, /尚未加入前端监控池/);
+    assert.ok(merged.compactContent.includes(`route add ${url}`));
+    assert.ok(merged.compactContent.includes(`route ignore ${url}`));
+    assert.ok(merged.compactContent.includes(`](${url})`));
   }
 });
