@@ -428,8 +428,8 @@ export async function fetchSafeProposals({
   return results;
 }
 
-async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
-  await withDeadline(() => fetchFn.waitForTurn?.(), timeoutMs + 5000, undefined, 'Safe API 排队超时');
+async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn, signal: parentSignal }) {
+  await withDeadline(() => fetchFn.waitForTurn?.(), timeoutMs + 5000, parentSignal, 'Safe API 排队超时');
   return withDeadline(async signal => {
     const response = await fetchFn(url, {
       headers: {
@@ -444,12 +444,13 @@ async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) {
       const suffix = status === 422 ? "（Safe 地址必须使用 EIP-55 校验和格式）" : "";
       const quotaExhausted = response?.headers?.get?.('x-ratelimit-remaining') === '0';
       const error = new Error(`Safe API HTTP ${status}${suffix}${quotaExhausted ? '（账户月度额度已耗尽）' : ''}`);
+      error.status = status;
       error.retryAfterMs = retryAfterMilliseconds(response);
       await response?.body?.cancel?.();
       throw error;
     }
     return await response.json();
-  }, timeoutMs, undefined, 'Safe API 请求或响应体读取超时');
+  }, timeoutMs, parentSignal, 'Safe API 请求或响应体读取超时');
 }
 
 export function createSafeRateLimitedFetch(state, fetchFn, { intervalMs = 5000, now = Date.now,
@@ -643,6 +644,9 @@ export async function runSafeProposalScan({
   maxSafesPerRun = Infinity,
   requestIntervalMs = 0,
   captureUnseenExecutions = false,
+  // Opt-in for the standalone Four.meme monitor; Flap keeps its existing policy.
+  isolateExecutionFailures = false,
+  executionBudgetMs = 3000,
   nowMs = Date.now(),
 } = {}) {
   if (!state || typeof state !== "object") throw new Error("缺少 Safe 提案状态");
@@ -660,6 +664,13 @@ export async function runSafeProposalScan({
 
   const migrated = migrateSafeProposalState(state, normalizedSafes);
   Object.assign(state, migrated);
+  if (isolateExecutionFailures) for (const health of Object.values(state.safes)) {
+    // Remove only the legacy execution-specific Safe-wide backoff. Credential
+    // quotas and server cooldowns remain untouched and authoritative.
+    if (/^执行结果待确认：/.test(health.lastError || '')) {
+      health.lastError = ''; health.nextAttemptAtMs = 0;
+    }
+  }
   const poolKeys = normalizeSafeApiKeys(apiKeys, apiKey);
   if (poolKeys.length) {
     fetchFn = createSafeApiPoolFetch(state, fetchFn, {apiKeys: poolKeys, apiBaseUrl, intervalMs: requestIntervalMs || 5000});
@@ -817,11 +828,22 @@ export async function runSafeProposalScan({
     }
   }
 
+  const executionEndsAt = Date.now() + executionBudgetMs;
+  const executionErrors = [];
+  const executionWork = operation => {
+    const remaining = executionEndsAt - Date.now();
+    if (remaining <= 0) throw Error('Safe 执行补查本轮用时达到上限，保留任务');
+    return withDeadline(operation, remaining, undefined, 'Safe 执行补查本轮用时达到上限，保留任务');
+  };
+  const readExecution = url => isolateExecutionFailures
+    ? executionWork(signal => fetchSafeJson(url, { apiKey, timeoutMs, fetchFn, signal }))
+    : fetchSafeJson(url, { apiKey, timeoutMs, fetchFn });
+  const waitExecution = () => isolateExecutionFailures ? executionWork(() => delay(SAFE_API_STAGGER_MS)) : delay(SAFE_API_STAGGER_MS);
   const staleRecords = Object.values(state.proposals || {}).filter(record =>
     ACTIVE_STATUSES.includes(record?.status)
     && Number.isInteger(currentNonces.get(record.safe))
     && record.nonce < currentNonces.get(record.safe));
-  const allStaleHashes = [...new Set(staleRecords.map(record => record.safeTxHash))];
+  const allStaleHashes = [...new Set(staleRecords.filter(record => !isolateExecutionFailures || !(record.executionNextAttemptAtMs > nowMs)).map(record => record.safeTxHash))];
   const cursor = Math.max(0, Number(state.executionCursor) || 0) % Math.max(1, allStaleHashes.length);
   const staleHashes = [...allStaleHashes.slice(cursor), ...allStaleHashes.slice(0, cursor)].slice(0, Number.isFinite(maxSafesPerRun) ? 1 : 10);
   state.executionCursor = (cursor + staleHashes.length) % Math.max(1, allStaleHashes.length);
@@ -831,30 +853,39 @@ export async function runSafeProposalScan({
     const health = state.safes[first.safe];
     for (const record of records) record.status = "confirming";
     state.pendingChanges = state.pendingChanges.filter(change => !records.some(record => record.key === change.key));
-    if (Number(health.nextAttemptAtMs) > nowMs) continue;
+    if ((!isolateExecutionFailures && Number(health.nextAttemptAtMs) > nowMs)
+      || (isolateExecutionFailures && Date.now() >= executionEndsAt)) continue;
     try {
-      await new Promise(resolve => setTimeout(resolve, SAFE_API_STAGGER_MS));
-      const options = { apiKey, timeoutMs, fetchFn };
+      await waitExecution();
       const base = String(apiBaseUrl).replace(/\/+$/, "");
-      let detail = await fetchSafeJson(base + "/multisig-transactions/" + safeTxHash + "/", options);
-      if (normalizeHash(detail?.safeTxHash) !== safeTxHash || normalizeAddress(detail?.safe) !== first.safe
-        || Number(detail?.nonce) !== first.nonce) throw new Error("Safe 提案详情与请求不匹配");
-      if (!detail.isExecuted) {
+      let detail;
+      try { detail = await readExecution(base + "/multisig-transactions/" + safeTxHash + "/"); }
+      catch (error) { if (!isolateExecutionFailures || error.status !== 404) throw error; }
+      if ((!detail && !isolateExecutionFailures) || (detail && (normalizeHash(detail?.safeTxHash) !== safeTxHash || normalizeAddress(detail?.safe) !== first.safe
+        || Number(detail?.nonce) !== first.nonce))) throw new Error("Safe 提案详情与请求不匹配");
+      if (isolateExecutionFailures ? detail?.isExecuted !== true : !detail?.isExecuted) {
         // A consumed nonce alone cannot distinguish replacement from indexer lag.
         const query = new URLSearchParams({ executed: "true", nonce: String(first.nonce), limit: "100" });
-        await new Promise(resolve => setTimeout(resolve, SAFE_API_STAGGER_MS));
-        const history = await fetchSafeJson(base + "/safes/" + safeApiAddress(apiAddressBySafe.get(first.safe)) + "/multisig-transactions/?" + query, options);
-        const winner = history.results?.find(item => item.isExecuted && Number(item.nonce) === first.nonce
+        await waitExecution();
+        const history = await readExecution(base + "/safes/" + safeApiAddress(apiAddressBySafe.get(first.safe)) + "/multisig-transactions/?" + query);
+        const winner = history.results?.find(item => (isolateExecutionFailures ? item.isExecuted === true : item.isExecuted) && Number(item.nonce) === first.nonce
           && normalizeAddress(item.safe) === first.safe && normalizeHash(item.transactionHash));
-        if (!winner) continue;
+        if (!winner) {
+          if (isolateExecutionFailures) throw Error('Safe 执行索引尚未提供匹配记录，保留提案');
+          continue;
+        }
         detail = winner;
       }
       const winnerHash = normalizeHash(detail.safeTxHash);
       const transactionHash = normalizeHash(detail.transactionHash);
-      if (!winnerHash || !transactionHash || (detail.isSuccessful !== true && detail.isSuccessful !== false)) continue;
+      if (!winnerHash || !transactionHash || (detail.isSuccessful !== true && detail.isSuccessful !== false)) {
+        if (isolateExecutionFailures) throw Error('Safe 执行记录缺少有效哈希或执行结果，保留提案');
+        continue;
+      }
       health.executionFailures = 0;
       const status = winnerHash !== safeTxHash ? "invalidated" : detail.isSuccessful ? "executed" : "failed";
       for (const record of records) {
+        if (isolateExecutionFailures) { record.executionError = ''; record.executionNextAttemptAtMs = 0; record.executionFailures = 0; }
         record.status = status;
         record.transactionHash = transactionHash;
         record.resolvedBySafeTxHash = winnerHash;
@@ -879,6 +910,16 @@ export async function runSafeProposalScan({
         if (!suppressNotifications) changes.push(appendPendingChange(state, status, record, runAt));
       }
     } catch (error) {
+      if (isolateExecutionFailures) {
+        for (const record of records) {
+          record.executionFailures = (record.executionFailures || 0) + 1;
+          record.executionNextAttemptAtMs = nowMs + Math.max(Number(error.retryAfterMs) || 0,
+            Math.min(maxBackoffMs, baseBackoffMs * 2 ** Math.min(6, record.executionFailures - 1)));
+          record.executionError = '执行结果待确认：' + error.message;
+        }
+        executionErrors.push(records[0].executionError);
+        continue;
+      }
       health.executionFailures = (Number(health.executionFailures) || 0) + 1;
       health.nextAttemptAtMs = nowMs + Math.min(maxBackoffMs, Math.max(Number(error.retryAfterMs) || 0,
         baseBackoffMs * 2 ** Math.min(6, health.executionFailures - 1)));
@@ -892,10 +933,11 @@ export async function runSafeProposalScan({
   if (captureUnseenExecutions) for (const safe of normalizedSafes) {
     const health = state.safes[safe], currentNonce = currentNonces.get(safe);
     if (!Number.isInteger(currentNonce) || !Number.isInteger(health.executionNextNonce) || health.executionNextNonce >= currentNonce) continue;
-    if (health.nextAttemptAtMs > nowMs) continue;
+    if (isolateExecutionFailures) health.executionGap = { from: health.executionNextNonce, to: currentNonce - 1 };
+    if (isolateExecutionFailures ? health.executionHistoryNextAttemptAtMs > nowMs || Date.now() >= executionEndsAt : health.nextAttemptAtMs > nowMs) continue;
     try {
       const query = new URLSearchParams({ executed: 'true', nonce__gte: String(health.executionNextNonce), nonce__lt: String(currentNonce), ordering: 'nonce', limit: '100' });
-      const page = await fetchSafeJson(String(apiBaseUrl).replace(/\/+$/, '') + '/safes/' + safeApiAddress(safe) + '/multisig-transactions/?' + query, { apiKey, timeoutMs, fetchFn });
+      const page = await readExecution(String(apiBaseUrl).replace(/\/+$/, '') + '/safes/' + safeApiAddress(safe) + '/multisig-transactions/?' + query);
       if (!Array.isArray(page.results)) throw Error('Safe 执行补查响应无效');
       for (const proposal of [...page.results].sort((a, b) => Number(a.nonce) - Number(b.nonce))) {
         const nonce = Number(proposal.nonce), hash = normalizeHash(proposal.safeTxHash), tx = normalizeHash(proposal.transactionHash);
@@ -913,9 +955,19 @@ export async function runSafeProposalScan({
         health.executionNextNonce++;
       }
       health.executionGap = health.executionNextNonce < currentNonce ? { from: health.executionNextNonce, to: currentNonce - 1 } : null;
+      if (isolateExecutionFailures) {
+        if (health.executionGap) throw Error('Safe 执行索引不连续，保留缺口');
+        health.executionHistoryFailures = 0; health.executionHistoryNextAttemptAtMs = 0; health.executionHistoryError = '';
+      }
     } catch (error) {
       health.executionGap = { from: health.executionNextNonce, to: currentNonce - 1 };
-      errors.push('Safe 执行补查保留缺口：' + error.message);
+      if (isolateExecutionFailures) {
+        health.executionHistoryFailures = (health.executionHistoryFailures || 0) + 1;
+        health.executionHistoryNextAttemptAtMs = nowMs + Math.max(Number(error.retryAfterMs) || 0,
+          Math.min(maxBackoffMs, baseBackoffMs * 2 ** Math.min(6, health.executionHistoryFailures - 1)));
+        health.executionHistoryError = 'Safe 执行补查保留缺口：' + error.message;
+        executionErrors.push(health.executionHistoryError);
+      } else errors.push('Safe 执行补查保留缺口：' + error.message);
     }
   }
 
@@ -933,6 +985,7 @@ export async function runSafeProposalScan({
     successfulSafes,
     configuredSafes: normalizedSafes.length,
     errors,
+    ...(isolateExecutionFailures ? { executionErrors } : {}),
   };
 }
 

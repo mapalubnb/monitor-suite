@@ -480,3 +480,10 @@ test('fm-status独立显示Four.meme Safe状态，兼容旧快照并保持GitHub
   assert.match(text, /签名门槛：3\/7/); assert.match(text, /nonce 150｜确认 1\/3/); assert.match(text, /提案轮询：5s/); assert.match(text, /AI：关闭/);
   assert.match(renderFourmemeStatus({}), /等待首次运行/);
 });
+
+test('fm-status将Four.meme执行补查重试与提案主通道分别显示', () => {
+  const text = renderFourmemeStatus({}, { safe: { enabled: true, configured: true, intervalMs: 5000, lastError: '',
+    executionHealth: { lastError: '执行索引缺失' }, executionRetries: [{ nonce: 151, retryAt: 1800000000000 }], executionHistoryRetryAt: 1800000000000 } });
+  assert.match(text, /独立重试，不暂停新提案查询/); assert.match(text, /旧提案 nonce 151/);
+  assert.match(text, /执行历史补扫重试/); assert.match(text, /提案轮询：5s/);
+});

@@ -541,6 +541,17 @@ test("execution result rate limits retain confirming state and block further API
     fetchFn: async () => assert.fail("退避中不应查询详情或列表") });
 });
 
+test('默认Flap路径不启用Four.meme的404兜底与独立执行退避', async () => {
+  const state = trackedState(), calls = [];
+  await runSafeProposalScan({ state, safes: [SAFE], nowMs: 10000, rpcBatch: rpcFixture({ nonce: 13 }), fetchFn: async url => {
+    calls.push(url); return url.includes('/multisig-transactions/0x') ? response([], { status: 404 }) : response([]);
+  } });
+  assert.equal(calls.some(url => url.includes('executed=true')), false);
+  assert.equal(state.safes[SAFE].nextAttemptAtMs, 15000);
+  assert.match(state.lastError, /404/);
+  assert.equal(Object.values(state.proposals)[0].executionNextAttemptAtMs, undefined);
+});
+
 test("pending proposal pagination retains nonce filter and refuses cross-origin next URLs", async () => {
   let count = 0;
   const base = "https://safe.test/api/v1";

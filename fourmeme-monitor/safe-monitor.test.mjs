@@ -96,7 +96,7 @@ test('Four.meme补抓两次轮询间直接执行的提案，索引缺口不跳�
   f.data.history = [second]; await f.poll();
   assert.deepEqual(f.monitor.summary().executionGap, { from: 150, to: 151 });
   assert.equal(f.disk._notificationOutbox?.length || 0, 0);
-  f.data.history = [first, second]; await f.poll();
+  f.data.history = [first, second]; f.advance(5100); await f.poll();
   assert.equal(f.monitor.summary().executionGap, null);
   assert.equal(f.disk._notificationOutbox[0].payload.fourmemeSafe.changes.length, 2);
   const restarted = fixture(f.disk); restarted.data.nonce = 152; restarted.data.proposals = []; await restarted.poll();
@@ -159,4 +159,93 @@ test('Safe身份首次读取无效不建立基线；旧身份复核失败仍可�
   f.data.proposals[0].confirmations.push({ owner: TOKEN }); await f.poll();
   assert.equal(f.disk.fourmemeSafe.identity.threshold, 3); assert.match(f.disk.fourmemeSafe.identityError, /无效/);
   assert.match(f.disk._notificationOutbox.at(-1).payload.title, /签名进度更新/);
+});
+
+test('Four.meme旧详情404按nonce查询实际执行者，旧提案只标替换且重启不重复', async () => {
+  const f = fixture(); await f.poll(); f.data.nonce = 151; f.data.proposals = [];
+  const winner = { ...proposal(), safeTxHash: '0x' + 'ee'.repeat(32), isExecuted: true, isSuccessful: true, transactionHash: TX };
+  const calls = [];
+  const m = createFourmemeSafeMonitor({ ...f.opts, fetchFn: async url => {
+    calls.push(url);
+    return url.includes('/multisig-transactions/0x') ? new Response('{}', { status: 404 })
+      : new Response(JSON.stringify({ results: url.includes('executed=true') ? [winner] : [], next: null }));
+  } });
+  await settle(); assert.equal(await m.poll(), true);
+  const old = Object.values(f.disk.fourmemeSafe.proposals).find(p => p.safeTxHash === HASH);
+  assert.equal(old.status, 'invalidated'); assert.equal(old.resolvedBySafeTxHash, winner.safeTxHash);
+  assert.ok(calls.some(x => x.includes('nonce=150'))); assert.equal(f.disk.fourmemeSafe.safes[FOURMEME_SAFE].nextAttemptAtMs, 0);
+  assert.equal(f.disk.fourmemeSafe.executionHealth.lastError, '');
+  const count = f.disk._notificationOutbox.length;
+  const restarted = fixture(f.disk); restarted.data.nonce = 151; restarted.data.proposals = [];
+  await restarted.poll(); assert.equal(restarted.disk._notificationOutbox.length, count);
+});
+
+test('缺失执行索引独立退避，下一轮仍捕获新提案和签名；旧退避迁移不清Key冷却', async () => {
+  const f = fixture(); await f.poll();
+  const initial = f.disk, health = initial.fourmemeSafe.safes[FOURMEME_SAFE];
+  health.lastError = '执行结果待确认：Safe API HTTP 404'; health.executionFailures = 211; health.nextAttemptAtMs = Date.now() + 300000;
+  initial.fourmemeSafe.apiAccounts.retained = { apiNextAttemptAtMs: Date.now() + 900000, apiQuota: { remaining: 0 } };
+  const g = fixture(initial); g.data.nonce = 151; g.data.proposals = [{ ...proposal(), nonce: 151, safeTxHash: '0x' + 'ee'.repeat(32) }];
+  const baseFetch = g.opts.fetchFn;
+  const m = createFourmemeSafeMonitor({ ...g.opts, fetchFn: url => url.includes('/multisig-transactions/0x') ? new Response('{}', { status: 404 }) : baseFetch(url) });
+  // A new fake clock must pass the snapshot's last per-key request slot.
+  g.advance(1000); await settle(); assert.equal(await m.poll(), true, JSON.stringify(m.summary()));
+  const old = Object.values(g.disk.fourmemeSafe.proposals).find(p => p.nonce === 150);
+  assert.equal(old.status, 'confirming'); assert.ok(old.executionNextAttemptAtMs > Date.now());
+  assert.equal(g.disk.fourmemeSafe.health.lastError, ''); assert.match(g.disk.fourmemeSafe.executionHealth.lastError, /索引/);
+  assert.equal(g.disk.fourmemeSafe.safes[FOURMEME_SAFE].nextAttemptAtMs, 0);
+  assert.deepEqual(g.disk.fourmemeSafe.apiAccounts.retained, initial.fourmemeSafe.apiAccounts.retained);
+  const failures = old.executionFailures;
+  g.data.proposals[0].confirmations.push({ owner: TOKEN }); g.advance(1000); await settle(); assert.equal(await m.poll(), true);
+  assert.match(g.disk._notificationOutbox.at(-1).payload.title, /签名进度/);
+  assert.equal(Object.values(g.disk.fourmemeSafe.proposals).find(p => p.nonce === 150).executionFailures, failures);
+  assert.equal(g.disk.fourmemeSafe.executionHealth.alerted, false);
+});
+
+test('错误Safe、nonce、缺哈希或未知结果不能将404旧提案认定已执行', async () => {
+  const f = fixture(); await f.poll(); const initial = f.disk;
+  for (const change of [{ safe: OWNER }, { nonce: 149 }, { transactionHash: '' }, { isSuccessful: null }]) {
+    const g = fixture(initial); g.data.nonce = 151; g.data.proposals = [];
+    const winner = { ...proposal(), isExecuted: true, isSuccessful: true, transactionHash: TX, ...change };
+    const m = createFourmemeSafeMonitor({ ...g.opts, fetchFn: url => url.includes('/multisig-transactions/0x')
+      ? new Response('{}', { status: 404 }) : new Response(JSON.stringify({ results: url.includes('executed=true') ? [winner] : [], next: null })) });
+    await settle(); await m.poll();
+    assert.equal(Object.values(g.disk.fourmemeSafe.proposals)[0].status, 'confirming');
+    assert.equal(g.disk._notificationOutbox.length, initial._notificationOutbox.length);
+    assert.match(g.monitor.summary().executionHealth.lastError, /保留/);
+  }
+});
+
+test('执行补查挂起受单独预算限制，已发现新提案仍提交，迟到结果不能覆盖状态', { timeout: 3000 }, async () => {
+  const f = fixture(); await f.poll(); f.data.nonce = 151;
+  f.data.proposals = [{ ...proposal(), nonce: 151, safeTxHash: '0x' + 'ee'.repeat(32) }];
+  let release;
+  const m = createFourmemeSafeMonitor({ ...f.opts,
+    scan: opts => runSafeProposalScan({ ...opts, requestIntervalMs: 1, executionBudgetMs: 600 }),
+    fetchFn: url => url.includes('/multisig-transactions/0x') ? new Promise(r => { release = r; }) : f.opts.fetchFn(url) });
+  await settle(); const start = Date.now(); assert.equal(await m.poll(), true); assert.ok(Date.now() - start < 1500);
+  assert.equal(Object.keys(f.disk.fourmemeSafe.proposals).length, 2); assert.match(m.summary().executionHealth.lastError, /用时达到上限/);
+  const saved = f.disk;
+  release(new Response(JSON.stringify({ ...proposal(), isExecuted: true, isSuccessful: true, transactionHash: TX })));
+  await settle(); assert.deepEqual(f.disk, saved); assert.deepEqual(JSON.parse(JSON.stringify(f.store.state)), saved);
+});
+
+test('执行补查健康在跳过重试及重启后保留，真实解决才恢复一次', async () => {
+  const f = fixture(); await f.poll(); let resolved = false;
+  const scan = async ({ state }) => {
+    state.safes[FOURMEME_SAFE].currentNonce = 151;
+    state.lastError = '';
+    const p = Object.values(state.proposals)[0];
+    p.status = resolved ? 'invalidated' : 'confirming'; p.executionError = resolved ? '' : '索引缺失';
+    return { successfulSafes: 1, errors: [], executionErrors: [] };
+  };
+  const m = createFourmemeSafeMonitor({ ...f.opts, scan });
+  await m.poll(); f.advance(60001); await m.poll();
+  assert.equal(f.disk.fourmemeSafe.health.lastError, '');
+  assert.equal(f.disk._notificationOutbox.filter(n => /执行补查异常/.test(n.payload.title)).length, 1);
+  const restarted = fixture(f.disk, { scan }); await restarted.poll();
+  assert.equal(restarted.disk.fourmemeSafe.executionHealth.alerted, true);
+  assert.equal(restarted.disk._notificationOutbox.filter(n => /执行补查恢复/.test(n.payload.title)).length, 0);
+  resolved = true; await restarted.poll(); await restarted.poll();
+  assert.equal(restarted.disk._notificationOutbox.filter(n => /执行补查恢复/.test(n.payload.title)).length, 1);
 });

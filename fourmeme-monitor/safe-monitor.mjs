@@ -98,6 +98,7 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
         }
         const scanned = await scan({ state: draft, safes: [FOURMEME_SAFE], rpcBatch: call,
           apiKeys, requestIntervalMs: 5000, maxSafesPerRun: 1, timeoutMs, nowMs: now(), captureUnseenExecutions: true,
+          isolateExecutionFailures: true, executionBudgetMs: 3000,
           fetchFn: async (url, options) => {
             assertActive(task); onRequest();
             const response = await withAbortSignal(() => fetchFn(url, options), task.signal);
@@ -127,10 +128,11 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
             { changes: changes.map(c => ({ id: c.id, hash: c.safeTxHash, nonce: c.nonce, type })) }));
         }
         acknowledgeSafeProposalChanges(draft, draft.pendingChanges.map(c => c.id));
-        const problem = [scanned.errors?.join('；'), identityFailure].filter(Boolean).join('；');
+        const problem = [draft.lastError || scanned.errors?.join('；'), identityFailure].filter(Boolean).join('；');
         const oldHealth = draft.health || {};
+        const failedAttempt = !!(scanned.errors?.length || identityFailure || draft.safes?.[FOURMEME_SAFE]?.lastNonceError);
         draft.health = { ...oldHealth, lastAttemptAt: task.startedAt, lastError: problem,
-          failures: problem ? (oldHealth.failures || 0) + 1 : 0 };
+          failures: problem ? (oldHealth.failures || 0) + Number(failedAttempt) : scanned.successfulSafes > 0 ? 0 : oldHealth.failures || 0 };
         if (!problem && scanned.successfulSafes > 0) {
           draft.health.lastSuccessAt = now();
           if (oldHealth.alerted) notices.push(notification('监控恢复', '已成功读取提案并保存进度；未清除历史提案或去重记录。', 'green'));
@@ -138,6 +140,25 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
         } else if (draft.health.failures >= 5 && !oldHealth.alerted) {
           draft.health.alerted = true;
           notices.push(notification('监控异常', `连续失败：${draft.health.failures} 次\n${problem}\n原状态与通知已保留，按现有限流规则自动重试。`, 'yellow'));
+        }
+        // Execution failures retain their own incident, deadlines and retries.
+        // A skipped execution job is neither another failure nor a recovery.
+        const pending = Object.values(draft.proposals || {}).filter(p => ACTIVE.has(p.status) && p.nonce < draft.safes?.[p.safe]?.currentNonce);
+        const safeHealth = draft.safes?.[FOURMEME_SAFE] || {};
+        const executionProblem = pending.length > 0 || !!safeHealth.executionGap;
+        const eh = draft.executionHealth ||= { failures: 0, alerted: false };
+        if (executionProblem) {
+          eh.pendingSince ||= now();
+          eh.failures += Number(!!scanned.executionErrors?.length);
+          eh.lastError = [...new Set([...pending.map(p => p.executionError || '旧提案执行结果待核验'),
+            ...(safeHealth.executionGap ? [safeHealth.executionHistoryError || '执行索引缺口待补齐'] : [])])].join('；');
+          if (!eh.alerted && (eh.failures >= 5 || now() - eh.pendingSince >= 60000)) {
+            eh.alerted = true;
+            notices.push(notification('执行补查异常', `${eh.lastError}\n缺口与旧提案保留，补查独立重试；新提案和签名监控继续运行。`, 'yellow'));
+          }
+        } else {
+          if (eh.alerted) notices.push(notification('执行补查恢复', '待核验的旧提案及执行缺口已处理，原提案与去重记录保留。', 'green'));
+          Object.assign(eh, { failures: 0, alerted: false, pendingSince: 0, lastError: '' });
         }
         await store.transaction(async () => {
           assertActive(task);
@@ -175,6 +196,10 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
         safe: FOURMEME_SAFE, identity: state.identity, identityError: state.identityError || '',
         currentNonce: state.safes?.[FOURMEME_SAFE]?.currentNonce, lastPollAt: state.lastRunAt,
         executionGap: state.safes?.[FOURMEME_SAFE]?.executionGap || null,
+        executionHealth: state.executionHealth || {},
+        executionRetries: Object.values(state.proposals || {}).filter(p => ACTIVE.has(p.status) && p.nonce < state.safes?.[p.safe]?.currentNonce)
+          .map(p => ({ nonce: p.nonce, hash: p.safeTxHash, retryAt: p.executionNextAttemptAtMs || 0, lastError: p.executionError || '' })),
+        executionHistoryRetryAt: state.safes?.[FOURMEME_SAFE]?.executionHistoryNextAttemptAtMs || 0,
         lastSuccessAt: state.lastSuccessAt, health: state.health || {}, activeTask: current ? { startedAt: current.startedAt, deadlineAt: current.deadlineAt } : null,
         activeProposals: Object.values(state.proposals || {}).filter(p => ACTIVE.has(p.status)).map(p => ({ nonce: p.nonce, hash: p.safeTxHash, confirmations: p.confirmations, required: p.required, status: p.status })),
         pendingNotifications: (store.state._notificationOutbox || []).filter(n => n.payload?.fourmemeSafe).length,

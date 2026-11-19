@@ -513,6 +513,10 @@ if [ -f "$SNAP" ]; then
     console.log('待执行／待核验：'+safeActive.length+' 项');
     const executionGap=safeRuntime.executionGap||(safeState.safes||{})[safeAddress]?.executionGap;
     if(executionGap) console.log('执行补查缺口：nonce '+executionGap.from+'—'+executionGap.to+'（等待索引或重试，未跳过）');
+    const executionHealth=safeRuntime.executionHealth||safeState.executionHealth||{};
+    if(executionHealth.lastError) console.log('执行补查：'+warn(cleanLabel(executionHealth.lastError))+'｜独立重试，不暂停新提案查询');
+    for(const job of safeRuntime.executionRetries||[]) console.log('旧提案 nonce '+job.nonce+'｜执行核验重试 '+fmtTime(job.retryAt));
+    if(safeRuntime.executionHistoryRetryAt) console.log('执行历史补扫重试：'+fmtTime(safeRuntime.executionHistoryRetryAt));
     for(const p of safeActive) console.log('nonce '+p.nonce+'｜确认 '+p.confirmations+'/'+p.required+'｜'+cleanLabel(p.status)+'｜'+(p.hash||p.safeTxHash));
     if(safeRuntime.lastError||safeState.health?.lastError) console.log('异常：'+warn(cleanLabel(safeRuntime.lastError||safeState.health.lastError)));
     if(safeRuntime.identityError||safeState.identityError) console.log('签名配置复核异常：'+warn(cleanLabel(safeRuntime.identityError||safeState.identityError)));

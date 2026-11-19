@@ -1,5 +1,9 @@
 # Flap 监控交接
 
+## 2026/11/19 Four.meme Safe执行补查兼容开关
+
+共享safe-proposal-monitor新增默认关闭的isolateExecutionFailures，只有Four.meme开启404执行列表兜底、每任务独立重试及3秒执行预算。Flap入口不传此开关，保持原执行/退避行为；新增默认路径404回归。两边继续用原12组Key，各自保存池状态，不新增跨进程排队/冷却、不改Flap版本、频率/AI/历史/队列、不重启Flap。详细测试部署验收见Four.meme HANDOFF。
+
 ## 2026/11/18 Four.meme复用Safe纯函数兼容扩展
 
 Four.meme1.5.30独立接入其Safe。safe-proposal-monitor新增可选captureUnseenExecutions（默认false）及owner格式化回调；operational-call-codec支持同样的可选回调，默认保留原Flap角色与行为。Flap入口不启用执行补查、不改配置/频率/Key池/AI/状态，不重启Flap。专项和全量回归、部署结果见Four.meme HANDOFF。新增流量复用账户时共同消耗Safe额度；未增加配额或改变Flap已有服务端冷却状态。
