@@ -1845,6 +1845,7 @@ async function fetchPoolConfig() {
   if (json?.code !== 0 && json?.code !== "0") {
     throw new Error(`API code=${json?.code}：${json?.message || json?.msg}`);
   }
+  if (!Array.isArray(json.data)) throw new Error("底池配置响应缺少列表");
   return json.data;
 }
 
@@ -1868,37 +1869,95 @@ const WATCH_FIELDS = [
   "tradeLevel", "minTradeFee",
 ];
 
-function diffPoolConfigs(oldList, newList) {
+const POOL_PUBLISH_GUARD_MS = 30_000;
+const REMOVED_POOLS_TTL = 600_000;
+
+function observeStableValue(previous, value, now, maxGapMs) {
+  if (!previous || previous.value !== value || now < previous.lastAt || now - previous.lastAt > maxGapMs) {
+    return { value, since: now, lastAt: now, samples: 1 };
+  }
+  return now === previous.lastAt ? previous : { ...previous, lastAt: now, samples: previous.samples + 1 };
+}
+
+function stableValueConfirmed(sample) {
+  return sample.samples >= 3 && sample.lastAt - sample.since >= 10_000;
+}
+
+function comparePublishedPoolStatus(guards, key, oldStatus, status, now) {
+  const guard = guards[key];
+  if (guard && (now < guard.until || guard.rollback)) {
+    if (status === "INIT") {
+      guard.rollback = observeStableValue(guard.rollback, status, now, Math.max(5_000, CONFIG.intervals.pool * 3));
+      if (!stableValueConfirmed(guard.rollback)) return ["PUBLISH", "PUBLISH"];
+    }
+    // An observed return to PUBLISH cancels the candidate without a second card.
+    if (status === "PUBLISH" && guard.rollback) {
+      log(`[底池] ${key.slice(5)} 上线状态短暂回摆已静默，持续 ${now - guard.rollback.since}ms`);
+    }
+    if (status === "PUBLISH" && now < guard.until) delete guard.rollback;
+    else delete guards[key];
+    return ["PUBLISH", status];
+  }
+  if (status === "PUBLISH" && oldStatus !== "PUBLISH") guards[key] = { until: now + POOL_PUBLISH_GUARD_MS };
+  else if (guard) delete guards[key];
+  return [oldStatus, status];
+}
+
+function diffPoolConfigs(oldList, newList, { state, now = Date.now() } = {}) {
   const oldMap = buildPoolMap(oldList);
   const newMap = buildPoolMap(newList);
-  const changes = [];
+  const additions = [], parameters = [], removals = [];
+  const guards = state ? (state._poolPublishGuards ||= {}) : null;
+  const pendingRemovals = state ? (state._pendingPoolRemovals ||= {}) : null;
+
   for (const [key, item] of newMap) {
-    if (!oldMap.has(key)) {
-      changes.push({ type: "新增底池", symbol: item.symbol || item.nativeSymbol || key, address: item.symbolAddress || "", status: item.status || "", details: item });
-    }
-  }
-  for (const [key, item] of oldMap) {
-    if (!newMap.has(key)) {
-      changes.push({ type: "移除底池", symbol: item.symbol || item.nativeSymbol || key, address: item.symbolAddress || "", details: item });
-    }
-  }
-  for (const [key, newItem] of newMap) {
+    const guardKey = `pool:${key}`;
     const oldItem = oldMap.get(key);
-    if (!oldItem) continue;
+    const cached = !oldItem && pendingRemovals && Object.hasOwn(pendingRemovals, key) ? pendingRemovals[key] : null;
+    const returned = cached && now <= cached.expireAt;
+    const previous = returned ? cached.data : oldItem;
+    const symbol = item.symbol || item.nativeSymbol || key, address = item.symbolAddress || "";
+    if (returned) {
+      delete pendingRemovals[key];
+      if (cached.publishUntil > now) guards[guardKey] = { until: cached.publishUntil };
+    }
+    const oldStatus = returned && cached.publishUntil ? "PUBLISH" : previous?.status;
+    const [before, after] = guards ? comparePublishedPoolStatus(guards, guardKey, oldStatus, item.status, now) : [oldStatus, item.status];
+    if (!previous) {
+      additions.push({ type: "新增底池", symbol, address, status: item.status || "", details: item });
+      continue;
+    }
     const fc = [];
     for (const f of WATCH_FIELDS) {
-      // The API now adjusts the quote-token fundraising amount dynamically.
-      // Retain the latest value in snapshots/cards, but do not alert on its drift.
-      if (f === "totalBAmount") continue;
-      const ov = JSON.stringify(oldItem[f] ?? "");
-      const nv = JSON.stringify(newItem[f] ?? "");
+      // Keep the existing comparisons for a pool recovered from the removal cache.
+      if (f === "totalBAmount" && !returned) continue;
+      const ov = JSON.stringify((f === "status" ? before : previous[f]) ?? "");
+      const nv = JSON.stringify((f === "status" ? after : item[f]) ?? "");
       if (ov !== nv) fc.push(`${f}: ${ov} → ${nv}`);
     }
-    if (fc.length > 0) {
-      changes.push({ type: "参数变更", symbol: newItem.symbol || newItem.nativeSymbol || key, address: newItem.symbolAddress || "", fieldChanges: fc });
-    }
+    if (fc.length) parameters.push({ type: "参数变更", symbol, address, fieldChanges: fc });
+    if (returned) log(`[底池] ${symbol} 短暂缺失后恢复，${fc.length ? "检测到参数变更" : "无需推送"}`);
   }
-  return changes;
+  let deferred = 0;
+  for (const [key, item] of oldMap) {
+    if (newMap.has(key)) continue;
+    if (!pendingRemovals) {
+      removals.push({ type: "移除底池", symbol: item.symbol || item.nativeSymbol || key, address: item.symbolAddress || "", details: item });
+      continue;
+    }
+    const guardKey = `pool:${key}`;
+    const publishUntil = guards[guardKey]?.until;
+    // Disappearance interrupts rollback confirmation. Preserve the reported
+    // PUBLISH baseline for a reappearance from the existing removal cache.
+    const cached = { data: item, expireAt: now + REMOVED_POOLS_TTL, ...(publishUntil ? { publishUntil } : {}) };
+    Object.defineProperty(pendingRemovals, key, { value: cached, enumerable: true, configurable: true, writable: true });
+    delete guards[guardKey];
+    deferred++;
+  }
+  if (deferred) {
+    log(`[底池] ${deferred} 个移除事件已缓存，等待确认`);
+  }
+  return [...additions, ...removals, ...parameters];
 }
 
 // 底池字段的中文语义注释，帮助 AI 和人类理解参数含义
@@ -6706,6 +6765,23 @@ function extractApiValues(obj, prefix = "", depth = 0) {
   return result;
 }
 
+function stabilizePublicConfigLength(state, values, now) {
+  const key = "data[].length";
+  const baseline = state.apiValues?.public_config?.[key];
+  const observed = values.public_config?.[key];
+  if (!Number.isInteger(baseline) || !Number.isInteger(observed) || observed === baseline) {
+    delete state._publicConfigLengthCandidate;
+    return values;
+  }
+  const candidate = observeStableValue(state._publicConfigLengthCandidate, observed, now, CONFIG.intervals.api * 3);
+  if (stableValueConfirmed(candidate)) {
+    delete state._publicConfigLengthCandidate;
+    return values;
+  }
+  state._publicConfigLengthCandidate = candidate;
+  return { ...values, public_config: { ...values.public_config, [key]: baseline } };
+}
+
 function diffApiValues(oldValues, newValues) {
   if (!oldValues || !newValues) return [];
   const changes = [];
@@ -9151,86 +9227,15 @@ const frontendMetrics = {
 };
 
 /* ── 已移除底池缓存（防止 API 短暂返回不完整数据导致误报）── */
-const removedPoolsCache = {
-  get values() { return snapshot._pendingPoolRemovals ||= {}; },
-  set(key, value) { this.values[key] = value; },
-  get(key) { return this.values[key]; },
-  delete(key) { delete this.values[key]; },
-  [Symbol.iterator]() { return Object.entries(this.values)[Symbol.iterator](); },
-};
-const REMOVED_POOLS_TTL = 600_000; // 10 分钟
-
-function cacheRemovedPools(removedChanges, oldList) {
-  if (!removedChanges || removedChanges.length === 0) return;
-  const oldMap = buildPoolMap(oldList);
-  for (const c of removedChanges) {
-    const key = (c.address || c.symbol || "").toLowerCase();
-    if (!key) continue;
-    const oldData = oldMap.get(key);
-    if (oldData) {
-      removedPoolsCache.set(key, { data: oldData, expireAt: Date.now() + REMOVED_POOLS_TTL });
-    }
-  }
-}
-
-function reconcilePoolChanges(changes, oldList) {
-  const reconciledChanges = [];
-  const deferredRemovals = [];
-
-  for (const c of changes) {
-    if (c.type === "新增底池") {
-      const key = (c.address || c.symbol || "").toLowerCase();
-      const cached = removedPoolsCache.get(key);
-      if (cached && Date.now() <= cached.expireAt) {
-        // 缓存命中：之前被"移除"的底池重新出现
-        removedPoolsCache.delete(key);
-        // 检查参数是否有变化
-        const fc = [];
-        const oldItem = cached.data;
-        const newItem = c.details || {};
-        for (const f of WATCH_FIELDS) {
-          const ov = JSON.stringify(oldItem[f] ?? "");
-          const nv = JSON.stringify(newItem[f] ?? "");
-          if (ov !== nv) fc.push(`${f}: ${ov} → ${nv}`);
-        }
-        if (fc.length > 0) {
-          // 参数不同，转为"参数变更"
-          reconciledChanges.push({ type: "参数变更", symbol: c.symbol, address: c.address, fieldChanges: fc });
-          log(`[底池] ${c.symbol} 部署抖动修复：移除→新增 转为参数变更`);
-        } else {
-          // 参数完全相同，静默忽略
-          log(`[底池] ${c.symbol} 部署抖动（内容未变），已忽略`);
-        }
-      } else {
-        reconciledChanges.push(c);
-      }
-    } else if (c.type === "移除底池") {
-      // 移除事件暂不推送，先缓存等待确认
-      deferredRemovals.push(c);
-    } else {
-      reconciledChanges.push(c);
-    }
-  }
-
-  // 缓存本轮移除的底池
-  if (deferredRemovals.length > 0) {
-    cacheRemovedPools(deferredRemovals, oldList);
-    log(`[底池] ${deferredRemovals.length} 个移除事件已缓存，等待确认`);
-  }
-
-  return reconciledChanges;
-}
-
-// 定期检查过期的移除缓存（过期意味着真的被移除了）并推送通知
 async function flushExpiredPoolRemovals() {
   await snapshotMutex.acquire();
   try {
     const now = Date.now();
     const expired = [];
-    for (const [key, entry] of removedPoolsCache) {
+    for (const [key, entry] of Object.entries(snapshot._pendingPoolRemovals || {})) {
       if (now > entry.expireAt) {
         expired.push({ type: "移除底池", symbol: entry.data.symbol || entry.data.nativeSymbol || key, address: entry.data.symbolAddress || key, details: entry.data });
-        removedPoolsCache.delete(key);
+        delete snapshot._pendingPoolRemovals[key];
       }
     }
     if (expired.length > 0) {
@@ -9446,8 +9451,8 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
    各模块检测逻辑
    ══════════════════════════════════════════ */
 
-async function runPoolCheck() {
-  const poolData = await fetchPoolConfig();
+async function runPoolCheck({ fetchConfig = fetchPoolConfig, now = Date.now, history = appendHistory } = {}) {
+  const poolData = await fetchConfig();
   if (!snapshot || !snapshot.poolConfig) {
     snapshot = snapshot || {};
     snapshot.poolConfig = poolData;
@@ -9457,12 +9462,7 @@ async function runPoolCheck() {
     printPoolList(poolData);
     return;
   }
-  let poolChanges = diffPoolConfigs(snapshot.poolConfig, poolData);
-
-  // 部署抖动修复：移除事件先缓存，新增事件查缓存
-  if (poolChanges.length > 0) {
-    poolChanges = reconcilePoolChanges(poolChanges, snapshot.poolConfig);
-  }
+  const poolChanges = diffPoolConfigs(snapshot.poolConfig, poolData, { state: snapshot, now: now() });
 
   if (poolChanges.length > 0) {
     log(`[底池] 检测到 ${poolChanges.length} 项变化！`);
@@ -9471,7 +9471,7 @@ async function runPoolCheck() {
     printPoolList(poolData);
     snapshot.poolConfig = poolData;
     await saveSnapshot(snapshot);
-    appendHistory("pool", `底池变更（${poolChanges.length}项）`, content.slice(0, 300), content);
+    history("pool", `底池变更（${poolChanges.length}项）`, content.slice(0, 300), content);
     await sendNotificationMaybeAi({ title: `底池变更（${poolChanges.length}项）`, content, template: "red", moduleContext: "Four.meme 底池配置变更", url: CONFIG.siteUrl });
   } else {
     if (!jsonEqual(snapshot.poolConfig, poolData)) {
@@ -9908,9 +9908,10 @@ async function runFrontendCheck() {
   }
 }
 
-async function runApiCheck() {
-  const { structures: rawNewStruct, values: newValues } = await fetchApiData();
+async function runApiCheck({ fetchData = fetchApiData, now = Date.now, history = appendHistory } = {}) {
+  const { structures: rawNewStruct, values: observedValues } = await fetchData();
   if (!snapshot) snapshot = {};
+  const newValues = stabilizePublicConfigLength(snapshot, observedValues, now());
   const prunedApiKeys = pruneInactiveApiSnapshots(snapshot);
   if (prunedApiKeys.length > 0) {
     log(`[API] 已清理停用端点快照：${prunedApiKeys.join(", ")}`);
@@ -9972,7 +9973,7 @@ async function runApiCheck() {
   if (notifications.length > 0) {
     const content = notifications.join("\n\n");
     await saveSnapshot(snapshot);
-    appendHistory("api", "API 变更", content.slice(0, 300), content);
+    history("api", "API 变更", content.slice(0, 300), content);
     await sendNotificationMaybeAi({ title: "API 变更", content: formatApiCard(apiChanges, valueChanges, newValues), template: "purple",
       moduleContext: "Four.meme API 变更", url: CONFIG.apiBase, cardOpts: { showDetailLink: false } });
   } else if (apiSnapshotChanged) {
@@ -10311,6 +10312,8 @@ export const __testables = {
   scheduleAiPatchRetry,
   CONFIG,
   diffPoolConfigs,
+  runPoolCheck,
+  runApiCheck,
   buildFourmemeRestartCard,
   createModuleRunner,
   sendNotificationMaybeAi,

@@ -318,6 +318,121 @@ test('动态满池金额不触发底池告警，其他参数及新增移除保�
   assert.equal(current.totalBAmount, '10013.4');
 });
 
+test('底池生产入口首报即时，回摆跨重启去重，持续回退确认一次', async () => {
+  const { CONFIG, createModuleRunner, runPoolCheck, setSnapshotForTests, loadSnapshot } = __testables;
+  const dir = mkdtempSync(join(tmpdir(), 'fourmeme-pool-status-'));
+  const originalPath = CONFIG.snapshotFile;
+  const asset = { networkCode: 'BSC', symbol: 'GEVB', symbolAddress: '0x' + '2'.repeat(40), buyFee: '0.01' };
+  let sample, timestamp;
+  const runner = createModuleRunner('pool', () => runPoolCheck({
+    fetchConfig: async () => sample, now: () => timestamp, history: () => {},
+  }), CONFIG.intervals.pool);
+  const scan = async (seconds, status, fields = {}) => {
+    timestamp = 1_800_000_000_000 + seconds * 1000;
+    sample = [{ ...asset, ...fields, status }];
+    await runner.run();
+    return loadSnapshot();
+  };
+  try {
+    CONFIG.snapshotFile = join(dir, 'snapshot.json');
+    setSnapshotForTests({ poolConfig: [] });
+    const added = await scan(0, 'INIT');
+    assert.match(added._notificationOutbox[0].payload.content, /新增底池/);
+    const launched = await scan(1, 'PUBLISH');
+    assert.equal(launched._notificationOutbox.length, 2);
+    assert.match(launched._notificationOutbox[1].payload.content, /status.*INIT.*PUBLISH/);
+    assert.equal((await scan(2, 'INIT'))._notificationOutbox.length, 2);
+    const withFee = await scan(3, 'INIT', { buyFee: '0.02' });
+    assert.equal(withFee._notificationOutbox.length, 3);
+    assert.match(withFee._notificationOutbox[2].payload.content, /buyFee/);
+    assert.doesNotMatch(withFee._notificationOutbox[2].payload.content, /status/);
+    assert.equal(withFee.poolConfig[0].status, 'INIT');
+    assert.equal(withFee._poolPublishGuards['pool:' + asset.symbolAddress].rollback.samples, 2);
+    setSnapshotForTests(withFee);
+    assert.equal((await scan(4, 'PUBLISH', { buyFee: '0.02' }))._notificationOutbox.length, 3);
+    for (const time of [5, 6, 15, 17, 19, 21, 23]) {
+      assert.equal((await scan(time, 'INIT', { buyFee: '0.02' }))._notificationOutbox.length, 3);
+    }
+    const confirmed = await scan(25, 'INIT', { buyFee: '0.02' });
+    assert.equal(confirmed._notificationOutbox.length, 4);
+    assert.match(confirmed._notificationOutbox[3].payload.content, /status.*PUBLISH.*INIT/);
+    assert.equal((await scan(26, 'INIT', { buyFee: '0.02' }))._notificationOutbox.length, 4);
+    assert.equal((await scan(27, 'PUBLISH', { buyFee: '0.02' }))._notificationOutbox.length, 5);
+    assert.equal((await scan(58, 'INIT', { buyFee: '0.02' }))._notificationOutbox.length, 6);
+  } finally {
+    CONFIG.snapshotFile = originalPath;
+    setSnapshotForTests({});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('底池缺失中断状态确认，重现沿用原基线且 HIDE 及时推送', () => {
+  const asset = { networkCode: 'BSC', symbol: 'SKUUB', symbolAddress: '0x' + '3'.repeat(40) };
+  const { diffPoolConfigs } = __testables;
+  const state = {};
+  const t = 1_800_000_000_000;
+  const published = [{ ...asset, status: 'PUBLISH' }];
+  const init = [{ ...asset, status: 'INIT' }];
+  const hidden = [{ ...asset, status: 'HIDE' }];
+  assert.equal(diffPoolConfigs([], published, { state, now: t })[0].type, '新增底池');
+  assert.deepEqual(diffPoolConfigs(published, init, { state, now: t + 5000 }), []);
+  assert.deepEqual(diffPoolConfigs(init, [], { state, now: t + 6000 }), []);
+  assert.equal(state._pendingPoolRemovals[asset.symbolAddress].expireAt, t + 606000);
+  assert.deepEqual(diffPoolConfigs([], init, { state, now: t + 14000 }), []);
+  assert.equal(state._poolPublishGuards['pool:' + asset.symbolAddress].rollback.samples, 1);
+  assert.deepEqual(diffPoolConfigs(init, published, { state, now: t + 15000 }), []);
+  assert.deepEqual(diffPoolConfigs(published, hidden, { state, now: t + 16000 })[0].fieldChanges, ['status: "PUBLISH" → "HIDE"']);
+  assert.deepEqual(state._pendingPoolRemovals, {});
+});
+
+test('API 生产入口仅确认 public/config 列表长度，其他字段和结构即时推送', async () => {
+  const { CONFIG, createModuleRunner, runApiCheck, setSnapshotForTests, loadSnapshot } = __testables;
+  const dir = mkdtempSync(join(tmpdir(), 'fourmeme-config-count-'));
+  const originalPath = CONFIG.snapshotFile;
+  const key = 'data[].length';
+  let observed, timestamp;
+  const runner = createModuleRunner('api', () => runApiCheck({
+    fetchData: async () => observed, now: () => timestamp, history: () => {},
+  }), CONFIG.intervals.api);
+  const scan = async (seconds, count, updated = true) => {
+    timestamp = 1_800_000_000_000 + seconds * 1000;
+    observed = count === null ? { structures: {}, values: {} } : {
+      structures: { public_config: { 'data[]': 'array', ...(updated ? { newFlag: 'boolean' } : {}) } },
+      values: { public_config: { [key]: count, fee: updated ? 2 : 1, ...(updated ? { newFlag: false } : {}) } },
+    };
+    await runner.run();
+    return loadSnapshot();
+  };
+  try {
+    CONFIG.snapshotFile = join(dir, 'snapshot.json');
+    setSnapshotForTests({ apiStructure: { public_config: { 'data[]': 'array' } }, apiValues: { public_config: { [key]: 164, fee: 1 } } });
+    const first = await scan(0, 163);
+    assert.equal(first._notificationOutbox.length, 1);
+    assert.match(first._notificationOutbox[0].payload.content, /newFlag/);
+    assert.match(first._notificationOutbox[0].payload.content, /fee/);
+    assert.match(first._notificationOutbox[0].payload.content, /data\[\]\.length: 164/);
+    assert.doesNotMatch(first._notificationOutbox[0].payload.content, /data\[\]\.length：/);
+    assert.equal(first.apiValues.public_config[key], 164);
+    assert.equal((await scan(8, 164))._publicConfigLengthCandidate, undefined);
+    assert.equal((await scan(16, 165))._notificationOutbox.length, 1);
+    assert.equal((await scan(24, null))._publicConfigLengthCandidate, undefined);
+    const candidate = await scan(32, 165);
+    setSnapshotForTests(candidate);
+    const second = await scan(40, 165);
+    assert.equal(second._notificationOutbox.length, 1);
+    assert.equal(second._publicConfigLengthCandidate.samples, 2);
+    const confirmed = await scan(48, 165);
+    assert.equal(confirmed._notificationOutbox.length, 2);
+    assert.match(confirmed._notificationOutbox[1].payload.content, /data\[\]\.length.*164.*165/);
+    assert.equal(confirmed.apiValues.public_config[key], 165);
+    assert.equal(confirmed._publicConfigLengthCandidate, undefined);
+  } finally {
+    CONFIG.snapshotFile = originalPath;
+    setSnapshotForTests({});
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('API 可选 filterId 进出前十条样本不会误报，保留最近类型基线', () => {
   const { normalizeApiPayload, extractStructure, stabilizeApiListTypes, diffApiStructures } = __testables;
   for (const endpoint of ['token_search_new', 'token_search_cap', 'token_ranking_cap', 'token_ranking_binance']) {
