@@ -58,6 +58,8 @@ export function normalizeRenderedDom(raw, url) {
   if (type === 'create' && (raw.fields?.length < 3 || !raw.headings?.length || raw.switches < 1)) throw Error('创建表单未完整渲染，保留旧基线');
   if (type === 'stock' && !(raw.buttons?.some(x => /鑄造|Mint/i.test(x)) && raw.buttons?.some(x => /贖回|Redeem/i.test(x)) && raw.fields?.length >= 1)) throw Error('4Stock核心控件未完整渲染，保留旧基线');
   if (['home', 'advanced'].includes(type) && (raw.navigation?.length < 4 || !raw.buttons?.length || /^(?:Loading|載入中)[.\s…]*$/i.test(raw.mainText))) throw Error('页面核心区域未完整渲染，保留旧基线');
+  if (type === 'home' && !raw.fields?.some(s => /搜尋|Search/i.test(s))) throw Error('首页搜索与列表控件尚未渲染，保留旧基线');
+  if (type === 'advanced' && !raw.fields?.length) throw Error('Advanced核心控件尚未渲染，保留旧基线');
   const signals = [];
   for (const [key, label] of [['headings', '标题'], ['tabs', '选项卡'], ['labels', '字段']]) {
     if (key === 'labels' && !['create', 'stock'].includes(type)) continue;
@@ -109,7 +111,7 @@ export function createRenderClient({ timeoutMs = 30000, workerFile = fileURLToPa
   }
   function start() {
     const env = Object.fromEntries(['PATH', 'Path', 'HOME', 'USER', 'TMP', 'TEMP', 'TMPDIR', 'SystemRoot', 'WINDIR', 'XDG_RUNTIME_DIR', 'FOURMEME_CHROMIUM_PATH'].filter(k => process.env[k]).map(k => [k, process.env[k]]));
-    child = forkFn(workerFile, [], { env, stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true });
+    child = forkFn(workerFile, [], { env, execArgv: ['--max-old-space-size=128'], stdio: ['ignore', 'ignore', 'ignore', 'ipc'], windowsHide: true });
     const current = child;
     child.on('message', msg => {
       if (child !== current) return;
