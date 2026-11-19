@@ -60,13 +60,70 @@ test('首页仅比较导航，不因匿名行情区未显示或列表刷新改�
   assert.equal(a.hash, b.hash);
 });
 
-function harness() {
-  let time = 1000, results = [{ url, data: raw() }], failPersist = false;
+function harness(target = url, data = raw()) {
+  let time = 1000, results = [{ url: target, data }], failPersist = false;
   const store = createTransactionalOutbox({ initial: { keep: { history: [1, 2], dedupe: ['old'] } }, persist: () => { if (failPersist) throw Error('disk fail'); }, deliver: async () => 'id' });
   const client = { scan: async () => results, close() {} };
-  const monitor = createFrontendRenderMonitor({ store, client, urls: [url], now: () => time });
+  const monitor = createFrontendRenderMonitor({ store, client, urls: [target], now: () => time });
   return { store, monitor, client, result: value => { results = value; }, time: value => { time = value; }, persistFailure: value => { failPersist = value; }, notices: () => store.state._notificationOutbox || [] };
 }
+
+test('Advanced 快速购买先加载时不接受采集，市场栏目就绪独立于栏目名字', () => {
+  const u = 'https://four.meme/en/advanced';
+  const nav = '<nav>' + ['advanced', 'contract', 'ranking', '4stock'].map(p => `<a href="/en/${p}">${p}</a>`).join('') + '</nav>';
+  const toolbar = '<input type="text" placeholder="Quick Buy (BNB)"><button>Open Four</button>';
+  const board = '<div class="no-scrollbar"><div class="flex-h"><section class="glass-panel"><header><h2>Verified Market</h2></header><div></div></section></div></div>';
+  const capture = content => {
+    const { document } = parseHTML(`<html><body>${nav}<main>${toolbar}${content}</main></body></html>`);
+    return vm.runInNewContext(`(${collectRenderedDom.toString()})()`, { document, location: { href: u, pathname: '/en/advanced' } });
+  };
+  const partial = capture('');
+  assert.equal(partial.fields.length, 1);
+  assert.throws(() => normalizeRenderedDom(partial, u), /市场栏目/);
+  assert.throws(() => normalizeRenderedDom(capture(board.replace('class="glass-panel"', 'class="glass-panel" hidden')), u), /市场栏目/);
+  assert.ok(normalizeRenderedDom(capture(board), u).signals.includes('标题：Verified Market'));
+  assert.equal(normalizeRenderedDom(capture(board.replace('<h2>Verified Market</h2>', '')), u).advancedBoardVerified, true);
+});
+
+test('中英文 Advanced 旧残缺基线静默补齐，真正新增和连续确认的移除仍及时通知', async () => {
+  for (const [lang, headings, button] of [
+    ['en', ['Newly Created', 'About to Launch', 'Trading Volume', 'Graduated', 'Hot'], ''],
+    ['zh-TW', ['新發行', '即將發射', '交易量', '已發射', '熱度'], '篩選'],
+  ]) {
+    const u = `https://four.meme/${lang}/advanced`;
+    const navigation = ['advanced', 'contract', 'ranking', '4stock'].map(p => ({ text: p, href: `/${lang}/${p}` }));
+    const data = raw({ url: u, advancedBoardReady: true, mainText: 'Market Dashboard', headings, tabs: [], navigation,
+      buttons: ['Open Four', ...(button ? [button] : [])], fields: ['input|text|Quick buy'] });
+    const current = normalizeRenderedDom(data, u);
+    const h = harness(u, data);
+    const { advancedBoardVerified, ...legacy } = current;
+    legacy.signals = current.signals.filter(signal => !signal.startsWith('标题：') && signal !== '按钮：篩選');
+    legacy.hash = 'legacy-toolbar';
+    h.store.state._frontendRendered = { pages: { [u]: legacy } };
+
+    h.result([{ url: u, data: { ...data, advancedBoardReady: false, headings: [] } }]);
+    await h.monitor.poll();
+    assert.equal(h.store.state._frontendRendered.pages[u].hash, 'legacy-toolbar');
+    h.result([{ url: u, data }]);
+    await h.monitor.poll();
+    await h.monitor.poll();
+    assert.equal(h.notices().length, 0);
+    assert.equal(h.store.state._frontendRendered.pages[u].hash, current.hash);
+    assert.equal(h.store.state._frontendRendered.pages[u].advancedBoardVerified, true);
+    assert.ok(h.store.state._frontendRendered.pages[u].signals.includes(`标题：${headings[0]}`));
+
+    h.result([{ url: u, data: { ...data, headings: [...headings, 'New Feature'] } }]);
+    await h.monitor.poll();
+    assert.equal(h.notices().length, 1);
+    assert.match(h.notices()[0].payload.content, /New Feature/);
+    h.result([{ url: u, data: { ...data, headings: [...headings.slice(1), 'New Feature'] } }]);
+    await h.monitor.poll();
+    assert.equal(h.notices().length, 1);
+    await h.monitor.poll();
+    assert.equal(h.notices().length, 2);
+    assert.ok(h.notices()[1].payload.content.includes(headings[0]));
+  }
+});
 test('首次基线一次说明，重启不重复，其他状态保留', async () => {
   const h = harness(); await h.monitor.poll(); await h.monitor.poll();
   assert.equal(h.notices().length, 1);

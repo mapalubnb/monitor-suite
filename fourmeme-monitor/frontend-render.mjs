@@ -27,9 +27,15 @@ export function collectRenderedDom() {
   const text = el => (el.innerText || el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
   const main = document.querySelector('main');
   const read = selector => [...(main?.querySelectorAll(selector) || [])].filter(visible);
+  const advanced = /\/advanced\/?$/.test(location.pathname);
+  // The quick-buy input renders before the asynchronous market columns.
+  // Verify the panel structure independently of its names and controls.
+  const advancedBoardReady = advanced && read('.no-scrollbar > .flex-h > .glass-panel')
+    .some(panel => panel.children.length >= 2 && visible(panel.firstElementChild));
   return {
     url: location.href,
     mainText: main ? text(main).slice(0, 20000) : '',
+    ...(advanced ? { advancedBoardReady } : {}),
     headings: read('h1,h2,h3,h4').map(text),
     tabs: read('[role="tab"]').map(text),
     labels: read('label,legend,p').map(text),
@@ -52,6 +58,10 @@ function stableLabel(value, allowNumbers = false) {
 
 const transientSignal = signal => /^按钮：(打開聊天|關閉聊天|打开聊天|关闭聊天|Open chat|Close chat)$/i.test(signal);
 const signalHash = signals => createHash('sha256').update(JSON.stringify(signals)).digest('hex');
+const advancedLegacyControls = {
+  en: new Set(['标题：About to Launch', '标题：Graduated', '标题：Hot', '标题：Newly Created', '标题：Trading Volume']),
+  'zh-TW': new Set(['按钮：篩選', '标题：交易量', '标题：即將發射', '标题：已發射', '标题：新發行', '标题：熱度']),
+};
 
 export function normalizeRenderedDom(raw, url) {
   const requested = new URL(url);
@@ -62,7 +72,7 @@ export function normalizeRenderedDom(raw, url) {
   if (type === 'create' && (raw.fields?.length < 3 || !raw.headings?.length || raw.switches < 1)) throw Error('创建表单未完整渲染，保留旧基线');
   if (type === 'stock' && !(raw.buttons?.some(x => /鑄造|Mint/i.test(x)) && raw.buttons?.some(x => /贖回|Redeem/i.test(x)) && raw.fields?.length >= 1)) throw Error('4Stock核心控件未完整渲染，保留旧基线');
   if (['home', 'advanced'].includes(type) && (raw.navigation?.length < 4 || !raw.buttons?.length || /^(?:Loading|載入中)[.\s…]*$/i.test(raw.mainText))) throw Error('页面核心区域未完整渲染，保留旧基线');
-  if (type === 'advanced' && !raw.fields?.length) throw Error('Advanced核心控件尚未渲染，保留旧基线');
+  if (type === 'advanced' && (raw.advancedBoardReady !== true || !raw.fields?.length)) throw Error('Advanced 市场栏目或核心控件尚未渲染，保留旧基线');
   const signals = [];
   for (const [key, label] of [['headings', '标题'], ['tabs', '选项卡'], ['labels', '字段']]) {
     if (type === 'home') continue; // Home coverage is navigation, not the live token feed.
@@ -87,7 +97,8 @@ export function normalizeRenderedDom(raw, url) {
   }
   const normalized = [...new Set(signals)].filter(s => !transientSignal(s)).sort();
   if (normalized.length < 5) throw Error('渲染结构信息不足，保留旧基线');
-  return { url, signals: normalized, hash: signalHash(normalized), kind: type };
+  return { url, signals: normalized, hash: signalHash(normalized), kind: type,
+    ...(type === 'advanced' ? { advancedBoardVerified: true } : {}) };
 }
 
 // Only this dedicated subprocess owns Chromium. Deadline kills its browser
@@ -180,6 +191,13 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
           if (old?.signals?.some(transientSignal)) {
             const signals = old.signals.filter(s => !transientSignal(s));
             old = { ...old, signals, hash: signalHash(signals) };
+          }
+          if (old?.hash && data.advancedBoardVerified && !old.advancedBoardVerified) {
+            // Older snapshots may have accepted the toolbar-only shell. Adopt
+            // only the known controls present in this verified board silently.
+            const known = advancedLegacyControls[new URL(url).pathname.split('/')[1]];
+            const signals = [...new Set([...old.signals, ...data.signals.filter(signal => known?.has(signal))])].sort();
+            old = { ...old, signals, hash: signalHash(signals), candidateHash: undefined };
           }
           if (!old?.hash) initialized.push(data);
           else if (old.hash !== data.hash) {
