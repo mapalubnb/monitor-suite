@@ -24,7 +24,7 @@ export function pageContentQuality(url, text = '') {
 export function collectRenderedDom() {
   const visible = el => !!el && !el.closest('[hidden],[aria-hidden="true"]')
     && (typeof el.getClientRects !== 'function' || el.getClientRects().length > 0);
-  const text = el => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  const text = el => (el.innerText || el.getAttribute('aria-label') || el.textContent || '').replace(/\s+/g, ' ').trim();
   const main = document.querySelector('main');
   const read = selector => [...(main?.querySelectorAll(selector) || [])].filter(visible);
   return {
@@ -41,11 +41,12 @@ export function collectRenderedDom() {
   };
 }
 
-function stableLabel(value) {
+function stableLabel(value, allowNumbers = false) {
   const s = String(value || '').replace(/\s+/g, ' ').trim();
   // Market/asset buttons contain ticker amounts, percentages or prices. A
   // number-only normalization would still leak changing ticker inventories.
-  if (!s || /(?:0x[a-f\d]{4}|\$|\d|錢包|Wallet|Orders|訂單|Loading|載入|Connect Wallet|連接錢包|登入|Log.?in)/i.test(s)) return '';
+  if (!s || /(?:0x[a-f\d]{4}|錢包|Wallet|Orders|訂單|Loading|載入|Connect Wallet|連接錢包|登入|Log.?in)/i.test(s)
+    || (!allowNumbers && /\$|\d/.test(s))) return '';
   return s.slice(0, 200);
 }
 
@@ -58,17 +59,17 @@ export function normalizeRenderedDom(raw, url) {
   if (type === 'create' && (raw.fields?.length < 3 || !raw.headings?.length || raw.switches < 1)) throw Error('创建表单未完整渲染，保留旧基线');
   if (type === 'stock' && !(raw.buttons?.some(x => /鑄造|Mint/i.test(x)) && raw.buttons?.some(x => /贖回|Redeem/i.test(x)) && raw.fields?.length >= 1)) throw Error('4Stock核心控件未完整渲染，保留旧基线');
   if (['home', 'advanced'].includes(type) && (raw.navigation?.length < 4 || !raw.buttons?.length || /^(?:Loading|載入中)[.\s…]*$/i.test(raw.mainText))) throw Error('页面核心区域未完整渲染，保留旧基线');
-  if (type === 'home' && !raw.fields?.some(s => /搜尋|Search/i.test(s))) throw Error('首页搜索与列表控件尚未渲染，保留旧基线');
   if (type === 'advanced' && !raw.fields?.length) throw Error('Advanced核心控件尚未渲染，保留旧基线');
   const signals = [];
   for (const [key, label] of [['headings', '标题'], ['tabs', '选项卡'], ['labels', '字段']]) {
+    if (type === 'home') continue; // Home coverage is navigation, not the live token feed.
     if (key === 'labels' && !['create', 'stock'].includes(type)) continue;
-    for (const v of raw[key] || []) { const s = stableLabel(v); if (s) signals.push(`${label}：${s}`); }
+    for (const v of raw[key] || []) { const s = stableLabel(v, true); if (s) signals.push(`${label}：${s}`); }
   }
   // Only stable functional buttons, not token cards or dynamic market filters.
-  const buttons = type === 'create' || type === 'stock' ? raw.buttons || [] : (raw.buttons || []).filter(x => /^(?:搜尋|Search|篩選|Filter|Refresh token list|Clear|全部代幣|普通代幣|Tax 代幣|Open Four|All Tokens|Normal Tokens|Tax Tokens)$/i.test(x));
+  const buttons = type === 'home' ? [] : type === 'create' || type === 'stock' ? raw.buttons || [] : (raw.buttons || []).filter(x => /^(?:搜尋|Search|篩選|Filter|Refresh token list|Clear|全部代幣|普通代幣|Tax 代幣|Open Four|All Tokens|Normal Tokens|Tax Tokens)$/i.test(x));
   for (const v of buttons) { const s = stableLabel(v); if (s) signals.push(`按钮：${s}`); }
-  for (const v of raw.fields || []) { if (!/搜尋更多.*(?:MEME|RWA)|Search more/i.test(v)) signals.push(`输入框：${v.slice(0, 180)}`); }
+  for (const v of type === 'home' ? [] : raw.fields || []) { if (!/搜尋更多.*(?:MEME|RWA)|Search more/i.test(v)) signals.push(`输入框：${v.slice(0, 180)}`); }
   if (type === 'create') {
     signals.push(`开关数量：${raw.switches}`);
     for (const label of ['CRYPTO', 'MEME', 'RWA', 'PREIPO', '反狙擊', '啟用稅收', 'Anti-sniper', 'Enable Tax']) {

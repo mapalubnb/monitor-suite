@@ -39,12 +39,25 @@ test('4Stock兑换按钮变化被保留，价格不参与比较', () => {
   assert.notEqual(a.hash, b.hash);
   assert.ok(b.signals.includes('按钮：兌換'));
 });
+test('静态业务阈值和费用说明中的数字不因行情降噪被过滤', () => {
+  const a = normalizeRenderedDom(raw({ labels: ['市值超過 200 萬美元後，將自動作為基礎代幣上架。'] }), url);
+  const b = normalizeRenderedDom(raw({ labels: ['市值超過 300 萬美元後，將自動作為基礎代幣上架。'] }), url);
+  assert.notEqual(a.hash, b.hash);
+  assert.ok(a.signals.some(s => s.includes('200 萬')));
+});
 test('壳、风控、跨域和重定向拒绝写入有效基线', () => {
   for (const patch of [{ fields: [] }, { mainText: 'verify you are human' }, { url: 'https://example.com/zh-TW/create-token' }, { url: 'https://four.meme/en' }]) assert.throws(() => normalizeRenderedDom(raw(patch), url));
 });
 test('排除基础设施伪路由，保留真实4Stock入口', () => {
   for (const route of ['/cdn-cgi/content', '/zh-TW/cdn-cgi/content', '/images/ui-redesign', '/en/images/ui-redesign']) assert.equal(isInfrastructureRoute(route), true);
   assert.equal(isInfrastructureRoute('/zh-TW/4stock'), false);
+});
+test('首页仅比较导航，不因匿名行情区未显示或列表刷新改变指纹', () => {
+  const u = 'https://four.meme/zh-TW';
+  const navigation = ['/', '/4stock', '/contract', '/advanced', '/agentic', '/campaign'].map(p => ({ text: p, href: '/zh-TW' + p }));
+  const a = normalizeRenderedDom(raw({ url: u, mainText: 'Four.meme Fair Launch', navigation, fields: [], buttons: ['它如何運作?'] }), u);
+  const b = normalizeRenderedDom(raw({ url: u, mainText: 'Four.meme Fair Launch TOKEN 999', navigation, headings: ['Dynamic Token'], fields: ['input|text|Search'], buttons: ['Search', 'Token 99'] }), u);
+  assert.equal(a.hash, b.hash);
 });
 
 function harness() {
