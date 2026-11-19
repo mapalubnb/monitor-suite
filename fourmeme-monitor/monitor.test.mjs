@@ -5,6 +5,25 @@ import "./contract-observation.test.mjs";
 import "./safe-monitor.test.mjs";
 import "./address-monitor.test.mjs";
 import "./address-rpc.test.mjs";
+
+test('addresses反复短退避仅记录等待，不进入通用恢复刷卡路径', async () => {
+  const previousLog = console.log, logs = [];
+  let failing = true;
+  console.log = message => logs.push(message);
+  try {
+    const runner = __testables.createModuleRunner('addresses', async () => {
+      if (failing) throw Object.assign(Error('[退避中] 日志节点冷却'), { addressFailureKind: 'cooldown' });
+      return true;
+    }, 1000, false);
+    for (let round = 0; round < 3; round++) {
+      failing = true; for (let i = 0; i < 5; i++) await runner.run();
+      failing = false; await runner.run();
+    }
+    assert.equal(logs.filter(l => /等待重试/.test(l)).length, 1);
+    assert.doesNotMatch(logs.join('\n'), /模块恢复|退避恢复|中间状态变更可能未被捕获|飞书/);
+    assert.equal(runner.intervalMs, 1000);
+  } finally { console.log = previousLog; }
+});
 import assert from "node:assert/strict";
 
 test('地址日志RPC兼容性筛选仅影响新增模块，其他读写路由不变', () => {

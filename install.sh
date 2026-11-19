@@ -528,7 +528,10 @@ if [ -f "$SNAP" ]; then
     console.log('降噪：纯被动代币收款只记录、不推送（同Flap）｜静默累计 '+(addr.silentTransactions??addrState.silentTransactions??0)+' 笔｜保留最近 '+(addr.passiveRecords??addrState.passive?.length??0)+' 条记录');
     console.log('主动转出、调用、授权、直接BNB转移继续推送｜不含完整内部 BNB trace');
     for(const a of addrCatalog) console.log(cleanLabel(a.label)+'｜'+bscAddress(a.address)+'｜'+cleanLabel(a.evidence));
-    if(addr.health?.lastError||addrState.health?.lastError) console.log('地址监控异常：'+warn(cleanLabel(addr.health?.lastError||addrState.health.lastError)));
+    const addrHealth=addr.health||addrState.health||{};
+    console.log('扫描健康：'+({healthy:'正常',waiting:'短暂等待重试',stalled:'持续异常，缺口保留',recovering:'正在稳定恢复'}[addrHealth.status]||'等待检查')+'｜告警：'+(addrHealth.alerted?'异常尚未解除':'无持续异常'));
+    if(addrHealth.lastError) console.log('最近重试原因：'+warn(cleanLabel(addrHealth.lastError))+'｜类别 '+({budget_wait:'节点预算等待',cooldown:'节点冷却',rate_limit:'上游限流',head_not_ready:'头块数据未就绪',timeout:'请求超时'}[addrHealth.failureKind]||'读取异常')+(addrHealth.provider?'｜节点 '+cleanLabel(addrHealth.provider):''));
+    if(addrHealth.retryAt) console.log('节点建议重试时间：'+fmtTime(addrHealth.retryAt));
     if(addr.activeTask) console.log('本轮开始：'+fmtTime(addr.activeTask.startedAt)+'｜截止：'+fmtTime(addr.activeTask.deadlineAt));
     console.log('---');
     console.log('更新时间：'+fmtTime(new Date()));

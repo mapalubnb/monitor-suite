@@ -464,6 +464,13 @@ test('fm-status独立地址包含1秒补扫、目录、缺口和安装依赖', (
   assert.match(installSource, /for source in safe-proposal-monitor operational-call-codec erc4337-codec/);
 });
 
+test('fm-status地址区分短暂等待、持续异常和稳定恢复，不将空错误回退到旧状态', () => {
+  const text = renderFourmemeStatus({}, { addresses: { health: { status: 'waiting', failureKind: 'rate_limit', lastError: 'HTTP 429', provider: 'rpc.test', retryAt: 1800000000000 } } });
+  assert.match(text, /短暂等待重试/); assert.match(text, /无持续异常/); assert.match(text, /上游限流/); assert.match(text, /节点建议重试时间/);
+  const recovered = renderFourmemeStatus({ fourmemeAddresses: { health: { lastError: '旧故障' } } }, { addresses: { health: { status: 'healthy', lastError: '' } } });
+  assert.doesNotMatch(recovered, /旧故障/);
+});
+
 test('fm-status独立显示Four.meme Safe状态，兼容旧快照并保持GitHub栏', () => {
   const safe = { enabled: true, configured: true, intervalMs: 5000, safe: '0x161dd0cfdb0aa25e2504f725655ef9b799375b71', currentNonce: 150,
     identity: { threshold: 3, owners: Array(7).fill('owner'), block: 134262303, checkedAt: 1794982780000 },

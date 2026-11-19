@@ -3,6 +3,7 @@ import { decodeOperationalCall, describeOperationalAction } from '../flap-monito
 import { USER_OPERATION_EVENT, receiptUserOperations, userOperationResult } from '../flap-monitor/erc4337-codec.mjs';
 import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS } from './address-catalog.mjs';
 import { formatBeijingTime } from '../shared/display-format.cjs';
+import { addressRpcFailure } from './address-rpc.mjs';
 
 export const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 export const APPROVAL = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
@@ -83,6 +84,50 @@ export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = 
   return { lines: passiveIncoming ? [] : lines, touched: [...touched], silent: passiveIncoming ? tokenEvents : silent, failed, passiveIncoming };
 }
 
+// One persisted incident stream. Failed rounds never advance the scan cursor;
+// success alone is insufficient to close an incident while a backlog remains.
+export function updateAddressHealth(state, { at, head, error, stallMs = 60000, recoveryMs = 30000 }) {
+  const h = state.health ||= {};
+  h.lastAttemptAt = at;
+  const lag = Math.max(0, (head || 0) - (state.cursor || 0));
+  if (error) {
+    h.failures = (h.failures || 0) + 1;
+    h.failureSince ??= at;
+    h.failureCursor ??= state.cursor ?? null;
+    h.lastError = error.message; h.failureKind = error.addressFailureKind || addressRpcFailure(error);
+    h.provider = error.provider || ''; h.retryAt = error.retryAfterMs > 0 ? at + error.retryAfterMs : null;
+    h.healthySince = null; h.healthyChecks = 0;
+  } else {
+    h.failures = 0; h.lastSuccessAt = at; h.retryAt = null;
+    if (h.failureCursor == null || state.cursor > h.failureCursor) { h.failureSince = null; h.failureCursor = null; }
+  }
+  const since = error ? (h.failureSince ?? at) : (state.lastProgressAt ?? h.lastSuccessAt ?? at);
+  // A single timeout or a burst of budget waits is diagnostic, not a new card.
+  if (lag > 32) h.lagSince ??= at; else h.lagSince = null;
+  const stalled = at - since >= stallMs || (h.lagSince != null && at - h.lagSince >= stallMs);
+  if (stalled && !h.alerted) {
+    h.alerted = true; h.incidentAt = at; h.incidentCursor = state.cursor ?? null;
+    h.healthySince = null; h.healthyChecks = 0; h.status = 'stalled';
+    const lagging = h.lagSince != null && at - h.lagSince >= stallMs;
+    return { title: '监控异常', content: `${error ? h.lastError : lagging ? '扫描持续落后超过32块' : '链上扫描持续未推进'}\n已持续 ${Math.floor((at - (lagging ? h.lagSince : since)) / 1000)} 秒。游标：${state.cursor ?? '待建立'}｜观测头块：${head || '未知'}｜落后：${lag} 块。\n失败区块未跳过；原缺口与去重保留，WSS＋1秒调度继续补扫。` };
+  }
+  const caughtUp = !error && !stalled && lag <= 2 && (h.incidentCursor == null || state.cursor > h.incidentCursor);
+  if (h.alerted && caughtUp) {
+    h.healthySince ??= at; h.healthyChecks = (h.healthyChecks || 0) + 1;
+    if (at - h.healthySince >= recoveryMs && h.healthyChecks >= 3) {
+      h.alerted = false; h.status = 'healthy'; h.lastError = ''; h.failureKind = ''; h.failureSince = null;
+      h.recoveredAt = at; h.healthySince = null; h.healthyChecks = 0;
+      return { title: '监控恢复', content: `已连续稳定核验至少 ${Math.floor(recoveryMs / 1000)} 秒并推进游标。\n当前游标：${state.cursor}｜观测头块：${head}｜落后：${lag} 块。\n历史缺口及去重记录保留；连续补扫已恢复。` };
+    }
+    h.status = 'recovering';
+  } else {
+    h.healthySince = null; h.healthyChecks = 0;
+    h.status = h.alerted ? 'stalled' : error ? 'waiting' : 'healthy';
+    if (!error && !h.alerted) { h.lastError = ''; h.failureKind = ''; }
+  }
+  return null;
+}
+
 export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now = Date.now, wake = () => {}, stopped = () => false,
   enabled = true, catalog = FOURMEME_ADDRESS_CATALOG, actorCovered = () => [], feed = () => ({}),
   maxBlocks = 32, confirmations = 0, timeoutMs = 12000, roundTimeoutMs = 25000 } = {}) {
@@ -110,6 +155,7 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
         if (draft.cursor === undefined) {
           const [anchor] = await blocks([target]);
           draft.cursor = target; draft.activatedAt = now(); draft.activationBlock = target;
+          draft.lastProgressAt = now();
           draft.anchors = [{ number: target, hash: lower(anchor.hash) }];
         } else {
           const anchor = validBlock(savedAnchor, draft.cursor);
@@ -181,8 +227,10 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
         }
         draft.passive = draft.passive.slice(-100);
         draft.seen = Object.fromEntries(Object.entries(draft.seen).slice(-4096));
-        if (draft.health.alerted) notices.push(notice('监控恢复', '已成功核验链上数据并恢复扫描；原缺口及去重保留。'));
-        draft.health = { failures: 0, alerted: false, lastError: '', lastSuccessAt: now() };
+        // Legacy snapshots may lack progress time until their first new block.
+        draft.lastProgressAt ??= draft.health.lastSuccessAt || now();
+        const healthNotice = updateAddressHealth(draft, { at: now(), head: Math.max(head, feed().latestHeadBlock || 0) - confirmations });
+        if (healthNotice) notices.push(notice(healthNotice.title, healthNotice.content));
         draft.head = head;
         await store.transaction(async () => { assertActive(); store.state.fourmemeAddresses = draft; for (const n of notices) await store.enqueue(n); }, { signal: current.signal });
         assertActive(); wake(); return true;
@@ -190,11 +238,8 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
     } catch (error) {
       if (!stopped()) await store.transaction(async () => {
         const state = store.state.fourmemeAddresses ||= { anchors: [], seen: {}, passive: [], catalog: [], health: {} };
-        state.health.failures = (state.health.failures || 0) + 1; state.health.lastError = error.message; state.health.lastAttemptAt = now();
-        if ((state.health.failures >= 5 || current.signal.aborted) && !state.health.alerted) {
-          state.health.alerted = true;
-          await store.enqueue(notice('监控异常', `${error.message}\n未推进失败区块游标，1秒调度继续重试。`));
-        }
+        const healthNotice = updateAddressHealth(state, { at: now(), head: Math.max(runtime.head, state.head || 0, feed().latestHeadBlock || 0) - confirmations, error });
+        if (healthNotice) await store.enqueue(notice(healthNotice.title, healthNotice.content));
       });
       wake(); throw error;
     } finally { deadline.dispose(); if (task === current) task = null; }

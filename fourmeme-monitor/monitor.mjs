@@ -9581,6 +9581,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
   let githubLastLogAt = 0;
   let githubLastFailureKind = "";
   let githubCooldownLogAt = 0;
+  let addressWaitLogAt = 0;
   const run = async () => {
     if (monitorStopping) return;
     if (running) {
@@ -9610,7 +9611,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
             githubCooldownLogAt = 0;
           }
           // warn if recovering from backoff skips (only notify if significant)
-          if (backoffSkips > 0) {
+          if (backoffSkips > 0 && name !== 'addresses') {
             const skipped = backoffSkips;
             backoffSkips = 0;
             log(`[${name}] 退避恢复：此前因风控跳过 ${skipped} 次检测，本轮已完成全量比对`);
@@ -9642,6 +9643,15 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
             if (!githubCooldownLogAt || Date.now() - githubCooldownLogAt >= 60_000) {
               log(`[${name}] ${err.message}`);
               githubCooldownLogAt = Date.now();
+            }
+          } else if (name === 'addresses' && ['budget_wait', 'cooldown', 'rate_limit', 'head_not_ready'].includes(err.addressFailureKind)) {
+            metricSample.backoffCount = 1;
+            recordModuleMetric(moduleMetrics, name, metricSample);
+            // The address scanner owns persisted incident/recovery cards.
+            // Keep actionable diagnostics without the generic skip/recovery pair.
+            if (!addressWaitLogAt || Date.now() - addressWaitLogAt >= 30_000) {
+              log(`[addresses] 等待重试（${err.addressFailureKind}）：${err.message}；失败游标保留`);
+              addressWaitLogAt = Date.now();
             }
           } else if (err.message?.includes("[退避中]")) {
             if (moduleErrors[name]) moduleErrors[name].healthySince = 0;
@@ -10304,6 +10314,7 @@ const fourmemeAddressConfig = readFourmemeAddressConfig();
 const fourmemeAddressMonitor = createFourmemeAddressMonitor({
   ...fourmemeAddressConfig, store: monitorStore, rpcBatch: bscRpcBatch,
   rpcFactory: round => createAddressRoundRpc({ signal: round.signal, id: round.startedAt, batchSize: RPC_BATCH_SIZE,
+    control: rpcControl,
     pool: rpcPoolFor([{ method: 'eth_getLogs', params: [{}] }]), request: requestBscRpcPayload,
     makePool: urls => createRpcEndpointPool(urls, { isBackedOff: url => Boolean(currentBackoffState(getDomain(url))) || Boolean(rpcControl.cooldown(url)) }),
   }),

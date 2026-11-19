@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
-import { createFourmemeAddressMonitor, observeFourmemeAddressTx, renderFourmemeAddressContent, addressLogFilters, TRANSFER, APPROVAL } from './address-monitor.mjs';
+import { createFourmemeAddressMonitor, updateAddressHealth, observeFourmemeAddressTx, renderFourmemeAddressContent, addressLogFilters, TRANSFER, APPROVAL } from './address-monitor.mjs';
 import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS, readFourmemeAddressConfig } from './address-catalog.mjs';
 import { ENTRY_POINT_V07, USER_OPERATION_EVENT } from '../flap-monitor/erc4337-codec.mjs';
 import { keccak_256 } from '@noble/hashes/sha3';
@@ -153,19 +153,55 @@ test('写盘失败原子回滚，不损坏旧字段或发布半份通知', async
   await assert.rejects(f.monitor.poll(), /disk full/); assert.deepEqual(f.disk, before); f.failWrite = false;
   await f.monitor.poll(); assert.equal(f.disk._notificationOutbox.length, 1);
 });
-test('强制超时释放、迟到结果隔离、异常/恢复各一条', async () => {
+test('单次强制超时释放、迟到结果隔离，不刷异常/恢复卡', async () => {
   const f = fixture({}, { timeoutMs: 20, roundTimeoutMs: 10 }); await f.monitor.poll();
   f.data.head = 102; f.add(101); f.data.hang = true; await assert.rejects(f.monitor.poll(), /超时/);
   assert.equal(f.monitor.summary().activeTask, null); assert.equal(f.disk.fourmemeAddresses.cursor, 100);
-  assert.match(f.disk._notificationOutbox[0].payload.title, /监控异常/);
+  assert.equal(f.disk._notificationOutbox, undefined);
+  assert.equal(f.disk.fourmemeAddresses.health.failureKind, 'timeout');
   f.data.hang = false; await f.monitor.poll(); f.data.release(); await new Promise(r => setTimeout(r, 30));
-  assert.equal(f.disk._notificationOutbox.length, 3); assert.equal(f.disk.fourmemeAddresses.cursor, 101);
+  assert.equal(f.disk._notificationOutbox.length, 1); assert.equal(f.disk.fourmemeAddresses.cursor, 101);
 });
-test('连续失败告警只报一次，RPC恢复保留原去重与缺口', async () => {
-  const f = fixture(); await f.monitor.poll(); f.data.fail = true;
+test('持续60秒失败告警一次；重启保留事件，追上且稳定30秒恢复一次', async () => {
+  let at = 1000;
+  const f = fixture({}, { now: () => at }); await f.monitor.poll(); f.data.fail = true;
   for (let i = 0; i < 6; i++) await assert.rejects(f.monitor.poll());
-  assert.equal(f.disk._notificationOutbox.length, 1); f.data.fail = false; await f.monitor.poll();
-  assert.equal(f.disk._notificationOutbox.length, 2); assert.equal(f.disk.fourmemeAddresses.cursor, 100);
+  assert.equal(f.disk._notificationOutbox, undefined);
+  at += 60001; await assert.rejects(f.monitor.poll());
+  assert.equal(f.disk._notificationOutbox.length, 1);
+  const restarted = createFourmemeAddressMonitor(f.opts);
+  await assert.rejects(restarted.poll()); assert.equal(f.disk._notificationOutbox.length, 1);
+  f.data.fail = false; await restarted.poll(); // same head must not recover
+  assert.equal(f.disk.fourmemeAddresses.health.alerted, true);
+  f.data.head++; await restarted.poll(); at += 15000; f.data.head++; await restarted.poll();
+  assert.equal(f.disk._notificationOutbox.length, 1);
+  at += 15000; f.data.head++; await restarted.poll();
+  assert.equal(f.disk._notificationOutbox.length, 2);
+  assert.match(f.disk._notificationOutbox[1].payload.content, /游标：103/);
+  await restarted.poll(); assert.equal(f.disk._notificationOutbox.length, 2);
+});
+
+test('反复短抖动不刷卡；持续落后即使RPC成功也告警；稳定期失败重新计时', () => {
+  const s = { cursor: 100, lastProgressAt: 1000, health: {} };
+  const wait = Object.assign(Error('预算暂满'), { rpcBudget: true });
+  for (let at = 1000; at < 200000; at += 10000) {
+    assert.equal(updateAddressHealth(s, { at, head: s.cursor + 1, error: wait }), null);
+    s.cursor++; s.lastProgressAt = at + 5000;
+    assert.equal(updateAddressHealth(s, { at: at + 5000, head: s.cursor }), null);
+  }
+  assert.equal(s.health.alerted || false, false);
+  updateAddressHealth(s, { at: 200000, head: s.cursor + 100 });
+  s.cursor++; s.lastProgressAt = 260001;
+  assert.match(updateAddressHealth(s, { at: 260001, head: s.cursor + 100 }).title, /异常/);
+  s.cursor++; s.lastProgressAt = 261000;
+  updateAddressHealth(s, { at: 261000, head: s.cursor });
+  updateAddressHealth(s, { at: 280000, head: s.cursor, error: wait });
+  s.cursor++; s.lastProgressAt = 290000;
+  updateAddressHealth(s, { at: 290000, head: s.cursor });
+  assert.equal(updateAddressHealth(s, { at: 300000, head: s.cursor }), null);
+  assert.equal(s.health.alerted, true);
+  s.cursor++; s.lastProgressAt = 320000;
+  assert.match(updateAddressHealth(s, { at: 320000, head: s.cursor }).title, /恢复/);
 });
 test('新增地址独立生效区块，旧地址掉线期间历史仍连续补回', async () => {
   const f = fixture({}, { catalog: [cat[0]], maxBlocks: 2 }); await f.monitor.poll(); f.add(101); f.add(102, { from: B }); f.data.head = 104;
