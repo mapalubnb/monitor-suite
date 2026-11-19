@@ -1,8 +1,11 @@
 import { chromium } from 'playwright-core';
 import { existsSync } from 'node:fs';
+import { setPriority } from 'node:os';
 import { collectRenderedDom, normalizeRenderedDom, RENDER_URLS } from './frontend-render.mjs';
 
-let server, browser, context, busy = false;
+let server, browser, context, page, busy = false;
+// Lower priority only for this worker and its subsequently spawned browser.
+try { setPriority(0, 10); } catch {}
 async function launch() {
   if (browser?.isConnected()) return;
   const executablePath = process.env.FOURMEME_CHROMIUM_PATH || ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium'].find(existsSync);
@@ -20,36 +23,30 @@ async function scan(urls, id) {
   // every request disables Chromium's cache and repeatedly cold-loads ~50 JS
   // chunks/page. HTML/API freshness remains controlled by the origin.
   const results = [], queue = [...urls];
-  try {
-    await Promise.all(Array.from({ length: 2 }, async () => {
-      while (queue.length) {
-        const url = queue.shift();
-        const page = await context.newPage();
-        try {
-          const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
-          if (!response?.ok()) throw Error(`页面HTTP ${response?.status() || 0}`);
-          const deadline = Date.now() + 10000;
-          let data, error;
-          do {
-            data = await page.evaluate(collectRenderedDom);
-            try { normalizeRenderedDom(data, url); error = null; break; } catch (e) { error = e; }
-            await new Promise(resolve => setTimeout(resolve, 200));
-          } while (Date.now() < deadline);
-          if (error) throw error;
-          results.push({ url, data });
-        } catch (error) { results.push({ url, error: error.message.split('\n')[0].slice(0, 300) }); }
-        finally {
-          const result = results.find(r => r.url === url);
-          if (result) process.send?.({ id, type: 'page', result });
-          await page.close();
-        }
-      }
-    }));
-    return results;
-  } finally {
-    // Close all task pages, retain anonymous cache for the next round.
-    await Promise.all(context.pages().map(page => page.close().catch(() => {})));
+  while (queue.length) {
+    const url = queue.shift();
+    if (!page || page.isClosed()) page = await context.newPage();
+    try {
+      const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 8000 });
+      if (!response?.ok()) throw Error(`页面HTTP ${response?.status() || 0}`);
+      const deadline = Date.now() + 10000;
+      let data, error;
+      do {
+        data = await page.evaluate(collectRenderedDom);
+        try { normalizeRenderedDom(data, url); error = null; break; } catch (e) { error = e; }
+        await new Promise(resolve => setTimeout(resolve, 200));
+      } while (Date.now() < deadline);
+      if (error) throw error;
+      results.push({ url, data });
+    } catch (error) { results.push({ url, error: error.message.split('\n')[0].slice(0, 300) }); }
+    finally {
+      const result = results.find(r => r.url === url);
+      if (result) process.send?.({ id, type: 'page', result });
+      // Stop market timers/WebSockets between jobs without discarding HTTP cache.
+      await page.goto('about:blank', { timeout: 2000 }).catch(async () => { await page.close().catch(() => {}); });
+    }
   }
+  return results;
 }
 
 process.on('message', async ({ id, urls }) => {

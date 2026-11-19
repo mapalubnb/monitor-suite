@@ -12,6 +12,7 @@ import { createAddressRoundRpc } from './address-rpc.mjs';
 import { discoverCreators } from "./creator-discovery.mjs";
 import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
 import { createRenderClient, createFrontendRenderMonitor, pageContentQuality, isInfrastructureRoute } from './frontend-render.mjs';
+import { createRenderScheduler } from './frontend-render-scheduler.mjs';
 import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
@@ -10355,9 +10356,17 @@ const fourmemeAddressMonitor = createFourmemeAddressMonitor({
   wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[Four.meme 地址 推送] ${error.message}`)); },
 });
 const frontendRenderClient = createRenderClient();
-const frontendRenderMonitor = createFrontendRenderMonitor({
+const frontendRenderer = createFrontendRenderMonitor({
   store: monitorStore, client: frontendRenderClient, stopped: () => monitorStopping, log,
   wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[前端渲染 推送] ${error.message}`)); },
+});
+const frontendRenderMonitor = createRenderScheduler({
+  store: monitorStore, renderer: frontendRenderer, stopped: () => monitorStopping, log,
+  wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[前端轻量 推送] ${error.message}`)); },
+  staticFingerprint: url => {
+    const p = monitorStore.state.frontendPages?.[urlToKey(url)];
+    return p ? md5(JSON.stringify([p.assetContentHash, p.i18nHash, p.contentHash])) : '';
+  },
 });
 const modules = [
   createModuleRunner("pool",     runPoolCheck,     CONFIG.intervals.pool),

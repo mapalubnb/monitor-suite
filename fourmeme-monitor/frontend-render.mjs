@@ -142,18 +142,18 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
   let running = false, closed = false, cursor = 0;
   const read = () => store.state._frontendRendered || { pages: {}, health: {} };
   const notice = (title, content, template = 'orange') => ({ title, content, template, skipAi: true, moduleContext: 'Four.meme 前端渲染核验', url: 'https://four.meme' });
-  async function poll() {
+  async function poll(targets = urls) {
     if (running || closed || stopped()) return false;
     running = true;
     const startedAt = now();
     try {
       let results;
       try {
-        const ordered = [...urls.slice(cursor), ...urls.slice(0, cursor)];
+        const ordered = [...targets.slice(cursor % targets.length), ...targets.slice(0, cursor % targets.length)];
         cursor = (cursor + 2) % urls.length;
         results = await client.scan(ordered);
       }
-      catch (error) { const partial = error.results || []; results = [...partial, ...urls.filter(url => !partial.some(r => r.url === url)).map(url => ({ url, error: error.message }))]; }
+      catch (error) { const partial = error.results || []; results = [...partial, ...targets.filter(url => !partial.some(r => r.url === url)).map(url => ({ url, error: error.message }))]; }
       if (closed || stopped()) return false;
       const byUrl = new Map((results || []).map(r => [r.url, r]));
       const notices = [];
@@ -161,7 +161,7 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
         const state = structuredClone(read());
         state.pages ||= {}; state.health ||= {};
         const changes = [], initialized = [], errors = [];
-        for (const url of urls) {
+        for (const url of targets) {
           const result = byUrl.get(url);
           const old = state.pages[url];
           if (!result || result.error || !result.data) {
@@ -188,6 +188,9 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
         if (initialized.length) notices.push(notice('Four.meme 页面渲染覆盖已补齐', `首次建立以下页面的渲染基线（不代表这些功能刚刚上线）：\n${initialized.map(p => `${new URL(p.url).pathname}：${p.signals.filter(s => /标题：|选项卡：|功能：|按钮：(?:鑄造|贖回|兌換|Mint|Redeem|Convert)/.test(s)).slice(0, 10).join('；') || '导航与功能控件'}`).join('\n')}\n时间：${formatBeijingTime(now())}`));
         if (changes.length) notices.push(notice('Four.meme 页面可见功能变更', changes.map(c => `[${new URL(c.url).pathname}](${c.url})\n${c.added.length ? '新增：\n' + c.added.map(x => '＋ ' + x).join('\n') : ''}\n${c.removed.length ? '移除（连续两次确认）：\n' + c.removed.map(x => '－ ' + x).join('\n') : ''}`).join('\n\n') + `\n时间：${formatBeijingTime(now())}`));
         const health = state.health;
+        // A partial scan must not declare unvisited failed pages recovered.
+        errors.length = 0;
+        for (const url of urls) if (state.pages[url]?.lastError || !state.pages[url]?.hash) errors.push(`${new URL(url).pathname}：${state.pages[url]?.lastError || '等待首次采集'}`);
         health.lastAttemptAt = startedAt; health.lastDurationMs = now() - startedAt;
         health.failedPages = errors.length; health.completePages = urls.length - errors.length;
         health.lastError = errors.join('；').slice(0, 2500);

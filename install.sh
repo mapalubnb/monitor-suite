@@ -442,7 +442,11 @@ if [ -f "$SNAP" ]; then
     const rendered=runtime.frontend?.rendered||s._frontendRendered?.health||{};
     const renderAge=rendered.lastSuccessAt?Date.now()-rendered.lastSuccessAt:Infinity;
     console.log('前端内容：HTTP成功 '+(runtime.frontend?.successfulPages??'-')+' 页 · 加载壳 '+(runtime.frontend?.shellPages??'-')+' 页（交独立渲染核验）');
-    console.log('渲染核验：完整 '+(rendered.completePages??0)+'/'+(rendered.targetPages??8)+' · 失败 '+(rendered.failedPages??0)+' · '+(renderAge<60000?'最近完整采集 '+Math.round(renderAge/1000)+'秒前':'待核验或已过期')+' · '+(rendered.running?'采集中':'空闲'));
+    console.log('渲染核验：完整 '+(rendered.completePages??0)+'/'+(rendered.targetPages??8)+' · 失败 '+(rendered.failedPages??0)+' · '+(renderAge<90000?'最近成功采集 '+Math.round(renderAge/1000)+'秒前':'待核验或已过期')+' · '+(rendered.running?'采集中':'空闲'));
+    if(rendered.mode==='on-demand') {
+      console.log('按需渲染：5秒轻量检测 · '+(rendered.fallbackMs/1000)+'秒逐页兜底 · 单页串行 · 待核验 '+rendered.pendingPages+' 页');
+      console.log('轻量检测：'+(rendered.lastCheckAt?Math.round((Date.now()-rendered.lastCheckAt)/1000)+'秒前':'等待首次检测')+' · 耗时 '+(rendered.lastCheckDurationMs||0)+'ms'+(rendered.probeError?' · '+rendered.probeError:''));
+    }
     if(rendered.lastError) console.log('渲染异常：'+rendered.lastError);
     if(runtime.rpc) console.log('RPC：请求 '+runtime.rpc.requested+' · 复用 '+runtime.rpc.reused+' · 冷却 '+runtime.rpc.cooled+' · 排队 '+runtime.rpc.queued+' · 本地预算等待 '+(runtime.rpc.budgetRejected||0)+' · 上游429 '+(runtime.rpc.upstream429||0)+' · 拒绝 '+(runtime.rpc.denied||0)+' · 超时 '+(runtime.rpc.timeouts||0));
     if(s._notificationOutbox?.length) console.log('⚠️ 待发送：'+warn(s._notificationOutbox.length+' 条，自动重试'));

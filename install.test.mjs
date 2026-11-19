@@ -49,11 +49,14 @@ function renderFourmemeStatus(snapshot, runtime = {}) {
 
 test('Four.meme面板区分HTTP成功、加载壳和独立渲染失败', () => {
   const output = renderFourmemeStatus({}, { frontend: { successfulPages: 20, shellPages: 4,
-    rendered: { targetPages: 8, completePages: 6, failedPages: 2, lastError: '创建表单未完整渲染', running: true } } });
+    rendered: { targetPages: 8, completePages: 6, failedPages: 2, lastError: '创建表单未完整渲染', running: true,
+      mode: 'on-demand', fallbackMs: 60000, pendingPages: 2, lastCheckAt: Date.now(), lastCheckDurationMs: 900 } } });
   assert.match(output, /HTTP成功 20 页/);
   assert.match(output, /加载壳 4 页/);
   assert.match(output, /完整 6\/8 · 失败 2/);
   assert.match(output, /创建表单未完整渲染/);
+  assert.match(output, /5秒轻量检测 · 60秒逐页兜底 · 单页串行 · 待核验 2 页/);
+  assert.match(output, /耗时 900ms/);
 });
 
 function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safeProposalState = {}, earlyState = {}, runtime = {}) {
