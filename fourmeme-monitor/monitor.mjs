@@ -1067,14 +1067,14 @@ async function patchCardViaApi(messageId, title, content, template = "red", diff
 
 const isTooLongForSingleCard = isMultiPartCard;
 
-/**
- * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
- * @param {string} [url] - 监控目标网址，展示在卡片最上方
- */
 function notificationUrlLine(url, cardOpts = {}) {
   return url && cardOpts.showDetailLink !== false ? `🔗 [查看详情](${url})\n\n` : "";
 }
 
+/**
+ * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
+ * @param {string} [url] - 监控目标网址，展示在卡片最上方
+ */
 async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, cardOpts = {}) {
   const urlLine = notificationUrlLine(url, cardOpts);
   const initialContent = urlLine + content;
