@@ -406,16 +406,16 @@ test('Safe status marks nonce failures unhealthy even when the API last succeede
 });
 
 
-test('fm-status GitHub uses all dynamic repositories with per-repo commits and pending details', () => {
+test('fm-status GitHub uses all dynamic repositories with per-repo commits', () => {
   const names = ['four-meme-community/four-meme-ai', 'bnb-chain/bnb-chain.github.io', 'four-meme-community/future-repo'];
   const snapshot = { githubSha: 'f'.repeat(40), githubRepos: { stale: { full_name: 'old/stale' } }, githubMonitor: {
     repos: Object.fromEntries(names.map((name, i) => [name, { name, branch: i === 1 ? 'master' : 'main', head: String(i + 1).repeat(40), checkedAt: Date.parse('2026-10-22T11:00:00Z') }])),
     jobs: [{ repo: names[1] }, { repo: names[1] }, { repo: names[2] }],
   } };
   const output = renderFourmemeStatus(snapshot), section = output.split('08｜📦 GitHub')[1];
-  assert.match(section, /仓库：3 个｜待补详情：3 项/);
+  assert.match(section, /仓库：3 个/);
   for (let i = 0; i < names.length; i++) assert.ok(section.includes('https://github.com/' + names[i] + '/commit/' + String(i + 1).repeat(40)));
-  assert.match(section, /默认分支：master/); assert.match(section, /待补详情：2 项/);
+  assert.match(section, /默认分支：master/); assert.doesNotMatch(section, /待补详情/);
   assert.match(section, /2026\/10\/22 19:00:00/);
   assert.doesNotMatch(section, /old\/stale|旧版主仓库提交|ffffffff/);
 });
@@ -432,7 +432,7 @@ test('fm-status supports legacy snapshots without assigning the main commit to o
     'old/other': { full_name: 'old/other', default_branch: 'develop' },
   } }).split('08｜📦 GitHub')[1];
   assert.match(text, /旧版主仓库提交/); assert.match(text, /默认分支：develop｜最新提交：暂无提交/);
-  assert.match(text, /旧版未记录/); assert.doesNotMatch(text, /old\/other\/commit/);
+  assert.doesNotMatch(text, /旧版未记录|old\/other\/commit/);
 });
 
 test('fm-status new empty repositories show no branch or commit and preserve other panels', () => {
@@ -450,19 +450,21 @@ test('fm-status newly discovered repository remains pending until its first succ
   assert.match(text, /默认分支：待同步｜最新提交：待同步/);
 });
 
-test('fm-status isolates unavailable GitHub repositories and displays retained detail gaps',()=>{
+test('fm-status isolates unavailable GitHub repositories and omits retired detail gaps',()=>{
   const text=renderFourmemeStatus({githubMonitor:{repos:{'flap-sh/missing':{name:'flap-sh/missing',head:'a'.repeat(40),branch:'main',availability:'unavailable',lastHeadError:'仓库不可访问',headRetryAt:1800000000000,checkedAt:1799999000000}},jobs:[{repo:'flap-sh/missing',lastError:'HTTP 404',blockedReason:'base_unavailable',attempts:353}]}}).split('08｜📦 GitHub')[1];
-  assert.match(text,/异常仓库：1/);assert.match(text,/仓库不可访问/);assert.match(text,/最近检查/);assert.match(text,/原提交不可访问/);assert.match(text,/等待仓库恢复/);
+  assert.match(text,/异常仓库：1/);assert.match(text,/仓库不可访问/);assert.match(text,/最近检查/);assert.match(text,/下次恢复探测/);
+  assert.doesNotMatch(text,/详情缺口|原提交不可访问|待补详情/);
 });
 
-test('fm-status distinguishes GitHub detail stalls, active deadlines and retained resource waits', () => {
+test('fm-status shows GitHub head and discovery health without restoring old detail metrics', () => {
   const runtime = { github: { health: { detailsStatus: 'waiting', readyDetails: 0, lastProgressAt: 1794898172889,
     details: { active: true, reason: '详情单轮超时', recoveries: 2 },
+    heads: { active: true, reason: '提交探测单轮超时', recoveries: 1 },
     activeTasks: { discovery: { startedAt: 1794898172889, deadlineAt: 1794898232889 } } },
     requests: { restPending: 1, hardTimeouts: 3, queueTimeouts: 1 } } };
   const text = renderFourmemeStatus({ githubMonitor: { repos: {}, jobs: [] } }, runtime).split('08｜📦 GitHub')[1];
-  assert.match(text, /等待首条送达、重试或历史资源恢复/);
-  assert.match(text, /详情停滞告警/); assert.match(text, /已触发恢复 2 次/); assert.match(text, /强制截止/);
+  assert.doesNotMatch(text, /等待首条送达|详情停滞告警|详情通道|待补详情/);
+  assert.match(text, /提交探测停滞告警.*已触发恢复 1 次/); assert.match(text, /仓库发现正在执行.*强制截止/);
   assert.match(text, /请求强制超时：3/); assert.match(text, /排队超时：1/);
 });
 

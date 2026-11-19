@@ -66,7 +66,6 @@ test('all notification families retain their original content through the shared
     templates: fm.formatOpenFourTemplateChanges({ added: [{ id: '1', name: 'Agent', status: 'PUBLISHED' }], statusChanged: [] }),
     contracts: fm.formatContractChanges([{ type: '合约升级', label: 'Manager', address, oldHash: 'old', newHash: 'new' }]),
     onchain: fm.formatOnchainChanges([{ type: 'Agent NFT 数量变更', old: 1, new: 2 }]),
-    github: fm.formatGithubRepoChanges({ added: [{ full_name: 'example/repo', html_url: 'https://github.com/example/repo', description: '完整描述', default_branch: 'main' }] }),
     pageRecovery: fl.buildOperationalNoticeContent({ status: 'recovered', url: 'https://flap.sh/create', reason: '页面恢复', detail: '保留全部诊断内容' }),
     vault: fl.buildCaStoreVaultChangeNotification({ type: 'added', name: 'Gift Vault', factory: address, description: '保留金库文案', sourceUrl: 'https://flap.sh/bnb/CAstore' }, {}).content,
     factory: fl.buildFactoryPoolMonitorContent({ changes: [], state: { assets: {}, headLastScannedBlock: 123 } }),

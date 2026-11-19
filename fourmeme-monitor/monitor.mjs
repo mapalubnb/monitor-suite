@@ -4,7 +4,7 @@ import { readSnapshot, createSnapshotStore } from "../shared/snapshot-store.cjs"
 import { recoverLiveCursor } from "../shared/scan-recovery.mjs";
 import { createActorStateCoordinator } from './actor-state.mjs';
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
-import { createGithubApi, createGithubMonitor, createGithubTransport } from "./github-monitor.mjs";
+import { createGithubApi, createGithubMonitor, createGithubTransport, retireGithubDetails } from "./github-monitor.mjs";
 import { createFourmemeSafeMonitor, readFourmemeSafeConfig } from "./safe-monitor.mjs";
 import { createFourmemeAddressMonitor } from './address-monitor.mjs';
 import { readFourmemeAddressConfig } from './address-catalog.mjs';
@@ -28,7 +28,7 @@ import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStag
  *   模块2: 前端代码   — 每 7s（统一页面池，含文案 diff、__NEXT_DATA__、i18n、路由/端点发现）
  *   模块3: API 结构    — 每 10s（多端点并行，含结构+值 diff）
  *   模块4: OpenFour模板 — 每 2s（新增模板 / 状态变化）
- *   模块5: GitHub     — 认证 GraphQL 每 2s；仓库发现 15s；详情异步补充
+ *   模块5: GitHub     — 认证 GraphQL 默认分支检查每 2s；仓库发现 15s
  *   模块6: 智能合约   — 每 2s（RPC batch，单次请求）
  *   模块7: 链上参数   — 每 2s（RPC batch，单次请求）
  *   模块8: 创建者动作 — WebSocket 新区块驱动 + HTTP 兜底（只监听创建者/手动配置地址发起的交易）
@@ -156,9 +156,6 @@ const CONFIG = {
   networkCode: "BSC",
 
   // GitHub 仓库监控
-  githubOwner: "four-meme-community",
-  githubRepo: "four-meme-community/four-meme-ai",
-  githubApiBranch: "main",
   githubToken: process.env.GITHUB_TOKEN || "",
 
   // 飞书 API（SDK 统一发送，只需 App 凭证 + Chat ID）
@@ -778,6 +775,7 @@ const jsonEqual = (a, b) => JSON.stringify(a ?? null) === JSON.stringify(b ?? nu
 
 /* ── 快照读写（带异步互斥锁防并发读写冲突）── */
 const CURRENT_SCHEMA_VERSION = 9;
+let retiredGithubDetailsOnLoad = false;
 let runtimeMetricsWriteQueue = Promise.resolve();
 let frontendSnapshotRevision = 0;
 let cachedFrontendDiskRevision = -1;
@@ -824,6 +822,7 @@ function loadSnapshot() {
     if (existsSync(CONFIG.snapshotFile)) {
       const data = readSnapshot(CONFIG.snapshotFile);
       const migrated = migrateSnapshot(data);
+      retiredGithubDetailsOnLoad = retireGithubDetails(migrated);
       try {
         if (!data._atomicNotifications && existsSync(CONFIG.actorStateFile)) {
           const actorState = JSON.parse(readFileSync(CONFIG.actorStateFile, "utf-8"));
@@ -7208,324 +7207,6 @@ async function runOpenFourModuleDiscoveryCheck(context = {}) {
   }
 }
 
-const GITHUB_API = "https://api.github.com";
-// githubETag 从 snapshot 恢复，避免重启后浪费 rate limit
-let githubETag = "";
-let githubReposETag = "";
-const GITHUB_COMMIT_DETAIL_LIMIT = 30;
-
-function githubHeaders() {
-  const h = {
-    "Accept": "application/vnd.github.v3+json",
-    "User-Agent": "fourmeme-monitor/2.0",
-  };
-  if (CONFIG.githubToken) h["Authorization"] = `Bearer ${CONFIG.githubToken}`;
-  return h;
-}
-
-async function fetchLatestCommits(perPage = 100, page = 1) {
-  const url = `${GITHUB_API}/repos/${CONFIG.githubRepo}/commits?sha=${CONFIG.githubApiBranch}&per_page=${perPage}&page=${page}`;
-  const headers = githubHeaders();
-
-  const res = await fetchSafe(url, { headers }, 10_000);
-
-  if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
-
-  // 提交监控每轮都按 SHA 主动确认，避免条件缓存 304 导致真实提交延迟到缓存失效后才推送。
-  // 这里仍记录 ETag 仅用于诊断/快照兼容，不再用于 commits 条件请求。
-  const etag = res.headers.get("etag");
-  if (etag) githubETag = etag;
-
-  return await res.json();
-}
-
-async function fetchGithubOwnerRepos(perPage = 100) {
-  const url = `${GITHUB_API}/users/${CONFIG.githubOwner}/repos?per_page=${perPage}&sort=updated`;
-  const headers = githubHeaders();
-  if (githubReposETag) headers["If-None-Match"] = githubReposETag;
-
-  const res = await fetchSafe(url, { headers }, 10_000);
-  if (res.status === 304) return null;
-  if (!res.ok) throw new Error(`GitHub 账号仓库 API HTTP ${res.status}`);
-
-  const etag = res.headers.get("etag");
-  if (etag) githubReposETag = etag;
-
-  return await res.json();
-}
-
-async function fetchCommitDetail(sha) {
-  const url = `${GITHUB_API}/repos/${CONFIG.githubRepo}/commits/${sha}`;
-  const res = await fetchSafe(url, { headers: githubHeaders() }, 10_000);
-  if (!res.ok) throw new Error(`GitHub API HTTP ${res.status}`);
-  return await res.json();
-}
-
-function normalizeGithubRepos(repos) {
-  const map = {};
-  for (const r of repos || []) {
-    if (!r?.full_name) continue;
-    map[r.full_name] = {
-      name: r.name || "",
-      full_name: r.full_name,
-      html_url: r.html_url || `https://github.com/${r.full_name}`,
-      description: r.description || "",
-      default_branch: r.default_branch || "",
-      created_at: r.created_at || "",
-      updated_at: r.updated_at || "",
-      pushed_at: r.pushed_at || "",
-      archived: Boolean(r.archived),
-      disabled: Boolean(r.disabled),
-    };
-  }
-  return map;
-}
-
-function diffGithubRepos(oldRepos = {}, newRepos = {}) {
-  const added = [];
-  const removed = [];
-  const changed = [];
-  for (const [fullName, repo] of Object.entries(newRepos)) {
-    const old = oldRepos[fullName];
-    if (!old) {
-      added.push(repo);
-      continue;
-    }
-    const fields = [];
-    // updated_at 会被 star/watch/fork 等非代码事件刷新，容易造成“仓库更新但无 diff”的误报。
-    // 这里仅通知会影响代码/项目形态的字段；代码提交以 pushed_at 和主仓库 commit diff 为准。
-    for (const key of ["pushed_at", "default_branch", "description", "archived", "disabled"]) {
-      if ((old[key] ?? "") !== (repo[key] ?? "")) {
-        fields.push({ key, old: old[key] ?? "", new: repo[key] ?? "" });
-      }
-    }
-    if (fields.length > 0) changed.push({ repo, fields });
-  }
-  for (const [fullName, repo] of Object.entries(oldRepos)) {
-    if (!newRepos[fullName]) removed.push(repo);
-  }
-  return { added, removed, changed };
-}
-
-async function checkGithubRepos(oldRepos, reportExistingNonPrimary = false) {
-  const repos = await fetchGithubOwnerRepos(100);
-  if (repos === null) return { repoMap: oldRepos || null, changes: null };
-  const repoMap = normalizeGithubRepos(repos);
-  if (!oldRepos) {
-    const added = reportExistingNonPrimary
-      ? Object.values(repoMap).filter(r => r.full_name !== CONFIG.githubRepo)
-      : [];
-    return {
-      repoMap,
-      changes: added.length > 0 ? { added, removed: [], changed: [] } : null,
-    };
-  }
-  const changes = diffGithubRepos(oldRepos, repoMap);
-  const hasChanges = changes.added.length || changes.removed.length || changes.changed.length;
-  return { repoMap, changes: hasChanges ? changes : null };
-}
-
-function formatGithubRepoChanges(changes) {
-  const lines = [];
-  lines.push(`**账号：** [${CONFIG.githubOwner}](https://github.com/${CONFIG.githubOwner})`);
-  const count = (changes.added?.length || 0) + (changes.removed?.length || 0) + (changes.changed?.length || 0);
-  lines.push(`**仓库/项目变更：** ${count} 项`);
-  lines.push("---");
-  for (const r of changes.added || []) {
-    lines.push(`🆕 **新增仓库：** [${r.full_name}](${r.html_url})`);
-    if (r.description) lines.push(`  描述：${r.description}`);
-    lines.push(`  默认分支：${r.default_branch || "未知"}　创建：${r.created_at || "未知"}　更新：${r.updated_at || "未知"}　推送：${r.pushed_at || "未知"}`);
-    lines.push("---");
-  }
-  for (const c of changes.changed || []) {
-    const r = c.repo;
-    lines.push(`🔄 **仓库更新：** [${r.full_name}](${r.html_url})`);
-    for (const f of c.fields) lines.push(formatValueChangeLine(f.key, f.old || "空", f.new || "空"));
-    lines.push("---");
-  }
-  for (const r of changes.removed || []) {
-    lines.push(`🗑️ **移除仓库：** [${r.full_name}](${r.html_url})`);
-    lines.push("---");
-  }
-  return lines.join("\n");
-}
-
-function formatPatchPreviewLines(patch, maxLines = 8) {
-  const preview = [];
-  for (const raw of String(patch || "").split(/\r?\n/)) {
-    if (preview.length >= maxLines) break;
-    if (!raw || raw.startsWith("+++") || raw.startsWith("---")) continue;
-    if (raw.startsWith("@@")) {
-      preview.push(`- ${changedText(raw, 160)}`);
-    } else if (raw.startsWith("+")) {
-      preview.push(formatAddedLine(raw.slice(1).trim() || "+", "", 160));
-    } else if (raw.startsWith("-")) {
-      preview.push(formatRemovedLine(raw.slice(1).trim() || "-", "", 160));
-    }
-  }
-  return preview;
-}
-
-function formatGithubChanges(newCommits) {
-  const lines = [];
-  lines.push(`**仓库：** [${CONFIG.githubRepo}](https://github.com/${CONFIG.githubRepo})`);
-  lines.push(`**新增提交：** ${newCommits.length} 个`);
-  lines.push("---");
-  for (const c of newCommits) {
-    const sha = c.sha.slice(0, 8);
-    const author = c.commit.author?.name || "未知";
-    const date = c.commit.author?.date || "";
-    const msg = c.commit.message.split("\n")[0];
-    const fullMsg = c.commit.message.trim();
-    lines.push(`**[\`${sha}\`](https://github.com/${CONFIG.githubRepo}/commit/${c.sha})** ${msg}`);
-    lines.push(`  作者：${author}　时间：${date}`);
-    // 多行 commit message 的正文部分（通常包含变更描述）
-    if (fullMsg.includes("\n")) {
-      const body = fullMsg.split("\n").slice(1).join("\n").trim();
-      if (body) {
-        lines.push(`  提交描述：`);
-        lines.push(`  ${diffSnippet(body, 500)}`);
-      }
-    }
-    if (c.files && c.files.length > 0) {
-      const added = c.files.filter(f => f.status === "added");
-      const modified = c.files.filter(f => f.status === "modified");
-      const removed = c.files.filter(f => f.status === "removed");
-      const renamed = c.files.filter(f => f.status === "renamed");
-      const summary = [];
-      if (added.length) summary.push(`新增 ${added.length}`);
-      if (modified.length) summary.push(`修改 ${modified.length}`);
-      if (removed.length) summary.push(`删除 ${removed.length}`);
-      if (renamed.length) summary.push(`重命名 ${renamed.length}`);
-      lines.push(`  文件：${summary.join("、")}（共 ${c.files.length} 个）`);
-      for (const f of c.files) {
-        const detail = `${f.filename}  (+${f.additions} -${f.deletions})`;
-        if (f.status === "added") lines.push(formatAddedLine(detail, ""));
-        else if (f.status === "removed") lines.push(formatRemovedLine(detail, ""));
-        else if (f.status === "renamed") lines.push(`- ${changedText(detail)}`);
-        else lines.push(`- ${diffSnippet(detail)}`);
-      }
-
-      // 输出关键文件的 patch（实际代码变更内容），帮助 AI 理解具体改了什么
-      const patchFiles = c.files
-        .filter(f => f.patch && f.patch.length > 0)
-        .sort((a, b) => (b.additions + b.deletions) - (a.additions + a.deletions));
-      if (patchFiles.length > 0) {
-        lines.push("");
-        lines.push("**关键改动预览：**");
-        let previewBudget = 18;
-        for (const f of patchFiles) {
-          if (previewBudget <= 0) break;
-          const preview = formatPatchPreviewLines(f.patch, Math.min(6, previewBudget));
-          if (preview.length === 0) continue;
-          lines.push(`\`${f.filename}\``);
-          lines.push(...preview);
-          previewBudget -= preview.length;
-        }
-        lines.push("完整 diff 已作为附件归档。");
-      }
-    } else {
-      lines.push("  文件详情：未获取到 commit detail，已在日志记录失败原因。");
-    }
-    lines.push("---");
-  }
-  return lines.join("\n");
-}
-
-function buildGithubFullDiff(newCommits) {
-  const lines = [];
-  lines.push(`GitHub 提交完整 diff`);
-  lines.push(`仓库: https://github.com/${CONFIG.githubRepo}`);
-  lines.push(`分支: ${CONFIG.githubApiBranch}`);
-  lines.push(`生成时间: ${ts()}`);
-  lines.push(`提交数: ${newCommits.length}`);
-  lines.push("");
-
-  for (const c of newCommits) {
-    const sha = c.sha || "";
-    const commitUrl = `https://github.com/${CONFIG.githubRepo}/commit/${sha}`;
-    const msg = c.commit?.message?.trim() || "";
-    const author = c.commit?.author?.name || "未知";
-    const date = c.commit?.author?.date || "";
-    lines.push("=".repeat(80));
-    lines.push(`commit ${sha}`);
-    lines.push(`url: ${commitUrl}`);
-    lines.push(`author: ${author}`);
-    lines.push(`date: ${date}`);
-    lines.push("");
-    lines.push(msg);
-    lines.push("");
-
-    if (!c.files || c.files.length === 0) {
-      lines.push("(未获取到文件级 diff，可能是 GitHub 未返回 patch 或详情请求失败)");
-      lines.push("");
-      continue;
-    }
-
-    const totalAdditions = c.files.reduce((sum, f) => sum + (f.additions || 0), 0);
-    const totalDeletions = c.files.reduce((sum, f) => sum + (f.deletions || 0), 0);
-    lines.push(`files: ${c.files.length}, +${totalAdditions} -${totalDeletions}`);
-    for (const f of c.files) {
-      lines.push("");
-      lines.push(`--- ${f.status || "changed"} ${f.filename} (+${f.additions || 0} -${f.deletions || 0})`);
-      if (f.previous_filename) lines.push(`previous: ${f.previous_filename}`);
-      if (f.patch) {
-        lines.push("```diff");
-        lines.push(f.patch);
-        lines.push("```");
-      } else {
-        lines.push("(GitHub 未返回该文件 patch，通常是二进制文件、文件过大或 diff 被折叠)");
-      }
-    }
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-async function checkGithub(lastSha, fetchPage = fetchLatestCommits, fetchDetail = fetchCommitDetail, delay = sleep) {
-  const commits = [];
-  for (let page = 1; ; page++) {
-    const batch = await fetchPage(100, page);
-    if (!Array.isArray(batch)) throw new Error("GitHub 提交列表无效");
-    commits.push(...batch);
-    if (!lastSha || batch.some(c => c.sha === lastSha) || batch.length < 100) break;
-    if (page >= 20) throw new Error("GitHub 提交积压超过 2000 条，保留游标，需检查分支历史");
-  }
-  if (!commits || commits.length === 0) return { newSha: lastSha, newCommits: [] };
-  const latestSha = commits[0].sha;
-  if (!lastSha) return { newSha: latestSha, newCommits: [] };
-  if (latestSha === lastSha) return { newSha: lastSha, newCommits: [] };
-
-  const newCommits = [];
-  for (const c of commits) {
-    if (c.sha === lastSha) break;
-    newCommits.push(c);
-  }
-
-  // 获取尽量完整的提交详情，确保通知和 diff 文件包含 files/patch。
-  // GitHub commit list 本身不带 patch，必须逐个请求 commit detail。
-  const detailed = [];
-  const detailLimit = Math.min(newCommits.length, GITHUB_COMMIT_DETAIL_LIMIT);
-  const detailTasks = newCommits.slice(0, detailLimit).map((c, i) => {
-    return delay(i * 250).then(async () => {
-      try {
-        return await fetchDetail(c.sha);
-      } catch (err) {
-        log(`[GitHub] 获取提交详情失败 ${c.sha.slice(0, 8)}：${err.message}`);
-        return c;
-      }
-    });
-  });
-  const detailResults = await Promise.allSettled(detailTasks);
-  for (const r of detailResults) {
-    detailed.push(r.status === "fulfilled" ? r.value : newCommits[detailed.length]);
-  }
-  for (const c of newCommits.slice(detailLimit)) detailed.push(c);
-
-  return { newSha: latestSha, newCommits: detailed };
-}
-
 /* ══════════════════════════════════════════
    模块 6：智能合约代码监控（RPC Batch）
    ══════════════════════════════════════════ */
@@ -9648,7 +9329,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
   let running = false;
   let pending = false;
   let backoffSkips = 0;
-  const githubTask = ["github", "githubDiscovery", "githubDetails"].includes(name);
+  const githubTask = ["github", "githubDiscovery"].includes(name);
   let githubFailures = 0;
   let githubLastLogAt = 0;
   let githubLastFailureKind = "";
@@ -9676,9 +9357,9 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
           if (firstRunStatus === "pending") firstRunStatus = "complete";
           metricSample.durationMs = Date.now() - startedAt;
           recordModuleMetric(moduleMetrics, name, metricSample);
-          const githubCompleted = name === "github" ? result?.checked > 0 : name === "githubDetails" ? result === true : true;
+          const githubCompleted = name !== "github" || result?.checked > 0;
           if (githubTask && githubFailures > 0 && githubCompleted) {
-            log(`[${name}] 请求恢复：此前 ${githubLastFailureKind} 失败 ${githubFailures} 次，本轮检查完成；详情完成情况以队列为准`);
+            log(`[${name}] 请求恢复：此前 ${githubLastFailureKind} 失败 ${githubFailures} 次，本轮检查完成`);
             githubFailures = 0;
             githubCooldownLogAt = 0;
           }
@@ -9703,7 +9384,6 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
         } catch (err) {
           if (err.code === 'FRONTEND_DEADLINE') pending = false;
           if (firstRunStatus === "pending" && err.code !== "GITHUB_BUDGET_WAIT") firstRunStatus = "failed";
-          if (name === "github") githubReposETag = "";
           metricSample.durationMs = Date.now() - startedAt;
           if (err.code === "GITHUB_BUDGET_WAIT") {
             metricSample.backoffCount = 1;
@@ -10385,11 +10065,7 @@ const githubApi = createGithubApi({
 const githubMonitor = createGithubMonitor({
   store: monitorStore,
   api: githubApi,
-  saveDiff: saveDiffLocally,
   stopped: () => monitorStopping,
-  resume: lane => {
-    if (lane === "details" && !monitorStopping) void modules.find(module => module.name === "githubDetails")?.run().catch(error => log(`[GitHub 详情恢复] ${error.message}`));
-  },
   wake: () => {
     if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[GitHub 推送] ${error.message}`));
   },
@@ -10440,7 +10116,6 @@ const modules = [
   createModuleRunner("openfourTemplates", runOpenFourTemplateCheck, CONFIG.intervals.openfourTemplates),
   createModuleRunner("github", githubMonitor.pollHeads, CONFIG.intervals.github, false),
   createModuleRunner("githubDiscovery", githubMonitor.discover, CONFIG.githubRepoListIntervalMs, false),
-  createModuleRunner("githubDetails", githubMonitor.enrich, 1000, false),
   createModuleRunner("contract", runContractCheck,  CONFIG.intervals.contract),
   createModuleRunner("onchain",  runOnchainCheck,   CONFIG.intervals.onchain),
   createModuleRunner("actor",    runActorCheck,     CONFIG.actorMonitor.wsEnabled ? CONFIG.actorMonitor.httpFallbackMs : CONFIG.intervals.actor, false),
@@ -10480,6 +10155,10 @@ function buildFourmemeRestartCard() {
 }
 
 async function startAllModules() {
+  if (retiredGithubDetailsOnLoad) {
+    await saveSnapshot();
+    log("[GitHub] 已完成旧详情队列迁移");
+  }
   log("Four.meme 全面监控 v2 启动中...");
   log("[AI] Four.meme 自动分析已关闭，仅推送原始监控结果和 diff");
   log("模块频率：");
@@ -10503,7 +10182,6 @@ async function startAllModules() {
   void startupNotifier.refresh();
   outboxTimer = setInterval(() => {
     void monitorStore.drain().catch(err => log(`[待发送] 落盘失败：${err.message}`));
-    void githubMonitor.checkHealth().catch(err => log(`[GitHub 健康检查] ${err.message}`));
   }, 1_000);
   void monitorStore.drain().catch(err => log(err.message));
   if (actorRunner && (CONFIG.actorMonitor.enabled || fourmemeAddressConfig.enabled)) global.__actorBlockFeed = startActorBlockFeed(actorRunner);
@@ -10644,7 +10322,6 @@ export const __testables = {
   diffContractFingerprints,
   runContractCheck,
   validateActorBlocks,
-  checkGithub,
   fetchWithTimeout,
   fetchOpenFourPresetIds,
   urlToKey,
@@ -10705,8 +10382,6 @@ export const __testables = {
   diffOpenFourPresetIds,
   formatOpenFourPresetIdChanges,
   formatOpenFourNewModules,
-  formatGithubRepoChanges,
-  formatGithubChanges,
   formatI18nChangesForFullDiff,
   formatI18nChanges,
   formatRouteChanges,

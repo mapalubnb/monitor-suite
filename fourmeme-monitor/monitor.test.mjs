@@ -476,25 +476,44 @@ test('GitHub 网络错误合并重复日志，冷却与恢复不误标为风控'
   }
 });
 
-test('GitHub 详情等待期间空轮次不谎报恢复', async () => {
-  const previousLog = console.log;
-  const logs = [];
-  let mode = 'failure';
-  console.log = message => logs.push(message);
+test('production snapshot loading retires GitHub diff work and preserves other queued cards', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fourmeme-github-retirement-'));
+  const config = __testables.CONFIG;
+  const originalPath = config.snapshotFile;
+  const head = { id: 'head', parts: ['sent-part'], cardParts: [{ content: '默认分支变化 / 文件 diff 待补' }, { content: '提交链接' }], payload: { title: 'GitHub 代码更新', content: '默认分支变化 / 文件 diff 待补\n提交链接', github: { kind: 'head' } } };
+  const discovery = { id: 'repo', payload: { title: 'GitHub 新增监控仓库', content: '已纳入默认分支与文件 diff 监控' } };
+  const frontend = { id: 'frontend', payload: { title: '前端变更', content: '保留差异', diffFilePath: '/old/frontend.diff' } };
+  const pendingDetails = [
+    { title: 'GitHub 文件 diff：example/repo', github: { kind: 'detail' } },
+    { title: 'GitHub 文件 diff 补全受阻' }, { title: 'GitHub 分支更新详情' },
+    { title: 'GitHub 详情通道停滞' }, { title: 'GitHub 详情通道恢复' },
+    { title: 'GitHub 新提交（3个）', diffFilePath: '/old/github.diff' },
+  ];
+  const heads = { 'example/repo': { head: 'original', branch: 'main' } };
+  const healthy = { heads: { active: false }, discovery: { active: true } };
   try {
-    const runner = __testables.createModuleRunner('githubDetails', async () => {
-      if (mode === 'failure') throw Object.assign(new Error('网络超时'), { code: 'GITHUB_REQUEST_FAILED', kind: 'timeout' });
-      return mode === 'success';
-    }, 1000, false);
-    await runner.run();
-    mode = 'idle';
-    await runner.run();
-    assert.doesNotMatch(logs.join('\n'), /请求恢复/);
-    mode = 'success';
-    await runner.run();
-    assert.match(logs.join('\n'), /请求恢复/);
+    config.snapshotFile = join(dir, 'snapshot.json');
+    writeFileSync(config.snapshotFile, JSON.stringify({
+      _atomicNotifications: true,
+      githubSha: 'original',
+      githubMonitor: { repos: heads, jobs: [{ id: '404' }], lastDetailAt: 1, health: { ...healthy, details: { active: true } } },
+      moduleErrors: { githubDetails: 'old', safe: 'preserve' },
+      _notificationOutbox: [head, ...pendingDetails.map((payload, index) => ({ id: String(index), payload })), frontend, discovery],
+    }));
+    const state = __testables.loadSnapshot();
+    assert.equal(state.githubSha, 'original');
+    assert.deepEqual(state.githubMonitor, { repos: heads, health: healthy });
+    assert.deepEqual(state.moduleErrors, { safe: 'preserve' });
+    assert.deepEqual(state._notificationOutbox.map(item => item.id), ['head', 'frontend', 'repo']);
+    const [survivingHead, survivingFrontend, survivingDiscovery] = state._notificationOutbox;
+    assert.deepEqual(survivingHead.parts, head.parts);
+    assert.deepEqual(survivingHead.cardParts, [{ content: '默认分支变化' }, { content: '提交链接' }]);
+    assert.equal(survivingHead.payload.content, '默认分支变化\n提交链接');
+    assert.deepEqual(survivingFrontend, frontend);
+    assert.equal(survivingDiscovery.payload.content, '已纳入默认分支监控');
   } finally {
-    console.log = previousLog;
+    config.snapshotFile = originalPath;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 
@@ -547,19 +566,6 @@ test('atomic snapshot migration ignores stale actor checkpoint and rejects corru
     Object.assign(config, previous);
     rmSync(dir, { recursive: true, force: true });
   }
-});
-
-test("GitHub six commits are unique and pagination covers more than 100 commits", async () => {
-  const commits = Array.from({ length: 106 }, (_, i) => ({ sha: `sha${i}` }));
-  const pages = [];
-  const result = await __testables.checkGithub('sha105', async (size, page) => {
-    pages.push(page); return commits.slice((page - 1) * size, page * size);
-  }, async sha => ({ sha, files: [] }), async () => {});
-  assert.deepEqual(pages, [1, 2]);
-  assert.equal(result.newCommits.length, 105);
-  assert.equal(new Set(result.newCommits.map(c => c.sha)).size, 105);
-  const six = await __testables.checkGithub('old', async () => commits.slice(0, 6), async sha => ({ sha }), async () => {});
-  assert.equal(six.newCommits.length, 6);
 });
 
 test("missing actor blocks and mixed forks cannot advance a scan", async () => {
@@ -857,7 +863,7 @@ test("restart card reports process and baseline separately within one card", () 
   assert.equal(card.title, "Four.meme 监控已启动");
   assert.match(card.content, /进程已启动/);
   assert.match(card.content, /前端：每 7 秒｜API：每 10 秒/);
-  assert.match(card.content, /首轮检查：完成 0\/16/);
+  assert.match(card.content, /首轮检查：完成 0\/15/);
   assert.doesNotMatch(card.content, /全部模块首轮检查完成|监控启动中/);
   assert.ok(card.content.length < 460);
 });
@@ -1304,24 +1310,6 @@ test("fourmeme diff cards use inline red-green highlights without scroll blocks"
       { type: "Agent NFT 数量变更", old: 1, new: 2 },
       { type: "新增 Agent NFT 合约", addresses: ["0x0000000000000000000000000000000000000001"] },
       { type: "移除 Agent NFT 合约", addresses: ["0x0000000000000000000000000000000000000002"] },
-    ]),
-    __testables.formatGithubChanges([
-      {
-        sha: "1234567890abcdef",
-        commit: {
-          author: { name: "dev", date: "2026-06-27T00:00:00Z" },
-          message: "更新文案",
-        },
-        files: [
-          {
-            filename: "src/page.tsx",
-            status: "modified",
-            additions: 1,
-            deletions: 1,
-            patch: "@@ -1 +1 @@\n-old copy\n+new copy",
-          },
-        ],
-      },
     ]),
   ];
 

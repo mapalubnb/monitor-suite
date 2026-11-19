@@ -203,21 +203,58 @@ export function createGithubApi({ token, fetchImpl = fetch, transport, now = Dat
   };
 }
 
+// Retire only GitHub's old detail work before the persisted outbox can drain.
+// Keep the IDs and part boundaries of surviving, possibly partly sent cards.
+export function retireGithubDetails(snapshot) {
+  const state = snapshot.githubMonitor;
+  const fields = [[state, "jobs"], [state, "lastDetailAt"], [state?.health, "details"], [snapshot.moduleErrors, "githubDetails"]];
+  let changed = false;
+  for (const [obj, key] of fields) {
+    if (obj && Object.hasOwn(obj, key)) {
+      delete obj[key];
+      changed = true;
+    }
+  }
+  if (Array.isArray(snapshot._notificationOutbox)) {
+    const surviving = [];
+    for (const entry of snapshot._notificationOutbox) {
+      const { title, github } = entry.payload || {};
+      if (github?.kind === "detail" || /^GitHub (?:文件 diff(?:[：:\s]|$)|分支更新详情$|详情通道(?:停滞|恢复)$|新提交（\d+个）$)/u.test(title || "")) {
+        changed = true;
+        continue;
+      }
+      const oldStatus = title === "GitHub 代码更新" ? "默认分支变化 / 文件 diff 待补"
+        : title === "GitHub 新增监控仓库" ? "已纳入默认分支与文件 diff 监控" : "";
+      if (oldStatus) {
+        const status = title === "GitHub 代码更新" ? "默认分支变化" : "已纳入默认分支监控";
+        for (const card of [entry.payload, ...(entry.cardParts || [])]) {
+          if (card.content?.includes(oldStatus)) {
+            card.content = card.content.replace(oldStatus, status);
+            changed = true;
+          }
+        }
+      }
+      surviving.push(entry);
+    }
+    if (surviving.length !== snapshot._notificationOutbox.length) snapshot._notificationOutbox = surviving;
+  }
+  return changed;
+}
+
 function freshState(snapshot) {
   const repos = {};
   for (const name of new Set([...GITHUB_REPOSITORIES, ...Object.keys(snapshot.githubRepos || {}).filter(name => GITHUB_DISCOVERY_OWNERS.includes(name.split("/")[0]))])) {
     repos[name] = { name, head: name === GITHUB_REPOSITORIES[0] ? snapshot.githubSha || "" : "", branch: name === GITHUB_REPOSITORIES[0] ? "main" : "" };
   }
-  return { version: 1, repos, jobs: [], lastHeadAt: 0, lastDiscoveryAt: 0, lastDetailAt: 0 };
+  return { version: 1, repos, lastHeadAt: 0, lastDiscoveryAt: 0 };
 }
 
-export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () => undefined, wake = () => {}, stopped = () => false,
-  taskTimeouts = {}, stallMs = 60_000, resume = () => {} }) {
+export function createGithubMonitor({ store, api, now = Date.now, wake = () => {}, stopped = () => false,
+  taskTimeouts = {} }) {
   let commits = Promise.resolve();
   const running = new Map();
   const taskContext = new AsyncLocalStorage();
-  const timeouts = { heads: 20_000, details: 30_000, discovery: 60_000, ...taskTimeouts };
-  let checkingHealth = false, eligibleSince = null, observedProgress = 0, lastRecoveryAt = 0;
+  const timeouts = { heads: 20_000, discovery: 60_000, ...taskTimeouts };
   const headGaps = [];
   let lastDelivery = null;
   const view = () => store.state.githubMonitor || freshState(store.state);
@@ -241,17 +278,17 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
     commits = result.catch(() => {});
     return result;
   }
-  const laneName = lane => ({ details: "详情", discovery: "仓库发现", heads: "提交探测" })[lane];
+  const laneName = lane => ({ discovery: "仓库发现", heads: "提交探测" })[lane];
   async function incident(state, lane, reason) {
     state.health ||= {};
     const previous = state.health[lane] || {};
     state.health[lane] = { ...previous, active: true, since: previous.active ? previous.since : now(), lastRecoveryAt: now(), recoveries: (previous.recoveries || 0) + 1, reason };
-    if (!previous.active) await store.enqueue({ title: `GitHub ${laneName(lane)}通道停滞`, content: `${cardStatus('warning', '工作已隔离 / 调度继续')}\n${reason}\n提交基线、历史缺口、分页与待发均保留，恢复请求遵守服务端限流。`, template: "yellow", skipAi: true });
+    if (!previous.active) await store.enqueue({ title: `GitHub ${laneName(lane)}通道停滞`, content: `${cardStatus('warning', '工作已隔离 / 调度继续')}\n${reason}\n提交基线与待发通知已保留，恢复请求遵守服务端限流。`, template: "yellow", skipAi: true });
   }
   async function recovered(state, lane) {
     const health = state.health?.[lane];
     if (!health?.active) return;
-    await store.enqueue({ title: `GitHub ${laneName(lane)}通道恢复`, content: `${cardStatus('healthy', '实际采集已恢复 / 进度已保存')}\n继续处理保留的任务，历史404等缺口仍单独保留，不表示全部详情已补齐。`, template: "green", skipAi: true });
+    await store.enqueue({ title: `GitHub ${laneName(lane)}通道恢复`, content: cardStatus('healthy', '采集已恢复 / 进度已保存'), template: "green", skipAi: true });
     Object.assign(health, { active: false, recoveredAt: now() });
   }
   async function guarded(lane, fn) {
@@ -263,16 +300,7 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
     catch (error) {
       if (attempt.signal.aborted && !stopped()) {
         const reason = `GitHub ${laneName(lane)}单轮超过${timeouts[lane] / 1000}秒，已取消本轮`;
-        await taskContext.run(undefined, () => change(async state => {
-          const job = state.jobs.find(item => item.id === attempt.jobId && item.workId === attempt.id);
-          if (job) {
-            delete job.workId;
-            job.attempts = (job.attempts || 0) + 1;
-            job.lastError = reason;
-            job.retryAt = Math.max(job.retryAt || 0, now() + 2000);
-          }
-          await incident(state, lane, reason);
-        }));
+        await taskContext.run(undefined, () => change(state => incident(state, lane, reason)));
         wake();
         throw Object.assign(new Error(reason), { code: "GITHUB_TASK_TIMEOUT", kind: "timeout" });
       }
@@ -281,32 +309,6 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
       deadline.dispose();
       if (running.get(lane) === attempt) running.delete(lane);
     }
-  }
-
-  function detailHealth() {
-    const state = view(), pending = new Set((store.state._notificationOutbox || []).map(entry => entry.id));
-    const ready = state.jobs.filter(job => !job.blockedReason && (job.retryAt || 0) <= now() && !pending.has(job.noticeId) && state.repos[job.repo]?.availability !== "unavailable");
-    const apiState = api.summary();
-    const cooldownUntil = Math.max(apiState.retryAt?.rest || 0, apiState.sharedRetryAt || 0);
-    const active = running.get("details");
-    return { ready: cooldownUntil > now() ? [] : ready, status: cooldownUntil > now() ? "cooldown" : active ? "running" : ready.length ? "pending" : state.jobs.length ? "waiting" : "idle", cooldownUntil, lastProgressAt: state.lastDetailAt || 0 };
-  }
-  // Reuses the independent 1s outbox tick; does not await a scan Promise.
-  async function checkHealth() {
-    if (checkingHealth || stopped()) return;
-    checkingHealth = true;
-    try {
-      const health = detailHealth();
-      if (!health.ready.length) { eligibleSince = null; return; }
-      if (health.lastProgressAt !== observedProgress) { observedProgress = health.lastProgressAt; eligibleSince = now(); }
-      eligibleSince ??= now();
-      if (now() - eligibleSince < stallMs || (lastRecoveryAt && now() - lastRecoveryAt < stallMs)) return;
-      await change(state => incident(state, "details", `有${health.ready.length}项可处理详情，连续${Math.floor((now() - eligibleSince) / 1000)}秒没有成功保存进度`));
-      lastRecoveryAt = now();
-      wake();
-      // Active tasks have their own hard deadline. Only resume idle work.
-      if (!running.has("details")) resume("details");
-    } finally { checkingHealth = false; }
   }
 
   async function pollHeads() {
@@ -334,7 +336,7 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
               const count = (previous.headFailures || 0) + 1;
               Object.assign(previous, { availability: unavailable ? "unavailable" : "degraded", lastHeadError: reason, headFailures: count, lastAttemptAt: now(), headRetryAt: count < 2 ? 0 : now() + (unavailable ? 60_000 : Math.min(60_000, 2000 * 2 ** Math.min(count - 1, 5))) });
               if (count >= 2 && !previous.incidentNotified) {
-                await store.enqueue({ title: "GitHub 单仓库监控异常", content: `${repoHeading(name)}\n${cardStatus('warning', '单仓库读取异常')}\n${reason}\n原提交与待补详情已保留，其他仓库继续检查。\n下次恢复探测：${formatBeijingTime(previous.headRetryAt)}`, url: `https://github.com/${name}`, cardOpts: { showDetailLink: false }, template: "yellow", skipAi: true });
+                await store.enqueue({ title: "GitHub 单仓库监控异常", content: `${repoHeading(name)}\n${cardStatus('warning', '单仓库读取异常')}\n${reason}\n已保留当前分支基线，其他仓库继续检查。\n下次恢复探测：${formatBeijingTime(previous.headRetryAt)}`, url: `https://github.com/${name}`, cardOpts: { showDetailLink: false }, template: "yellow", skipAi: true });
                 previous.incidentNotified = true;
               }
               errors.push(`${name}: ${reason}`);
@@ -343,20 +345,15 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
             const branch = repository.defaultBranchRef;
             const current = { ...previous, name: repository.nameWithOwner, nodeId: repository.id, checkedAt: now(), lastAttemptAt: now(), availability: "healthy", lastHeadError: "", headFailures: 0, headRetryAt: 0, incidentNotified: false, lastCheckGapMs: previous.checkedAt ? now() - previous.checkedAt : 0 };
             checked++;
-            if (previous.incidentNotified) await store.enqueue({ title: "GitHub 单仓库监控恢复", content: `${repoHeading(current.name)}\n${cardStatus('healthy', '已恢复读取')}\n继续从保留的提交基线比较，历史缺口以详情队列为准。`, url: `https://github.com/${current.name}`, cardOpts: { showDetailLink: false }, template: "green", skipAi: true });
-            for (const job of state.jobs) if (job.repo === name) {
-              job.repo = current.name;
-              if (previous.availability === "unavailable") job.retryAt = 0;
-            }
+            if (previous.incidentNotified) await store.enqueue({ title: "GitHub 单仓库监控恢复", content: `${repoHeading(current.name)}\n${cardStatus('healthy', '已恢复读取')}\n继续检查默认分支及最新提交。`, url: `https://github.com/${current.name}`, cardOpts: { showDetailLink: false }, template: "green", skipAi: true });
             const head = branch?.target?.oid || "";
             const branchName = branch?.name || "";
             if ((previous.head && (previous.head !== head || previous.branch !== branchName)) || (!previous.head && previous.initialized && head)) {
-              const id = randomUUID();
               const url = `https://github.com/${current.name}`;
               const target = branch?.target?.url || url;
               const content = [
                 repoHeading(current.name, target),
-                cardStatus('changed', '默认分支变化 / 文件 diff 待补'),
+                cardStatus('changed', '默认分支变化'),
                 `分支：${previous.branch !== branchName ? `${plain(previous.branch || '无')} → ` : ''}${plain(branchName || '无（空仓库）')}`,
                 `提交：${previous.head || '无'} → ${head || '无'}`,
                 plain(branch?.target?.messageHeadline || '默认分支已清空'),
@@ -364,8 +361,7 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
                 `提交时间：${branch?.target?.committedDate ? formatBeijingTime(branch.target.committedDate) : '未知'}`,
                 `${cardTime(now())}（发现时间）`,
               ].join('\n');
-              const noticeId = await store.enqueue({ title: "GitHub 代码更新", content, url: target, cardOpts: { showDetailLink: false }, template: "turquoise", skipAi: true, github: { repo: current.name, kind: "head", detectedAt: now() } });
-              if (head) state.jobs.push({ id, repo: current.name, branch: branchName, base: previous.head, head, noticeId, createdAt: now(), stage: previous.head ? "compare" : "files", page: 1, commits: previous.head ? [] : [{ sha: head }], index: 0, files: [], attempts: 0, retryAt: 0 });
+              await store.enqueue({ title: "GitHub 代码更新", content, url: target, cardOpts: { showDetailLink: false }, template: "turquoise", skipAi: true, github: { repo: current.name, kind: "head", detectedAt: now() } });
             }
             current.head = head;
             current.branch = branchName;
@@ -424,12 +420,11 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
           const existing = Object.values(state.repos).find(item => item.nodeId === repo.node_id || item.name === repo.full_name);
           if (existing) {
             if (existing.name !== repo.full_name) delete state.repos[existing.name];
-            for (const job of state.jobs) if (job.repo === existing.name) job.repo = repo.full_name;
             const reappeared = previousCatalog && !Object.values(previousCatalog).some(item => item.node_id === repo.node_id);
             state.repos[repo.full_name] = { ...existing, name: repo.full_name, nodeId: repo.node_id, ...(reappeared || existing.name !== repo.full_name ? { headRetryAt: 0 } : {}) };
           } else {
             state.repos[repo.full_name] = { name: repo.full_name, nodeId: repo.node_id, head: "", branch: "" };
-            await store.enqueue({ title: "GitHub 新增监控仓库", content: `${repoHeading(repo.full_name, repo.html_url)}\n${cardStatus('added', '已纳入默认分支与文件 diff 监控')}\n首次探测建立基线，不回放全部历史。\n${cardTime(now())}（发现时间）`, url: repo.html_url, cardOpts: { showDetailLink: false }, template: "turquoise", skipAi: true });
+            await store.enqueue({ title: "GitHub 新增监控仓库", content: `${repoHeading(repo.full_name, repo.html_url)}\n${cardStatus('added', '已纳入默认分支监控')}\n首次探测建立基线，不回放全部历史。\n${cardTime(now())}（发现时间）`, url: repo.html_url, cardOpts: { showDetailLink: false }, template: "turquoise", skipAi: true });
           }
         }
         for (const [name, before] of Object.entries(previousCatalog || {})) {
@@ -443,144 +438,8 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
     });
   }
 
-  async function enrich() {
-    return guarded("details", async signal => {
-      const pending = new Set((store.state._notificationOutbox || []).map(entry => entry.id));
-      const job = structuredClone(view().jobs.find(item => item.retryAt <= now() && !pending.has(item.noticeId) && view().repos[item.repo]?.availability !== "unavailable"));
-      if (!job) return false;
-      const attempt = taskContext.getStore();
-      attempt.jobId = job.id; attempt.repo = job.repo; attempt.stage = job.stage;
-      await change(state => {
-        const current = state.jobs.find(item => item.id === job.id);
-        if (current) { current.workId = attempt.id; current.lastAttemptAt = now(); }
-      });
-      try {
-        if (job.recoveryProbe) {
-          const probe = job.recoveryProbe;
-          const probeSha = probe === "base" ? job.base : probe === "commit" ? job.commits[job.index]?.sha || job.head : job.head;
-          const path = probe === "repo" ? `/repos/${job.repo}` : `/repos/${job.repo}/commits/${probeSha}`;
-          const result = await api.rest(path, { signal });
-          assertActive();
-          if (probe === "repo" ? !result.data.full_name : result.data.sha !== probeSha) throw new Error("GitHub 恢复探测响应不完整");
-          job.recoveryProbe = probe === "repo" ? (job.stage === "compare" && job.base ? "base" : "commit") : probe === "base" ? "head" : "";
-          if (!job.recoveryProbe) job.blockedReason = "";
-        } else if (job.stage === "compare") {
-          const result = await api.rest(`/repos/${job.repo}/compare/${job.base}...${job.head}?per_page=100&page=${job.page}`, { signal });
-          assertActive();
-          if (!Array.isArray(result.data.commits) || !["ahead", "behind", "diverged", "identical"].includes(result.data.status)) throw new Error("GitHub compare 响应不完整");
-          job.status = result.data.status;
-          for (const commit of result.data.commits) {
-            if (!commit.sha) throw new Error("GitHub compare 缺失提交 SHA");
-            if (!job.commits.some(item => item.sha === commit.sha)) job.commits.push({ sha: commit.sha });
-          }
-          if (result.hasNext) job.page++;
-          else {
-            if (Number.isFinite(result.data.total_commits) && job.commits.length < result.data.total_commits) throw new Error("GitHub compare 提交分页不完整");
-            job.stage = "files";
-            job.page = 1;
-          }
-        } else if (job.index < job.commits.length) {
-          const sha = job.commits[job.index].sha;
-          const result = await api.rest(`/repos/${job.repo}/commits/${sha}?per_page=100&page=${job.page}`, { signal });
-          assertActive();
-          if (result.data.sha !== sha || !Array.isArray(result.data.files)) throw new Error("GitHub commit 文件响应不完整");
-          job.message = result.data.commit?.message || sha;
-          job.committedAt = result.data.commit?.committer?.date || "";
-          for (const file of result.data.files) {
-            if (!file.filename) throw new Error("GitHub commit 缺失文件名");
-            if (!job.files.some(item => item.filename === file.filename)) job.files.push(file);
-          }
-          if (result.hasNext && job.files.length < 3000) job.page++;
-          else {
-            const limitNote = job.files.length >= 3000 || result.hasNext ? "\n注意：已触及 GitHub 单提交 3000 文件上限，不能视为完整 diff。" : "";
-            const text = `仓库：${job.repo}\n默认分支：${job.branch}\n提交：${sha}\n提交时间：${job.committedAt ? formatBeijingTime(job.committedAt) : "未知"}\n${job.message}\n比较状态：${job.status || "首次提交"}${limitNote}\n\n${job.files.map(file => `${file.status} ${file.filename}${file.previous_filename ? `（原路径 ${file.previous_filename}）` : ""} +${file.additions} -${file.deletions}\n${file.patch ?? "GitHub 未提供 patch（二进制或超大文件等），请查看提交链接。"}`).join("\n\n")}`;
-            const title = `GitHub 文件 diff：${job.repo} ${sha.slice(0, 8)}`;
-            const diffFilePath = saveDiff(`GitHub_${job.id.slice(0, 8)}_${sha.slice(0, 12)}`, text);
-            if (!diffFilePath) throw new Error("GitHub diff 文件保存失败，保留详情任务重试");
-            const target = `https://github.com/${job.repo}/commit/${sha}`;
-            const fileCounts = new Map();
-            for (const { status } of job.files) fileCounts.set(status, (fileCounts.get(status) ?? 0) + 1);
-            const statusNames = { added: '新增', removed: '删除', renamed: '重命名', modified: '修改' };
-            const missing = job.files.filter(file => file.patch == null).length;
-            const content = [
-              repoHeading(job.repo, target),
-              `分支：${plain(job.branch)} / 提交 ${sha.slice(0, 8)}`,
-              plain(Array.from(String(job.message).split('\n')[0]).slice(0, 180).join('')),
-              `比较状态：${job.status || '首次提交'}`,
-              `文件 ${job.files.length} 个${fileCounts.size ? ' / ' + [...fileCounts].map(([status, count]) => `${statusNames[status] || plain(status) || '未标明状态'} ${count}`).join(' / ') : ''}`,
-              ...job.files.slice(0, 8).map(file => `- ${plain(file.filename)}${file.previous_filename ? `（原路径 ${plain(file.previous_filename)}）` : ''}`),
-              ...(job.files.length > 8 ? [`其余 ${job.files.length - 8} 个文件见完整 DIFF。`] : []),
-              ...(missing ? [`GitHub 未提供 ${missing} 个文件的 patch，原因见完整 DIFF。`] : []),
-              ...(limitNote ? [limitNote.trim()] : []),
-              `提交时间：${job.committedAt ? formatBeijingTime(job.committedAt) : '未知'}`,
-            ].filter(Boolean).join('\n');
-            job.notification = { title, content, diffFilePath, aiInput: text, moduleContext: "GitHub 提交与文件 diff", template: "turquoise", skipAi: true,
-              url: target, cardOpts: { showDetailLink: false }, github: { repo: job.repo, kind: "detail", detectedAt: job.createdAt } };
-            job.index++;
-            job.page = 1;
-            job.files = [];
-          }
-        }
-        await change(async state => {
-          const index = state.jobs.findIndex(item => item.id === job.id);
-          if (index < 0) return;
-          if (state.jobs[index].workId !== attempt.id) throw Object.assign(new Error("GitHub 详情任务已由新轮次接管"), { code: "GITHUB_STALE_TASK" });
-          // Discovery/head polling may have renamed this repository while REST
-          // was in flight. Never restore the stale name from the detached job.
-          job.repo = state.jobs[index].repo;
-          job.lastAttemptAt = state.jobs[index].lastAttemptAt;
-          delete job.workId;
-          if (job.notification) {
-            await store.enqueue(job.notification);
-            delete job.notification;
-          }
-          if (!job.recoveryProbe && !job.blockedReason && job.stage === "files" && job.index === job.commits.length) {
-            if (!job.commits.length) {
-              const url = `https://github.com/${job.repo}/compare/${job.base}...${job.head}`;
-              await store.enqueue({ title: "GitHub 分支更新详情", content: `${repoHeading(job.repo, url)}\n${cardStatus('warning', '没有新增可达提交')}\n分支：${plain(job.branch)} / 比较状态：${job.status}\n${job.base} → ${job.head}\n可能为分支回退，不能当作新增提交。`, url, cardOpts: { showDetailLink: false }, template: "turquoise", skipAi: true });
-            }
-            state.jobs.splice(index, 1);
-          } else {
-            state.jobs.splice(index, 1);
-            state.jobs.push({ ...job, attempts: job.recoveryProbe ? job.attempts : 0, retryAt: 0, lastError: job.recoveryProbe ? job.lastError : "" });
-          }
-          state.lastDetailAt = now();
-          await recovered(state, "details");
-        });
-        wake();
-        return true;
-      } catch (error) {
-        assertActive(); // Expired workers cannot overwrite a newer lease.
-        await change(async state => {
-          const original = state.jobs.find(item => item.id === job.id);
-          if (!original || original.workId !== attempt.id) return;
-          delete original.workId;
-          if (error.code === "GITHUB_COOLDOWN" || error.code === "GITHUB_BUDGET_WAIT") {
-            original.retryAt = error.retryAt;
-            return;
-          }
-          original.attempts++;
-          original.lastError = error.message;
-          if (error.code === "GITHUB_RESOURCE_UNAVAILABLE") {
-            original.blockedReason = job.recoveryProbe === "repo" ? "repository_unavailable" : ["base", "head", "commit"].includes(job.recoveryProbe) ? `${job.recoveryProbe}_unavailable` : "comparison_or_commit_unavailable";
-            original.recoveryProbe = "repo";
-            original.retryAt = Math.max(error.retryAt || 0, now() + 300_000);
-            if (!original.gapNotified) {
-              await store.enqueue({ title: "GitHub 文件 diff 补全受阻", content: `${repoHeading(job.repo)}\n${cardStatus('warning', '资源不可访问 / 补全待继续')}\n${job.base || "无"} → ${job.head}\n已保留任务、分页进度及历史缺口，其他仓库继续处理。\n后续将核验仓库与原始提交，不将缺失内容视为已补全。`, url: `https://github.com/${job.repo}`, cardOpts: { showDetailLink: false }, template: "yellow", skipAi: true });
-              original.gapNotified = true;
-            }
-            return;
-          }
-          original.retryAt = Math.max(error.retryAt || 0, now() + Math.min(300_000, 2000 * 2 ** Math.min(original.attempts, 7)));
-        });
-        if (error.code === "GITHUB_RESOURCE_UNAVAILABLE") { wake(); return false; }
-        throw error;
-      }
-    });
-  }
-
   return {
-    pollHeads, discover, enrich, checkHealth,
+    pollHeads, discover,
     recordDelivery(payload) {
       if (payload.github) lastDelivery = { ...payload.github, sentAt: now(), delayMs: Math.max(0, now() - payload.github.detectedAt) };
     },
@@ -588,9 +447,8 @@ export function createGithubMonitor({ store, api, now = Date.now, saveDiff = () 
       const state = view();
       const gaps = headGaps.map(item => item.gap).filter(value => value > 0).sort((a,b) => a-b);
       const pending = (store.state._notificationOutbox || []).filter(entry => entry.payload?.github || entry.payload?.title?.startsWith("GitHub"));
-      const health = detailHealth();
-      const taskStatus = Object.fromEntries([...running].map(([lane, { id, startedAt, deadlineAt, jobId, repo, stage }]) => [lane, { id, startedAt, deadlineAt, jobId, repo, stage }]));
-      return { health: { ...structuredClone(state.health || {}), detailsStatus: health.status, readyDetails: health.ready.length, lastProgressAt: health.lastProgressAt, eligibleSince, activeTasks: taskStatus }, repositories: Object.values(state.repos).map(({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs }) => ({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs })), lastHeadAt: state.lastHeadAt, headErrors: state.headErrors || [], lastDiscoveryAt: state.lastDiscoveryAt, lastDetailAt: state.lastDetailAt, pendingDetails: state.jobs.length, oldestDetailAt: state.jobs.length ? Math.min(...state.jobs.map(job => job.createdAt)) : 0, detailErrors: state.jobs.filter(job => job.lastError).map(({ repo, lastError, retryAt, blockedReason }) => ({ repo, lastError, retryAt, blockedReason })), headIntervals: { samples: gaps.length, p95Ms: gaps[Math.ceil(gaps.length * .95)-1] || 0, maxMs: gaps.at(-1) || 0 }, delivery: { pending: pending.length, oldestAt: pending.length ? Math.min(...pending.map(item=>item.createdAt)) : 0, last: lastDelivery ? { ...lastDelivery } : null }, ...api.summary() };
+      const taskStatus = Object.fromEntries([...running].map(([lane, { id, startedAt, deadlineAt }]) => [lane, { id, startedAt, deadlineAt }]));
+      return { health: { ...structuredClone(state.health || {}), activeTasks: taskStatus }, repositories: Object.values(state.repos).map(({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs }) => ({ name, head, branch, checkedAt, availability, lastHeadError, headRetryAt, lastCheckGapMs })), lastHeadAt: state.lastHeadAt, headErrors: state.headErrors || [], lastDiscoveryAt: state.lastDiscoveryAt, headIntervals: { samples: gaps.length, p95Ms: gaps[Math.ceil(gaps.length * .95)-1] || 0, maxMs: gaps.at(-1) || 0 }, delivery: { pending: pending.length, oldestAt: pending.length ? Math.min(...pending.map(item=>item.createdAt)) : 0, last: lastDelivery ? { ...lastDelivery } : null }, ...api.summary() };
     },
   };
 }

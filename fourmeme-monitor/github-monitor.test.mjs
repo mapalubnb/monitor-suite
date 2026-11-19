@@ -19,7 +19,7 @@ function fixture(initial = {}, options = {}) {
     summary: () => ({}),
   };
   const store = createTransactionalOutbox({ initial, persist: value => { if (failPersist) throw new Error("disk full"); persisted = structuredClone(value); }, deliver: async payload => { sent.push(payload); return "message-id"; } });
-  const monitor = createGithubMonitor({ store, api, now: () => timestamp, saveDiff: () => "test.diff", ...options });
+  const monitor = createGithubMonitor({ store, api, now: () => timestamp, ...options });
   return { monitor, api, store, heads, requests, sent, get persisted() { return persisted; }, set failPersist(value) { failPersist = value; }, advance: value => { timestamp += value; }, change: (name = GITHUB_REPOSITORIES[0], sha = "new") => { heads.get(name).defaultBranchRef.target.oid = sha; } };
 }
 
@@ -31,7 +31,7 @@ async function changedFixture(options = {}) {
   return context;
 }
 
-test("GitHub 旧五仓库状态接入flap-sh，保留游标任务，新仓库翻页纳入且只提醒一次", async () => {
+test("GitHub 旧五仓库状态接入flap-sh，保留游标，新仓库翻页纳入且只提醒一次", async () => {
   const old = fixture();
   await old.monitor.pollHeads();
   old.change();
@@ -50,7 +50,6 @@ test("GitHub 旧五仓库状态接入flap-sh，保留游标任务，新仓库翻
   await context.monitor.discover();
   await context.monitor.discover();
   assert.equal(Object.keys(context.persisted.githubMonitor.repos).length, 9);
-  assert.deepEqual(context.persisted.githubMonitor.jobs, initial.githubMonitor.jobs);
   assert.equal(context.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]].head, 'new');
   assert.equal(context.persisted._notificationOutbox.length, 5); // original + four additions
   assert.equal(paths.filter(p => p.includes('/users/flap-sh/') && p.endsWith('page=2')).length, 2);
@@ -60,8 +59,9 @@ test("GitHub 旧五仓库状态接入flap-sh，保留游标任务，新仓库翻
   assert.equal(context.persisted._notificationOutbox.length, 5); // no historical replay
   context.change(extra.full_name, 'second');
   await context.monitor.pollHeads();
-  assert.equal(context.persisted.githubMonitor.jobs.at(-1).repo, extra.full_name);
-  assert.equal(context.persisted.githubMonitor.jobs.at(-1).base, 'first');
+  const notice = context.persisted._notificationOutbox.at(-1).payload;
+  assert.equal(notice.github.repo, extra.full_name);
+  assert.match(notice.content, /first → second/);
 });
 
 test("GitHub 第二账号失败不提交半份目录、不误报其他账号移除", async () => {
@@ -90,21 +90,27 @@ test("GitHub 八仓库单次 GraphQL 建立基线，不回放历史", async () =
   assert.match(buildHeadQuery(GITHUB_REPOSITORIES), /repo7: repository/);
 });
 
-test("GitHub 每个仓库都提醒，首条不请求详情、不等待 AI，重复探测不重复推送", async () => {
+test("GitHub 每个仓库都提醒，只发分支通知，不请求详情或 AI，重复探测不重复推送", async () => {
   const context = fixture();
   await context.monitor.pollHeads();
   for (const name of GITHUB_REPOSITORIES) context.change(name);
   await context.monitor.pollHeads();
   await context.monitor.pollHeads();
   assert.equal(context.persisted._notificationOutbox.length, 8);
-  assert.equal(context.persisted.githubMonitor.jobs.length, 8);
-  assert.ok(context.persisted._notificationOutbox.every(entry => entry.payload.skipAi));
+  assert.equal(context.persisted.githubMonitor.jobs, undefined);
+  for (const { payload } of context.persisted._notificationOutbox) {
+    assert.equal(payload.skipAi, true);
+    assert.match(payload.content, /默认分支变化/);
+    assert.doesNotMatch(payload.content, /文件 diff|待补/);
+    assert.equal(payload.diffFilePath, undefined);
+  }
   assert.ok(context.requests.every(Array.isArray));
-  await context.monitor.enrich();
+  await context.store.drain();
   assert.equal(context.requests.length, 3);
+  assert.equal(context.sent.length, 8);
 });
 
-test("GitHub 游标与首条提醒、详情任务原子落盘，磁盘失败不丢失", async () => {
+test("GitHub 游标与分支提醒原子落盘，磁盘失败不丢失", async () => {
   const context = fixture();
   await context.monitor.pollHeads();
   context.change();
@@ -114,13 +120,12 @@ test("GitHub 游标与首条提醒、详情任务原子落盘，磁盘失败不�
   context.failPersist = false;
   await context.monitor.pollHeads();
   assert.equal(context.persisted._notificationOutbox.length, 1);
-  assert.equal(context.persisted.githubMonitor.jobs.length, 1);
 });
 
 test("GitHub 迁移旧主仓库 SHA，其他仓库不误报历史", async () => {
   const context = fixture({ githubSha: "previous" });
   await context.monitor.pollHeads();
-  assert.equal(context.persisted.githubMonitor.jobs[0].base, "previous");
+  assert.match(context.persisted._notificationOutbox[0].payload.content, /previous → old/);
   assert.equal(context.persisted._notificationOutbox.length, 1);
 });
 
@@ -145,8 +150,8 @@ test("GitHub 仓库发现完整翻页、自动纳入，下轮监测提交", asyn
   await context.monitor.pollHeads();
   context.change(name, "second");
   await context.monitor.pollHeads();
-  assert.equal(context.persisted.githubMonitor.jobs[0].repo, name);
-  assert.equal(context.persisted.githubMonitor.jobs[0].branch, "master");
+  assert.equal(context.persisted._notificationOutbox[1].payload.github.repo, name);
+  assert.match(context.persisted._notificationOutbox[1].payload.content, /分支：master/);
   assert.equal(context.persisted._notificationOutbox.length, 2);
 });
 
@@ -170,70 +175,22 @@ test("GitHub 更名按 node ID 迁移，不丢失基线", async () => {
   assert.equal(context.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[0]], undefined);
 });
 
-test("GitHub compare 分页去重，逐提交文件分页，首条送达后才补详情", async () => {
-  const saved = [];
-  const context = await changedFixture({ saveDiff: (_, text) => { saved.push(text); return "test.diff"; } });
-  await context.store.drain();
-  let call = 0;
-  context.api.rest = async () => {
-    call++;
-    if (call === 1) return { data: { status: "ahead", total_commits: 2, commits: [{ sha: "one" }] }, hasNext: true };
-    if (call === 2) return { data: { status: "ahead", total_commits: 2, commits: [{ sha: "one" }, { sha: "two" }] } };
-    if (call === 3) return { data: { sha: "one", files: [{ filename: "a", patch: "+a" }] }, hasNext: true };
-    if (call === 4) return { data: { sha: "one", files: [{ filename: "a", patch: "+a" }, { filename: "b" }] } };
-    return { data: { sha: "two", files: [{ filename: "c", patch: "+c" }] } };
-  };
-  for (let count = 0; count < 5; count++) await context.monitor.enrich();
-  assert.equal(context.persisted.githubMonitor.jobs.length, 0);
-  assert.equal(context.persisted._notificationOutbox.length, 2);
-  const first = context.persisted._notificationOutbox[0].payload;
-  assert.match(first.content, /未提供 1 个文件的 patch/);
-  assert.match(first.content, /文件 2 个/);
-  assert.doesNotMatch(first.content, /\+a/);
-  assert.equal(first.diffFilePath, "test.diff");
-  assert.equal((saved[0].match(/\+a/g) || []).length, 1);
-  assert.match(saved[0], /GitHub 未提供 patch/);
-});
-
-test("GitHub 详情失败保留任务和分页进度，重启后重试", async () => {
-  const context = await changedFixture();
-  await context.store.drain();
-  await assert.rejects(context.monitor.enrich(), /未设置/);
-  assert.equal(context.persisted.githubMonitor.jobs[0].stage, "compare");
-  assert.equal(context.persisted.githubMonitor.jobs[0].attempts, 1);
-  const resumed = fixture(context.persisted);
-  resumed.advance(10_000);
-  resumed.api.rest = async () => ({ data: { status: "ahead", commits: [{ sha: "new" }], total_commits: 1 } });
-  await resumed.monitor.enrich();
-  assert.equal(resumed.persisted.githubMonitor.jobs[0].stage, "files");
-});
-
 test("GitHub 分支回退不伪造新提交，空仓库后首次提交也监控", async () => {
   const context = await changedFixture();
   await context.store.drain();
-  context.api.rest = async () => ({ data: { status: "behind", commits: [], total_commits: 0 } });
-  await context.monitor.enrich();
-  assert.match(context.persisted._notificationOutbox[0].payload.content, /没有新增可达提交/);
+  context.change(GITHUB_REPOSITORIES[0], "old");
+  await context.monitor.pollHeads();
+  const notice = context.persisted._notificationOutbox[0].payload;
+  assert.equal(notice.title, "GitHub 代码更新");
+  assert.match(notice.content, /new → old/);
+  assert.match(notice.content, /回退或切换/);
+  assert.ok(context.requests.every(Array.isArray));
   const empty = fixture();
   empty.heads.get(GITHUB_REPOSITORIES[0]).defaultBranchRef = null;
   await empty.monitor.pollHeads();
   empty.heads.get(GITHUB_REPOSITORIES[0]).defaultBranchRef = { name: "main", target: { oid: "first" } };
   await empty.monitor.pollHeads();
-  assert.equal(empty.persisted.githubMonitor.jobs[0].commits[0].sha, "first");
-});
-
-test("GitHub 慢详情不阻塞头探测，新变化仍即时入队", async () => {
-  const context = await changedFixture();
-  await context.store.drain();
-  let release;
-  context.api.rest = () => new Promise(resolve => { release = resolve; });
-  const detail = context.monitor.enrich();
-  context.change(GITHUB_REPOSITORIES[1]);
-  await context.monitor.pollHeads();
-  assert.equal(context.persisted._notificationOutbox.length, 1);
-  release({ data: { status: "ahead", commits: [{ sha: "new" }], total_commits: 1 } });
-  await detail;
-  assert.equal(context.persisted.githubMonitor.jobs.length, 2);
+  assert.match(empty.persisted._notificationOutbox[0].payload.content, /无 → first/);
 });
 
 test("GitHub 无 token 不发匿名请求", async () => {
@@ -280,7 +237,7 @@ test("GitHub 默认分支更换即使 SHA 一致也提醒", async () => {
   context.heads.get(GITHUB_REPOSITORIES[0]).defaultBranchRef.name = "develop";
   await context.monitor.pollHeads();
   assert.equal(context.persisted._notificationOutbox.length, 1);
-  assert.equal(context.persisted.githubMonitor.jobs[0].branch, "develop");
+  assert.match(context.persisted._notificationOutbox[0].payload.content, /main → develop/);
 });
 
 test("GitHub 保留仓库元数据变化，pushed_at 不重复发项目提醒", async () => {
@@ -298,17 +255,6 @@ test("GitHub 保留仓库元数据变化，pushed_at 不重复发项目提醒", 
   assert.match(context.persisted._notificationOutbox[0].payload.content, /description：old → new/);
 });
 
-test("GitHub 文件 diff 落盘失败不能删除详情任务", async () => {
-  const context = await changedFixture();
-  await context.store.drain();
-  context.api.rest = async () => ({ data: { status: "ahead", commits: [{ sha: "new" }], total_commits: 1 } });
-  await context.monitor.enrich();
-  const monitor = createGithubMonitor({ store: context.store, api: context.api, saveDiff: () => null });
-  context.api.rest = async () => ({ data: { sha: "new", files: [] } });
-  await assert.rejects(monitor.enrich(), /文件保存失败/);
-  assert.equal(context.store.state.githubMonitor.jobs[0].index, 0);
-});
-
 test("GitHub 大于 25 仓库跨轮分批，持久化轮转不遗漏", async () => {
   const names = Array.from({ length: 27 }, (_, index) => `four-meme-community/repo${index}`);
   const context = fixture({ githubRepos: Object.fromEntries(names.map(name => [name, {}])) });
@@ -322,23 +268,10 @@ test("GitHub 大于 25 仓库跨轮分批，持久化轮转不遗漏", async () 
   assert.ok(Object.values(context.persisted.githubMonitor.repos).every(repo => repo.initialized));
 });
 
-test("GitHub 慢详情任务轮转，其他仓库详情不会被单个大提交独占", async () => {
-  const context = await changedFixture();
-  context.change(GITHUB_REPOSITORIES[1]);
-  await context.monitor.pollHeads();
-  await context.store.drain();
-  const paths = [];
-  context.api.rest = async path => { paths.push(path); return { data: { status: "ahead", commits: [{ sha: "new" }], total_commits: 1 } }; };
-  await context.monitor.enrich();
-  await context.monitor.enrich();
-  assert.ok(paths[0].includes(GITHUB_REPOSITORIES[0]));
-  assert.ok(paths[1].includes(GITHUB_REPOSITORIES[1]));
-});
-
 test("GitHub 停止后不再请求或写入", async () => {
   const context = fixture();
   const monitor = createGithubMonitor({ store: context.store, api: context.api, stopped: () => true });
-  await Promise.all([monitor.pollHeads(), monitor.discover(), monitor.enrich()]);
+  await Promise.all([monitor.pollHeads(), monitor.discover()]);
   assert.equal(context.requests.length, 0);
   assert.deepEqual(context.persisted, {});
 });
@@ -472,22 +405,7 @@ test("GitHub 耗时样本有界且仅记录成功请求，诊断副本不可改�
   assert.equal(api.summary().diagnostics.graphql.successSamples, 120);
 });
 
-test("GitHub 详情冷却只调整就绪时间，不累加请求失败或丢失分页", async () => {
-  const context = await changedFixture();
-  await context.store.drain();
-  const original = structuredClone(context.persisted.githubMonitor.jobs[0]);
-  const retryAt = original.createdAt + 120000;
-  context.api.rest = async () => { throw Object.assign(new Error("冷却"), { code: "GITHUB_COOLDOWN", retryAt }); };
-  await assert.rejects(context.monitor.enrich());
-  assert.deepEqual(context.persisted.githubMonitor.jobs[0], { ...original, retryAt, lastAttemptAt: original.createdAt });
-  assert.equal(await context.monitor.enrich(), false);
-  context.advance(120000);
-  context.api.rest = async () => ({ data: { status: "ahead", commits: [{ sha: "new" }], total_commits: 1 } });
-  assert.equal(await context.monitor.enrich(), true);
-  assert.equal(context.persisted.githubMonitor.jobs[0].stage, "files");
-});
-
-test("GitHub 探测网络中断不推进游标，恢复后仍推送新提交并保留详情", async () => {
+test("GitHub 探测网络中断不推进游标，恢复后仍推送新提交", async () => {
   const context = fixture();
   await context.monitor.pollHeads();
   const heads = context.api.heads;
@@ -499,7 +417,6 @@ test("GitHub 探测网络中断不推进游标，恢复后仍推送新提交并�
   await context.monitor.pollHeads();
   await context.monitor.pollHeads();
   assert.equal(context.persisted._notificationOutbox.length, 1);
-  assert.equal(context.persisted.githubMonitor.jobs.length, 1);
 });
 
 test('GitHub 404/409/410/422不冻结正常REST，也不扩大网络失败计数', async () => {
@@ -520,15 +437,14 @@ test('GitHub 资源404仍遵守服务端Retry-After和额度保护', async () =>
   await assert.rejects(api.heads(GITHUB_REPOSITORIES),e=>e.code==='GITHUB_COOLDOWN'&&e.retryAt===61000);
 });
 
-test('GitHub 不可见仓库隔离后正常仓库继续更新，恢复从旧基线补齐且故障仅通知一次', async () => {
+test('GitHub 不可见仓库隔离后正常仓库继续更新，恢复沿用旧基线且故障仅通知一次', async () => {
   const c=await changedFixture();await c.store.drain();
-  const bad=GITHUB_REPOSITORIES[0], original=structuredClone(c.persisted.githubMonitor.jobs);
+  const bad=GITHUB_REPOSITORIES[0];
   const heads=c.api.heads;let missing=true;
   c.api.heads=async names=>{const r=await heads(names);const i=names.indexOf(bad);if(missing&&i>=0){r.data['repo'+i]=null;r.errors=[{type:'NOT_FOUND',path:['repo'+i]}];}return r;};
   await c.monitor.pollHeads();await c.monitor.pollHeads();
   assert.equal(c.persisted.githubMonitor.repos[bad].availability,'unavailable');
-  assert.equal(await c.monitor.enrich(),false);
-  assert.deepEqual(c.persisted.githubMonitor.jobs,original);
+  assert.equal(c.persisted.githubMonitor.repos[bad].head,"new");
   c.change(GITHUB_REPOSITORIES[1],'healthy-new');await c.monitor.pollHeads();
   assert.ok(!c.requests.at(-1).includes(bad));
   assert.equal(c.persisted.githubMonitor.repos[GITHUB_REPOSITORIES[1]].head,'healthy-new');
@@ -537,13 +453,13 @@ test('GitHub 不可见仓库隔离后正常仓库继续更新，恢复从旧基�
   assert.equal(c.persisted._notificationOutbox.filter(e=>e.payload.title==='GitHub 单仓库监控异常').length,1);
   missing=false;c.change(bad,'after-recovery');c.advance(60000);await c.monitor.pollHeads();
   assert.equal(c.persisted.githubMonitor.repos[bad].availability,'healthy');
-  assert.equal(c.persisted.githubMonitor.jobs.find(j=>j.head==='after-recovery').base,'new');
+  assert.match(c.persisted._notificationOutbox.find(e=>e.payload.github?.repo===bad).payload.content,/new → after-recovery/);
   assert.equal(c.persisted._notificationOutbox.filter(e=>e.payload.title==='GitHub 单仓库监控恢复').length,1);
   await c.monitor.pollHeads();
-  assert.equal(c.persisted.githubMonitor.jobs.filter(j=>j.head==='after-recovery').length,1);
+  assert.equal(c.persisted._notificationOutbox.filter(e=>e.payload.github?.repo===bad).length,1);
 });
 
-test('GitHub 仓库隔离及历史详情重启保留，全部不可见时不伪造成功检查',async()=>{
+test('GitHub 仓库隔离状态重启保留，全部不可见时不伪造成功检查',async()=>{
   const c=await changedFixture();await c.store.drain();
   c.api.heads=async names=>({data:Object.fromEntries(names.map((_,i)=>['repo'+i,null]))});
   await c.monitor.pollHeads();await c.monitor.pollHeads();
@@ -551,7 +467,7 @@ test('GitHub 仓库隔离及历史详情重启保留，全部不可见时不伪�
   const resumed=fixture(c.persisted);resumed.advance(2000);
   assert.deepEqual(await resumed.monitor.pollHeads(),{checked:0,failed:0});
   assert.equal(resumed.persisted.githubMonitor.lastHeadAt,last);
-  assert.deepEqual(resumed.persisted.githubMonitor.jobs,c.persisted.githubMonitor.jobs);
+  assert.deepEqual(resumed.persisted.githubMonitor.repos,c.persisted.githubMonitor.repos);
 });
 
 test('GitHub 完整目录重现立即恢复探测，持续目录不反复清除隔离',async()=>{
@@ -566,43 +482,6 @@ test('GitHub 完整目录重现立即恢复探测，持续目录不反复清除�
   const list=c.api.rest;c.api.rest=async path=>{const r=await list(path);r.data=r.data.filter(x=>x.full_name!==bad);return r;};
   await c.monitor.discover();c.api.rest=list;await c.monitor.discover();
   assert.equal(c.persisted.githubMonitor.repos[bad].headRetryAt,0);
-});
-
-test('GitHub 更名同步迁移已排队详情，保留原始SHA和进度',async()=>{
-  const c=await changedFixture();const before=structuredClone(c.persisted.githubMonitor.jobs[0]);
-  const name=GITHUB_REPOSITORIES[0];c.heads.get(name).nameWithOwner='four-meme-community/renamed';
-  await c.monitor.pollHeads();
-  assert.deepEqual(c.persisted.githubMonitor.jobs[0],{...before,repo:'four-meme-community/renamed'});
-});
-
-const resourceFailure=()=>Object.assign(new Error('HTTP 404'),{code:'GITHUB_RESOURCE_UNAVAILABLE',status:404});
-test('GitHub 缺失compare保留任务，分步区分仓库及旧提交缺口，不阻塞其他任务',async()=>{
-  const c=await changedFixture();await c.store.drain();
-  const original=structuredClone(c.persisted.githubMonitor.jobs[0]);
-  c.api.rest=async()=>{throw resourceFailure();};assert.equal(await c.monitor.enrich(),false);
-  let j=c.persisted.githubMonitor.jobs[0];assert.equal(j.base,original.base);assert.equal(j.stage,'compare');assert.equal(j.recoveryProbe,'repo');
-  c.change(GITHUB_REPOSITORIES[1],'another');await c.monitor.pollHeads();await c.store.drain();
-  c.api.rest=async()=>({data:{status:'ahead',commits:[{sha:'another'}]}});
-  assert.equal(await c.monitor.enrich(),true);
-  c.advance(300000);
-  c.api.rest=async path=>{if(path.endsWith('/commits/old'))throw resourceFailure();return {data:{full_name:original.repo}};};
-  assert.equal(await c.monitor.enrich(),true); // repository can be accessed
-  // Another job has a turn; keep focus on the blocked comparison without losing it.
-  await c.store.transaction(()=>{c.store.state.githubMonitor.jobs.find(x=>x.repo!==original.repo).retryAt=Number.MAX_SAFE_INTEGER;});
-  assert.equal(await c.monitor.enrich(),false);
-  j=c.persisted.githubMonitor.jobs.find(x=>x.id===original.id);
-  assert.equal(j.blockedReason,'base_unavailable');assert.equal(j.base,original.base);assert.deepEqual(j.commits,[]);
-  assert.equal(c.sent.filter(x=>x.title==='GitHub 文件 diff 补全受阻').length,1);
-});
-
-test('GitHub 404任务重启后恢复仓库和提交验证，继续原compare并生成diff',async()=>{
-  const c=await changedFixture();await c.store.drain();c.api.rest=async()=>{throw resourceFailure();};await c.monitor.enrich();
-  const r=fixture(c.persisted);r.advance(300000);
-  const paths=[];r.api.rest=async path=>{paths.push(path);if(path.includes('/compare/'))return {data:{status:'ahead',commits:[{sha:'new'}]}};if(path.endsWith('/commits/old'))return {data:{sha:'old'}};if(path.endsWith('/commits/new'))return {data:{sha:'new'}};if(path.includes('/commits/new?'))return {data:{sha:'new',files:[{filename:'a',patch:'+a'}]}};return {data:{full_name:GITHUB_REPOSITORIES[0]}};};
-  for(let i=0;i<5;i++)await r.monitor.enrich();
-  assert.equal(r.persisted.githubMonitor.jobs.length,0);
-  assert.equal(paths.length,5);
-  assert.equal(r.persisted._notificationOutbox.filter(e=>e.payload.title.startsWith('GitHub 文件 diff：')).length,1);
 });
 
 test('GitHub 隔离写盘失败不提交健康状态或通知',async()=>{
@@ -634,15 +513,6 @@ test('GitHub 检查间隔与发现至送达分别统计，首条不等详情及A
   const payload=c.persisted._notificationOutbox[0].payload;assert.equal(payload.skipAi,true);assert.equal(payload.github.kind,'head');
   assert.equal(c.monitor.summary().delivery.pending,1);c.advance(450);c.monitor.recordDelivery(payload);await c.store.drain();
   assert.equal(c.monitor.summary().delivery.pending,0);assert.equal(c.monitor.summary().delivery.last.delayMs,450);assert.equal(c.monitor.summary().headIntervals.p95Ms,2000);
-});
-
-test('GitHub 详情请求进行中更名不会被旧任务覆盖',async()=>{
-  const c=await changedFixture();await c.store.drain();let release;
-  c.api.rest=()=>new Promise(resolve=>{release=resolve;});
-  const work=c.monitor.enrich();await new Promise(resolve=>setImmediate(resolve));
-  c.heads.get(GITHUB_REPOSITORIES[0]).nameWithOwner='four-meme-community/renamed';await c.monitor.pollHeads();
-  release({data:{status:'ahead',commits:[{sha:'new'}]}});await work;
-  assert.equal(c.persisted.githubMonitor.jobs[0].repo,'four-meme-community/renamed');assert.equal(c.persisted.githubMonitor.jobs[0].stage,'files');
 });
 
 test('GitHub 缺失字段响应不误判仓库已不可见，不推进有效SHA',async()=>{
@@ -728,35 +598,6 @@ test('GitHub工作轮次取消能够释放实际REST请求，销毁连接永不�
   assert.equal(made, 2); assert.equal(api.summary().requests.restPending, 0);
 });
 
-test('GitHub详情单轮强制取消保留原进度；另一仓库可继续，旧响应不能落盘或发卡', { timeout: 2000 }, async () => {
-  const c = fixture({}, { taskTimeouts: { details: 20 } }); await c.monitor.pollHeads();
-  c.change(GITHUB_REPOSITORIES[0]); c.change(GITHUB_REPOSITORIES[1]); await c.monitor.pollHeads(); await c.store.drain();
-  const original = structuredClone(c.persisted.githubMonitor.jobs[0]); const late = deferred();
-  c.api.rest = () => late.promise;
-  await assert.rejects(c.monitor.enrich(), e => e.code === 'GITHUB_TASK_TIMEOUT');
-  const retained = c.persisted.githubMonitor.jobs.find(j => j.id === original.id);
-  for (const k of ['id', 'base', 'head', 'stage', 'page', 'index', 'noticeId']) assert.equal(retained[k], original[k]);
-  assert.equal(c.persisted.githubMonitor.health.details.active, true);
-  c.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } });
-  await c.monitor.enrich(); // first job is cooling; second repo progresses now
-  assert.equal(c.persisted.githubMonitor.jobs.find(j => j.repo === GITHUB_REPOSITORIES[1]).stage, 'files');
-  const after = structuredClone(c.persisted); late.resolve({ data: { status: 'ahead', commits: [{ sha: 'stale' }] } }); await tick();
-  assert.deepEqual(c.persisted, after);
-  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.title.includes('停滞')).length, 1);
-  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.title.includes('通道恢复')).length, 1);
-});
-
-test('GitHub迟到的文件详情不会写diff或重复通知，成功重试只发布一次', { timeout: 2000 }, async () => {
-  let saved = 0; const c = await changedFixture({ taskTimeouts: { details: 20 }, saveDiff: () => { saved++; return 'fixture.diff'; } });
-  await c.store.drain(); c.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } }); await c.monitor.enrich();
-  const late = deferred(); c.api.rest = () => late.promise;
-  await assert.rejects(c.monitor.enrich(), e => e.code === 'GITHUB_TASK_TIMEOUT');
-  c.advance(2000); c.api.rest = async () => ({ data: { sha: 'new', files: [] } }); await c.monitor.enrich();
-  late.resolve({ data: { sha: 'new', files: [{ filename: 'stale', patch: 'late' }] } }); await tick();
-  assert.equal(saved, 1); assert.equal(c.persisted.githubMonitor.jobs.length, 0);
-  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.github?.kind === 'detail').length, 1);
-});
-
 test('GitHub仓库发现超时不能发布半份目录，下一轮可恢复且迟到目录不覆盖', { timeout: 2000 }, async () => {
   const c = fixture({}, { taskTimeouts: { discovery: 20 } }); await c.monitor.pollHeads();
   const late = deferred(); c.api.rest = path => path.includes('flap-sh') ? late.promise : Promise.resolve({ data: [] });
@@ -766,59 +607,4 @@ test('GitHub仓库发现超时不能发布半份目录，下一轮可恢复且�
   c.api.rest = async () => ({ data: [] }); await c.monitor.discover();
   const after = structuredClone(c.persisted); late.resolve({ data: [{ full_name: 'flap-sh/late', node_id: 'late' }] }); await tick();
   assert.deepEqual(c.persisted, after); assert.equal(c.persisted.githubMonitor.health.discovery.active, false);
-});
-
-test('GitHub有可处理任务却无进展会告警并唤醒，重复检查和重启不重复告警', async () => {
-  let resumes = 0; const c = await changedFixture({ resume: () => { resumes++; } }); await c.store.drain();
-  await c.monitor.checkHealth(); c.advance(60000); await c.monitor.checkHealth(); await c.monitor.checkHealth();
-  assert.equal(resumes, 1); assert.equal(c.persisted.githubMonitor.health.details.active, true);
-  const restarted = fixture(structuredClone(c.persisted)); await restarted.monitor.checkHealth(); restarted.advance(60000); await restarted.monitor.checkHealth();
-  assert.equal(restarted.persisted._notificationOutbox.filter(n => n.payload.title.includes('停滞')).length, 1);
-  restarted.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } }); await restarted.monitor.enrich();
-  assert.equal(restarted.persisted._notificationOutbox.filter(n => n.payload.title.includes('通道恢复')).length, 1);
-});
-
-test('GitHub历史404缺口、首条待送及服务端冷却不是可处理停滞，不清记录或绕过限制', async () => {
-  for (const mode of ['gap', 'notice', 'cooldown', 'retry', 'unavailable']) {
-    const c = await changedFixture(); if (mode !== 'notice') await c.store.drain();
-    const job = c.store.state.githubMonitor.jobs[0];
-    if (mode === 'gap') { job.blockedReason = 'base_unavailable'; job.gapNotified = true; job.attempts = 356; }
-    if (mode === 'cooldown') c.api.summary = () => ({ sharedRetryAt: job.createdAt + 1000000 });
-    if (mode === 'retry') job.retryAt = job.createdAt + 1000000;
-    if (mode === 'unavailable') c.store.state.githubMonitor.repos[job.repo].availability = 'unavailable';
-    const before = structuredClone(c.store.state.githubMonitor);
-    await c.monitor.checkHealth(); c.advance(60000); await c.monitor.checkHealth();
-    assert.deepEqual(c.store.state.githubMonitor, before, mode);
-    assert.equal(c.monitor.summary().health.readyDetails, 0);
-  }
-});
-
-test('GitHub健康告警写盘失败不丢告警资格，重试与恢复都原子保存', async () => {
-  const c = await changedFixture(); await c.store.drain(); await c.monitor.checkHealth(); c.advance(60000); c.failPersist = true;
-  await assert.rejects(c.monitor.checkHealth(), /disk full/); assert.equal(c.store.state.githubMonitor.health, undefined);
-  c.failPersist = false; await c.monitor.checkHealth();
-  assert.equal(c.persisted._notificationOutbox.filter(n => n.payload.title.includes('停滞')).length, 1);
-  const before = structuredClone(c.persisted.githubMonitor.jobs[0]); c.failPersist = true;
-  await assert.rejects(c.monitor.enrich(), /disk full/); assert.deepEqual(c.persisted.githubMonitor.jobs[0], before);
-});
-
-test('GitHub持续分页推进不误报停滞，空闲不触发恢复', async () => {
-  let resumes = 0; const c = await changedFixture({ resume: () => resumes++ }); await c.store.drain();
-  c.api.rest = async () => ({ data: { status: 'ahead', commits: [] }, hasNext: true });
-  for (let i = 0; i < 5; i++) { await c.monitor.enrich(); await c.monitor.checkHealth(); c.advance(30000); }
-  assert.equal(c.persisted.githubMonitor.health, undefined); assert.equal(resumes, 0);
-  assert.equal(c.persisted.githubMonitor.jobs[0].page, 6);
-  const idle = fixture({}, { resume: () => resumes++ }); await idle.monitor.checkHealth(); idle.advance(100000); await idle.monitor.checkHealth(); assert.equal(resumes, 0);
-});
-
-test('GitHub诊断展示活动阶段与截止时间，进程重启不复用旧轮次锁', { timeout: 2000 }, async () => {
-  const c = await changedFixture({ taskTimeouts: { details: 20 } }); await c.store.drain();
-  const started = deferred(); c.api.rest = async () => { started.resolve(); return new Promise(() => {}); };
-  const work = assert.rejects(c.monitor.enrich(), e => e.code === 'GITHUB_TASK_TIMEOUT'); await started.promise;
-  const active = c.monitor.summary().health.activeTasks.details;
-  assert.equal(active.stage, 'compare'); assert.equal(active.repo, GITHUB_REPOSITORIES[0]); assert.equal(active.deadlineAt - active.startedAt, 20);
-  await work; assert.deepEqual(c.monitor.summary().health.activeTasks, {});
-  const restarted = fixture(structuredClone(c.persisted)); restarted.advance(2000);
-  restarted.api.rest = async () => ({ data: { status: 'ahead', commits: [{ sha: 'new' }] } }); await restarted.monitor.enrich();
-  assert.equal(restarted.persisted.githubMonitor.jobs[0].stage, 'files'); assert.equal(restarted.persisted.githubMonitor.jobs[0].workId, undefined);
 });

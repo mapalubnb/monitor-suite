@@ -393,15 +393,13 @@ if [ -f "$SNAP" ]; then
     const sha=(s.githubSha||'')||'未知';
     const github=s.githubMonitor||{};
     const hasNewGithub=Object.prototype.hasOwnProperty.call(github,'repos');
-    const githubJobs=hasNewGithub&&Array.isArray(github.jobs)?github.jobs:[];
     const repoEntries=Object.entries((hasNewGithub?github.repos:s.githubRepos)||{}).map(([key,repo])=>{
       const name=(hasNewGithub?repo.name:repo.full_name)||key;
       return {name,url:'https://github.com/'+name,
         branch:hasNewGithub?repo.branch:repo.default_branch, initialized:Boolean(repo.initialized||repo.head||repo.branch),
         head:hasNewGithub?(repo.head||''):(name==='four-meme-community/four-meme-ai'&&sha!=='未知'?sha:''),
         checkedAt:hasNewGithub?repo.checkedAt:repo.updated_at,
-        availability:repo.availability, lastHeadError:repo.lastHeadError, headRetryAt:repo.headRetryAt,
-        pending:githubJobs.filter(job=>job.repo===name).length};
+        availability:repo.availability, lastHeadError:repo.lastHeadError, headRetryAt:repo.headRetryAt};
     }).sort((a,b)=>a.name.localeCompare(b.name));
     const fp=s.contractFingerprints||{};
     const fpKeys=Object.keys(fp);
@@ -481,15 +479,13 @@ if [ -f "$SNAP" ]; then
     if(!Object.keys(runtime.modules||{}).length) console.log('等待运行指标');
 
     section('08｜📦 GitHub');
-    console.log('仓库：'+repoEntries.length+' 个｜待补详情：'+(hasNewGithub?githubJobs.length+' 项':'旧版未记录'));
+    console.log('仓库：'+repoEntries.length+' 个');
     const ghRuntime=runtime.github||{};
     const ghHealth=ghRuntime.health||{};
-    const ghHealthNames={idle:'无待处理任务',pending:'等待处理',running:'处理中',waiting:'等待首条送达、重试或历史资源恢复',cooldown:'遵守服务端冷却'};
-    if(ghHealth.detailsStatus) console.log('详情通道：'+(ghHealthNames[ghHealth.detailsStatus]||ghHealth.detailsStatus)+'｜可处理 '+(ghHealth.readyDetails||0)+' 项｜最近成功推进 '+fmtTime(ghHealth.lastProgressAt));
-    for(const [lane,label] of [['details','详情'],['discovery','仓库发现'],['heads','提交探测']]){
+    for(const [lane,label] of [['discovery','仓库发现'],['heads','提交探测']]){
       const health=ghHealth[lane],task=(ghHealth.activeTasks||{})[lane];
       if(health&&health.active) console.log(label+'停滞告警：'+warn(cleanLabel(health.reason))+'｜已触发恢复 '+health.recoveries+' 次');
-      if(task) console.log(label+'正在执行：'+cleanLabel(task.repo||lane)+'｜开始 '+fmtTime(task.startedAt)+'｜强制截止 '+fmtTime(task.deadlineAt));
+      if(task) console.log(label+'正在执行｜开始 '+fmtTime(task.startedAt)+'｜强制截止 '+fmtTime(task.deadlineAt));
     }
     if(ghRuntime.requests) console.log('REST待完成：'+ghRuntime.requests.restPending+'｜请求强制超时：'+ghRuntime.requests.hardTimeouts+'｜排队超时：'+ghRuntime.requests.queueTimeouts);
     const unhealthy=repoEntries.filter(repo=>repo.availability&&repo.availability!=='healthy').length;
@@ -506,9 +502,8 @@ if [ -f "$SNAP" ]; then
     for(const [index,repo] of repoEntries.entries()){
       console.log(String(index+1).padStart(2,'0')+'　'+mdLink(repo.name,repo.url));
       console.log('默认分支：'+cleanLabel(repo.branch||(hasNewGithub?(repo.initialized?'无默认分支':'待同步'):'未知'))+'｜最新提交：'+(repo.head?mdLink(repo.head.slice(0,8),repo.url+'/commit/'+repo.head):(hasNewGithub&&!repo.initialized?'待同步':'暂无提交')));
-      console.log('待补详情：'+(hasNewGithub?repo.pending+' 项':'旧版未记录')+'｜'+(hasNewGithub?'最近检查：':'仓库更新时间：')+fmtTime(repo.checkedAt));
+      console.log((hasNewGithub?'最近检查：':'仓库更新时间：')+fmtTime(repo.checkedAt));
       if(repo.lastHeadError) console.log('状态：'+warn(cleanLabel(repo.lastHeadError))+'｜下次恢复探测：'+fmtTime(repo.headRetryAt));
-      for(const job of githubJobs.filter(job=>job.repo===repo.name&&job.lastError)) console.log('详情缺口：'+cleanLabel(({repository_unavailable:'仓库不可访问',base_unavailable:'原提交不可访问',head_unavailable:'目标提交不可访问',commit_unavailable:'待补提交不可访问',comparison_or_commit_unavailable:'比较或提交不可访问'})[job.blockedReason]||job.lastError)+'｜已尝试 '+(job.attempts||0)+' 次｜'+(repo.availability==='unavailable'?'等待仓库恢复':'下次补全 '+fmtTime(job.retryAt)));
     }
     section('09｜🔐 Four.meme Safe');
     const safeRuntime=runtime.safe||{},safeState=s.fourmemeSafe||{};

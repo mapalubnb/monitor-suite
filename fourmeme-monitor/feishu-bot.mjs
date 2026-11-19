@@ -367,7 +367,7 @@ function buildMonitorContext() {
       // GitHub
       const githubRepos = snap.githubMonitor?.repos;
       if (githubRepos) {
-        parts.push(`GitHub 仓库: ${Object.keys(githubRepos).length} 个｜待补详情 ${snap.githubMonitor.jobs?.length || 0} 项`);
+        parts.push(`GitHub 仓库: ${Object.keys(githubRepos).length} 个`);
         for (const repo of Object.values(githubRepos)) parts.push(`  ${repo.name} (${repo.branch || "无默认分支"}): ${repo.head?.slice(0, 12) || "无提交"}`);
       } else {
         parts.push(`GitHub SHA: ${snap.githubSha || "未知"}`);
