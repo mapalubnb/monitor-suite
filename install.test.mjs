@@ -47,6 +47,15 @@ function renderFourmemeStatus(snapshot, runtime = {}) {
   }
 }
 
+test('Four.meme面板区分HTTP成功、加载壳和独立渲染失败', () => {
+  const output = renderFourmemeStatus({}, { frontend: { successfulPages: 20, shellPages: 4,
+    rendered: { targetPages: 8, completePages: 6, failedPages: 2, lastError: '创建表单未完整渲染', running: true } } });
+  assert.match(output, /HTTP成功 20 页/);
+  assert.match(output, /加载壳 4 页/);
+  assert.match(output, /完整 6\/8 · 失败 2/);
+  assert.match(output, /创建表单未完整渲染/);
+});
+
 function renderFlapStatus(snapshot, factoryState = {}, integrityState = {}, safeProposalState = {}, earlyState = {}, runtime = {}) {
   const source = extractHeredoc("fl-status");
   const script = extractNodeEvalScripts(source).find(item => item.includes("vaultLink"));

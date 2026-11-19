@@ -11,6 +11,7 @@ import { readFourmemeAddressConfig } from './address-catalog.mjs';
 import { createAddressRoundRpc } from './address-rpc.mjs';
 import { discoverCreators } from "./creator-discovery.mjs";
 import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
+import { createRenderClient, createFrontendRenderMonitor, pageContentQuality, isInfrastructureRoute } from './frontend-render.mjs';
 import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
 /**
  * Four.meme 全面监控脚本 v2 — 高频并行版
@@ -127,6 +128,8 @@ const CONFIG = {
   apiBase: "https://four.meme/meme-api",
   siteUrl: "https://four.meme",
   monitorUrls: [
+    "https://four.meme/en/4stock",
+    "https://four.meme/zh-TW/4stock",
     "https://four.meme/en/create-token",
     "https://four.meme/en/advanced",
     "https://four.meme/zh-TW/create-token",
@@ -704,6 +707,8 @@ function scheduleRuntimeMetricsWrite() {
         failedPages: frontendMetrics.failed,
         skippedPages: frontendMetrics.skipped || 0,
         pageHealth: frontendMetrics.pages,
+        rendered: frontendRenderMonitor.summary(),
+        shellPages: Object.values(frontendMetrics.pages).filter(p => p.contentQuality === "shell").length,
       },
     };
     runtimeMetricsWriteQueue = runtimeMetricsWriteQueue.then(() => {
@@ -2171,6 +2176,7 @@ function isDiscoverableFrontendUrl(url) {
   const canonical = canonicalFrontendUrl(url);
   if (!canonical || REMOVED_FRONTEND_URLS.has(canonical)) return false;
   const route = normalizeRouteString(canonical).split("?")[0].replace(/\/+$/, "") || "/";
+  if (isInfrastructureRoute(route)) return false;
   if (!isTrackableRouteString(route)) return false;
   if (isApiOrEndpointRoute(route)) return false;
   if (isUnsupportedLocalePrefixedRoute(route)) return false;
@@ -2195,7 +2201,7 @@ function normalizeRouteString(raw) {
 }
 
 function isTrackableRouteString(route) {
-  if (!route || route[0] !== "/") return false;
+  if (!route || route[0] !== "/" || isInfrastructureRoute(route)) return false;
   if (route === "/") return false;
   if (route.startsWith("//")) return false;
   if (isPlaceholderFrontendRoute(route)) return false;
@@ -4944,9 +4950,18 @@ async function fetchFrontendData(url, oldFeatures = null, assetCache = null) {
     features.htmlLastModified = res.headers.get("last-modified") || "";
     features.fetchMeta = { status: res.status, durationMs: Date.now() - startedAt };
     validateFrontendPageFeatures(url, html, features);
+    features.contentQuality = pageContentQuality(url, features.textContent);
   } catch (err) {
     if (classifyFetchFailure(err) !== 'backoff') log(`  [${urlLabel(url)}] HTML 抓取失败：${err.message}`);
     return { data: null, error: { url, reason: classifyFetchFailure(err), message: err.message || String(err), durationMs: Date.now() - startedAt } };
+  }
+
+  // A valid HTTP response can contain only the SSR loading shell. Keep the
+  // previous usable body while still comparing fresh JS/i18n; rendered DOM has
+  // its own baseline, health and transaction in frontendRender.
+  if (features.contentQuality === "shell" && oldFeatures?.textContent && pageContentQuality(url, oldFeatures.textContent) === "complete") {
+    features.textContent = oldFeatures.textContent;
+    features.contentHash = oldFeatures.contentHash;
   }
 
   // 第二层：按需下载资源（仅当 assetHash 变化时）
@@ -9676,7 +9691,7 @@ function createModuleRunner(name, fn, intervalMs, transactional = true, options 
             }
             // Safe owns a persisted, atomic incident/recovery notification pair.
             // Keep runtime error metrics without a second generic alert stream.
-            if (!['safe', 'addresses'].includes(name)) recordModuleError(name, err.message);
+            if (!['safe', 'addresses', 'frontendRender'].includes(name)) recordModuleError(name, err.message);
           }
         } finally {
           // A first pass is complete even if WSS has already queued another pass.
@@ -9736,6 +9751,15 @@ async function runFrontendCheck() {
   if (mergeExternalFrontendRouteState(snapshot)) {
     log("[前端] 已合并飞书交互产生的新路由确认状态");
   }
+  // Explicitly authorized fixed 4Stock coverage supersedes its old pending
+  // discovery status; retain the original discovery/decision audit fields.
+  for (const url of CONFIG.monitorUrls.filter(url => /\/4stock$/.test(url))) {
+    const pending = snapshot._frontendPendingRoutes[url];
+    if (pending?.status === 'pending') {
+      snapshot._frontendPendingRoutes[url] = { ...pending, status: 'approved', approvedAt: Date.now(), source: 'configured-monitor' };
+      snapshot._frontendRouteApprovals[url] = { ...pending, status: 'approved', approvedAt: Date.now(), source: 'configured-monitor' };
+    }
+  }
   if (!snapshot._frontendNotifyDedupe) snapshot._frontendNotifyDedupe = {};
   if (!snapshot._frontendWarmup) snapshot._frontendWarmup = {};
   frontendMetrics.lastRunAt = Date.now();
@@ -9767,6 +9791,7 @@ async function runFrontendCheck() {
       lastSuccessAt: Date.now(),
       durationMs: newPages[key]?.fetchMeta?.durationMs || 0,
       status: newPages[key]?.fetchMeta?.status || 200,
+      contentQuality: newPages[key].contentQuality || pageContentQuality(newPages[key].originalUrl, newPages[key].textContent),
     };
   }
 
@@ -10017,7 +10042,7 @@ async function runFrontendCheck() {
 
     // ── 3. 页面文案 diff（独立，不依赖资源下载）──
     let textDiff = null;
-    if (oldData.contentHash && newData.contentHash && oldData.contentHash !== newData.contentHash) {
+    if (newData.contentQuality !== "shell" && oldData.contentHash && newData.contentHash && oldData.contentHash !== newData.contentHash) {
       textDiff = diffTextContent(oldData.textContent, newData.textContent);
       if (textDiff) {
         if (textDiff.reordered) {
@@ -10108,6 +10133,12 @@ async function runFrontendCheck() {
   }
 
   const confirmationPages = { ...newPages };
+  for (const [url, rendered] of Object.entries(snapshot._frontendRendered?.pages || {})) {
+    if (!rendered.hash || rendered.lastError || Date.now() - rendered.lastSuccessAt > 60_000) continue;
+    const key = urlToKey(url);
+    confirmationPages[key] = { ...confirmationPages[key], originalUrl: url,
+      textContent: (confirmationPages[key]?.textContent || '') + '\n' + rendered.signals.join('\n') };
+  }
   for (const page of pendingRoutePages) {
     if (page?.originalUrl) confirmationPages[urlToKey(page.originalUrl)] = page;
   }
@@ -10323,9 +10354,15 @@ const fourmemeAddressMonitor = createFourmemeAddressMonitor({
   feed: () => ({ connected: actorBlockFeedState.connected, lastHeadAt: actorBlockFeedState.lastHeadAt, latestHeadBlock: actorBlockFeedState.latestHeadBlock, mode: actorBlockFeedMode() }),
   wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[Four.meme 地址 推送] ${error.message}`)); },
 });
+const frontendRenderClient = createRenderClient();
+const frontendRenderMonitor = createFrontendRenderMonitor({
+  store: monitorStore, client: frontendRenderClient, stopped: () => monitorStopping, log,
+  wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[前端渲染 推送] ${error.message}`)); },
+});
 const modules = [
   createModuleRunner("pool",     runPoolCheck,     CONFIG.intervals.pool),
   createModuleRunner("frontend", runFrontendCheck,  CONFIG.intervals.frontend),
+  createModuleRunner("frontendRender", frontendRenderMonitor.poll, CONFIG.intervals.frontend, false),
   createModuleRunner("api",      runApiCheck,       CONFIG.intervals.api),
   createModuleRunner("openfourTemplates", runOpenFourTemplateCheck, CONFIG.intervals.openfourTemplates),
   createModuleRunner("github", githubMonitor.pollHeads, CONFIG.intervals.github, false),
@@ -10468,6 +10505,7 @@ async function gracefulShutdown(signal) {
   if (monitorStopping) return;
   monitorStopping = true;
   clearInterval(global.__frontendHealthTimer);
+  frontendRenderMonitor.close();
   log(`收到 ${signal}，正在优雅退出...`);
   // 停止所有模块定时器，防止退出期间继续生产新通知
   if (global.__moduleTimers) {

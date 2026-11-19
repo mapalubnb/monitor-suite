@@ -1,4 +1,14 @@
 import test from "node:test";
+
+test('固定4Stock覆盖不受历史pending阻止，基础设施路由不被发现', () => {
+  const url = 'https://four.meme/zh-TW/4stock';
+  __testables.setSnapshotForTests({ _frontendPendingRoutes: { [url]: { status: 'pending', url } } });
+  assert.ok(__testables.getFrontendMonitorUrls().includes(url));
+  assert.ok(__testables.getFrontendMonitorUrls().includes('https://four.meme/en/4stock'));
+  assert.equal(__testables.isDiscoverableFrontendUrl('https://four.meme/zh-TW/cdn-cgi/content'), false);
+  assert.equal(__testables.isDiscoverableFrontendUrl('https://four.meme/zh-TW/images/ui-redesign'), false);
+  __testables.setSnapshotForTests({});
+});
 import "./github-monitor.test.mjs";
 import "./creator-discovery.test.mjs";
 import "./contract-observation.test.mjs";
@@ -847,7 +857,7 @@ test("restart card reports process and baseline separately within one card", () 
   assert.equal(card.title, "Four.meme 监控已启动");
   assert.match(card.content, /进程已启动/);
   assert.match(card.content, /前端：每 7 秒｜API：每 10 秒/);
-  assert.match(card.content, /首轮检查：完成 0\/15/);
+  assert.match(card.content, /首轮检查：完成 0\/16/);
   assert.doesNotMatch(card.content, /全部模块首轮检查完成|监控启动中/);
   assert.ok(card.content.length < 460);
 });

@@ -428,6 +428,7 @@ if [ -f "$SNAP" ]; then
     const lag=am.actorLagBlocks??(am.safeLatestBlock?Math.max(0,am.safeLatestBlock-am.lastBlock):'-');
     const health=[];
     if(actorHistory.historyError) health.push(warn('创建者历史补扫异常'));
+    if(runtime.frontend?.rendered?.lastError) health.push(warn('前端渲染待核验'));
     if(pendingRoutes>0) health.push(warn('新路由待确认 '+pendingRoutes));
     if(feed.enabled!==undefined&&!feed.connected) health.push(warn('新区块 WS 未连接'));
     if(typeof lag==='number'&&lag>120) health.push(warn('扫链延迟 '+lag+' 块'));
@@ -438,6 +439,11 @@ if [ -f "$SNAP" ]; then
     console.log('状态：'+(health.length?warn('需要关注')+'｜'+health.join('｜'):ok('运行正常')));
     console.log('覆盖：底池 '+allPools.length+' · 页面 '+pageEntries.length+' · API '+apiKeys.length+' · 合约 '+fpKeys.length);
     console.log('前端：资源 '+downloaded+'/'+assetFiles+' · i18n '+i18nTotal+' · 路由待确认 '+pendingRoutes+' / 已纳管 '+approvedRoutes+' / 已忽略 '+ignoredRoutes);
+    const rendered=runtime.frontend?.rendered||s._frontendRendered?.health||{};
+    const renderAge=rendered.lastSuccessAt?Date.now()-rendered.lastSuccessAt:Infinity;
+    console.log('前端内容：HTTP成功 '+(runtime.frontend?.successfulPages??'-')+' 页 · 加载壳 '+(runtime.frontend?.shellPages??'-')+' 页（交独立渲染核验）');
+    console.log('渲染核验：完整 '+(rendered.completePages??0)+'/'+(rendered.targetPages??8)+' · 失败 '+(rendered.failedPages??0)+' · '+(renderAge<60000?'最近完整采集 '+Math.round(renderAge/1000)+'秒前':'待核验或已过期')+' · '+(rendered.running?'采集中':'空闲'));
+    if(rendered.lastError) console.log('渲染异常：'+rendered.lastError);
     if(runtime.rpc) console.log('RPC：请求 '+runtime.rpc.requested+' · 复用 '+runtime.rpc.reused+' · 冷却 '+runtime.rpc.cooled+' · 排队 '+runtime.rpc.queued+' · 本地预算等待 '+(runtime.rpc.budgetRejected||0)+' · 上游429 '+(runtime.rpc.upstream429||0)+' · 拒绝 '+(runtime.rpc.denied||0)+' · 超时 '+(runtime.rpc.timeouts||0));
     if(s._notificationOutbox?.length) console.log('⚠️ 待发送：'+warn(s._notificationOutbox.length+' 条，自动重试'));
 
