@@ -9,6 +9,8 @@ const html = '<script src="/_next/static/a.js"></script><link rel="stylesheet" h
 test('轻量指纹忽略行情、nonce和资源顺序，但捕获部署资源变化', () => {
   const a = renderSourceFingerprint(html + '<p>price 1</p>', urls[0]);
   assert.equal(a, renderSourceFingerprint('<p nonce="123">price 999</p>' + html, urls[0]));
+  assert.equal(a, renderSourceFingerprint(html + '<script>const translations={BasicAccessControlDenied:"Access denied"}</script>', urls[0]));
+  assert.throws(() => renderSourceFingerprint('<title>Access denied</title>' + html, urls[0]));
   assert.notEqual(a, renderSourceFingerprint(html.replace('a.js', 'c.js'), urls[0]));
   assert.throws(() => renderSourceFingerprint('Access denied', urls[0]));
   assert.throws(() => renderSourceFingerprint('<html>Loading</html>', urls[0]));

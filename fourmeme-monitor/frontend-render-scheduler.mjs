@@ -5,7 +5,9 @@ import { RENDER_URLS } from './frontend-render.mjs';
 // market data, CSP nonces or hydration payloads. Same-URL content changes are
 // also covered by the existing static channel and the periodic DOM audit.
 export function renderSourceFingerprint(html, url) {
-  if (/verify you are human|access denied|<title[^>]*>[^<]*captcha/i.test(html)) throw Error('轻量探测被源站拦截');
+  // English hydration dictionaries legitimately contain "Access denied".
+  // Inspect document headings, not application strings embedded in scripts.
+  if (/<(?:title|h1)\b[^>]*>[^<]*(?:verify you are human|access denied|captcha)/i.test(html)) throw Error('轻量探测被源站拦截');
   const resources = [];
   for (const match of html.matchAll(/<(?:script|link)\b[^>]*>/gi)) {
     const tag = match[0];

@@ -5,11 +5,11 @@ import { collectRenderedDom, normalizeRenderedDom, RENDER_URLS } from './fronten
 
 let server, browser, context, page, busy = false;
 // Lower priority only for this worker and its subsequently spawned browser.
-try { setPriority(0, 10); } catch {}
+try { setPriority(0, 5); } catch {}
 async function launch() {
   if (browser?.isConnected()) return;
   const executablePath = process.env.FOURMEME_CHROMIUM_PATH || ['/usr/bin/chromium', '/usr/bin/chromium-browser', '/snap/bin/chromium'].find(existsSync);
-  server = await chromium.launchServer({ executablePath, headless: true, host: '127.0.0.1', timeout: 12000,
+  server = await chromium.launchServer({ executablePath, headless: true, host: '127.0.0.1', timeout: 20000,
     args: ['--disable-dev-shm-usage', '--blink-settings=imagesEnabled=false'], });
   process.send?.({ type: 'browser', pid: server.process().pid });
   browser = await chromium.connect(server.wsEndpoint(), { timeout: 5000 });

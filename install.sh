@@ -429,6 +429,7 @@ if [ -f "$SNAP" ]; then
     const health=[];
     if(actorHistory.historyError) health.push(warn('创建者历史补扫异常'));
     if(runtime.frontend?.rendered?.lastError) health.push(warn('前端渲染待核验'));
+    if(runtime.frontend?.rendered?.probeError) health.push(warn('前端轻量检测异常'));
     if(pendingRoutes>0) health.push(warn('新路由待确认 '+pendingRoutes));
     if(feed.enabled!==undefined&&!feed.connected) health.push(warn('新区块 WS 未连接'));
     if(typeof lag==='number'&&lag>120) health.push(warn('扫链延迟 '+lag+' 块'));
