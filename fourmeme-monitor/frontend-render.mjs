@@ -50,6 +50,9 @@ function stableLabel(value, allowNumbers = false) {
   return s.slice(0, 200);
 }
 
+const transientSignal = signal => /^按钮：(打開聊天|關閉聊天|打开聊天|关闭聊天|Open chat|Close chat)$/i.test(signal);
+const signalHash = signals => createHash('sha256').update(JSON.stringify(signals)).digest('hex');
+
 export function normalizeRenderedDom(raw, url) {
   const requested = new URL(url);
   const actual = new URL(raw.url || url);
@@ -82,9 +85,9 @@ export function normalizeRenderedDom(raw, url) {
       if (u.origin === requested.origin && !isInfrastructureRoute(u.pathname) && !/\/(?:token|contract)\/[^/]+/.test(u.pathname)) signals.push(`导航：${link.text.slice(0, 80)} → ${u.pathname}`);
     } catch {}
   }
-  const normalized = [...new Set(signals)].sort();
+  const normalized = [...new Set(signals)].filter(s => !transientSignal(s)).sort();
   if (normalized.length < 5) throw Error('渲染结构信息不足，保留旧基线');
-  return { url, signals: normalized, hash: createHash('sha256').update(JSON.stringify(normalized)).digest('hex'), kind: type };
+  return { url, signals: normalized, hash: signalHash(normalized), kind: type };
 }
 
 // Only this dedicated subprocess owns Chromium. Deadline kills its browser
@@ -163,7 +166,7 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
         const changes = [], initialized = [], errors = [];
         for (const url of targets) {
           const result = byUrl.get(url);
-          const old = state.pages[url];
+          let old = state.pages[url];
           if (!result || result.error || !result.data) {
             const error = result?.error || '未收到页面结果';
             state.pages[url] = { ...old, lastAttemptAt: startedAt, lastError: error };
@@ -172,6 +175,12 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
           let data;
           try { data = normalizeRenderedDom(result.data, url); }
           catch (error) { state.pages[url] = { ...old, lastAttemptAt: startedAt, lastError: error.message }; errors.push(`${new URL(url).pathname}：${error.message}`); continue; }
+          // Migrate only an observed valid page. A support widget appearing late
+          // is not a launch feature; don't emit a removal for old widget labels.
+          if (old?.signals?.some(transientSignal)) {
+            const signals = old.signals.filter(s => !transientSignal(s));
+            old = { ...old, signals, hash: signalHash(signals) };
+          }
           if (!old?.hash) initialized.push(data);
           else if (old.hash !== data.hash) {
             const added = data.signals.filter(x => !old.signals.includes(x));

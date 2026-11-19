@@ -102,6 +102,21 @@ test('落盘失败不确认基线和通知，下轮可恢复', async () => {
   assert.equal(h.store.state._frontendRendered, undefined); assert.equal(h.notices().length, 0);
   h.persistFailure(false); await h.monitor.poll(); assert.equal(h.notices().length, 1);
 });
+test('附属聊天开关显示波动不改变功能指纹，核心功能仍保留', () => {
+  const a = normalizeRenderedDom(raw(), url);
+  const b = normalizeRenderedDom(raw({ buttons: [...raw().buttons, '打開聊天', 'Open chat'] }), url);
+  assert.equal(a.hash, b.hash);
+  assert.notEqual(a.hash, normalizeRenderedDom(raw({ buttons: [...raw().buttons, '新增功能'] }), url).hash);
+});
+test('旧聊天控件基线成功核验后静默迁移，不发移除卡且失败时保留原值', async () => {
+  const h = harness(); await h.monitor.poll();
+  const old = h.store.state._frontendRendered.pages[url]; old.signals.push('按钮：打開聊天'); old.hash = 'legacy-chat';
+  h.result([{ url, error: 'offline' }]); await h.monitor.poll();
+  assert.equal(h.store.state._frontendRendered.pages[url].hash, 'legacy-chat');
+  h.result([{ url, data: raw() }]); await h.monitor.poll();
+  assert.equal(h.store.state._frontendRendered.pages[url].hash, normalizeRenderedDom(raw(), url).hash);
+  assert.equal(h.notices().length, 1);
+});
 test('停机后的迟到结果不写状态、不入队', async () => {
   const h = harness(); let complete; h.client.scan = () => new Promise(resolve => { complete = resolve; });
   const work = h.monitor.poll(); h.monitor.close(); complete([{ url, data: raw() }]); await work;
