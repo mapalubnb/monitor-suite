@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import { RENDER_URLS } from './frontend-render.mjs';
+import { withDeadline } from '../shared/request-deadline.mjs';
 
 // Resource URLs identify a deployed frontend build without hashing volatile
 // market data, CSP nonces or hydration payloads. Same-URL content changes are
@@ -22,23 +23,39 @@ export function renderSourceFingerprint(html, url) {
 }
 
 export async function probeRenderSource(url, previous = {}, { fetchFn = fetch, timeoutMs = 3500 } = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(Error('前端轻量探测超时')), timeoutMs);
-  try {
+  return withDeadline(async signal => {
     const headers = { 'User-Agent': 'FourMeme-Monitor/1.0', Accept: 'text/html' };
     if (previous.etag) headers['If-None-Match'] = previous.etag;
     if (previous.modified) headers['If-Modified-Since'] = previous.modified;
-    const response = await fetchFn(url, { headers, signal: controller.signal, redirect: 'error' });
+    const response = await fetchFn(url, { headers, signal, redirect: 'error' });
+    if (signal.aborted) {
+      void response.body?.cancel().catch(() => {});
+      signal.throwIfAborted();
+    }
     if (response.status === 304 && previous.fingerprint) { await response.body?.cancel(); return { fingerprint: previous.fingerprint, etag: previous.etag, modified: previous.modified }; }
     if (!response.ok) { await response.body?.cancel(); throw Error(`前端轻量HTTP ${response.status}`); }
+    const reader = response.body.getReader();
+    const cancelBody = () => { void reader.cancel().catch(() => {}); };
+    signal.addEventListener('abort', cancelBody, { once: true });
     let bytes = 0; const chunks = [];
-    for await (const chunk of response.body) {
-      bytes += chunk.length;
-      if (bytes > 2 * 1024 * 1024) { controller.abort(); throw Error('前端轻量HTML超过2MiB'); }
-      chunks.push(chunk);
+    try {
+      for (;;) {
+        const { value: chunk, done } = await reader.read();
+        if (done) break;
+        bytes += chunk.length;
+        if (bytes > 2 * 1024 * 1024) {
+          cancelBody();
+          throw Error('前端轻量HTML超过2MiB');
+        }
+        chunks.push(chunk);
+      }
+      signal.throwIfAborted();
+    } finally {
+      signal.removeEventListener('abort', cancelBody);
+      reader.releaseLock();
     }
     return { fingerprint: renderSourceFingerprint(Buffer.concat(chunks).toString('utf8'), url), etag: response.headers.get('etag') || '', modified: response.headers.get('last-modified') || '' };
-  } finally { clearTimeout(timer); }
+  }, timeoutMs, undefined, '前端轻量探测超时');
 }
 
 // Owns only _frontendRenderSchedule; the renderer owns _frontendRendered.

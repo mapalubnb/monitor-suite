@@ -66,10 +66,12 @@ function createSnapshotStore(file, { threshold = 65536, now = Date.now } = {}) {
     delete next._snapshotFields[key];
     delete next[key];
     if (json === undefined) return;
-    if (Buffer.byteLength(json) < threshold) { next[key] = JSON.parse(json); return; }
     let cached = encoded.get(key);
-    if (cached?.json !== json) cached = { json, digest: createHash('sha256').update(json).digest('hex') };
-    encoded.set(key, cached);
+    if (cached?.json !== json) {
+      if (Buffer.byteLength(json) < threshold) { next[key] = JSON.parse(json); return; }
+      cached = { json, digest: createHash('sha256').update(json).digest('hex') };
+      encoded.set(key, cached);
+    }
     const blob = path.join(directory, cached.digest + '.json');
     if (!written.has(cached.digest)) {
       fs.mkdirSync(directory, { recursive: true });

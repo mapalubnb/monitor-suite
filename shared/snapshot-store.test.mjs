@@ -50,3 +50,22 @@ test('unchanged data does not rewrite the manifest', () => {
     assert.equal(store.write({ cursor: 1 }), false);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('reuses unchanged large fields and rechecks size after a value changes', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'snapshot-store-')), file = join(dir, 'snapshot.json');
+  try {
+    const store = createSnapshotStore(file, { threshold: 10 });
+    const text = '北京时间', state = { text, cursor: 10 };
+    store.write(state);
+    const initial = JSON.parse(readFileSync(file))._snapshotFields.text;
+    assert.ok(initial);
+    const updated = { ...state, cursor: 11 };
+    store.write(updated);
+    assert.equal(JSON.parse(readFileSync(file))._snapshotFields.text, initial);
+    assert.deepEqual(readSnapshot(file), updated);
+    store.write({ ...updated, text: '短' });
+    assert.equal(JSON.parse(readFileSync(file))._snapshotFields.text, undefined);
+    store.write(updated);
+    assert.deepEqual(readSnapshot(file), updated);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -36,6 +36,28 @@ function harness() {
   const scheduler = createRenderScheduler(options);
   return { store, renderer, scheduler, options, calls, time: t => time = t, hash: h => hash = h, static: h => staticHash = h, failure: s => failure = s, disk: b => diskFail = b };
 }
+test('响应体不响应取消时释放探测，保留旧指纹并在下轮继续', { timeout: 1500 }, async () => {
+  const h = harness();
+  let stall = false, cancelled = false;
+  const s = createRenderScheduler({ ...h.options, urls: [urls[0]], probe: (url, old) =>
+    probeRenderSource(url, old, { timeoutMs: 30, fetchFn: async () => stall
+      ? new Response(new ReadableStream({ cancel() { cancelled = true; return new Promise(() => {}); } }))
+      : new Response(html) }) });
+  await s.poll();
+  const before = h.store.state._frontendRenderSchedule.pages[urls[0]].fingerprint;
+  stall = true;
+  await s.poll();
+  assert.equal(s.summary().checking, false);
+  assert.equal(cancelled, true);
+  assert.match(s.summary().probeError, /轻量探测超时/);
+  assert.equal(h.store.state._frontendRenderSchedule.pages[urls[0]].fingerprint, before);
+
+  stall = false;
+  await s.poll();
+  assert.equal(s.summary().checkCount, 3);
+  assert.equal(s.summary().probeError, '');
+  assert.equal(h.store.state._frontendRenderSchedule.pages[urls[0]].fingerprint, before);
+});
 test('5秒未变化探测不重复渲染，60秒兜底按页面错开', async () => {
   const h = harness(); await h.scheduler.poll(); await h.scheduler.runNext();
   assert.deepEqual(h.calls, [[urls[0]]]);
