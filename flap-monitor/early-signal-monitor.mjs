@@ -6,7 +6,8 @@ import { formatBeijingTime } from '../shared/display-format.cjs';
 import { withDeadline } from '../shared/request-deadline.mjs';
 import { recoverLiveCursor, activateHistoryGap, readAvailableLogWindow } from "../shared/scan-recovery.mjs";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
+import { readEarlySignalSnapshot, saveEarlySignalSnapshot } from './early-signal-storage.mjs';
 import { CORE_SAFES, AUXILIARY_SAFES, EXECUTION_WALLETS, CORE_OWNERS, ALLOWANCE_MODULE, PROXY_ADMINS,
   DEX, POSITION_MANAGERS, BASE_ASSETS, RELATED_SAFES, observationAddresses } from "./early-signal-catalog.mjs";
 import { TOPICS } from "./early-signal-topics.mjs";
@@ -47,7 +48,7 @@ export function createEarlySignalState() {
 export function loadEarlySignalState(path) {
   if (!existsSync(path)) return createEarlySignalState();
   if (statSync(path).size > 32 * 1024 * 1024) throw new Error("提前监控状态超过 32MB，请检查积压");
-  const raw = JSON.parse(readFileSync(path, "utf8"));
+  const raw = readEarlySignalSnapshot(path);
   if (raw.chainId !== 56) throw new Error("提前监控状态不是 BSC");
   const state = { ...createEarlySignalState(), ...raw, schemaVersion: EARLY_SIGNAL_SCHEMA_VERSION };
   for (const name of ["events", "tokens", "pools", "positions", "orders", "candidates", "safeInfo", "balances", "stages", "proposalVersions", "fastBlocks", "cowNotifications", "publicPoolNotifications", "health"]) {
@@ -93,8 +94,14 @@ function pruneDiscoveryPools(state) {
   for (const pool of unrelated.slice(512)) delete state.pools[pool.address];
 }
 export function saveEarlySignalState(path, state) {
-  writeFileSync(`${path}.tmp`, JSON.stringify(state), "utf8");
-  renameSync(`${path}.tmp`, path);
+  saveEarlySignalSnapshot(path, state);
+}
+function draftEarlySignalState(state) {
+  // Receipt decoding appends events. Existing event records are replaced
+  // explicitly by enrichment and delivery so unchanged records can be reused.
+  const { events, pendingChanges, publicPoolArchive, ...mutable } = state;
+  return { ...structuredClone(mutable), events: { ...events }, pendingChanges: [...pendingChanges],
+    ...(publicPoolArchive ? { publicPoolArchive } : {}) };
 }
 export function acknowledgeEarlySignals(state, ids) {
   const set = new Set(ids);
@@ -102,7 +109,8 @@ export function acknowledgeEarlySignals(state, ids) {
 }
 function emit(state, event, { silent = false, nowMs = Date.now() } = {}) {
   const id = event.id || hash(JSON.stringify(event));
-  if (state.events[id]) return false;
+  const archived = state.publicPoolArchive?.events?.[id];
+  if (state.events[id] || archived && !archived.revertedAt) return false;
   if (!silent && state.pendingChanges.length >= MAX_PENDING) throw Object.assign(new Error("提前信号通知积压达到上限，停止推进以免丢失"), { earlyOutboxFull: true });
   const record = { ...event, id, observedAt: iso(nowMs) };
   state.events[id] = record;
@@ -543,6 +551,16 @@ export function rewindEarlySignals(state, fromBlock, nowMs = Date.now()) {
   state.reorgRevision = (state.reorgRevision || 0) + 1;
   for (const block of Object.keys(state.fastBlocks || {})) if (Number(block) >= fromBlock) delete state.fastBlocks[block];
   const invalid = new Set(Object.values(state.events).filter(e => Number.isInteger(e.blockNumber) && e.blockNumber >= fromBlock).map(e => e.id));
+  const archive = state.publicPoolArchive;
+  const orphaned = Object.values(archive?.events || {}).filter(e => !e.revertedAt && Number.isInteger(e.blockNumber) && e.blockNumber >= fromBlock);
+  if (orphaned.length) {
+    const events = { ...archive.events };
+    for (const event of orphaned) {
+      events[event.id] = { ...event, revertedAt: iso(nowMs) };
+      invalid.add(event.id);
+    }
+    state.publicPoolArchive = { ...archive, events };
+  }
   for (const id of invalid) delete state.events[id];
   state.pendingChanges = state.pendingChanges.filter(e => !invalid.has(e.id));
   for (const [id, pool] of Object.entries(state.pools)) if (pool.blockNumber >= fromBlock) delete state.pools[id];
@@ -751,7 +769,7 @@ export async function scanEarlyChain(state, config, rpcBatch, nowMs) {
   const finalBoundary = (discoveries.length || Object.keys(discoveryDraft.ownerRelations).length) ? await strictRpc(rpcBatch, "eth_getBlockByNumber", [blockTag(to), false]) : check;
   if (lower(finalBoundary.hash) !== lower(boundary.hash) || (state.reorgRevision || 0) !== reorgRevision) throw Error('发现核验期间重组，保留游标重试');
   // Commit a complete window atomically in memory. Any malformed response leaves the old cursor intact.
-  const draft = structuredClone(state);
+  const draft = draftEarlySignalState(state);
   mergeObservedSafes(draft, discoveryDraft);
   for (const { log, ...event } of discoveries) emit(draft, { ...event, id: `${logId(log)}:safeDiscovery`, source: 'chain',
     blockNumber: Number(log.blockNumber), blockHash: lower(log.blockHash), transactionHash: lower(log.transactionHash) }, { nowMs });
@@ -844,7 +862,7 @@ export async function processEarlyReceiptHints(state, hints, config, rpcBatch, n
       const finalBlock = await strictRpc(rpcBatch, 'eth_getBlockByNumber', [receipt.blockNumber, false]);
       if (lower(finalBlock.hash) !== lower(receipt.blockHash) || (state.reorgRevision || 0) !== reorgRevision) continue;
     }
-    const draft = structuredClone(state);
+    const draft = draftEarlySignalState(state);
     mergeObservedSafes(draft, discoveryDraft);
     for (const { log, ...event } of discoveries) emit(draft, { ...event, id: `${logId(log)}:safeDiscovery`, source: 'chain',
       blockNumber: Number(log.blockNumber), blockHash: lower(log.blockHash), transactionHash: lower(log.transactionHash) }, { nowMs });
@@ -880,7 +898,13 @@ export async function refreshEarlyAssets(state, config, rpcBatch, nowMs) {
     if (underlying && underlying !== ZERO && underlying !== token) {
       meta.underlying = underlying;
       meta.mappingVerifiedAt = iso(nowMs);
-      for (const event of Object.values(state.events)) if (event.token === token && event.kind === "wrap") event.stage = "stocking";
+      const updated = new Map();
+      for (const [id, event] of Object.entries(state.events)) if (event.token === token && event.kind === "wrap" && event.stage !== 'stocking') {
+        const next = { ...event, stage: 'stocking' };
+        state.events[id] = next;
+        updated.set(event, next);
+      }
+      if (updated.size) state.pendingChanges = state.pendingChanges.map(event => updated.get(event) || event);
     }
     // Never convert RPC errors/empty reads into disabled/opened states.
     if (!/^0x[a-f0-9]{320}$/i.test(values[1] || "") || !/^0x0{63}[01]$/i.test(values[2] || "")) throw new Error(`资产 ${token} 的 Factory 配置读取失败，保留上次快照`);

@@ -1,7 +1,7 @@
 import './safe-4337.test.mjs';
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, mkdtempSync, rmSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createEarlySignalState, decodeEarlyReceipt, ingestCowOrders, earlyAssetStage, syncEarlyProposals,
@@ -17,6 +17,53 @@ import { safeReceiptPayment, summarizeEarlyOperations } from './early-operation-
 import { earlyNotificationPriority } from './early-signal-notifications.mjs';
 import { observationAddresses, OBSERVATION_WALLETS, RELATED_SAFES } from './early-signal-catalog.mjs';
 import { establishObservationCoverage, observeAddressTransaction } from './address-observation.mjs';
+import { readEarlySignalSnapshot } from './early-signal-storage.mjs';
+
+test('提前信号旧状态原子分片，游标增量保留未变事件及原插入顺序', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'early-state-shards-')), file = join(dir, 'early-signal-state.json');
+  try {
+    const state = createEarlySignalState();
+    state.events = Object.fromEntries(Array.from({ length: 280 }, (_, i) => [`e${i}`, { id: `e${i}`, detail: '原始证据'.repeat(200), blockNumber: i }]));
+    state.pendingChanges = [state.events.e279];
+    state.cursor = 10;
+    writeFileSync(file, JSON.stringify(state));
+    saveEarlySignalState(file, state);
+    const first = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(first._earlyEventChunks, 3);
+    assert.ok(first._snapshotFields._earlyEventChunk_0);
+    assert.deepEqual(readEarlySignalSnapshot(file), state);
+    delete state.events.e0;
+    state.events.e279 = { ...state.events.e279, detail: '同一事件的已确认更新' };
+    state.cursor = 11;
+    mkdirSync(file + '.tmp');
+    assert.throws(() => saveEarlySignalState(file, state));
+    assert.equal(readEarlySignalSnapshot(file).cursor, 10);
+    rmSync(file + '.tmp', { recursive: true });
+    saveEarlySignalState(file, state);
+    const second = JSON.parse(readFileSync(file, 'utf8'));
+    assert.equal(second._snapshotFields._earlyEventChunk_1, first._snapshotFields._earlyEventChunk_1);
+    const reloaded = readEarlySignalSnapshot(file);
+    assert.deepEqual(Object.keys(reloaded.events), Object.keys(state.events));
+    assert.deepEqual(reloaded, state);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('重组使归档中的孤块公共池事件失效并保留原证据', () => {
+  const state = createEarlySignalState();
+  const stable = { id: 'stable', kind: 'poolCreated', blockNumber: 99 };
+  const orphan = { id: 'orphan', kind: 'liquidityAdded', blockNumber: 100 };
+  state.cursor = 110;
+  state.realtimeCursor = 111;
+  state.events = { stable };
+  state.publicPoolArchive = { archivedAt: new Date(1000).toISOString(), events: { stable, orphan } };
+  rewindEarlySignals(state, 100, 2000);
+  assert.deepEqual(state.publicPoolArchive.events.stable, stable);
+  assert.equal(state.publicPoolArchive.events.orphan.revertedAt, new Date(2000).toISOString());
+  assert.equal(state.publicPoolArchive.events.orphan.blockNumber, 100);
+  assert.equal(state.cursor, 99);
+  assert.equal(state.realtimeCursor, 99);
+  assert.match(state.pendingChanges[0].detail, /撤回 1 条/);
+});
 
 const coverageFixture = JSON.parse(readFileSync(new URL('./fixtures/address-coverage-20261017.json', import.meta.url)));
 test('关联覆盖：所有者与资金观察地址有效，真实 Safe 调拨不提升官方准备状态', () => {

@@ -4011,6 +4011,81 @@ test('公共池首次发送失败后按原计划恢复，发送中到达的新�
   assert.equal(state.publicPoolNotifications[token].messageId,'public-card');
 });
 
+test('公共池历史仅归档纯公共事务，同笔关联保持即时，单份摘要重启可续发', async () => {
+  const { createEarlySignalState } = await import('./early-signal-monitor.mjs');
+  const { archivePublicPoolBacklog } = await import('./public-pool-notifications.mjs');
+  const token = '0x' + '36'.repeat(20), tx = '0x' + '36'.repeat(32);
+  const event = (id, kind, rel, hash) => ({ id, kind, poolRelevance: rel, token,
+    transactionHash: hash, poolAddress: token, blockNumber: 20, observedAt: new Date(1000).toISOString() });
+  const old = createEarlySignalState();
+  const rows = [event('create', 'poolCreated', 'public', tx), event('add', 'liquidityAdded', 'public', tx),
+    event('mixed-pub', 'liquidityRemoved', 'public', 'mixed'), event('mixed-related', 'liquidityRemoved', 'related', 'mixed')];
+  old.pendingChanges = rows;
+  old.events = Object.fromEntries(rows.map(e => [e.id, e]));
+  old.pools[token] = { officialOperation: true };
+  let state = archivePublicPoolBacklog(old, 2000);
+  assert.deepEqual(Object.keys(state.publicPoolArchive.events), ['create', 'add']);
+  assert.deepEqual(state.pendingChanges.map(e => e.id), ['mixed-pub', 'mixed-related']);
+  assert.equal(archivePublicPoolBacklog(state, 2100), null);
+  assert.equal(old.pendingChanges.length, 4);
+
+  let disk, attempts = 0, firstPlan, clock = 2000;
+  const opts = { now: () => clock, saveStateFn: (_file, next) => { disk = JSON.stringify(next); },
+    sendCardFn: async (title, body, _color, _file, plan) => {
+      if (!title.includes('历史重点摘要')) return 'immediate-id';
+      assert.match(body, /同笔建池并加池 1 组/);
+      if (++attempts === 1) { firstPlan = plan.deliveryId; throw Error('temporarily offline'); }
+      assert.equal(plan.deliveryId, firstPlan);
+      await plan.onPartSent(['summary-id']);
+      return 'summary-id';
+    } };
+  await __testables.deliverFlapEarlySignals(state, opts);
+  assert.equal(state.pendingChanges.length, 0);
+  await assert.rejects(__testables.deliverFlapEarlySignals(state, opts), /temporarily offline/);
+  state = JSON.parse(disk);
+  assert.equal((await __testables.deliverFlapEarlySignals(state, opts)).sent, false);
+  clock += 60_001;
+  await __testables.deliverFlapEarlySignals(state, opts);
+  assert.equal(state.publicPoolSummary.messageId, 'summary-id');
+  state = JSON.parse(disk);
+  assert.equal((await __testables.deliverFlapEarlySignals(state, opts)).sent, false);
+  assert.equal(attempts, 2);
+  assert.equal(Object.keys(state.publicPoolArchive.events).length, 2);
+});
+
+test('公共池确认飞书 230031 才停止旧卡重试，保留新活动并只续接一张卡', async () => {
+  const { createEarlySignalState } = await import('./early-signal-monitor.mjs');
+  const token = '0x' + '37'.repeat(20);
+  let state = createEarlySignalState(), persisted, time = 20_000, patches = 0, creates = 0;
+  const append = id => {
+    const e = { id, token, kind: 'liquidityAdded', poolRelevance: 'public', blockNumber: Number(id), transactionHash: id };
+    state.events[id] = e;
+    state.pendingChanges.push(e);
+  };
+  state.publicPoolNotifications[token] = { messageId: 'expired', nextAttemptAtMs: 0 };
+  append('1');
+  const options = { now: () => time, saveStateFn: (_file, next) => { persisted = JSON.stringify(next); },
+    patchCardFn: async id => {
+      patches++;
+      if (id === 'expired') throw Object.assign(Error('Request failed with status code 400'), { response: { data: { code: 230031 } } });
+      assert.equal(id, 'new-card');
+    },
+    sendCardFn: async () => { creates++; return 'new-card'; } };
+  assert.equal((await __testables.deliverFlapEarlySignals(state, options)).sent, false);
+  state = JSON.parse(persisted);
+  assert.equal(state.pendingChanges.length, 1);
+  assert.equal(state.publicPoolNotifications[token].expiredMessageId, 'expired');
+  assert.equal(creates, 0);
+  await __testables.deliverFlapEarlySignals(state, options);
+  assert.equal(state.publicPoolNotifications[token].messageId, 'new-card');
+  assert.equal(state.pendingChanges.length, 0);
+  time += 10_001;
+  append('2');
+  await __testables.deliverFlapEarlySignals(state, options);
+  assert.equal(creates, 1);
+  assert.equal(patches, 2);
+});
+
 test('history denial leaves same-provider live logs working',async()=>{
  const original=globalThis.fetch;__testables.resetBscRpcHealth();let denied=true;
  globalThis.fetch=async(_url,options)=>{const req=JSON.parse(options.body);if(denied)return {ok:false,status:403,body:{cancel:async()=>{}}};return {ok:true,json:async()=>({result:req.method==='eth_blockNumber'?'0x100':[]})};};

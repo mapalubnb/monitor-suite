@@ -4,12 +4,13 @@ const { createHash } = require('node:crypto');
 
 // Large fields are immutable blobs. Publish their references and the small
 // cursor/outbox fields together with one atomic manifest rename.
-function readSnapshot(file) {
+function readSnapshot(file, { fields } = {}) {
   for (let attempt = 0; ; attempt++) {
     const raw = fs.readFileSync(file, 'utf8');
     const data = JSON.parse(raw);
     try {
       for (const [key, digest] of Object.entries(data._snapshotFields || {})) {
+        if (fields && !fields.has(key)) continue;
         if (!/^[a-f0-9]{64}$/.test(digest) || key === '__proto__') throw new Error('无效快照引用');
         const content = fs.readFileSync(path.join(file + '.parts', digest + '.json'), 'utf8');
         if (createHash('sha256').update(content).digest('hex') !== digest) throw new Error('快照内容校验失败：' + key);

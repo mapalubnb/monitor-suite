@@ -4,6 +4,9 @@ import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
 import { formatBeijingTime, formatDisplayText } from '../shared/display-format.cjs';
 
 export const APPS_URL = 'https://flap.sh/apps?lang=zh';
+const APPS_DIRECTORY_URL = 'https://flap.sh/api/apps-directory?tab=all&limit=24';
+const validSlug = slug => typeof slug === 'string' && /^[a-z0-9][a-z0-9-]{0,100}$/.test(slug);
+const sameApp = (a, b) => a.appId && b.appId ? a.appId === b.appId : a.slug === b.slug;
 export function appConfigDiff(before, after, path = '') {
   if (stable(before) === stable(after)) return [];
   if (before && after && typeof before === 'object' && typeof after === 'object' && !Array.isArray(before) && !Array.isArray(after))
@@ -45,7 +48,7 @@ export function parseAppList(html) {
   if (!rows || rows.length > 128) throw Error('小程序目录结构缺失或超限，保留基线');
   const seen = new Set();
   for (const row of rows) {
-    if (!/^[a-z0-9][a-z0-9-]{0,100}$/.test(row.slug || '') || !row.appId || seen.has(row.slug))
+    if (!validSlug(row?.slug) || !row.appId || seen.has(row.slug))
       throw Error('小程序目录身份无效或重复');
     seen.add(row.slug);
   }
@@ -54,9 +57,47 @@ export function parseAppList(html) {
     displayTitle: displayTitle === '$undefined' ? undefined : displayTitle, category }));
 }
 
+export async function fetchAppCatalog(fetchText) {
+  let body;
+  try { body = await fetchText(APPS_DIRECTORY_URL); }
+  catch (error) {
+    if (/^HTTP 404\b/.test(error.message)) return parseAppList(await fetchText(APPS_URL));
+    throw error;
+  }
+  const rows = [], cursors = new Set(), seen = new Set();
+  let expected;
+  for (;;) {
+    let page;
+    try { page = JSON.parse(body); } catch { throw Error('小程序目录 JSON 无效，保留基线'); }
+    if (!Number.isInteger(page?.total) || page.total < 0 || page.total > 128 || !Array.isArray(page.items)
+      || (expected !== undefined && page.total !== expected)) throw Error('小程序目录结构缺失或超限，保留基线');
+    expected = page.total;
+    for (const item of page.items) {
+      if (!validSlug(item?.slug) || seen.has(item.slug)) throw Error('小程序目录身份无效或重复');
+      seen.add(item.slug);
+      const displayTitle = item.displayTitle && typeof item.displayTitle === 'object'
+        ? Object.fromEntries(['zh', 'en'].filter(lang => typeof item.displayTitle[lang] === 'string')
+          .map(lang => [lang, item.displayTitle[lang].slice(0, 200)])) : undefined;
+      rows.push({ slug: item.slug, name: displayTitle?.zh || displayTitle?.en || item.slug, displayTitle,
+        category: typeof item.category === 'string' ? item.category : undefined });
+      if (rows.length > expected) throw Error('小程序目录分页总数不一致，保留基线');
+    }
+    if (page.nextCursor === null) break;
+    const cursor = page.nextCursor;
+    if (typeof cursor !== 'string' || !cursor || cursor.length > 512 || cursors.has(cursor)
+      || !page.items.length || rows.length >= expected) throw Error('小程序目录分页游标无效，保留基线');
+    cursors.add(cursor);
+    body = await fetchText(APPS_DIRECTORY_URL + '&cursor=' + encodeURIComponent(cursor));
+  }
+  if (rows.length !== expected) throw Error('小程序目录分页总数不一致，保留基线');
+  return rows;
+}
+
 export function parseRegistration(html, app) {
   const registration = flightObjects(html).find(v => v.registration)?.registration;
-  if (!registration || registration.slug !== app.slug || registration.appId !== app.appId)
+  if (!registration && html.includes('NEXT_HTTP_ERROR_FALLBACK;404')) throw Error('目录已列出，官网详情返回 404');
+  if (!registration || registration.slug !== app.slug || typeof registration.appId !== 'string' || !registration.appId
+    || (app.appId && registration.appId !== app.appId))
     throw Error('小程序注册身份不匹配');
   return registration;
 }
@@ -227,12 +268,14 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
     });
     await box.drain();
     try {
-      const rows = parseAppList(await fetchText(APPS_URL)).filter(row => !excluded(row));
+      const old = box.state.catalog;
+      const known = new Map((old || []).map(row => [row.slug, row.appId]));
+      const rows = (await fetchAppCatalog(fetchText)).filter(row => !excluded(row))
+        .map(row => row.appId || !known.get(row.slug) ? row : { ...row, appId: known.get(row.slug) });
       await box.transaction(async () => {
-        const old = box.state.catalog;
         if (old) {
-          for (const row of rows) if (!old.some(v => v.appId === row.appId)) await notify('新增应用', `${row.displayTitle?.zh || row.name}\nhttps://flap.sh/apps/${row.slug}`);
-          for (const row of old) if (!rows.some(v => v.appId === row.appId)) await notify('应用目录移除', `${row.name}\n${APPS_URL}\n仅表示目录未再列出，不代表链上停用。`);
+          for (const row of rows) if (!old.some(item => sameApp(item, row))) await notify('新增应用', `${row.displayTitle?.zh || row.name}\nhttps://flap.sh/apps/${row.slug}`);
+          for (const row of old) if (!rows.some(item => sameApp(item, row))) await notify('应用目录移除', `${row.name}\n${APPS_URL}\n仅表示目录未再列出，不代表链上停用。`);
         }
         box.state.catalog = rows;
       });
@@ -242,10 +285,12 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
           const artifact = await readAppArtifact(registration, fetchText, cache);
           await box.transaction(async () => {
             const apps = box.state.apps ||= {};
-            const old = apps[row.appId];
-            const config = { ...artifact, enabled: registration.enabled, artifactEnabled: registration.artifact.enabled, catalog: row };
+            const catalog = { ...row, appId: registration.appId };
+            const old = apps[registration.appId];
+            const config = { ...artifact, enabled: registration.enabled, artifactEnabled: registration.artifact.enabled, catalog };
             if (old && stable(old.config) !== stable(config)) await notify('描述、资源或配置变更', `${row.name}\nhttps://flap.sh/apps/${row.slug}\n${appConfigDiff(old.config, config).join('\n')}`);
-            apps[row.appId] = { ...old, config, lastSuccess: formatBeijingTime(new Date()), lastError: '' };
+            apps[registration.appId] = { ...old, config, lastSuccess: formatBeijingTime(new Date()), lastError: '' };
+            if (!row.appId) box.state.catalog = box.state.catalog.map(item => item.slug === row.slug ? catalog : item);
           });
           if (row.slug === 'agent-bonding-curve' && registration.enabled && registration.artifact.enabled) {
             const result = await scanAgentMarkets(box.state.apps[row.appId]?.markets, artifact.manifest, rpc);
@@ -260,14 +305,19 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
           }
         } catch (e) {
           await box.transaction(async () => {
-            const errors = box.state.errors ||= {}, failures = (errors[row.appId]?.failures || 0) + 1;
-            errors[row.appId] = { message: e.message, failures, at: formatBeijingTime(new Date()) };
+            const key = row.appId || row.slug;
+            const errors = box.state.errors ||= {}, failures = (errors[key]?.failures || 0) + 1;
+            errors[key] = { message: e.message, failures, at: formatBeijingTime(new Date()) };
             if (failures === 1 || failures === 3) log(`${row.slug}：${e.message}`);
             if (failures === 3) await notify('采集失败', `${row.name}\n连续 3 次失败：${e.message}\n保留旧基线和队列。`);
           });
           continue;
         }
-        await box.transaction(() => { if (box.state.errors) delete box.state.errors[row.appId]; });
+        await box.transaction(() => {
+          if (!box.state.errors) return;
+          delete box.state.errors[row.slug];
+          if (row.appId) delete box.state.errors[row.appId];
+        });
       }
       await box.transaction(() => { box.state.lastSuccess = formatBeijingTime(new Date()); box.state.lastError = ''; box.state.failures = 0; });
     } catch (e) {
@@ -296,5 +346,5 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
   }
   return { run: () => flight ||= pass().finally(() => { flight = null; }), wait: () => flight,
     setTemplates: rows => { templates = rows.filter(row => address(row.factory) && row.sourceUrl === `https://flap.sh/bnb/CAstore/vault/${row.factory}?lang=zh`); },
-    status: () => ({ lastSuccess: box.state.lastSuccess, lastError: box.state.lastError, errors: box.state.errors || {}, detailErrors: box.state.detailErrors || {}, templateDetails: Object.keys(box.state.templateDetails || {}).length, apps: Object.keys(box.state.apps || {}).length, pending: (box.state._notificationOutbox || []).length }) };
+    status: () => ({ lastSuccess: box.state.lastSuccess, lastError: box.state.lastError, errors: box.state.errors || {}, detailErrors: box.state.detailErrors || {}, templateDetails: Object.keys(box.state.templateDetails || {}).length, catalog: (box.state.catalog || []).length, apps: Object.keys(box.state.apps || {}).length, pending: (box.state._notificationOutbox || []).length }) };
 }

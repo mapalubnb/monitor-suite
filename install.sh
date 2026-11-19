@@ -641,7 +641,11 @@ if [ -f "$SNAP" ]; then
     const fp=fs.existsSync('$FACTORY_STATE')?JSON.parse(fs.readFileSync('$FACTORY_STATE','utf-8')):{};
     const ci=fs.existsSync('$INTEGRITY_STATE')?JSON.parse(fs.readFileSync('$INTEGRITY_STATE','utf-8')):{};
     const sp=fs.existsSync('$SAFE_STATE')?JSON.parse(fs.readFileSync('$SAFE_STATE','utf-8')):{};
-    const es=fs.existsSync('$EARLY_STATE')?JSON.parse(fs.readFileSync('$EARLY_STATE','utf-8')):{};
+    const earlyFile='$EARLY_STATE';
+    const earlyRaw=fs.existsSync(earlyFile)?JSON.parse(fs.readFileSync(earlyFile,'utf-8')):{};
+    const es=earlyRaw._snapshotFields
+      ?require(require('path').resolve(require('path').dirname('$SNAP'),'../shared/snapshot-store.cjs')).readSnapshot(earlyFile,{fields:new Set(['pendingChanges','tokens','health','realtimeGaps'])})
+      :earlyRaw;
     const cleanLabel=v=>String(v??'-').replace(/[\[\]<>|｜*_~]/g,' ').replaceAll(String.fromCharCode(96),' ').replace(/\s+/g,' ').trim();
     const mdLink=(label,url)=>'['+cleanLabel(label)+']('+url+')';
     const vaultLink=(address)=>mdLink('打开金库','https://flap.sh/launch?vaultfactory='+address+'&chain='+'bnb'+'&lang=zh');
@@ -809,6 +813,8 @@ if [ -f "$SNAP" ]; then
     section('07｜🔎 底池提前信号');
     console.log('实时扫描：'+(es.realtimeCursor??'未建立')+' · 最新 '+(es.latestBlock??'未知')+' · 候选资产 '+Object.keys(es.tokens||{}).length+' · 待推送 '+(es.pendingChanges||[]).length);
     console.log('历史补扫：'+(es.cursor??'未建立')+' / '+(es.historyEndBlock??'未知')+' · 待补 '+gaps(es.realtimeGaps));
+    if(runtime.publicPoolArchive?.count)console.log('公共池历史归档：'+runtime.publicPoolArchive.count+' 条 · 摘要 '+(runtime.publicPoolArchive.summarySentAt?fmtTime(runtime.publicPoolArchive.summarySentAt):'待送达'));
+    if(Number.isInteger(runtime.miniApps?.catalog))console.log('小程序目录：'+runtime.miniApps.catalog+' 项 · '+(runtime.miniApps.lastError||runtime.miniApps.lastSuccess||'待检查'));
     const cowHealth=Object.entries(es.health||{}).filter(([name])=>name.startsWith('cow:')).map(([,h])=>h);
     const cowTimes=cowHealth.map(h=>Date.parse(h.lastSuccessAt||'')).filter(Number.isFinite);
     if(cowHealth.length)console.log('CoW 订单：'+cowHealth.length+' 个地址｜最近成功范围 '+(cowTimes.length?fmtTime(Math.min(...cowTimes))+' — '+fmtTime(Math.max(...cowTimes)):'暂无'));

@@ -38,7 +38,7 @@ import { createWakeableJob, createSubscriptionSet } from "./realtime-scheduler.m
 import { processEarlyReceiptHints, shouldPrioritizeEarlyLog, rewindEarlySignals, validateFastBlocks } from "./early-signal-monitor.mjs";
 import { selectEarlyNotification, archiveRoutineEarlySignals } from './early-signal-notifications.mjs';
 import { selectCowNotification } from './cow-notifications.mjs';
-import { selectPublicPoolNotification } from './public-pool-notifications.mjs';
+import { archivePublicPoolBacklog, buildPublicPoolBacklogSummary, expiredPublicPoolMessage, selectPublicPoolNotification } from './public-pool-notifications.mjs';
 import { formatQuoteRoute } from "./quote-token-codec.mjs";
 import { hasTokenDecimals, operationalAmountToken } from "./operational-call-codec.mjs";
 import { decodeRegistryLog, ingestRegistryLog, drainRegistryNotifications, auditRegistryNotifications } from './registry-notifications.mjs';
@@ -6808,6 +6808,36 @@ function earlySignalConfig() {
     safeApiKeys: CONFIG.safeProposalMonitor.apiKeys };
 }
 const earlySignalNameFlights = new Set();
+async function deliverPublicPoolBacklogSummary(state, sendCardFn, saveStateFn, now) {
+  if (!state.publicPoolArchive || state.publicPoolSummary?.messageId || state.publicPoolSummary?.nextAttemptAt > now())
+    return { sent: false };
+  const saveSummary = summary => {
+    saveStateFn(CONFIG.earlySignalMonitor.stateFile, { ...state, publicPoolSummary: summary });
+    state.publicPoolSummary = summary;
+  };
+  let plan = state.publicPoolSummary;
+  if (!plan) {
+    const card = buildPublicPoolBacklogSummary(state);
+    if (!card) return { sent: false };
+    const deliveryId = createHash('sha256').update(`public-pool-backlog:${state.publicPoolArchive.archivedAt}`).digest('hex');
+    plan = { ...card, deliveryId, sentParts: [], cardParts: planCardParts(card.title, card.content, card.template) };
+    saveSummary(plan);
+  }
+  try {
+    const messageId = await sendCardFn(plan.title, plan.content, plan.template, undefined, {
+      deliveryId: plan.deliveryId, cardParts: plan.cardParts, sentParts: state.publicPoolSummary.sentParts,
+      onPartSent: async parts => saveSummary({ ...state.publicPoolSummary, sentParts: [...parts] }),
+    });
+    if (!messageId) throw Error('飞书公共池历史摘要缺少 message_id');
+    saveSummary({ ...state.publicPoolSummary, messageId, sentAt: new Date(now()).toISOString(), nextAttemptAt: 0, lastError: '' });
+    log(`[Flap 公共池通知] 历史重点摘要已送达：${messageId}`);
+    return { sent: true };
+  } catch (error) {
+    saveSummary({ ...state.publicPoolSummary, nextAttemptAt: now() + 60_000, lastError: error.message });
+    throw error;
+  }
+}
+
 async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, saveStateFn = saveEarlySignalState,
   resolveMetadataFn = sendCardFn === sendCardViaApi ? resolveFactoryPoolTokenMetadata : null,
   patchCardFn = patchCard, now = Date.now, pendingOperationState = null, persistPendingOperations = () => {} } = {}) {
@@ -6825,7 +6855,12 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
   if (state.notificationDelivery?.ids.some(id => !pendingIds.has(id))) delete state.notificationDelivery;
   let delivery = state.notificationDelivery;
   if (!delivery) {
-    const selection = selectEarlyNotification(state, now(), linked.heldIds) || selectCowNotification(state, now()) || selectPublicPoolNotification(state, now());
+    let selection = selectEarlyNotification(state, now(), linked.heldIds) || selectCowNotification(state, now());
+    if (!selection) {
+      const summary = await deliverPublicPoolBacklogSummary(state, sendCardFn, saveStateFn, now);
+      if (summary.sent) return summary;
+      selection = selectPublicPoolNotification(state, now());
+    }
     if (!selection) return { sent: false };
     const { changes, title, template, mode } = selection;
     const content = selection.content || buildEarlySignalContent(changes, state);
@@ -6851,6 +6886,19 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
       await patchCardFn(delivery.patchMessageId, title, content, template);
       id = delivery.patchMessageId;
     } catch (error) {
+      if (delivery.publicToken && expiredPublicPoolMessage(error)) {
+        const publicPoolNotifications = { ...state.publicPoolNotifications, [delivery.publicToken]: {
+          ...state.publicPoolNotifications?.[delivery.publicToken], expiredMessageId: delivery.patchMessageId,
+          nextAttemptAtMs: 0, lastError: '230031',
+        } };
+        const next = { ...state, publicPoolNotifications };
+        if (next.notificationDelivery?.deliveryId === delivery.deliveryId) delete next.notificationDelivery;
+        saveStateFn(CONFIG.earlySignalMonitor.stateFile, next);
+        state.publicPoolNotifications = publicPoolNotifications;
+        if (!next.notificationDelivery) delete state.notificationDelivery;
+        log(`[Flap 公共池通知] 原卡过期，保留本次新活动等待续卡｜${delivery.publicToken}`);
+        return { sent: false };
+      }
       // Keep the evidence; back off only this order. A terminal transition and
       // unrelated urgent alerts can still bypass a failed progress edit.
       const records = delivery.publicToken ? (state.publicPoolNotifications ||= {}) : (state.cowNotifications ||= {});
@@ -6869,18 +6917,20 @@ async function deliverFlapEarlySignals(state, { sendCardFn = sendCardViaApi, sav
   if (!id) return { sent: false };
   if (delivery.publicToken) {
     state.publicPoolNotifications ||= {};
+    const expiredMessageId = state.publicPoolNotifications[delivery.publicToken]?.expiredMessageId;
     state.publicPoolNotifications[delivery.publicToken] = { messageId: id, lastUpdatedAt: new Date(now()).toISOString(),
+      ...(expiredMessageId ? { expiredMessageId } : {}),
       failures: 0, lastError: '', nextAttemptAtMs: now() + 10_000 };
-    for (const event of changes) if (state.events[event.id]) Object.assign(state.events[event.id], {
-      notificationDisposition: delivery.mode, notificationMessageId: id, notificationHandledAt: new Date(now()).toISOString() });
+    for (const event of changes) if (state.events[event.id]) state.events[event.id] = { ...state.events[event.id],
+      notificationDisposition: delivery.mode, notificationMessageId: id, notificationHandledAt: new Date(now()).toISOString() };
     log(`[Flap 公共池通知] ${delivery.patchMessageId ? '更新原卡' : '首次观察'}｜${delivery.publicToken}｜合并 ${changes.length} 条记录`);
   }
   if (delivery.cowUid) {
     state.cowNotifications ||= {};
     state.cowNotifications[delivery.cowUid] = { ...delivery.cowRecord, messageId: id,
       lastUpdatedAt: new Date(now()).toISOString(), failures: 0, lastError: '', nextAttemptAtMs: 0 };
-    for (const event of changes) if (state.events[event.id]) Object.assign(state.events[event.id], {
-      notificationDisposition: delivery.mode, notificationMessageId: id, notificationHandledAt: new Date(now()).toISOString() });
+    for (const event of changes) if (state.events[event.id]) state.events[event.id] = { ...state.events[event.id],
+      notificationDisposition: delivery.mode, notificationMessageId: id, notificationHandledAt: new Date(now()).toISOString() };
     log(`[Flap CoW 通知] ${delivery.patchMessageId ? '更新原卡' : '即时提醒'}｜${delivery.cowUid.slice(0, 18)}｜合并 ${changes.length} 条记录`);
   }
   acknowledgeEarlySignals(state, changes.map(e => e.id));
@@ -7238,6 +7288,14 @@ async function startMonitor() {
     CONFIG.safeProposalMonitor.safes,
   );
   const earlySignalState = loadEarlySignalState(CONFIG.earlySignalMonitor.stateFile);
+  if (CONFIG.earlySignalMonitor.enabled) {
+    const archived = archivePublicPoolBacklog(earlySignalState);
+    if (archived) {
+      saveEarlySignalState(CONFIG.earlySignalMonitor.stateFile, archived);
+      if (!archived.notificationDelivery) delete earlySignalState.notificationDelivery;
+      Object.assign(earlySignalState, archived);
+    }
+  }
   let safeAi = null;
   try {
     const aiMetadata = () => ({ ...factoryPoolState.assets, ...safeProposalState.tokenMetadata });
@@ -7281,6 +7339,8 @@ async function startMonitor() {
     ].map(([name, job]) => [name, job.snapshot()]));
     writeFileSync(file + ".tmp", JSON.stringify({ updatedAt: new Date().toISOString(), rpc: rpcControl.summary(), memory: process.memoryUsage(), jobs,
       registryPending: registryPendingHealth, miniApps: miniAppMonitor?.status(),
+      publicPoolArchive: { count: Object.keys(earlySignalState.publicPoolArchive?.events || {}).length,
+        summarySentAt: earlySignalState.publicPoolSummary?.sentAt, summaryError: earlySignalState.publicPoolSummary?.lastError },
       earlyScanTimings: earlySignalState.scanTimings || {}, cowTransport: earlySignalState.cowTransport || {},
       ai: { enabled: FLAP_AI_ANALYSIS_ENABLED }, safeAi: safeAi?.status() || { enabled: false, health: 'unavailable' } }));
     renameSync(file + ".tmp", file); lastMetricsAt = Date.now();

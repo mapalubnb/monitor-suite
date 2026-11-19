@@ -2,9 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
-import { parseAppList, parseRegistration, parseTemplateDetail, readAppArtifact, scanAgentMarkets, decodeMarketCards, createMiniAppMonitor } from './mini-app-monitor.mjs';
+import { parseAppList, fetchAppCatalog, parseRegistration, parseTemplateDetail, readAppArtifact, scanAgentMarkets, decodeMarketCards, createMiniAppMonitor } from './mini-app-monitor.mjs';
 const fixture = JSON.parse(readFileSync(new URL('./fixtures/mini-app-20261023.json', import.meta.url)));
 const flight = object => `<script>self.__next_f.push(${JSON.stringify([1, '7:' + JSON.stringify(['$', '$L1', null, object]) + '\n'])})</script>`;
+const legacyDirectory = fetchText => async url => {
+  if (new URL(url).pathname === '/api/apps-directory') throw Error('HTTP 404');
+  return fetchText(url);
+};
 const word = v => BigInt(v).toString(16).padStart(64, '0');
 const addr = n => '0x' + n.toString(16).padStart(40, '0');
 const block = { number: '0x100', hash: '0x' + 'a'.repeat(64) };
@@ -101,7 +105,7 @@ test('模板详情只读取名称和说明，忽略风险加载占位、代币�
   assert.throws(() => parseTemplateDetail('<h1>Loading</h1>'), /不完整/);
   let saved = {}, current = html, sent = [];
   const monitor = createMiniAppMonitor({ persist: state => { saved = structuredClone(state); },
-    fetchText: async url => url.includes('/apps?') ? flight({ apps: [] }) : current,
+    fetchText: legacyDirectory(async url => url.includes('/apps?') ? flight({ apps: [] }) : current),
     deliver: async p => { sent.push(p); return 'id'; } });
   monitor.setTemplates([{ factory: addr(1), sourceUrl: `https://flap.sh/bnb/CAstore/vault/${addr(1)}?lang=zh` }]);
   await monitor.run(); assert.equal(sent.length, 0);
@@ -134,7 +138,7 @@ test('资源哈希校验、成功缓存，不执行组件；拒绝非公开资�
 
 test('小程序目录新建、发送失败持久化、重启重投，坏页面不移除应用', async () => {
   let saved = {}, rows = [{ appId: 'other-app', slug: 'other-app', name: 'Other' }], sends = 0;
-  const fetchText = async url => url.includes('/apps?') ? flight({ apps: rows }) : '<h1>incomplete</h1>';
+  const fetchText = legacyDirectory(async url => url.includes('/apps?') ? flight({ apps: rows }) : '<h1>incomplete</h1>');
   const make = deliver => createMiniAppMonitor({ initial: saved, persist: s => { saved = structuredClone(s); }, fetchText, rpc: async () => { throw Error('not reached'); }, deliver });
   let monitor = make(async () => { sends++; throw Error('delivery failed'); });
   await monitor.run(); assert.equal(sends, 0);
@@ -145,7 +149,7 @@ test('小程序目录新建、发送失败持久化、重启重投，坏页面�
   monitor = make(async (p, options) => { if (p.title.includes('新增应用')) sends++; assert(options.deliveryId); return 'message-id'; });
   await monitor.run(); assert.equal(saved._notificationOutbox.length, 0);
   const before = sends; await monitor.run(); assert.equal(sends, before);
-  const broken = createMiniAppMonitor({ initial: saved, persist: s => { saved = structuredClone(s); }, fetchText: async () => '<h1>Error</h1>', deliver: async () => { throw Error('must not send'); } });
+  const broken = createMiniAppMonitor({ initial: saved, persist: s => { saved = structuredClone(s); }, fetchText: legacyDirectory(async () => '<h1>Error</h1>'), deliver: async () => { throw Error('must not send'); } });
   await broken.run(); assert.equal(saved.catalog.length, 2); assert.match(saved.lastError, /结构缺失/);
 });
 
@@ -160,7 +164,7 @@ test('停用 Agent Curve：旧队列先归档，目录失败或重启均不补�
   const delivered = [], requests = [];
   let broken = true;
   const make = () => createMiniAppMonitor({ initial: saved, persist: s => { saved = structuredClone(s); },
-    fetchText: async url => { requests.push(url); assert.match(url, /\/apps\?/); return broken ? '<h1>Error</h1>' : flight({ apps: [app] }); },
+    fetchText: legacyDirectory(async url => { requests.push(url); assert.match(url, /\/apps\?/); return broken ? '<h1>Error</h1>' : flight({ apps: [app] }); }),
     rpc: async () => assert.fail('停用市场不得查询 RPC'), deliver: async p => { delivered.push(p); return 'ok'; } });
   await make().run();
   assert.equal(delivered.length, 1); assert.match(delivered[0].content, /另一个应用/);
@@ -172,4 +176,25 @@ test('停用 Agent Curve：旧队列先归档，目录失败或重启均不补�
   assert.equal(delivered.length, 1); assert.equal(saved.disabledAppNotifications.length, 2);
   assert.deepEqual(saved.catalog, []); assert.equal(monitor.status().apps, 0);
   assert.equal(requests.length, 3); assert.equal(monitor.status().pending, 0);
+});
+
+test('新目录按公开 API 翻页，完整空目录有效，重复和不完整页面保留基线', async () => {
+  const requests = [];
+  const page = (total, items, nextCursor = null) => JSON.stringify({ total, items, nextCursor });
+  const rows = await fetchAppCatalog(async url => {
+    requests.push(new URL(url));
+    return requests.length === 1 ? page(2, [{ slug: 'corla', displayTitle: { zh: '发射台' } }], 'page+/2')
+      : page(2, [{ slug: 'agent-raise' }]);
+  });
+  assert.deepEqual(rows.map(row => [row.slug, row.name]), [['corla', '发射台'], ['agent-raise', 'agent-raise']]);
+  assert.equal(requests[0].searchParams.get('tab'), 'all');
+  assert.equal(requests[1].searchParams.get('cursor'), 'page+/2');
+  assert.deepEqual(await fetchAppCatalog(async () => page(0, [])), []);
+  await assert.rejects(fetchAppCatalog(async () => page(2, [{ slug: 'corla' }])), /总数不一致/);
+  await assert.rejects(fetchAppCatalog(async () => page(2, [{ slug: 'corla' }, { slug: 'corla' }])), /重复/);
+  await assert.rejects(fetchAppCatalog(async () => page(2, [], 'cursor')), /游标无效/);
+  assert.throws(() => parseRegistration('NEXT_HTTP_ERROR_FALLBACK;404', rows[0]), /目录已列出/);
+  assert.equal(parseRegistration(flight({ registration: { appId: 'corla-id', slug: 'corla' } }), rows[0]).appId, 'corla-id');
+  assert.throws(() => parseRegistration(flight({ registration: { appId: 'other', slug: 'corla' } }),
+    { ...rows[0], appId: 'expected' }), /身份不匹配/);
 });
