@@ -62,7 +62,10 @@ export async function probeRenderSource(url, previous = {}, { fetchFn = fetch, t
 // All queue mutations are short serialized transactions, never spanning I/O.
 export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, probe = probeRenderSource,
   now = Date.now, fallbackMs = 60000, minGapMs = 1500, stopped = () => false, log = () => {}, wake = () => {},
-  staticFingerprint = () => '', autoRun = true }) {
+  staticFingerprint = () => '', optionalUrls = [], optionalFallbackUrls = [], autoRun = true }) {
+  const targets = [...new Set([...urls, ...optionalUrls])];
+  const core = new Set(urls);
+  const periodic = new Set([...urls, ...optionalFallbackUrls]);
   let checking = false, running = false, closed = false, timer, writes = Promise.resolve();
   let lastCheckAt = 0, lastCheckDurationMs = 0, checkCount = 0, lastError = '', nextStartAt = 0;
   const recentChecks = [];
@@ -88,15 +91,22 @@ export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, pro
         try { return { url, result: await probe(url, read().pages[url] || {}), staticHash: staticFingerprint(url) }; }
         catch (e) { return { url, error: e.message }; }
       }));
+      for (const url of optionalUrls) {
+        const staticHash = staticFingerprint(url);
+        if (staticHash) results.push({ url, staticHash });
+      }
       if (closed || stopped()) return false;
       await mutate(async state => {
         for (const { url, result, error, staticHash } of results) {
           const old = state.pages[url] || {};
           const dom = store.state._frontendRendered?.pages[url];
-          const sourceChanged = result && old.fingerprint && (old.fingerprint !== result.fingerprint || (old.staticHash && staticHash && old.staticHash !== staticHash));
+          const changedStatic = old.staticHash && staticHash && old.staticHash !== staticHash;
+          const sourceChanged = core.has(url)
+            ? result && old.fingerprint && (old.fingerprint !== result.fingerprint || changedStatic)
+            : changedStatic;
           // Startup audit is staggered; retained DOM baselines are never reset.
-          const nextAuditAt = old.nextAuditAt ?? (dom?.hash ? start + urls.indexOf(url) * fallbackMs / urls.length : start);
-          const due = !dom?.hash || dom.candidateHash || dom.lastError || start >= nextAuditAt;
+          const nextAuditAt = old.nextAuditAt ?? (dom?.hash && core.has(url) ? start + urls.indexOf(url) * fallbackMs / urls.length : start);
+          const due = !dom?.hash || dom.candidateHash || dom.lastError || (periodic.has(url) && start >= nextAuditAt);
           const item = { ...old, ...(result || {}), staticHash: staticHash || old.staticHash || '', nextAuditAt, probeError: error || '', probeFailureAt: error ? old.probeFailureAt || start : 0 };
           if (sourceChanged || (due && !old.pending)) {
             item.revision = (old.revision || 0) + 1;
@@ -132,29 +142,52 @@ export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, pro
   async function runNext() {
     if (running || closed || stopped() || now() < nextStartAt) return false;
     const priority = p => p.reason === 'source-change' ? 0 : p.reason === 'confirm-removal' ? 1 : 2;
-    const job = Object.entries(read().pages).filter(([url, p]) => urls.includes(url) && p.pending && !(p.retryAt > now()))
-      .sort((a, b) => priority(a[1]) - priority(b[1]) || a[1].queuedAt - b[1].queuedAt)[0];
+    const available = Object.entries(read().pages).filter(([url, p]) => targets.includes(url) && p.pending && !(p.retryAt > now()))
+      .sort((a, b) => Number(core.has(b[0])) - Number(core.has(a[0])) || priority(a[1]) - priority(b[1]) || a[1].queuedAt - b[1].queuedAt);
+    const job = available[0];
     if (!job) return false;
-    running = true; const [url, request] = job; const startedAt = now();
+    const [url, request] = job;
+    const otherLocale = url.replace(/\/(en|zh-TW)(?=\/|$)/, (_, locale) => locale === 'en' ? '/zh-TW' : '/en');
+    // Collect a peer only when both change checks are already queued. Routine
+    // audits of existing pages keep their previous independent cadence.
+    const peer = available.find(([target, item]) => target !== url && target === otherLocale
+      && item.reason === request.reason && (item.reason !== 'audit' || !core.has(url)));
+    const batch = peer ? [job, peer] : [job];
+    running = true; const startedAt = now();
+    const errors = [];
     try {
-      await renderer.poll([url]);
+      await renderer.poll(batch.map(([target]) => target));
       if (closed || stopped()) return false;
-      const dom = store.state._frontendRendered?.pages[url];
-      if (!dom?.hash || dom.lastError) throw Error(dom?.lastError || '渲染未产生有效结果');
       await mutate(state => {
-        const item = state.pages[url];
-        item.lastRenderAt = now(); item.lastQueueDelayMs = startedAt - request.queuedAt;
-        item.lastRenderDurationMs = now() - startedAt; item.lastError = '';
-        item.nextAuditAt = now() + fallbackMs;
-        // An observation made during this render must survive its completion.
-        if (item.revision === request.revision) {
-          item.pending = !!dom.candidateHash; item.retryAt = 0;
-          if (item.pending) { item.reason = 'confirm-removal'; item.queuedAt = now(); }
+        for (const [target, scheduled] of batch) {
+          const item = state.pages[target];
+          const dom = store.state._frontendRendered?.pages[target];
+          if (!dom?.hash || dom.lastError) {
+            item.lastError = dom?.lastError || '渲染未产生有效结果';
+            if (item.revision === scheduled.revision) item.retryAt = now() + (core.has(target) ? 10000 : fallbackMs);
+            errors.push([target, item.lastError]);
+            continue;
+          }
+          item.lastRenderAt = now(); item.lastQueueDelayMs = startedAt - scheduled.queuedAt;
+          item.lastRenderDurationMs = now() - startedAt; item.lastError = '';
+          item.nextAuditAt = now() + fallbackMs;
+          // An observation made during this render must survive its completion.
+          if (item.revision === scheduled.revision) {
+            item.pending = !!dom.candidateHash; item.retryAt = 0;
+            if (item.pending) { item.reason = 'confirm-removal'; item.queuedAt = now(); }
+          }
         }
       });
-      return true;
+      for (const [target, error] of errors) log(`[前端渲染队列] ${new URL(target).pathname}：${error}`);
+      return errors.length < batch.length;
     } catch (error) {
-      await mutate(state => { const item = state.pages[url]; item.lastError = error.message; item.retryAt = now() + 10000; });
+      await mutate(state => {
+        for (const [target, scheduled] of batch) {
+          const item = state.pages[target];
+          item.lastError = error.message;
+          if (item.revision === scheduled.revision) item.retryAt = now() + (core.has(target) ? 10000 : fallbackMs);
+        }
+      });
       log(`[前端渲染队列] ${new URL(url).pathname}：${error.message}`);
       return false;
     } finally {
@@ -164,12 +197,14 @@ export function createRenderScheduler({ store, renderer, urls = RENDER_URLS, pro
   }
   return { poll, runNext, close() { closed = true; clearTimeout(timer); renderer.close(); },
     summary() {
-      const pages = Object.values(read().pages);
+      const pages = urls.map(url => read().pages[url]).filter(Boolean);
+      const optional = optionalUrls.map(url => read().pages[url]).filter(Boolean);
       const rendered = renderer.summary();
       return { ...rendered, running, checking, mode: 'on-demand', fallbackMs, minGapMs, lastCheckAt, lastCheckDurationMs, checkCount, recentChecks: [...recentChecks],
         probeError: lastError, pendingPages: pages.filter(p => p.pending).length,
         oldestQueuedAt: pages.some(p => p.pending) ? Math.min(...pages.filter(p => p.pending).map(p => p.queuedAt)) : 0,
         maxQueueDelayMs: Math.max(0, ...pages.map(p => p.lastQueueDelayMs || 0)),
-        pages: Object.fromEntries(urls.map(url => [url, { ...rendered.pages[url], ...read().pages[url] }])) };
+        optionalPages: optionalUrls.length, optionalPendingPages: optional.filter(p => p.pending).length,
+        pages: Object.fromEntries(targets.map(url => [url, { ...rendered.pages[url], ...read().pages[url] }])) };
     } };
 }

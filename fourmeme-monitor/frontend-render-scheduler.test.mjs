@@ -81,6 +81,46 @@ test('单页资源变化只调度受影响页面', async () => {
   await s.poll(); await s.runNext(); version = 'b'; await s.poll(); await s.runNext();
   assert.deepEqual(h.calls, [[urls[0]], [urls[0]]]);
 });
+
+test('补充公开页面复用静态指纹，核心页面优先，活动到期复核', async () => {
+  const h = harness();
+  const campaign = 'https://four.meme/en/campaign', bridge = 'https://four.meme/en/bridge';
+  const core = urls[0];
+  const probes = [];
+  let version = 'first';
+  const s = createRenderScheduler({ ...h.options, urls: [core], optionalUrls: [campaign, bridge], optionalFallbackUrls: [campaign],
+    probe: async url => { probes.push(url); return { fingerprint: 'core' }; },
+    staticFingerprint: url => url === bridge ? version : 'first' });
+  await s.poll();
+  await s.runNext();
+  await s.runNext();
+  await s.runNext();
+  assert.deepEqual(h.calls, [[core], [campaign], [bridge]]);
+  h.time(61000); await s.poll(); await s.runNext(); await s.runNext();
+  assert.deepEqual(h.calls.slice(3), [[core], [campaign]]);
+  assert.deepEqual(probes, [core, core]);
+  version = 'second'; await s.poll(); await s.runNext();
+  assert.deepEqual(h.calls.at(-1), [bridge]);
+  assert.equal(s.summary().optionalPendingPages, 0);
+});
+
+test('已经同时排队的双语资源变更同批验证，一页失败只保留该页任务', async () => {
+  const h = harness();
+  const zh = 'https://four.meme/zh-TW/create-token', en = urls[0];
+  h.store.state._frontendRendered.pages[zh] = { hash: 'dom', lastSuccessAt: 1000 };
+  const s = createRenderScheduler({ ...h.options, urls: [en, zh] });
+  const poll = h.renderer.poll;
+  h.renderer.poll = async targets => {
+    await poll(targets);
+    if (targets.length === 2) h.store.state._frontendRendered.pages[zh].lastError = 'offline';
+  };
+  await s.poll(); await s.runNext();
+  h.hash('new');
+  await s.poll(); await s.runNext();
+  assert.deepEqual(h.calls.at(-1), [en, zh]);
+  assert.equal(s.summary().pages[en].pending, false);
+  assert.equal(s.summary().pages[zh].pending, true);
+});
 test('渲染中继续轻量探测，新版本不能被旧任务完成确认', async () => {
   const h = harness(); let release;
   const original = h.renderer.poll;

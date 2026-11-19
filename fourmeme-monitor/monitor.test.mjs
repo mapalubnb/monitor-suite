@@ -2332,3 +2332,26 @@ test('后台指标回调脱离已取消前端事务，仍可读取有效快照',
   assert.equal(read, 7);
   __testables.setSnapshotForTests({});
 });
+
+test('公开模板通知直达详情，多模板与未公开模板链接目录', () => {
+  const item = { id: '1778027615733', name: '4STOCK', status: 'PUBLISHED' };
+  const detail = 'https://four.meme/zh-TW/contract/1778027615733';
+  const directory = 'https://four.meme/zh-TW/contract';
+  const one = { added: [item], statusChanged: [] };
+  assert.equal(__testables.openFourTemplateNoticeUrl(one), detail);
+  assert.ok(__testables.formatOpenFourTemplateChanges(one).includes(detail));
+  assert.equal(__testables.openFourTemplateNoticeUrl({ added: [item, { ...item, id: '5' }], statusChanged: [] }), directory);
+  assert.equal(__testables.openFourTemplateNoticeUrl({ added: [{ ...item, status: 'DRAFT' }], statusChanged: [] }), directory);
+});
+
+test('同预售的双语待确认通知合并，两种页面审批命令保留', () => {
+  const zh = 'https://four.meme/zh-TW/presale/102364633';
+  const en = 'https://four.meme/en/presale/102364633';
+  const other = 'https://four.meme/zh-TW/presale/101549127';
+  const result = __testables.groupActivityRouteNotifications([zh, en, other].map(url => ({ url, content: `route add ${url}` })));
+  assert.equal(result.length, 2);
+  assert.equal(result[0].url, zh);
+  assert.ok(result[0].content.includes(`route add ${zh}`));
+  assert.ok(result[0].content.includes(`route add ${en}`));
+  assert.equal(result[1].url, other);
+});

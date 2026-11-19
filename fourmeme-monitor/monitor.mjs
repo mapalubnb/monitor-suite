@@ -11,7 +11,7 @@ import { readFourmemeAddressConfig } from './address-catalog.mjs';
 import { createAddressRoundRpc } from './address-rpc.mjs';
 import { discoverCreators } from "./creator-discovery.mjs";
 import { withDeadline, withAbortSignal } from '../shared/request-deadline.mjs';
-import { createRenderClient, createFrontendRenderMonitor, pageContentQuality, isInfrastructureRoute } from './frontend-render.mjs';
+import { createRenderClient, createFrontendRenderMonitor, pageContentQuality, isInfrastructureRoute, PUBLIC_RENDER_URLS } from './frontend-render.mjs';
 import { createRenderScheduler } from './frontend-render-scheduler.mjs';
 import { createFrontendGuard, frontendSignal, assertFrontendActive, frontendStage, frontendRequest } from './frontend-lifecycle.mjs';
 /**
@@ -145,6 +145,8 @@ const CONFIG = {
     "https://four.meme/en/contract/collection",
     "https://four.meme/en/contract/create",
     "https://four.meme/en/contract/profile",
+    "https://four.meme/zh-TW/bridge",
+    "https://four.meme/en/bridge",
   ],
   frontendDiscoverySeedUrls: [
     "https://four.meme/en",
@@ -4490,6 +4492,22 @@ function buildFrontendNewPageNotification(page) {
   };
 }
 
+function groupActivityRouteNotifications(notifications) {
+  const groups = new Map();
+  for (const notification of notifications) {
+    const path = new URL(notification.url).pathname;
+    const event = path.match(/^\/(?:en|zh-TW)\/((?:presale|competition)\/\d+)$/)?.[1];
+    const key = event || notification.url;
+    const group = groups.get(key) || [];
+    group.push(notification);
+    groups.set(key, group);
+  }
+  return [...groups.values()].map(([first, ...peers]) => {
+    if (!peers.length) return first;
+    return { ...first, content: [first, ...peers].map(n => n.content).join('\n\n---\n\n') };
+  });
+}
+
 /* ── 路由/端点发现 ── */
 
 function extractRouteSignals(html, assetContents, nextData) {
@@ -6839,6 +6857,16 @@ function formatOpenFourTemplate(item) {
   return lines.join("\n");
 }
 
+function openFourTemplateDetailUrl(item) {
+  if (!/^\d+$/.test(item?.id || '') || !/^(?:PUBLISHED|CREATE_PAUSED)$/i.test(item.status || '')) return '';
+  return `${CONFIG.siteUrl}/zh-TW/contract/${item.id}`;
+}
+
+function openFourTemplateNoticeUrl(changes) {
+  const items = [...changes.added, ...changes.statusChanged.map(change => change.item)];
+  return (items.length === 1 ? openFourTemplateDetailUrl(items[0]) : '') || `${CONFIG.siteUrl}/zh-TW/contract`;
+}
+
 function formatOpenFourTemplateChanges(changes) {
   const lines = [];
   lines.push(`**接口：** \`POST /v1/public/token_template/search\``);
@@ -6849,6 +6877,8 @@ function formatOpenFourTemplateChanges(changes) {
   for (const item of changes.added) {
     const marker = String(item.status).toUpperCase() === "PUBLISHED" ? "🆕 新模板上线" : "🆕 新模板";
     lines.push(`**${marker}：${item.name || item.id}**`);
+    const target = openFourTemplateDetailUrl(item);
+    if (target) lines.push(pageLink(target, '查看模板详情'));
     for (const line of formatOpenFourTemplate(item).split("\n")) {
       const [key, ...rest] = line.split(":");
       lines.push(formatAddedLine(key.trim(), rest.join(":").trim(), 180));
@@ -6859,6 +6889,8 @@ function formatOpenFourTemplateChanges(changes) {
   for (const c of changes.statusChanged) {
     const marker = String(c.newStatus).toUpperCase() === "PUBLISHED" ? "🚀 模板已发布" : "🔄 模板状态变化";
     lines.push(`**${marker}：${c.item.name || c.item.id}**`);
+    const target = openFourTemplateDetailUrl(c.item);
+    if (target) lines.push(pageLink(target, '查看模板详情'));
     lines.push(`- id: ${diffSnippet(c.item.id)}`);
     lines.push(formatValueChangeLine("status", c.oldStatus || "空", c.newStatus || "空"));
     if (c.item.tag) lines.push(`- tag: ${diffSnippet(c.item.tag)}`);
@@ -6904,7 +6936,7 @@ async function runOpenFourTemplateCheck() {
     const content = formatOpenFourTemplateChanges(changes);
     await saveSnapshot(snapshot);
     appendHistory("openfour", title, content.slice(0, 300), content);
-    await sendNotificationMaybeAi({ title, content, template: "orange", moduleContext: "Four.meme OpenFour 业务模板变更", url: `${CONFIG.siteUrl}/zh-TW/contract/create` });
+    await sendNotificationMaybeAi({ title, content, template: "orange", moduleContext: "Four.meme OpenFour 业务模板变更", url: openFourTemplateNoticeUrl(changes) });
   }
 
   if (snapshotChanged || hasChanges) {
@@ -9859,7 +9891,7 @@ async function runFrontendCheck() {
   }
 
   if (routeDiscoveryNotifications.length > 0) {
-    const dedupedRouteNotifications = filterFrontendDedupe(routeDiscoveryNotifications, snapshot);
+    const dedupedRouteNotifications = groupActivityRouteNotifications(filterFrontendDedupe(routeDiscoveryNotifications, snapshot));
     frontendMetrics.notifications += dedupedRouteNotifications.length;
     await saveSnapshot(snapshot);
     for (const n of dedupedRouteNotifications) {
@@ -10358,10 +10390,13 @@ const fourmemeAddressMonitor = createFourmemeAddressMonitor({
 const frontendRenderClient = createRenderClient();
 const frontendRenderer = createFrontendRenderMonitor({
   store: monitorStore, client: frontendRenderClient, stopped: () => monitorStopping, log,
+  optionalUrls: PUBLIC_RENDER_URLS,
   wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[前端渲染 推送] ${error.message}`)); },
 });
 const frontendRenderMonitor = createRenderScheduler({
   store: monitorStore, renderer: frontendRenderer, stopped: () => monitorStopping, log,
+  optionalUrls: PUBLIC_RENDER_URLS,
+  optionalFallbackUrls: PUBLIC_RENDER_URLS.filter(url => /\/(?:campaign|announcement)$/.test(url)),
   wake: () => { if (!IS_TEST_MODE && !monitorStopping) void monitorStore.drain().catch(error => log(`[前端轻量 推送] ${error.message}`)); },
   staticFingerprint: url => {
     const p = monitorStore.state.frontendPages?.[urlToKey(url)];
@@ -10627,6 +10662,8 @@ export const __testables = {
   formatApiValueChanges,
   formatFrontendSignalChanges,
   formatOpenFourTemplateChanges,
+  openFourTemplateNoticeUrl,
+  groupActivityRouteNotifications,
   diffOpenFourPresetIds,
   formatOpenFourPresetIdChanges,
   formatOpenFourNewModules,

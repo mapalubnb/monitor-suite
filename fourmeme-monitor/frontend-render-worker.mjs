@@ -1,7 +1,7 @@
 import { chromium } from 'playwright-core';
 import { existsSync } from 'node:fs';
 import { setPriority } from 'node:os';
-import { collectRenderedDom, normalizeRenderedDom, RENDER_URLS } from './frontend-render.mjs';
+import { ADVANCED_FILTER, ADVANCED_PANEL, CREATE_OPEN_MODE, collectRenderedDom, normalizeRenderedDom, PUBLIC_RENDER_URLS, RENDER_URLS } from './frontend-render.mjs';
 
 let server, browser, context, page, busy = false;
 // Lower priority only for this worker and its subsequently spawned browser.
@@ -16,8 +16,47 @@ async function launch() {
   context = await browser.newContext({ locale: 'en-US', viewport: { width: 1440, height: 1000 }, serviceWorkers: 'block' });
 }
 
+async function readInteractiveDetails(page, data, url, deadline) {
+  const timeLeft = () => {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw Error('公开控件核验超过页面时限');
+    return { timeout: remaining };
+  };
+  if (/\/create-token$/.test(url) && data.tabs.some(name => CREATE_OPEN_MODE.test(name))) {
+    const tab = page.locator('main').getByRole('tab', { name: CREATE_OPEN_MODE });
+    await tab.dispatchEvent('click', {}, timeLeft());
+    await tab.and(page.locator('[aria-selected="true"]')).waitFor(timeLeft());
+    const openMode = await page.evaluate(collectRenderedDom);
+    if (!CREATE_OPEN_MODE.test(openMode.selectedTab) || openMode.detailFields.length < 3 || !openMode.headings.length) {
+      throw Error('创建页开放模式尚未完整渲染');
+    }
+    const { selectedTab, headings, tabs, labels, buttons, detailFields, switches } = openMode;
+    data.openMode = { selectedTab, headings, tabs, labels, buttons, detailFields, switches };
+  }
+  if (/\/advanced$/.test(url)) {
+    const panels = page.locator(`${ADVANCED_PANEL}:visible`);
+    for (const [index, column] of data.columns.entries()) {
+      if (!column.controls.some(name => ADVANCED_FILTER.test(name))) continue;
+      const filter = panels.nth(index).getByRole('button', { name: ADVANCED_FILTER });
+      // The column can be outside the horizontal viewport. Only open the
+      // verified filters popover, without altering its settings or inputs.
+      await filter.dispatchEvent('click', {}, timeLeft());
+      const open = filter.and(page.locator('[aria-expanded="true"]'));
+      await open.waitFor(timeLeft());
+      const filterId = await open.getAttribute('aria-controls', timeLeft());
+      column.filter = await page.evaluate(collectRenderedDom, { layer: 'filter', filterId });
+      if (!column.filter) throw Error(`Advanced 筛选面板未完成渲染：${column.label}`);
+      await open.dispatchEvent('click', {}, timeLeft());
+      await filter.and(page.locator('[aria-expanded="false"]')).waitFor(timeLeft());
+    }
+    const verified = await page.evaluate(collectRenderedDom, { layer: 'columns' });
+    if (data.columns.map(column => column.label).join('\n') !== verified.join('\n')) throw Error('Advanced 市场栏目仍在加载');
+  }
+  data.captureVersion = 2;
+}
+
 async function scan(urls, id) {
-  if (urls.some(url => !RENDER_URLS.includes(url))) throw Error('拒绝非公开监控目标');
+  if (urls.some(url => !RENDER_URLS.includes(url) && !PUBLIC_RENDER_URLS.includes(url))) throw Error('拒绝非公开监控目标');
   await launch();
   // Reuse only this worker's anonymous context and normal HTTP cache. Routing
   // every request disables Chromium's cache and repeatedly cold-loads ~50 JS
@@ -37,6 +76,7 @@ async function scan(urls, id) {
         await new Promise(resolve => setTimeout(resolve, 200));
       } while (Date.now() < deadline);
       if (error) throw error;
+      await readInteractiveDetails(page, data, url, deadline);
       results.push({ url, data });
     } catch (error) { results.push({ url, error: error.message.split('\n')[0].slice(0, 300) }); }
     finally {

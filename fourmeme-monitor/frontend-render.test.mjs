@@ -33,11 +33,13 @@ test('稳定DOM指纹排除价格余额和动态代币列表', () => {
   assert.ok(a.signals.includes('选项卡：開放模式'));
 });
 test('4Stock兑换按钮变化被保留，价格不参与比较', () => {
-  const r = raw({ url: stock, buttons: ['鑄造', '贖回', '1 RYDE ≈ $1.1'], fields: ['input|text|'] });
+  const r = raw({ url: stock, stockReady: true, buttons: ['鑄造', '贖回', '1 RYDE ≈ $1.1'], fields: ['input|text|'] });
   const a = normalizeRenderedDom(r, stock);
   const b = normalizeRenderedDom({ ...r, buttons: ['鑄造', '贖回', '兌換', '1 RYDE ≈ $2.1'] }, stock);
   assert.notEqual(a.hash, b.hash);
   assert.ok(b.signals.includes('按钮：兌換'));
+  assert.throws(() => normalizeRenderedDom({ ...r, stockReady: false }, stock), /资产选择器尚未就绪/);
+  assert.ok(!normalizeRenderedDom({ ...r, buttons: ['贖回'] }, stock).signals.includes('按钮：鑄造'));
 });
 test('静态业务阈值和费用说明中的数字不因行情降噪被过滤', () => {
   const a = normalizeRenderedDom(raw({ labels: ['市值超過 200 萬美元後，將自動作為基礎代幣上架。'] }), url);
@@ -52,12 +54,15 @@ test('排除基础设施伪路由，保留真实4Stock入口', () => {
   for (const route of ['/cdn-cgi/content', '/zh-TW/cdn-cgi/content', '/images/ui-redesign', '/en/images/ui-redesign']) assert.equal(isInfrastructureRoute(route), true);
   assert.equal(isInfrastructureRoute('/zh-TW/4stock'), false);
 });
-test('首页仅比较导航，不因匿名行情区未显示或列表刷新改变指纹', () => {
+test('首页比较导航与稳定控件，动态市场卡片和价格不改变指纹', () => {
   const u = 'https://four.meme/zh-TW';
   const navigation = ['/', '/4stock', '/contract', '/advanced', '/agentic', '/campaign'].map(p => ({ text: p, href: '/zh-TW' + p }));
   const a = normalizeRenderedDom(raw({ url: u, mainText: 'Four.meme Fair Launch', navigation, fields: [], buttons: ['它如何運作?'] }), u);
-  const b = normalizeRenderedDom(raw({ url: u, mainText: 'Four.meme Fair Launch TOKEN 999', navigation, headings: ['Dynamic Token'], fields: ['input|text|Search'], buttons: ['Search', 'Token 99'] }), u);
+  const b = normalizeRenderedDom(raw({ url: u, mainText: 'Four.meme Fair Launch TOKEN 999', navigation, headings: ['Dynamic Token'], fields: ['input|text|Search'], buttons: ['Token 99'] }), u);
   assert.equal(a.hash, b.hash);
+  const controls = normalizeRenderedDom(raw({ url: u, navigation, buttons: ['Search', 'All Token'] }), u);
+  assert.ok(controls.signals.includes('页面控件：Search'));
+  assert.ok(controls.signals.includes('页面控件：All Token'));
 });
 
 function harness(target = url, data = raw()) {
@@ -136,9 +141,70 @@ test('真实功能新增立即入队，删除需两次连续成功确认', async
   const h = harness(); await h.monitor.poll();
   h.result([{ url, data: raw({ tabs: ['經典模式', '開放模式', '新模式'] }) }]); await h.monitor.poll();
   assert.equal(h.notices().length, 2);
+  assert.equal(h.notices()[1].payload.url, url);
   h.result([{ url, data: raw() }]); await h.monitor.poll(); assert.equal(h.notices().length, 2);
   await h.monitor.poll(); assert.equal(h.notices().length, 3);
   assert.match(h.notices()[2].payload.content, /新模式/);
+});
+
+test('升级只补齐已知结构维度，两个创建模式与同名字段各自保留', async () => {
+  const base = raw();
+  const h = harness(url, base);
+  await h.monitor.poll();
+  const classicFields = [
+    { name: 'name', label: '', type: 'text' },
+    { name: 'shortName', label: '', type: 'text' },
+    { name: 'webUrl', label: '選填', type: 'text' },
+    { name: 'twitterUrl', label: '選填', type: 'text' },
+  ];
+  const updated = raw({ captureVersion: 2, selectedTab: '經典模式', detailFields: classicFields,
+    openMode: raw({ selectedTab: '開放模式', headings: ['選擇認證合約'], detailFields: classicFields }),
+    headings: [...base.headings, '真实新增'] });
+  h.result([{ url, data: updated }]);
+  await h.monitor.poll();
+  const stored = h.store.state._frontendRendered.pages[url];
+  for (const mode of ['經典模式', '開放模式']) {
+    assert.ok(stored.signals.includes(`表单字段：${mode} / 選填 [webUrl] text`));
+    assert.ok(stored.signals.includes(`表单字段：${mode} / 選填 [twitterUrl] text`));
+  }
+  assert.match(h.notices()[1].payload.content, /真实新增/);
+  assert.doesNotMatch(h.notices()[1].payload.content, /選擇認證合約|\[webUrl\]/);
+});
+
+test('同批双语栏目匹配为一个变更，两页入口都保留', async () => {
+  const en = 'https://four.meme/en/advanced';
+  const zh = 'https://four.meme/zh-TW/advanced';
+  const page = (url, button, label, controls = []) => raw({ url, advancedBoardReady: true,
+    headings: [label], buttons: [button], columns: [{ label, controls }],
+    navigation: ['4stock', 'advanced', 'contract', 'agentic'].map(path => ({ text: path, href: new URL(path, url).pathname })) });
+  const first = [page(en, 'Filters', 'Hot'), page(zh, '篩選', '熱度')];
+  const h = harness();
+  const monitor = createFrontendRenderMonitor({ store: h.store, client: h.client, urls: [en, zh] });
+  h.result(first.map(data => ({ url: data.url, data })));
+  await monitor.poll();
+  assert.ok(h.store.state._frontendRendered.pages[en].signals.includes('按钮：Filters'));
+  h.result(first.map((data, i) => ({ url: data.url, data: { ...data,
+    columns: [{ ...data.columns[0], controls: [i ? '暫停更新' : 'Pause updates'] }] } })));
+  await monitor.poll();
+  const event = h.notices()[1].payload;
+  assert.ok(event.content.includes(en) && event.content.includes(zh));
+  assert.equal((event.content.match(/暂停\/继续更新/g) || []).length, 1);
+});
+
+test('活动基线静默建立，详情按实际语言路由跳转，公告保留列表地址', async () => {
+  const target = 'https://four.meme/zh-TW/campaign';
+  const detail = 'https://four.meme/zh-TW/presale/102364633';
+  const page = ids => raw({ url: target, links: ids.map(id => ({ href: `/presale/${id}`, text: `已結束 Main Event ${id}` })) });
+  const h = harness(target, page([1]));
+  const monitor = createFrontendRenderMonitor({ store: h.store, client: h.client, urls: [], optionalUrls: [target] });
+  await monitor.poll([target]);
+  assert.equal(h.notices().length, 0);
+  h.result([{ url: target, data: page([1, 102364633]) }]);
+  await monitor.poll([target]);
+  assert.equal(h.notices()[0].payload.url, detail);
+  assert.match(h.notices()[0].payload.content, /\/zh-TW\/presale\/102364633/);
+  const announcement = 'https://four.meme/en/announcement';
+  assert.deepEqual(normalizeRenderedDom(raw({ url: announcement, articles: ['Four.meme Change 2026.11.19'] }), announcement).signalUrls, {});
 });
 test('渲染失败保留有效基线并打断删除确认，不污染静态快照', async () => {
   const h = harness(); await h.monitor.poll(); const original = h.store.state._frontendRendered.pages[url].hash;
