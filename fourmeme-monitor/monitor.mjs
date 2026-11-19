@@ -1071,9 +1071,12 @@ const isTooLongForSingleCard = isMultiPartCard;
  * 先推裸 diff（秒级送达），AI 摘要完成后自动编辑原消息补充分析
  * @param {string} [url] - 监控目标网址，展示在卡片最上方
  */
+function notificationUrlLine(url, cardOpts = {}) {
+  return url && cardOpts.showDetailLink !== false ? `🔗 [查看详情](${url})\n\n` : "";
+}
+
 async function sendThenEnrichWithAi(title, content, template, moduleContext, aiInput, enrichFn, diffFilePath, url, cardOpts = {}) {
-  // 卡片最上方加入监控目标网址
-  const urlLine = url ? `🔗 [查看详情](${url})\n\n` : "";
+  const urlLine = notificationUrlLine(url, cardOpts);
   const initialContent = urlLine + content;
   // 1. 立即推送裸 diff（秒级送达）
   let messageId = await sendCardViaApi(title, initialContent, template, diffFilePath, 2, cardOpts);
@@ -1195,7 +1198,7 @@ async function sendNotificationMaybeAi(payload) { return monitorStore.enqueue(pa
 
 async function deliverNotification({ title, content, template = "red", moduleContext = "", aiInput, enrichFn, diffFilePath, url, cardOpts = {}, skipAi = false }) {
   if (!shouldUseAiForNotification({ title, content, moduleContext, aiInput, skipAi })) {
-    const urlLine = url ? `🔗 [查看详情](${url})\n\n` : "";
+    const urlLine = notificationUrlLine(url, cardOpts);
     let messageId = await sendCardViaApi(title, urlLine + content, template, diffFilePath, 2, cardOpts || {});
     if (!messageId && !cardOpts.deliveryId) {
       log(`[推送] AI 已跳过，立即通道失败，切换队列兜底：${title}`);
@@ -5723,6 +5726,14 @@ function compactFrontendUrlList(pages) {
   return result;
 }
 
+function compactFrontendPageCard({ title, content, pageLabel }) {
+  if (!pageLabel || !title.endsWith(`：${pageLabel}`)) return content;
+  for (const heading of [`**页面：${pageLabel}**\n`, `**📄 ${pageLabel}**\n`]) {
+    if (content.startsWith(heading)) return content.slice(heading.length).trimStart();
+  }
+  return content;
+}
+
 function buildMergedFrontendAssetNotification(group) {
   const pages = compactFrontendUrlList(group.pages);
   const pageCount = pages.length;
@@ -5756,6 +5767,7 @@ function buildMergedFrontendAssetNotification(group) {
     title,
     content: lines.join("\n"),
     template: group.template || "orange",
+    pageLabel: pageCount === 1 ? pages[0].label : undefined,
     fullDiff: group.fullDiffs.filter(Boolean).join("\n\n"),
     url: pages[0]?.url || CONFIG.siteUrl,
     dedupeKey: group.signature ? `frontend:asset:${group.signature}` : undefined,
@@ -10193,9 +10205,10 @@ async function runFrontendCheck() {
     await saveSnapshot(snapshot);
     for (const n of dedupedNotifications) {
       n.title = normalizeFrontendNotificationTitle(n.title, n.url);
+      const content = compactFrontendPageCard(n);
       appendHistory("frontend", n.title, n.content.slice(0, 300), n.content);
       const diffFilePath = n.fullDiff ? saveDiffLocally(n.title, n.fullDiff) : null;
-      await sendNotificationMaybeAi({ title: n.title, content: n.content, template: n.template, moduleContext: `Four.meme 前端变更 ${n.title}`, aiInput: n.aiInput, diffFilePath, url: n.url, cardOpts: n.cardOpts || {}, skipAi: n.skipAi });
+      await sendNotificationMaybeAi({ title: n.title, content, template: n.template, moduleContext: `Four.meme 前端变更 ${n.title}`, aiInput: n.aiInput, diffFilePath, url: n.url, cardOpts: n.cardOpts || {}, skipAi: n.skipAi });
     }
   } else if (snapshotDirty || failCountChanged) {
     await saveSnapshot(snapshot);
@@ -10651,6 +10664,8 @@ export const __testables = {
   isGlobalI18nResourceEvidenceSufficient,
   shouldConfirmI18nRemoval,
   frontendNotificationDedupeKey,
+  notificationUrlLine,
+  compactFrontendPageCard,
   shouldUseAiForNotification,
   isTooLongForSingleCard,
   buildFrontendFailureNotifications,

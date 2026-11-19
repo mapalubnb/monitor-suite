@@ -5,6 +5,7 @@ import { parseHTML } from 'linkedom';
 import vm from 'node:vm';
 import { collectRenderedDom, normalizeRenderedDom, pageContentQuality, isInfrastructureRoute, createRenderClient, createFrontendRenderMonitor } from './frontend-render.mjs';
 import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
+import { buildCardJson } from '../shared/feishu-client.mjs';
 
 const url = 'https://four.meme/zh-TW/create-token';
 const stock = 'https://four.meme/zh-TW/4stock';
@@ -204,6 +205,32 @@ test('同批双语栏目匹配为一个变更，两页入口都保留', async ()
   const event = h.notices()[1].payload;
   assert.ok(event.content.includes(en) && event.content.includes(zh));
   assert.equal((event.content.match(/暂停\/继续更新/g) || []).length, 1);
+  assert.equal(event.template, 'green');
+  assert.ok(event.content.includes(`[英文](${en}) / [繁中](${zh})`));
+});
+
+test('可见功能卡合并同类栏目，保留新增、已确认移除和单一灰色时间', async () => {
+  const u = 'https://four.meme/en/advanced';
+  const initial = raw({ url: u, advancedBoardReady: true, headings: ['Hot'],
+    navigation: ['4stock', 'advanced', 'contract', 'agentic'].map(path => ({ text: path, href: `/en/${path}` })) });
+  const h = harness(u, initial);
+  await h.monitor.poll();
+  h.result([{ url: u, data: { ...initial, headings: ['Graduated', 'Trading Volume'] } }]);
+  await h.monitor.poll();
+  assert.equal(h.notices().length, 1);
+  await h.monitor.poll();
+  const { title, content, template, url, cardOpts } = h.notices()[1].payload;
+  assert.equal(url, u);
+  assert.equal(cardOpts.showDetailLink, false);
+  assert.equal(template, 'orange');
+  const card = JSON.parse(buildCardJson(title, content, template, cardOpts));
+  const [heading, body, time] = card.body.elements;
+  assert.equal(heading.text.content, `📍 [Advanced · 英文](${u})`);
+  assert.equal(heading.text.text_size, 'heading');
+  assert.match(body.content, /<font color="green">🟢 新增 2<\/font>\n栏目 · Graduated \/ Trading Volume/);
+  assert.match(body.content, /<font color="red">🔴 移除 1 · 两次确认<\/font>\n栏目 · Hot/);
+  assert.deepEqual([time.text.content, time.text.text_color], ['更新时间：1970/1/1 08:00:01.000', 'grey']);
+  assert.equal(card.body.elements.length, 3);
 });
 
 test('筛选面板超时独立保留字段，栏目其他变化仍然入队', async () => {

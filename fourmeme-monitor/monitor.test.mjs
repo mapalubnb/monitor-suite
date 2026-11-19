@@ -2355,3 +2355,19 @@ test('同预售的双语待确认通知合并，两种页面审批命令保留',
   assert.ok(result[0].content.includes(`route add ${en}`));
   assert.equal(result[1].url, other);
 });
+
+test('已有页面直达入口的卡不重复显示通用链接，其余卡沿用通用入口', () => {
+  const url = 'https://four.meme/en/advanced';
+  assert.equal(__testables.notificationUrlLine(url, { showDetailLink: false }), '');
+  assert.equal(__testables.notificationUrlLine(url), `🔗 [查看详情](${url})\n\n`);
+});
+
+test('静态单页卡只精简标题中已有的第一行页名，保留技术差异和多页内容', () => {
+  const pageLabel = '/en/advanced';
+  const evidence = '**文案变更：**\n+ New option\n---\n**页面级附加变更：**\n更多资料';
+  for (const heading of [`**页面：${pageLabel}**`, `**📄 ${pageLabel}**`]) {
+    const input = { title: `前端文案变更：${pageLabel}`, pageLabel, content: `${heading}\n\n${evidence}` };
+    assert.equal(__testables.compactFrontendPageCard(input), evidence);
+    assert.equal(__testables.compactFrontendPageCard({ ...input, title: '前端变更（影响 2 页）' }), input.content);
+  }
+});

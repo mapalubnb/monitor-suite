@@ -12,6 +12,10 @@ export const ADVANCED_FILTER = /^(?:篩選|筛选|Filters?)$/i;
 export const CREATE_OPEN_MODE = /^(?:開放模式|开放模式|Open(?: Mode)?)$/i;
 
 const profileFor = pathname => pathname.split('/').filter(Boolean)[1] || 'home';
+const pageNames = {
+  home: '首页', advanced: 'Advanced', 'create-token': '创建代币', '4stock': '4Stock',
+  contract: 'Open Four', agentic: 'Agentic', campaign: '活动', announcement: '公告', bridge: '跨链桥',
+};
 
 export function isInfrastructureRoute(route) {
   return /^\/(?:en\/|zh-TW\/)?(?:cdn-cgi|images|assets|fonts)(?:\/|$)/i.test(route);
@@ -195,20 +199,45 @@ function groupRenderedChanges(changes) {
 }
 
 function formatRenderedChanges(changes) {
-  const link = url => `[${new URL(url).pathname}](${url})`;
+  const link = (url, label) => `[${label}](${url})`;
+  const locale = url => new URL(url).pathname.split('/')[1] === 'zh-TW' ? '繁中' : '英文';
   const sections = groupRenderedChanges(changes).map(group => {
     const change = group[0];
-    const format = (list, prefix, sign, urls) => list.length ? prefix + '\n' + list.map(value => {
-      const target = urls?.[value];
-      return sign + value + (target ? ` · ${link(target)}` : '');
-    }).join('\n') : '';
+    const path = new URL(change.url).pathname;
+    const profile = profileFor(path);
+    const name = pageNames[profile] || path;
+    const heading = group.length === 1
+      ? link(change.url, `${name} · ${locale(change.url)}`)
+      : `${name} · ${group.map(p => link(p.url, locale(p.url))).join(' / ')}`;
+    const format = (list, removed, urls) => {
+      if (!list.length) return '';
+      const rows = [], sameType = new Map();
+      for (const value of list) {
+        const target = urls?.[value];
+        const label = value.match(/^(标题|选项卡|按钮|功能)：(.+)$/);
+        if (!target && label) {
+          const type = label[1] === '标题' && profile === 'advanced' ? '栏目' : label[1];
+          if (!sameType.has(type)) {
+            const names = [];
+            sameType.set(type, names);
+            rows.push({ type, names });
+          }
+          sameType.get(type).push(label[2]);
+        } else {
+          rows.push(target ? `${value} · ${link(target, '详情')}` : value);
+        }
+      }
+      const status = removed ? `🔴 移除 ${list.length} · 两次确认` : `🟢 新增 ${list.length}`;
+      return [`<font color="${removed ? 'red' : 'green'}">${status}</font>`,
+        ...rows.map(row => typeof row === 'string' ? row : `${row.type} · ${row.names.join(' / ')}`)].join('\n');
+    };
     const localizedDetails = group.slice(1).flatMap(peer =>
       [...new Set([...peer.added.map(value => peer.addedUrls?.[value]), ...peer.removed.map(value => peer.removedUrls?.[value])].filter(Boolean))]);
     return [
-      group.map(p => link(p.url)).join(' · '),
-      format(change.added, '新增：', '＋ ', change.addedUrls),
-      format(change.removed, '移除（连续两次确认）：', '－ ', change.removedUrls),
-      localizedDetails.length ? localizedDetails.map(link).join(' · ') : '',
+      `## 📍 ${heading}`,
+      format(change.added, false, change.addedUrls),
+      format(change.removed, true, change.removedUrls),
+      localizedDetails.length ? `详情 · ${localizedDetails.map(target => link(target, locale(target))).join(' / ')}` : '',
     ].filter(Boolean).join('\n');
   });
   const first = changes[0];
@@ -497,7 +526,11 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
         if (initialized.length) notices.push(notice('Four.meme 页面渲染覆盖已补齐', `首次建立以下页面的渲染基线（不代表这些功能刚刚上线）：\n${initialized.map(p => `${new URL(p.url).pathname}：${p.signals.filter(s => /标题：|选项卡：|功能：|按钮：(?:鑄造|贖回|兌換|Mint|Redeem|Convert)/.test(s)).slice(0, 10).join('；') || '导航与功能控件'}`).join('\n')}\n时间：${formatBeijingTime(now())}`));
         if (changes.length) {
           const { content, url } = formatRenderedChanges(changes);
-          notices.push(notice('Four.meme 页面可见功能变更', `${content}\n时间：${formatBeijingTime(now())}`, 'orange', url));
+          const template = changes.some(change => change.removed.length) ? 'orange' : 'green';
+          notices.push({
+            ...notice('Four.meme 页面可见功能变更', `${content}\n更新时间：${formatBeijingTime(now())}`, template, url),
+            cardOpts: { showDetailLink: false },
+          });
         }
         const health = state.health;
         // A partial scan must not declare unvisited failed pages recovered.
