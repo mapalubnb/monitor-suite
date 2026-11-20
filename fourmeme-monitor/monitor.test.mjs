@@ -1326,6 +1326,23 @@ test("header-only frontend diff is not considered meaningful", () => {
   assert.equal(__testables.hasMeaningfulFrontendDiffBody(diffText), false);
 });
 
+test('同秒同标题的前端差异附件不会互相覆盖', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'fourmeme-same-title-diff-'));
+  try {
+    const en = '新增 3 个独立英文 i18n 键\n'.repeat(8);
+    const zh = '新增 7 个独立繁中 i18n 键\n'.repeat(8);
+    const name = '前端功能上线确认：common';
+    const first = __testables.saveDiffLocally(name, en, dir);
+    const second = __testables.saveDiffLocally(name, zh, dir);
+    assert.match(first, /_[a-f0-9]{16}\.txt$/);
+    assert.notEqual(first, second);
+    assert.equal(readFileSync(first, 'utf8'), en);
+    assert.equal(readFileSync(second, 'utf8'), zh);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("frontend notification dedupe key ignores full diff timestamps", () => {
   const base = {
     title: "前端 i18n 资源变更（影响 2 页）",
@@ -2192,6 +2209,32 @@ test('i18n 真实移除需来源页当前资源证据，旧静态字符串不冒
   assert.equal(notifications.length, 1);
   assert.match(notifications[0].content, /资源键已移除/);
   assert.match(notifications[0].fullDiff, /移除|删除/);
+});
+
+test('i18n 历史批次因单键缺失误确认后安全重开，混合批次要求逐键缺失和积极证据', () => {
+  const state = {};
+  const url = 'https://four.meme/zh-TW/contract';
+  const { item } = __testables.registerGlobalI18nResourceWatch(state, {
+    locale: 'zh-TW', pages: [{ url }], changes: [
+      { type: 'added', key: 'contract.new', value: '全新功能標題' },
+      { type: 'removed', key: 'contract.removed.one', value: '功能一' },
+      { type: 'removed', key: 'contract.removed.two', value: '功能二' },
+    ],
+  });
+  const at = item.firstSeenAt + 90_000;
+  const page = { originalUrl: url, textContent: '', i18nHash: 'valid', i18nStrings: { 'contract.removed.two': '功能二' } };
+  const notify = time => __testables.confirmGlobalI18nResourceWatches(state, { page }, { at: time }).notifications;
+  Object.assign(item, { lastSeenAt: at - 86400_000, status: 'confirmed', confirmedAt: at, confirmationNotifiedAt: at,
+    evidence: [{ type: 'resource_absent', detail: 'contract.removed.one', strength: 'strong' }] });
+  assert.deepEqual(notify(at + 1), []);
+  assert.equal(item.status, 'pending');
+  assert.equal(item.confirmationNotifiedAt, 0);
+  item.lastSeenAt = at;
+  assert.deepEqual(notify(at + 2), []);
+  page.i18nStrings = { 'contract.other': '剩餘功能' };
+  assert.deepEqual(notify(at + 3), []);
+  page.textContent = '全新功能標題';
+  assert.equal(notify(at + 4).length, 1);
 });
 
 test("failed static asset expansion candidates are cooled down", () => {

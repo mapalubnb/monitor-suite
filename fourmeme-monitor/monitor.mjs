@@ -1218,12 +1218,11 @@ async function deliverNotification({ title, content, template = "red", moduleCon
  * @param {string} diffText - 完整 diff 文本内容
  * @returns {string|null} 本地文件路径（供卡片按钮引用），内容过短时返回 null
  */
-function saveDiffLocally(title, diffText) {
+function saveDiffLocally(title, diffText, diffDir = join(__dirname, "diffs")) {
   assertFrontendActive();
   if (!diffText || diffText.length < 50) return null;
   if (!hasMeaningfulFrontendDiffBody(diffText)) return null;
   try {
-    const diffDir = join(__dirname, "diffs");
     if (!existsSync(diffDir)) mkdirSync(diffDir, { recursive: true });
     const safeName = title.replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]/g, "_").slice(0, 40);
     const now = new Date();
@@ -1236,7 +1235,8 @@ function saveDiffLocally(title, diffText) {
       String(now.getMinutes()).padStart(2, "0"),
       String(now.getSeconds()).padStart(2, "0"),
     ].join("");
-    const fileName = `diff_${safeName}_${dateStr}.txt`;
+    const digest = createHash("sha256").update(diffText).digest("hex").slice(0, 16);
+    const fileName = `diff_${safeName}_${dateStr}_${digest}.txt`;
     const filePath = join(diffDir, fileName);
     writeFileSync(filePath, diffText, "utf-8");
     log(`[diff文件] 已保存: ${filePath} (${diffText.length} 字)`);
@@ -3843,6 +3843,7 @@ function preserveOldI18nSnapshot(newData, oldData) {
 }
 
 const I18N_RESOURCE_SETTLE_MS = 90_000;
+const I18N_REMOVAL_EVIDENCE_MAX_AGE_MS = 30 * 60_000;
 
 function frontendResourceLocale(url) {
   return String(url || "").match(/^https:\/\/four\.meme\/(en|zh-TW)(?:[/?#]|$)/)?.[1] || "";
@@ -3995,11 +3996,12 @@ function finishSearchSteps(iterator) {
   do { step = iterator.next(); } while (!step.done);
   return step.value;
 }
-function* globalI18nResourceSteps(item, pages = {}, cache = new Map()) {
+function* globalI18nResourceSteps(item, pages = {}, cache = new Map(), at = Date.now()) {
   const evidence = [];
   const seen = new Set();
   const locale = globalI18nWatchLocale(item);
-  const sources = new Set((item.pages || []).map(page => canonicalFrontendUrl(page.url || "")));
+  const recent = isRecentI18nRemoval(item, at);
+  const sources = new Set(recent ? (item.pages || []).map(page => canonicalFrontendUrl(page.url || "")) : []);
 
   function addEvidence(type, page, detail, strength = "strong") {
     const url = page?.originalUrl || "";
@@ -4055,6 +4057,29 @@ function* globalI18nResourceSteps(item, pages = {}, cache = new Map()) {
 
 function isGlobalI18nResourceEvidenceSufficient(evidence = []) {
   return evidence.some(e => e.strength === "strong");
+}
+
+function isRecentI18nRemoval(item, at) {
+  const elapsed = at - (item.lastSeenAt || item.firstSeenAt || 0);
+  return elapsed >= 0 && elapsed <= I18N_REMOVAL_EVIDENCE_MAX_AGE_MS;
+}
+
+function confirmedI18nChanges(item, evidence, at) {
+  const changes = item.changes || [];
+  const removed = changes.filter(change => change.type === "removed");
+  if (removed.length) {
+    const absentKeys = new Set(evidence.filter(e => e.type === "resource_absent" && e.strength === "strong").map(e => e.detail));
+    if (!isRecentI18nRemoval(item, at) || !removed.every(change => absentKeys.has(change.key))) return false;
+  }
+  return removed.length === changes.length
+    ? removed.length > 0
+    : isGlobalI18nResourceEvidenceSufficient(evidence.filter(e => e.type !== "resource_absent"));
+}
+
+function effectiveI18nWatch(item) {
+  return item.revertedKeys?.length
+    ? { ...item, changes: item.changes.filter(change => !item.revertedKeys.includes(change.key)) }
+    : item;
 }
 
 function buildGlobalI18nResourceConfirmNotification(item) {
@@ -4162,8 +4187,22 @@ function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity, at = Da
   const cache = new Map();
   const watch = ensureGlobalI18nResourceWatchState(state);
   const notifications = [];
-  const pendingItems = Object.values(watch).filter(item => item && !["confirmed", "reverted"].includes(item.status));
-  let changed = reconcileGlobalI18nReversals(pendingItems, at);
+  const pendingItems = [];
+  let changed = false;
+  for (const item of Object.values(watch)) {
+    if (!item || item.status === "reverted") continue;
+    if (item.status === "confirmed") {
+      // Early deployments may have accepted one absence as proof of a full
+      // batch. Keep the resource observation and reopen only that case.
+      if (!item.evidence?.some(e => e.type === "resource_absent")
+          || confirmedI18nChanges(effectiveI18nWatch(item), item.evidence, item.confirmedAt)) continue;
+      Object.assign(item, { status: "pending", confirmedAt: 0, confirmationNotifiedAt: 0,
+        evidence: item.evidence.filter(e => e.type !== "resource_absent") });
+      changed = true;
+    }
+    pendingItems.push(item);
+  }
+  if (reconcileGlobalI18nReversals(pendingItems, at)) changed = true;
   const pending = pendingItems.filter(item => item.status !== "reverted"
     && (!item.locale || at - (item.firstSeenAt || 0) >= I18N_RESOURCE_SETTLE_MS));
   const start = (state._globalI18nWatchCursor || 0) % Math.max(1, pending.length);
@@ -4171,15 +4210,13 @@ function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity, at = Da
   if (Number.isFinite(maxItems)) state._globalI18nWatchCursor = start + selected.length;
   for (const item of selected) {
     item.lastCheckedAt = at;
-    const effective = item.revertedKeys?.length
-      ? { ...item, changes: item.changes.filter(change => !item.revertedKeys.includes(change.key)) }
-      : item;
+    const effective = effectiveI18nWatch(item);
     const evidence = [
-      ...(yield* globalI18nResourceSteps(effective, pages, cache)),
+      ...(yield* globalI18nResourceSteps(effective, pages, cache, at)),
       ...(yield* globalI18nStaticSteps(effective, state, cache)),
     ];
-    if (!isGlobalI18nResourceEvidenceSufficient(evidence)) {
-      if (evidence.length > 0) item.evidence = evidence;
+    if (!confirmedI18nChanges(effective, evidence, at)) {
+      item.evidence = evidence;
       changed = true;
       continue;
     }
@@ -10475,6 +10512,7 @@ export const __testables = {
   rememberActorNotifications,
   buildFullDiffText,
   hasMeaningfulFrontendDiffBody,
+  saveDiffLocally,
   diffRoutes,
   collectFrontendRouteUnion,
   reconcileGlobalFrontendRoutes,
