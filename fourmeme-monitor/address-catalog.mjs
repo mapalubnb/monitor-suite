@@ -23,6 +23,35 @@ export const KNOWN_ASSETS = Object.freeze({
   '0x8ac76a51cc950d9822d68b83fe1ad97b32cd580d': { symbol: 'USDC', decimals: 18 },
   '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c': { symbol: 'WBNB', decimals: 18 },
 });
+
+// BSC symbol()/decimals() verified at block 134645454. Display and the
+// specific Keeper policy only; these assets do not expand watched traffic.
+const displayRows = [
+  ['0x6a2b0b704650a93f7495d728c3b851a1c5f73172', 'RYDE4', 18],
+  ['0xbe9d156892e55e7154bcd3cb0fea677f9d3103e1', 'SPCXB', 18],
+  ['0x46ceefda28dd7207059ed19b0acdc026955bb15c', 'GMEB', 18],
+  ['0x4902c5ebc598265ed2212b559b042de8a5eeec3f', 'BNCB', 18],
+  ['0x8d0d000ee44948fc98c9b98a4fa4921476f08b0d', 'USD1', 18],
+  ['0x205812cdbed920aff76c6580abd681a46d11efc7', 'QQQB', 18],
+  ['0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82', 'Cake', 18],
+  ['0x02fca66c1d1afb4e2a7884261eb00f63598a7436', 'NVDAB', 18],
+  ['0x2d2d8449ec0bb78c497c36ffaac583dff4bd4444', 'MVP', 18],
+  ['0xbe82f76637dba2c114c41df856c2c51e522e2cb8', 'EWYB', 18],
+  ['0xca750ef65f295bbecd685abf54e82caf297bdb61', 'SKHYB', 18],
+  ['0x5b1910eaad6450e50f816082aa078c41f10c292f', 'TSLAB', 18],
+  ['0x92aa03137385f18539301349dcfc9ebc923ffb10', 'SKYAI', 18],
+  ['0x7c8d5502b544ddaf8852fc46d1174e34876d545c', 'BNC4', 18],
+  ['0x26e32dab9f844d7256db4195b3a43750272a51e9', 'EWJB', 18],
+  ['0xce24439f2d9c6a2289f741120fe202248b666666', 'U', 18],
+  ['0x38dd26788cf2d901e3abf04efe3007d459d0fc53', 'ANTB', 18],
+  ['0x1d80392d12caaaf9e333bb0bb7f021eacf297fe6', 'pPOLY', 18],
+  ['0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a', 'BEM', 8],
+  ['0xc0c240c870606a5cb3150795e2d0dfff9f1f7456', 'RION', 18],
+];
+export const VERIFIED_ASSET_DISPLAY = Object.freeze(Object.fromEntries(
+  displayRows.map(([address, symbol, decimals]) => [address, Object.freeze({ symbol, decimals })]),
+));
+
 export function readFourmemeAddressConfig(env = process.env) {
   return { enabled: env.FOURMEME_ADDRESS_MONITOR !== 'false', intervalMs: 1000,
     catalog: FOURMEME_ADDRESS_CATALOG };

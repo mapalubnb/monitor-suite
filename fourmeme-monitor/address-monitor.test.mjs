@@ -119,6 +119,70 @@ test('主动授权/转移未知资产保留精度未知；失败调用不声称�
   const t = f.add(102, { value: '0x0', logs: [{ address: X, topics: [APPROVAL, topic(A), topic(B)], data: h(123) }] });
   assert.match(observeFourmemeAddressTx(t.tx, t.r, cat).lines.join('\n'), /精度未知/);
 });
+
+const keeper = FOURMEME_ADDRESS_CATALOG.find(x => x.label === 'OpenFour Rebate Keeper');
+const completionTopic = '0x0b930379a90ac974f8f7af77345b7d40a967fc4ea295de11245b4045781ecdf3';
+const companionTopic = '0x0226a2f5c1ae0e071aeec3d4ebafcefdc5c549be11f40ed27e76e802acccf374';
+const claimInput = '0xffb83a52' + [100137601, 160, 352, 1795154819, 544].map(word).join('');
+const completion = { address: keeper.address, topics: [completionTopic], data: h(100137601) };
+const stock = '0x4902c5ebc598265ed2212b559b042de8a5eeec3f';
+const bem = '0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a';
+const payout = (address, raw, to = X) => ({ address, topics: [TRANSFER, topic(keeper.address), topic(to)], data: h(raw) });
+const claim = (logs, extra = {}) => ({ from: X, to: keeper.address, value: '0x0', input: claimInput, logs: [...logs, completion], ...extra });
+
+test('Keeper 已证实的小额与零额领取只写审计，同币种累计超限照常推送', async () => {
+  const f = fixture({}, { catalog: [keeper] });
+  await f.monitor.poll();
+  const first = payout(stock, 32687671412000000n);
+  const companion = { ...first, topics: [companionTopic, ...first.topics.slice(1)], data: first.data + word(32687671412000000n) };
+  f.add(101, claim([first, companion, payout(bem, 462n)]));
+  f.add(101, claim([]));
+  f.add(101, claim([payout(stock, 30000000000000000n), payout(stock, 30000000000000000n)]));
+  f.data.head = 102;
+  await f.monitor.poll();
+  assert.equal(f.disk.fourmemeAddresses.cursor, 101);
+  assert.equal(f.disk.fourmemeAddresses.keeperSmallRebates, 2);
+  assert.deepEqual(f.disk.fourmemeAddresses.passive.map(x => [x.reason, x.eventCount]), [['keeper_small_rebate', 2], ['keeper_small_rebate', 0]]);
+  assert.equal(BigInt(f.disk.fourmemeAddresses.passive[0].events[0].rawAmount), 32687671412000000n);
+  assert.equal(f.disk._notificationOutbox.length, 1);
+  const card = f.disk._notificationOutbox[0].payload.content;
+  assert.match(card, /资产转移 · 2 项/);
+  assert.match(card, /0\.03 BNCB/);
+  assert.match(card, /Keeper 返佣路径/);
+  assert.equal(card.match(new RegExp('→ \\[' + X + '\\]', 'g')).length, 1);
+  await createFourmemeAddressMonitor(f.opts).poll();
+  assert.equal(f.disk.fourmemeAddresses.keeperSmallRebates, 2);
+});
+
+test('Keeper 领取锚点不匹配、不同收款方、未知精度、授权、失败和原生转账持续告警', () => {
+  const f = fixture({}, { catalog: [keeper, ...cat] });
+  const small = payout(stock, 1n);
+  const samples = [
+    claim([small], { input: '0x12345678' + claimInput.slice(10) }),
+    claim([small], { logs: [small, { ...completion, data: h(22) }] }),
+    claim([payout(stock, 1n, A)]),
+    claim([payout('0x' + '67'.repeat(20), 1n)]),
+    claim([small, { ...small, topics: [APPROVAL, ...small.topics.slice(1)] }]),
+    claim([], { status: '0x0' }),
+    claim([small], { value: '0x1' }),
+    claim([payout(stock, 1n, A)], { from: A }),
+  ];
+  for (const sample of samples) {
+    const { tx, r } = f.add(101, sample);
+    const result = observeFourmemeAddressTx(tx, r, [keeper, ...cat]);
+    assert.equal(result.silentReason, undefined);
+    assert.ok(result.lines.length);
+  }
+});
+
+test('已验证精度显示 BEM 的八位小数，展示资产不扩大被动监听', () => {
+  const f = fixture();
+  const active = f.add(101, { from: A, to: X, value: '0x0', logs: [{ address: bem, topics: [TRANSFER, topic(A), topic(X)], data: h(462) }] });
+  assert.match(observeFourmemeAddressTx(active.tx, active.r, cat).lines.join('\n'), /0\.00000462 BEM/);
+  const passive = f.add(101, { from: X, to: X, value: '0x0', logs: [{ address: bem, topics: [TRANSFER, topic(X), topic(A)], data: h(462) }] });
+  assert.deepEqual(observeFourmemeAddressTx(passive.tx, passive.r, cat).lines, []);
+});
+
 test('部署记录与已有创建者通道去重，但新资产事件保留', () => {
   const f = fixture(); const t = f.add(101, { to: null, value: '0x0' }); const creators = [{ ...cat[0], role: 'creator' }];
   assert.match(observeFourmemeAddressTx(t.tx, t.r, creators).lines.join('\n'), /创建合约/);

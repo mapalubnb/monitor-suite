@@ -1,7 +1,7 @@
 import { withDeadline, withAbortSignal, createDeadlineSignal } from '../shared/request-deadline.mjs';
 import { decodeOperationalCall, describeOperationalAction } from '../flap-monitor/operational-call-codec.mjs';
 import { USER_OPERATION_EVENT, receiptUserOperations, userOperationResult } from '../flap-monitor/erc4337-codec.mjs';
-import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS } from './address-catalog.mjs';
+import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS, VERIFIED_ASSET_DISPLAY } from './address-catalog.mjs';
 import { formatBeijingTime } from '../shared/display-format.cjs';
 import { addressRpcFailure } from './address-rpc.mjs';
 import { cardStatus, cardTime } from './card-style.mjs';
@@ -16,6 +16,43 @@ const num = x => { if (!/^0x[0-9a-f]+$/i.test(x || '')) throw Error('地址监�
 const topicAddress = t => /^0x0{24}[a-f0-9]{40}$/i.test(t || '') ? lower('0x' + t.slice(-40)) : '';
 const link = a => `[${a}](https://bscscan.com/address/${a})`;
 const amount = (n, decimals) => { const v = BigInt(n).toString().padStart(decimals + 1, '0'); return decimals ? (v.slice(0, -decimals) + '.' + v.slice(-decimals)).replace(/\.?0+$/, '') : v; };
+const REBATE_KEEPER = '0xee5617402708bc9560772f753213ddae852c38ed';
+const REBATE_SELECTOR = '0xffb83a52';
+const REBATE_COMPLETION = '0x0b930379a90ac974f8f7af77345b7d40a967fc4ea295de11245b4045781ecdf3';
+const REBATE_TRANSFER_COMPANION = '0x0226a2f5c1ae0e071aeec3d4ebafcefdc5c549be11f40ed27e76e802acccf374';
+const uintWord = /^0x[a-f0-9]{64}$/i;
+const displayAsset = (token, assets) => assets[token] ?? VERIFIED_ASSET_DISPLAY[token];
+
+// The full receipt must match the observed direct claim shape. In particular
+// the selector alone says nothing about the effects of a proxy call.
+function matchKeeperRebate(tx, receipt, watched, assets) {
+  const caller = lower(tx.from), input = lower(tx.input), logs = receipt.logs || [];
+  if (lower(tx.to) !== REBATE_KEEPER || !watched.has(REBATE_KEEPER) || !addressOK(caller) || watched.has(caller)
+      || receipt.status !== '0x1' || BigInt(tx.value || '0x0') !== 0n
+      || !input.startsWith(REBATE_SELECTOR) || !/^(?:[a-f0-9]{64}){5,}$/.test(input.slice(10))) return null;
+  const end = logs.at(-1);
+  if (lower(end?.address) !== REBATE_KEEPER || end.topics?.length !== 1 || lower(end.topics[0]) !== REBATE_COMPLETION
+      || lower(end.data) !== '0x' + input.slice(10, 74)) return null;
+  let small = true, previous = null;
+  const totals = new Map();
+  for (const l of logs.slice(0, -1)) {
+    const token = lower(l.address), topic = lower(l.topics?.[0]), data = lower(l.data);
+    if (!addressOK(token) || watched.has(token) || l.topics?.length !== 3
+        || topicAddress(l.topics[1]) !== REBATE_KEEPER || topicAddress(l.topics[2]) !== caller) return null;
+    if (topic === TRANSFER && uintWord.test(data)) {
+      const raw = (totals.get(token) || 0n) + BigInt(data);
+      totals.set(token, raw);
+      const decimals = displayAsset(token, assets)?.decimals;
+      // 0.05 units per verified asset and per whole transaction.
+      if (!Number.isInteger(decimals) || decimals < 2 || decimals > 77 || raw > 5n * 10n ** BigInt(decimals - 2)) small = false;
+      previous = { token, data };
+    } else if (topic === REBATE_TRANSFER_COMPANION && previous?.token === token
+        && /^0x[a-f0-9]{128}$/.test(data) && data.slice(0, 66) === previous.data) {
+      previous = null;
+    } else return null;
+  }
+  return { small };
+}
 
 export function renderFourmemeAddressContent({ result, catalog, txHash, block, observedAt, chainAt }) {
   const action = result.failed ? cardStatus('failed', '关联操作 / 交易失败')
@@ -47,21 +84,41 @@ export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = 
   for (const op of operations) touched.add(op.sender);
   const active = direct || operations.length > 0;
   const lines = [], silent = [], tokenEvents = [];
+  const keeperRebate = matchKeeperRebate(tx, receipt, watched, assets);
+  let transfers = null;
+  function flushTransfers() {
+    if (!transfers) return;
+    const { a, b, rows } = transfers, path = `${link(a)} → ${link(b)}`;
+    lines.push(rows.length === 1 ? `资产转移：${rows[0]}\n${path}` : `资产转移 · ${rows.length} 项：${path}\n${rows.map(row => `- ${row}`).join('\n')}`);
+    transfers = null;
+  }
   for (const l of receipt.logs || []) {
     const topic = lower(l.topics?.[0]);
     if (![TRANSFER, APPROVAL].includes(topic)) continue;
     const a = topicAddress(l.topics[1]), b = topicAddress(l.topics[2]);
     if (!watched.has(a) && !(topic === TRANSFER && watched.has(b))) continue;
     if (![3, 4].includes(l.topics.length)) continue;
-    const token = lower(l.address), meta = assets[token];
+    const token = lower(l.address), meta = displayAsset(token, assets);
     const raw = l.topics.length === 4 ? l.topics[3] : l.data;
-    if (!/^0x[a-f0-9]{64}$/i.test(raw || '')) continue;
+    if (!uintWord.test(raw || '')) continue;
     const event = { token, from: a, to: b, kind: topic === TRANSFER ? 'transfer' : 'approval', rawAmount: raw, logIndex: l.logIndex, nft: l.topics.length === 4 };
     tokenEvents.push(event);
-    if (!active && !meta) { silent.push(event); continue; }
+    if (keeperRebate?.small) continue;
+    if (!active && !assets[token]) { silent.push(event); continue; }
     if (watched.has(a)) touched.add(a); if (watched.has(b)) touched.add(b);
     const quantity = l.topics.length === 4 ? `NFT ID ${BigInt(raw)}` : meta ? `${amount(raw, meta.decimals)} ${meta.symbol}` : `数量原始整数 ${BigInt(raw)}（精度未知）`;
-    lines.push(`${topic === TRANSFER ? '资产转移' : '授权变更'}：${link(token)}｜${quantity}\n${link(a)} → ${link(b)}`);
+    if (topic === TRANSFER) {
+      if (transfers?.a !== a || transfers?.b !== b) flushTransfers();
+      transfers ||= { a, b, rows: [] };
+      transfers.rows.push(`${link(token)}｜${quantity}`);
+    } else {
+      flushTransfers();
+      lines.push(`授权变更：${link(token)}｜${quantity}\n${link(a)} → ${link(b)}`);
+    }
+  }
+  flushTransfers();
+  if (keeperRebate?.small) {
+    return { lines, touched: [...touched], silent: tokenEvents, failed: false, passiveIncoming: false, silentReason: 'keeper_small_rebate' };
   }
   const failed = num(receipt.status) === 0;
   const native = BigInt(tx.value || '0x0');
@@ -69,6 +126,7 @@ export function observeFourmemeAddressTx(tx, receipt, catalog, { actorCovered = 
   const actorOnly = watched.get(from)?.role === 'creator' && actorCovered.includes(from) && (!watched.has(to) || watched.get(to)?.role === 'creator');
   if (direct && (!actorOnly || lines.length)) {
     if (!to) lines.push(`创建合约：${failed ? '失败' : link(lower(receipt.contractAddress))}`);
+    else if (keeperRebate) lines.push(`调用：Keeper 返佣路径 / ${REBATE_SELECTOR}（回执已核验）`);
     else if ((tx.input || '0x').length >= 10) {
       const action = decodeOperationalCall({ to, data: tx.input, value: tx.value || '0x0' });
       lines.push(`${failed ? '调用尝试（交易失败，未生效）' : '调用解码（内部效果仍以事件核验）'}：${describeOperationalAction(action, assets, { formatOwner: link })}`);
@@ -206,9 +264,11 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
               const eligible = draft.catalog.filter(a => n > a.activationBlock);
               const result = observeFourmemeAddressTx(tx, r, eligible, { actorCovered: actorCovered() });
               const id = `${lower(b.hash)}:${lower(tx.hash)}`;
-              if (result.silent.length) {
-                draft.passive.push({ id, block: n, tx: tx.hash, observedAt: now(), reason: result.passiveIncoming ? 'passive_token_income' : 'unknown_asset', eventCount: result.silent.length, events: result.silent.slice(0, 100) });
+              if (result.silent.length || result.silentReason) {
+                const reason = result.silentReason || (result.passiveIncoming ? 'passive_token_income' : 'unknown_asset');
+                draft.passive.push({ id, block: n, tx: tx.hash, observedAt: now(), reason, eventCount: result.silent.length, events: result.silent.slice(0, 100) });
                 draft.silentTransactions = (draft.silentTransactions || 0) + 1;
+                if (reason === 'keeper_small_rebate') draft.keeperSmallRebates = (draft.keeperSmallRebates || 0) + 1;
               }
               if (!result.lines.length || draft.seen[id]) continue;
               const detectedAt = now();
@@ -249,7 +309,7 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
     const s = read(), currentFeed = feed(), observedHead = Math.max(runtime.head || s.head || 0, currentFeed.latestHeadBlock || 0);
     return { enabled, intervalMs: 1000, confirmations, aiEnabled: false, catalog: s.catalog.length ? s.catalog : catalog,
       cursor: s.cursor, head: observedHead, lagBlocks: s.cursor === undefined ? null : Math.max(0, observedHead - confirmations - s.cursor),
-      activatedAt: s.activatedAt, activationBlock: s.activationBlock, lastProgressAt: s.lastProgressAt, health: s.health, passiveRecords: s.passive.length, silentTransactions: s.silentTransactions || 0, passivePolicy: 'flap-passive-token-silent',
+      activatedAt: s.activatedAt, activationBlock: s.activationBlock, lastProgressAt: s.lastProgressAt, health: s.health, passiveRecords: s.passive.length, silentTransactions: s.silentTransactions || 0, keeperSmallRebates: s.keeperSmallRebates || 0, passivePolicy: 'flap-passive-token-silent',
       lastAttemptAt: runtime.lastAttemptAt, reorgs: s.reorgs || 0, feed: currentFeed,
       pendingNotifications: (store.state._notificationOutbox || []).filter(n => n.payload?.fourmemeAddress).length,
       activeTask: task ? { startedAt: task.startedAt, deadlineAt: task.deadlineAt } : null };
