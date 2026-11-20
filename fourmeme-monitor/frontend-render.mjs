@@ -156,6 +156,8 @@ function stableLabel(value, allowNumbers = false) {
 
 const transientSignal = signal => /^按钮：(打開聊天|關閉聊天|打开聊天|关闭聊天|Open chat|Close chat)$/i.test(signal);
 const signalHash = signals => createHash('sha256').update(JSON.stringify(signals)).digest('hex');
+const HOME_SEARCH = '页面控件：搜尋';
+const HOME_SEARCH_STABLE_MS = 120_000;
 const detailSignal = /^(?:页面控件|栏目控件|筛选字段|筛选控件|模式结构|表单字段|面板字段)：/;
 const isColumnFilterSignal = (column, signal) => signal.startsWith(`筛选字段：${column} / `) || signal.startsWith(`筛选控件：${column} / `);
 const publicProfile = /^(?:contract|agentic|campaign|announcement|bridge)$/;
@@ -510,6 +512,23 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
               old = { ...old, signals, hash: signalHash(signals), candidateHash: undefined };
             }
           }
+          let searchConfirmed = false;
+          if (old?.hash && /^\/zh-TW\/?$/.test(new URL(url).pathname)) {
+            const hadSearch = old.signals.includes(HOME_SEARCH);
+            const hasSearch = data.signals.includes(HOME_SEARCH);
+            if (hadSearch !== hasSearch) {
+              const previous = old.lastError ? null : old.homeSearchCandidate;
+              const candidate = previous?.visible === hasSearch
+                ? { ...previous, samples: previous.samples + 1 }
+                : { visible: hasSearch, since: startedAt, samples: 1 };
+              searchConfirmed = candidate.samples >= 3 && startedAt - candidate.since >= HOME_SEARCH_STABLE_MS;
+              if (!searchConfirmed) {
+                data.homeSearchCandidate = candidate;
+                data.signals = hadSearch ? [...data.signals, HOME_SEARCH].sort() : data.signals.filter(signal => signal !== HOME_SEARCH);
+                data.hash = signalHash(data.signals);
+              }
+            }
+          }
           if (!old?.hash) {
             if (!optionalUrls.includes(url)) initialized.push(data);
           } else if (old.hash !== data.hash) {
@@ -517,8 +536,9 @@ export function createFrontendRenderMonitor({ store, client, now = Date.now, url
             const removed = old.signals.filter(x => !data.signals.includes(x));
             // Removal/partial rendering needs consecutive confirmation. Pure
             // additions are useful immediately; failed scans reset candidates.
-            if (removed.length && (old.candidateHash !== data.hash || old.lastError)) {
-              state.pages[url] = { ...old, candidateHash: data.hash, lastAttemptAt: startedAt, lastSuccessAt: now(), lastError: '' }; continue;
+            if (removed.some(signal => signal !== HOME_SEARCH || !searchConfirmed) && (old.candidateHash !== data.hash || old.lastError)) {
+              state.pages[url] = { ...old, candidateHash: data.hash, homeSearchCandidate: data.homeSearchCandidate ?? (searchConfirmed ? old.homeSearchCandidate : undefined),
+                lastAttemptAt: startedAt, lastSuccessAt: now(), lastError: '' }; continue;
             }
             changes.push({ url, added, removed, addedUrls: data.signalUrls, removedUrls: old.signalUrls });
           }

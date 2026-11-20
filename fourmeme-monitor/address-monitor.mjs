@@ -5,6 +5,7 @@ import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS, VERIFIED_ASSET_DISPLAY } from '
 import { formatBeijingTime } from '../shared/display-format.cjs';
 import { addressRpcFailure } from './address-rpc.mjs';
 import { cardStatus, cardTime } from './card-style.mjs';
+import { observedSafeExecution } from './safe-execution-delivery.mjs';
 
 export const TRANSFER = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 export const APPROVAL = '0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925';
@@ -186,7 +187,7 @@ export function updateAddressHealth(state, { at, head, error, stallMs = 60000, r
 }
 
 export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now = Date.now, wake = () => {}, stopped = () => false,
-  enabled = true, catalog = FOURMEME_ADDRESS_CATALOG, actorCovered = () => [], feed = () => ({}),
+  enabled = true, catalog = FOURMEME_ADDRESS_CATALOG, actorCovered = () => [], feed = () => ({}), mergeSafeExecutions = false,
   maxBlocks = 32, confirmations = 0, timeoutMs = 12000, roundTimeoutMs = 25000 } = {}) {
   if (catalog.length === 0 || catalog.some(a => !addressOK(a.address)) || new Set(catalog.map(a => a.address)).size !== catalog.length) throw Error('地址目录无效或重复');
   let task = null, runtime = { head: 0, lastAttemptAt: 0 };
@@ -273,8 +274,11 @@ export function createFourmemeAddressMonitor({ store, rpcBatch, rpcFactory, now 
               if (!result.lines.length || draft.seen[id]) continue;
               const detectedAt = now();
               const chainAt = num(b.timestamp) * 1000;
+              const safeExecution = mergeSafeExecutions && observedSafeExecution(tx, r, result);
+              if (safeExecution) result.lines[0] = 'Safe 执行成功（链上回执已核验）';
               notices.push({ ...notice('关联地址观察', renderFourmemeAddressContent({ result, catalog: eligible,
-                txHash: tx.hash, block: n, observedAt: detectedAt, chainAt }), { txHash: tx.hash, block: n, chainAt }),
+                txHash: tx.hash, block: n, observedAt: detectedAt, chainAt }), { txHash: tx.hash, block: n, chainAt,
+                  ...(safeExecution ? { safeExecution } : {}) }),
                 ...(result.failed ? { template: 'red' } : {}),
                 title: result.failed ? 'Four.meme 关联地址观察｜交易失败' : 'Four.meme 关联地址观察' });
               draft.seen[id] = { tx: tx.hash, block: n, detectedAt };

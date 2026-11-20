@@ -2,8 +2,9 @@ import { createSafeProposalState, runSafeProposalScan, acknowledgeSafeProposalCh
   buildSafeProposalContent, normalizeSafeApiKeys } from '../flap-monitor/safe-proposal-monitor.mjs';
 import { createDeadlineSignal, withAbortSignal, withDeadline } from '../shared/request-deadline.mjs';
 import { cardStatus } from './card-style.mjs';
+import { FOURMEME_SAFE } from './address-catalog.mjs';
 
-export const FOURMEME_SAFE = '0x161dd0cfdb0aa25e2504f725655ef9b799375b71';
+export { FOURMEME_SAFE };
 const ACTIVE = new Set(['pending', 'ready', 'confirming']);
 const address = word => /^0{24}[a-f0-9]{40}$/i.test(word || '') ? '0x' + word.slice(24).toLowerCase() : '';
 const words = value => typeof value === 'string' && /^0x(?:[a-f0-9]{64})+$/i.test(value) ? value.slice(2).match(/.{64}/g) : [];
@@ -133,7 +134,8 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
           const changes = draft.pendingChanges.filter(c => c.type === type);
           notices.push(notification(suffix[type] || '提案状态更新', renderFourmemeSafe(changes, draft.tokenMetadata, draft.identity),
             type === 'executed' ? 'green' : ['failed', 'invalidated'].includes(type) ? 'yellow' : 'red',
-            { changes: changes.map(c => ({ id: c.id, hash: c.safeTxHash, nonce: c.nonce, type })) }));
+            { changes: changes.map(c => ({ id: c.id, hash: c.safeTxHash, nonce: c.nonce, type,
+              ...(type === 'executed' && c.transactionHash ? { transactionHash: c.transactionHash } : {}) })) }));
         }
         acknowledgeSafeProposalChanges(draft, draft.pendingChanges.map(c => c.id));
         const problem = [draft.lastError || scanned.errors?.join('；'), identityFailure].filter(Boolean).join('；');

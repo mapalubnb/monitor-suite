@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
 import { createFourmemeAddressMonitor, updateAddressHealth, observeFourmemeAddressTx, renderFourmemeAddressContent, addressLogFilters, TRANSFER, APPROVAL } from './address-monitor.mjs';
-import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS, readFourmemeAddressConfig } from './address-catalog.mjs';
+import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS, FOURMEME_SAFE, readFourmemeAddressConfig } from './address-catalog.mjs';
+import { deliverSafeExecutionCard } from './safe-execution-delivery.mjs';
 import { ENTRY_POINT_V07, USER_OPERATION_EVENT } from '../flap-monitor/erc4337-codec.mjs';
 import { keccak_256 } from '@noble/hashes/sha3';
 const A = FOURMEME_ADDRESS_CATALOG[0].address, B = FOURMEME_ADDRESS_CATALOG[1].address, X = '0x' + '33'.repeat(20);
@@ -84,6 +85,99 @@ test('被调用的EIP7702账户无需作为tx.from也被捕获，签名人标识
   const f = fixture(); await f.monitor.poll(); f.add(101, { from: X, to: A, value: '0x0', input: '0x12345678' }); f.data.head = 102; await f.monitor.poll();
   assert.match(f.disk._notificationOutbox[0].payload.content, /未解析调用.*0x12345678/);
 });
+
+const safeSuccessTopic = '0x442e715f626346e8c54381002da614f62bee8d27386535b2521ec8540898556e';
+const safeFailureTopic = '0x23428b18acfb3ea64b08dc0c1d296ea9c09702c09083ca5272e64d115b687d23';
+const safeReceiptEvent = { address: FOURMEME_SAFE, topics: [safeSuccessTopic], data: h(700) + word(0) };
+
+test('Safe 即时地址卡仅为已核验的通用执行观察附上关联键', async () => {
+  const safe = FOURMEME_ADDRESS_CATALOG.find(a => a.address === FOURMEME_SAFE);
+  const f = fixture({}, { catalog: [safe], mergeSafeExecutions: true });
+  await f.monitor.poll();
+  const call = { from: X, to: FOURMEME_SAFE, value: '0x0', input: '0x6a761202' };
+  f.add(101, { ...call, logs: [safeReceiptEvent] });
+  f.add(101, { ...call, logs: [safeReceiptEvent, { address: token, topics: [TRANSFER, topic(FOURMEME_SAFE), topic(X)], data: h(12) }] });
+  f.add(101, { ...call, logs: [{ ...safeReceiptEvent, topics: [safeFailureTopic] }] });
+  f.data.head = 102;
+  await f.monitor.poll();
+  const [first, funding, failed] = f.disk._notificationOutbox.map(entry => entry.payload);
+  assert.equal(first.fourmemeAddress.safeExecution.safeTxHash, h(700));
+  assert.equal(first.fourmemeAddress.safeExecution.executor, X);
+  assert.match(first.content, /Safe 执行成功（链上回执已核验）/);
+  assert.equal(funding.fourmemeAddress.safeExecution, undefined);
+  assert.match(funding.content, /资产转移/);
+  assert.equal(failed.fourmemeAddress.safeExecution, undefined);
+});
+
+const addressCard = {
+  title: '地址首报', content: '完整首报',
+  fourmemeAddress: { txHash: h(701), block: 134540147, chainAt: 1795000000000, detectedAt: 1795000000123,
+    safeExecution: { blockHash: h(702), safeTxHash: h(700), executor: X } },
+};
+const executionCard = {
+  title: 'Safe 详细执行', content: '保留完整提案和调用证据',
+  fourmemeSafe: { safe: FOURMEME_SAFE, changes: [{ type: 'executed', hash: h(700), transactionHash: h(701) }] },
+};
+
+function safeDeliveryHarness() {
+  let disk = {}, current, failures = 0;
+  const sent = [], edits = [];
+  function restart() {
+    current = createTransactionalOutbox({ initial: structuredClone(disk), persist: state => { disk = structuredClone(state); },
+      deliver: (payload, options) => deliverSafeExecutionCard({ store: current, payload, options,
+        send: async p => { sent.push(p); return 'message-' + sent.length; },
+        edit: async (id, p) => { edits.push({ id, p }); if (failures-- > 0) throw Error('edit failure'); },
+        fitsSingleCard: p => !p.tooLarge,
+      }),
+    });
+    return current;
+  }
+  return { sent, edits, restart, failEdits: n => { failures = n; } };
+}
+
+test('Safe 先送即时首报，跨重启在原卡补完整详情，详细先到也只发一张', async () => {
+  for (const safeFirst of [false, true]) {
+    const h = safeDeliveryHarness();
+    let store = h.restart();
+    await store.enqueue(safeFirst ? executionCard : addressCard);
+    await store.drain();
+    assert.equal(h.sent.length, 1);
+    assert.equal(h.sent[0].title, safeFirst ? executionCard.title : addressCard.title);
+    store = h.restart();
+    await store.enqueue(safeFirst ? addressCard : executionCard);
+    await store.drain();
+    assert.equal(h.sent.length, 1);
+    assert.equal(store.state._notificationOutbox.length, 0);
+    if (safeFirst) assert.equal(h.edits.length, 0);
+    else {
+      assert.equal(h.edits[0].id, 'message-1');
+      assert.match(h.edits[0].p.content, /保留完整提案和调用证据.*执行者.*134540147/s);
+    }
+  }
+});
+
+test('Safe 编辑失败跨重启重试并兜底，重组后新锚点与不同 SafeTxHash 都照常发送', async () => {
+  const delivery = safeDeliveryHarness();
+  let store = delivery.restart();
+  await store.enqueue(addressCard);
+  await store.drain();
+  delivery.failEdits(2);
+  await store.enqueue(executionCard);
+  await store.drain();
+  assert.equal(store.state._notificationOutbox.length, 1);
+  assert.equal(delivery.sent.length, 1);
+  store = delivery.restart();
+  await store.drain(Date.now() + 60_000);
+  assert.equal(store.state._notificationOutbox.length, 0);
+  assert.deepEqual(delivery.sent.map(x => x.title), [addressCard.title, executionCard.title]);
+  await store.enqueue({ ...addressCard, fourmemeAddress: { ...addressCard.fourmemeAddress,
+    safeExecution: { ...addressCard.fourmemeAddress.safeExecution, blockHash: h(703) } } });
+  await store.enqueue({ ...executionCard, fourmemeSafe: { ...executionCard.fourmemeSafe,
+    changes: [{ ...executionCard.fourmemeSafe.changes[0], hash: h(704) }] } });
+  await store.drain();
+  assert.equal(delivery.sent.length, 4);
+});
+
 test('监控地址间资产转移推送；未知资产被动收入静默记录；一笔多地址仅一条', async () => {
   const f = fixture(); await f.monitor.poll();
   f.add(101, { from: X, to: X, value: '0x0', logs: [{ address: token, topics: [TRANSFER, topic(A), topic(B)], data: h(1000000000000000000n) }] });

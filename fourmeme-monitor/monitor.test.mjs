@@ -2147,6 +2147,53 @@ test("global i18n resource watch confirms from static assets without probing gue
   assert.match(confirmed.notifications[0].content, /静态资源路由信号/);
 });
 
+test('i18n 只抵消同语言相同值的短时往返，通用路由不确认，独立变化保留', () => {
+  const state = {};
+  const { registerGlobalI18nResourceWatch: register, confirmGlobalI18nResourceWatches: confirm } = __testables;
+  const at = Date.now(), en = 'https://four.meme/en/contract', zh = 'https://four.meme/zh-TW/contract';
+  const target = 'contract.ui_mechanics.allTokens', independent = 'contract.independent';
+  const add = (locale, url, changes) => register(state, { locale, pages: [{ url }], changes }).item;
+  const zhAdded = add('zh-TW', zh, [{ type: 'added', key: target, value: '所有代幣' },
+    { type: 'added', key: independent, value: '獨立真實標題' }]);
+  const zhRemoved = add('zh-TW', zh, [{ type: 'removed', key: target, value: '所有代幣' }]);
+  const english = add('en', en, [{ type: 'added', key: target, value: '所有代幣' }]);
+  zhAdded.firstSeenAt = at;
+  zhRemoved.firstSeenAt = at + 36_000;
+  english.firstSeenAt = at;
+  const genericPages = { en: { originalUrl: en, routes: ['/en/contract'], textContent: '' },
+    zh: { originalUrl: zh, routes: ['/zh-TW/contract'], textContent: '' } };
+  assert.deepEqual(confirm(state, genericPages, { at: at + 50_000 }).notifications, []);
+  assert.equal(zhRemoved.status, 'reverted');
+  assert.deepEqual(zhAdded.revertedKeys, [target]);
+  assert.deepEqual(confirm(state, genericPages, { at: at + 90_000 }).notifications, []);
+  assert.equal(english.status, 'pending');
+  assert.ok(english.evidence.every(e => e.strength === 'medium'));
+  genericPages.en.textContent = '所有代幣';
+  genericPages.zh.textContent = '獨立真實標題';
+  const result = confirm(state, genericPages, { at: at + 120_000 }).notifications;
+  assert.equal(result.length, 2);
+  const zhCard = result.find(n => n.content.includes('语言：繁中'));
+  assert.ok(zhCard.fullDiff.includes(independent));
+  assert.doesNotMatch(zhCard.fullDiff, /allTokens/);
+  assert.ok(result.find(n => n.content.includes('语言：英文')).fullDiff.includes(target));
+});
+
+test('i18n 真实移除需来源页当前资源证据，旧静态字符串不冒充移除确认', () => {
+  const state = {};
+  const url = 'https://four.meme/zh-TW/contract';
+  const { item } = __testables.registerGlobalI18nResourceWatch(state, {
+    locale: 'zh-TW', pages: [{ url }], changes: [{ type: 'removed', key: 'contract.label', value: '原本功能標題' }],
+  });
+  const pages = { page: { originalUrl: url, textContent: '', routes: ['/zh-TW/contract'], i18nHash: 'good', i18nStrings: { 'contract.label': '原本功能標題' } } };
+  const at = item.firstSeenAt + 90_000;
+  assert.equal(__testables.confirmGlobalI18nResourceWatches(state, pages, { at }).notifications.length, 0);
+  pages.page.i18nStrings = { 'contract.other': '正常剩餘功能' };
+  const { notifications } = __testables.confirmGlobalI18nResourceWatches(state, pages, { at: at + 30_000 });
+  assert.equal(notifications.length, 1);
+  assert.match(notifications[0].content, /资源键已移除/);
+  assert.match(notifications[0].fullDiff, /移除|删除/);
+});
+
 test("failed static asset expansion candidates are cooled down", () => {
   const state = {
     _frontendStaticIndex: {

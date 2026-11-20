@@ -161,6 +161,39 @@ test('真实功能新增立即入队，删除需两次连续成功确认', async
   assert.match(h.notices()[2].payload.content, /新模式/);
 });
 
+test('繁中首页搜尋双向稳态确认，独立功能即时通知，失败中断且重启续接', async () => {
+  const u = 'https://four.meme/zh-TW';
+  const navigation = ['/4stock', '/contract', '/advanced', '/agentic'].map(p => ({ text: p, href: '/zh-TW' + p }));
+  const data = (search, grid = false) => raw({ url: u, navigation, buttons: ['All Tokens'],
+    homeControls: ['All Tokens', ...(search ? ['搜尋'] : []), ...(grid ? ['Grid layout'] : [])] });
+  const h = harness(u, data(false));
+  await h.monitor.poll();
+  const scan = async (at, sample, monitor = h.monitor) => {
+    h.time(at); h.result([{ url: u, ...(sample ? { data: sample } : { error: 'offline' }) }]);
+    await monitor.poll();
+  };
+  await scan(5_000, data(true, true));
+  assert.equal(h.notices().length, 2);
+  assert.match(h.notices()[1].payload.content, /Grid layout/);
+  assert.doesNotMatch(h.notices()[1].payload.content, /搜尋/);
+  await scan(65_000, data(true, true));
+  await scan(109_000, data(false, true));
+  assert.equal(h.notices().length, 2);
+  await scan(200_000, data(true, true));
+  await scan(230_000, null);
+  await scan(250_000, data(true, true));
+  const resumed = createFrontendRenderMonitor({ store: h.store, client: h.client, urls: [u], now: () => 370_000 });
+  await scan(315_000, data(true, true));
+  await scan(370_000, data(true, true), resumed);
+  assert.equal(h.notices().length, 3);
+  assert.match(h.notices()[2].payload.content, /新增 1[\s\S]*搜尋/);
+  await scan(400_000, data(false, true));
+  await scan(460_000, data(false, true));
+  await scan(520_000, data(false, true));
+  assert.equal(h.notices().length, 4);
+  assert.match(h.notices()[3].payload.content, /移除 1[\s\S]*搜尋/);
+});
+
 test('升级只补齐已知结构维度，两个创建模式与同名字段各自保留', async () => {
   const base = raw();
   const h = harness(url, base);

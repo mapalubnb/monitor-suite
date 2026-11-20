@@ -6,6 +6,7 @@ import { createActorStateCoordinator } from './actor-state.mjs';
 import { createHttpRecovery, isFourmemeHttp } from "./http-recovery.mjs";
 import { createGithubApi, createGithubMonitor, createGithubTransport, retireGithubDetails } from "./github-monitor.mjs";
 import { createFourmemeSafeMonitor, readFourmemeSafeConfig } from "./safe-monitor.mjs";
+import { deliverSafeExecutionCard } from "./safe-execution-delivery.mjs";
 import { createFourmemeAddressMonitor } from './address-monitor.mjs';
 import { readFourmemeAddressConfig } from './address-catalog.mjs';
 import { createAddressRoundRpc } from './address-rpc.mjs';
@@ -3841,16 +3842,30 @@ function preserveOldI18nSnapshot(newData, oldData) {
   newData.i18nMissCount = oldData.i18nMissCount || 0;
 }
 
+const I18N_RESOURCE_SETTLE_MS = 90_000;
+
+function frontendResourceLocale(url) {
+  return String(url || "").match(/^https:\/\/four\.meme\/(en|zh-TW)(?:[/?#]|$)/)?.[1] || "";
+}
+
+function globalI18nWatchLocale(item) {
+  if (item?.locale) return item.locale;
+  const locales = new Set((item?.pages || []).map(page => frontendResourceLocale(page.url)));
+  return locales.size === 1 ? [...locales][0] : "";
+}
+
 function addGlobalI18nResourceChange(groups, page, changes) {
   if (!changes?.length) return;
   const signature = i18nChangeSignature(changes);
   if (!signature) return;
-  let group = groups.get(signature);
-  if (!group) {
-    group = { signature, changes, pages: [] };
-    groups.set(signature, group);
-  }
   const url = page?.originalUrl || "";
+  const locale = frontendResourceLocale(url);
+  const groupKey = `${locale}:${signature}`;
+  let group = groups.get(groupKey);
+  if (!group) {
+    group = { signature, locale, changes, pages: [] };
+    groups.set(groupKey, group);
+  }
   const pageKey = canonicalFrontendUrl(url) || url || urlLabel(url);
   if (!group.pages.some(p => p.key === pageKey)) {
     group.pages.push({
@@ -3867,6 +3882,7 @@ function normalizeGlobalI18nResourceGroup(group = {}) {
   const namespaces = [...namespaceSet].sort();
   return {
     signature: group.signature || i18nChangeSignature(changes),
+    locale: group.locale || "",
     namespaces,
     primaryNamespace: namespaces.length === 1 ? namespaces[0] : "mixed",
     changes,
@@ -3877,7 +3893,8 @@ function normalizeGlobalI18nResourceGroup(group = {}) {
 function globalI18nWatchKey(group = {}) {
   const normalized = normalizeGlobalI18nResourceGroup(group);
   if (!normalized.signature) return "";
-  return `${normalized.primaryNamespace}:${normalized.signature}`;
+  const legacyKey = `${normalized.primaryNamespace}:${normalized.signature}`;
+  return normalized.locale ? `${legacyKey}:${normalized.locale}` : legacyKey;
 }
 
 function ensureGlobalI18nResourceWatchState(state = snapshot) {
@@ -3906,11 +3923,18 @@ function registerGlobalI18nResourceWatch(state, group) {
   if (!watchKey) return { item: null, isNew: false, changed: false };
 
   const now = Date.now();
-  const prev = watch[watchKey];
+  let prev = watch[watchKey];
+  const legacyKey = `${normalized.primaryNamespace}:${normalized.signature}`;
+  if (!prev && normalized.locale && globalI18nWatchLocale(watch[legacyKey]) === normalized.locale) {
+    prev = watch[legacyKey];
+    delete watch[legacyKey];
+  }
+  if (prev?.revertedKeys?.length && now - prev.lastSeenAt >= I18N_RESOURCE_SETTLE_MS) prev = undefined;
   const item = {
     ...(prev || {}),
     key: watchKey,
     signature: normalized.signature,
+    locale: normalized.locale,
     namespaces: normalized.namespaces,
     primaryNamespace: normalized.primaryNamespace,
     changes: normalized.changes,
@@ -3974,6 +3998,8 @@ function finishSearchSteps(iterator) {
 function* globalI18nResourceSteps(item, pages = {}, cache = new Map()) {
   const evidence = [];
   const seen = new Set();
+  const locale = globalI18nWatchLocale(item);
+  const sources = new Set((item.pages || []).map(page => canonicalFrontendUrl(page.url || "")));
 
   function addEvidence(type, page, detail, strength = "strong") {
     const url = page?.originalUrl || "";
@@ -3992,17 +4018,21 @@ function* globalI18nResourceSteps(item, pages = {}, cache = new Map()) {
 
   for (const page of Object.values(pages || {})) {
     yield;
-    if (!page) continue;
+    if (!page || (locale && frontendResourceLocale(page.originalUrl) !== locale)) continue;
     const pageText = page.textContent || "";
+    const sourceStrings = page.i18nHash && !page.i18nMissCount && sources.has(canonicalFrontendUrl(page.originalUrl))
+      && Object.keys(page.i18nStrings || {}).length ? page.i18nStrings : null;
     for (const change of item.changes || []) {
       if (isI18nChangeVisibleOnPage(change, "", pageText)) {
         addEvidence("visible_text", page, `${change.key}: ${frontendDisplaySnippet(i18nChangeValue(change), 100)}`, "strong");
+      } else if (change.type === "removed" && sourceStrings && !Object.hasOwn(sourceStrings, change.key)) {
+        addEvidence("resource_absent", page, change.key, "strong");
       }
     }
     for (const route of page.routes || []) {
       if (routeMatchesGlobalI18nWatch(route, item)) {
         const type = isApiOrEndpointRoute(route) ? "api_endpoint" : "route";
-        addEvidence(type, page, route, type === "route" ? "strong" : "medium");
+        addEvidence(type, page, route, "medium");
       }
     }
     let allStrings = cache.get(page);
@@ -4024,7 +4054,7 @@ function* globalI18nResourceSteps(item, pages = {}, cache = new Map()) {
 }
 
 function isGlobalI18nResourceEvidenceSufficient(evidence = []) {
-  return evidence.some(e => e.strength === "strong" || e.type === "api_endpoint");
+  return evidence.some(e => e.strength === "strong");
 }
 
 function buildGlobalI18nResourceConfirmNotification(item) {
@@ -4035,6 +4065,7 @@ function buildGlobalI18nResourceConfirmNotification(item) {
   const lines = [
     cardStatus('healthy', `已确认 / 确认依据 ${evidence.length} 条（强证据 ${strongCount}）`),
     `命名空间：\`${namespace}\` / 确认耗时 ${elapsedMin} 分钟`,
+    ...(item.locale ? [`语言：${item.locale === "zh-TW" ? "繁中" : "英文"}`] : []),
     `资源首次发现：${item.firstSeenAt ? formatBeijingTime(item.firstSeenAt) : "未知"}`,
   ];
   for (const e of evidence.slice(0, 12)) {
@@ -4046,6 +4077,7 @@ function buildGlobalI18nResourceConfirmNotification(item) {
       static_asset: "静态资源代码信号",
       static_route: "静态资源路由信号",
       asset_usage: "JS 资源使用信号",
+      resource_absent: "资源键已移除",
     }[e.type] || e.type;
     lines.push(`- ${typeLabel}：${label} — ${e.detail}`);
   }
@@ -4093,21 +4125,58 @@ async function confirmGlobalI18nResourceWatchesAsync(state, pages = {}, options 
     }
   }
 }
-function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity } = {}) {
+function reconcileGlobalI18nReversals(pending, now) {
+  const byChange = new Map(), reversed = new Map();
+  for (const item of pending) {
+    const locale = globalI18nWatchLocale(item);
+    if (!locale || !Number.isFinite(item.firstSeenAt)) continue;
+    for (const change of item.changes || []) {
+      if (!["added", "removed"].includes(change.type) || item.revertedKeys?.includes(change.key)) continue;
+      const key = JSON.stringify([locale, change.key, change.value]);
+      if (!byChange.has(key)) byChange.set(key, { added: [], removed: [] });
+      byChange.get(key)[change.type].push({ item, key: change.key });
+    }
+  }
+  for (const group of byChange.values()) {
+    if (!group.added.length || !group.removed.length) continue;
+    for (const type of ["added", "removed"]) {
+      const opposite = group[type === "added" ? "removed" : "added"];
+      for (const { item, key } of group[type]) {
+        if (!opposite.some(other => Math.abs(other.item.firstSeenAt - item.firstSeenAt) <= I18N_RESOURCE_SETTLE_MS)) continue;
+        if (!reversed.has(item)) reversed.set(item, new Set(item.revertedKeys || []));
+        reversed.get(item).add(key);
+      }
+    }
+  }
+  for (const [item, keys] of reversed) {
+    item.revertedKeys = [...keys];
+    if (item.changes.every(change => keys.has(change.key))) {
+      item.status = "reverted";
+      item.revertedAt = now;
+    }
+  }
+  return reversed.size > 0;
+}
+
+function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity, at = Date.now() } = {}) {
   const cache = new Map();
   const watch = ensureGlobalI18nResourceWatchState(state);
   const notifications = [];
-  let changed = false;
-  const now = Date.now();
-  const pending = Object.values(watch).filter(item => item && item.status !== "confirmed");
+  const pendingItems = Object.values(watch).filter(item => item && !["confirmed", "reverted"].includes(item.status));
+  let changed = reconcileGlobalI18nReversals(pendingItems, at);
+  const pending = pendingItems.filter(item => item.status !== "reverted"
+    && (!item.locale || at - (item.firstSeenAt || 0) >= I18N_RESOURCE_SETTLE_MS));
   const start = (state._globalI18nWatchCursor || 0) % Math.max(1, pending.length);
   const selected = [...pending.slice(start), ...pending.slice(0, start)].slice(0, maxItems);
   if (Number.isFinite(maxItems)) state._globalI18nWatchCursor = start + selected.length;
   for (const item of selected) {
-    item.lastCheckedAt = now;
+    item.lastCheckedAt = at;
+    const effective = item.revertedKeys?.length
+      ? { ...item, changes: item.changes.filter(change => !item.revertedKeys.includes(change.key)) }
+      : item;
     const evidence = [
-      ...(yield* globalI18nResourceSteps(item, pages, cache)),
-      ...(yield* globalI18nStaticSteps(item, state, cache)),
+      ...(yield* globalI18nResourceSteps(effective, pages, cache)),
+      ...(yield* globalI18nStaticSteps(effective, state, cache)),
     ];
     if (!isGlobalI18nResourceEvidenceSufficient(evidence)) {
       if (evidence.length > 0) item.evidence = evidence;
@@ -4115,12 +4184,12 @@ function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity } = {}) 
       continue;
     }
     item.status = "confirmed";
-    item.confirmedAt = item.confirmedAt || now;
+    item.confirmedAt = item.confirmedAt || at;
     item.evidence = evidence;
     changed = true;
     if (!item.confirmationNotifiedAt) {
-      item.confirmationNotifiedAt = now;
-      notifications.push(buildGlobalI18nResourceConfirmNotification(item));
+      item.confirmationNotifiedAt = at;
+      notifications.push(buildGlobalI18nResourceConfirmNotification({ ...effective, evidence }));
     }
   }
   return { notifications, changed };
@@ -4372,7 +4441,9 @@ function* globalI18nStaticSteps(item, state = snapshot, cache = new Map()) {
   if (!index?.assets) return [];
   const evidence = [];
   const seen = new Set();
-  const { namespaces, keys, sampleValues } = globalI18nWatchKeywords(item);
+  const positive = (item.changes || []).filter(change => change.type !== "removed");
+  if (!positive.length) return [];
+  const { namespaces, keys, sampleValues } = globalI18nWatchKeywords({ ...item, changes: positive });
 
   function add(type, asset, detail, strength = "strong") {
     const key = `${type}:${asset.path}:${detail}`;
@@ -4397,9 +4468,9 @@ function* globalI18nStaticSteps(item, state = snapshot, cache = new Map()) {
     const routeHits = (asset.routes || []).filter(route => routeMatchesGlobalI18nWatch(route, item)).slice(0, 5);
     const pathHit = namespaces.some(ns => ns && asset.path.toLowerCase().includes(ns.toLowerCase()));
 
-    if (routeHits.length > 0 && (keyHits.length > 0 || valueHits.length > 0 || pathHit)) {
+    if (routeHits.length > 0 && keyHits.length > 0 && valueHits.length > 0) {
       add("static_route", asset, `routes=${routeHits.join(", ")}${keyHits.length ? `; keys=${keyHits.join(",")}` : ""}`, "strong");
-    } else if (pathHit && (keyHits.length > 0 || valueHits.length > 0)) {
+    } else if (pathHit && keyHits.length > 0 && valueHits.length > 0) {
       add("static_asset", asset, `${asset.path}${keyHits.length ? `; keys=${keyHits.join(",")}` : ""}${valueHits.length ? `; values=${valueHits.map(v => frontendDisplaySnippet(v, 50)).join(" | ")}` : ""}`, "strong");
     } else if (keyHits.length >= 2 || (keyHits.length > 0 && valueHits.length > 0)) {
       add("static_asset", asset, `keys=${keyHits.join(",")}${valueHits.length ? `; values=${valueHits.map(v => frontendDisplaySnippet(v, 50)).join(" | ")}` : ""}`, "medium");
@@ -4485,7 +4556,7 @@ function buildGlobalI18nResourceNotification(group) {
     fullDiff,
     url: CONFIG.siteUrl,
     pageLabel: "全局 i18n 资源",
-    dedupeKey: `frontend:i18n-resource:${normalized.signature}`,
+    dedupeKey: `frontend:i18n-resource:${normalized.signature}${normalized.locale ? `:${normalized.locale}` : ""}`,
   };
 }
 
@@ -9196,7 +9267,13 @@ const monitorStore = createTransactionalOutbox({
   initial: loadSnapshot() || {},
   persist: persistMonitorSnapshot,
   deliver: async (payload, deliveryOptions) => {
-    const id = await deliverNotification({ ...payload, cardOpts: { ...payload.cardOpts, ...deliveryOptions } });
+    const send = (p, options) => deliverNotification({ ...p, cardOpts: { ...p.cardOpts, ...options } });
+    const id = payload.fourmemeAddress?.safeExecution || payload.fourmemeSafe?.changes?.length === 1
+      ? await deliverSafeExecutionCard({ store: monitorStore, payload, options: deliveryOptions, send, log,
+        fitsSingleCard: p => !isMultiPartCard(notificationUrlLine(p.url, p.cardOpts) + p.content, p.title, p.template, p.cardOpts),
+        edit: (messageId, p) => patchCardViaApi(messageId, p.title, notificationUrlLine(p.url, p.cardOpts) + p.content, p.template, p.diffFilePath, p.cardOpts),
+      })
+      : await send(payload, deliveryOptions);
     if (id && payload.github) {
       githubMonitor.recordDelivery(payload);
       log(`[GitHub 送达] ${payload.github.repo} ${payload.github.kind}｜发现至送达 ${Date.now() - payload.github.detectedAt}ms`);
@@ -10083,6 +10160,7 @@ const fourmemeSafeMonitor = createFourmemeSafeMonitor({
 const fourmemeAddressConfig = readFourmemeAddressConfig();
 const fourmemeAddressMonitor = createFourmemeAddressMonitor({
   ...fourmemeAddressConfig, store: monitorStore, rpcBatch: bscRpcBatch,
+  mergeSafeExecutions: fourmemeSafeConfig.enabled && fourmemeSafeConfig.apiKeys.length > 0,
   rpcFactory: round => createAddressRoundRpc({ signal: round.signal, id: round.startedAt, batchSize: RPC_BATCH_SIZE,
     control: rpcControl,
     pool: rpcPoolFor([{ method: 'eth_getLogs', params: [{}] }]), request: requestBscRpcPayload,
