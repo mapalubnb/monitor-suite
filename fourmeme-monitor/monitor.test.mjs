@@ -2235,6 +2235,9 @@ test('i18n 历史批次因单键缺失误确认后安全重开，混合批次要
   assert.deepEqual(notify(at + 3), []);
   page.textContent = '全新功能標題';
   assert.equal(notify(at + 4).length, 1);
+  item.lastSeenAt = at + 10_000;
+  assert.deepEqual(notify(at + 10_001), []);
+  assert.equal(item.status, 'confirmed');
 });
 
 test("failed static asset expansion candidates are cooled down", () => {

@@ -4194,10 +4194,12 @@ function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity, at = Da
     if (item.status === "confirmed") {
       // Early deployments may have accepted one absence as proof of a full
       // batch. Keep the resource observation and reopen only that case.
-      if (!item.evidence?.some(e => e.type === "resource_absent")
-          || confirmedI18nChanges(effectiveI18nWatch(item), item.evidence, item.confirmedAt)) continue;
+      if (!item.evidence?.some(e => e.type === "resource_absent")) continue;
+      const confirmedObservation = { ...effectiveI18nWatch(item), lastSeenAt: item.confirmedResourceSeenAt || item.lastSeenAt };
+      if (confirmedI18nChanges(confirmedObservation, item.evidence, item.confirmedAt)) continue;
       Object.assign(item, { status: "pending", confirmedAt: 0, confirmationNotifiedAt: 0,
         evidence: item.evidence.filter(e => e.type !== "resource_absent") });
+      delete item.confirmedResourceSeenAt;
       changed = true;
     }
     pendingItems.push(item);
@@ -4222,6 +4224,7 @@ function* globalI18nWatchSteps(state, pages = {}, { maxItems = Infinity, at = Da
     }
     item.status = "confirmed";
     item.confirmedAt = item.confirmedAt || at;
+    if (evidence.some(e => e.type === "resource_absent")) item.confirmedResourceSeenAt = item.lastSeenAt || item.firstSeenAt;
     item.evidence = evidence;
     changed = true;
     if (!item.confirmationNotifiedAt) {
