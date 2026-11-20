@@ -334,8 +334,9 @@ test('Keeper 报价合并刷新，缺价、低可信、过期和请求失败不�
   let at = 1795171226000, calls = 0, unavailable = false;
   const prices = createKeeperTransferPrices({ now: () => at, async fetchImpl(url) {
     calls++;
-    assert.match(url, /coins\.llama\.fi\/prices\/current\/coingecko:binancecoin,bsc:/);
     if (unavailable) throw Error('offline');
+    if (url.startsWith('https://api.dexscreener.com/')) return { ok: true, json: async () => [] };
+    assert.match(url, /coins\.llama\.fi\/prices\/current\/coingecko:binancecoin,bsc:/);
     const quote = { price: 500, timestamp: at / 1000, confidence: 0.999 };
     return { ok: true, json: async () => ({ coins: { 'coingecko:binancecoin': quote,
       ['bsc:' + stock]: { ...quote, price: 3.37 },
@@ -351,7 +352,7 @@ test('Keeper 报价合并刷新，缺价、低可信、过期和请求失败不�
   assert.equal(prices.priceOf(bem), undefined);
   assert.equal(prices.priceOf(token), undefined);
   await prices.refresh();
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
   unavailable = true;
   at += 60_000;
   await prices.refresh();
@@ -359,6 +360,24 @@ test('Keeper 报价合并刷新，缺价、低可信、过期和请求失败不�
   at += 240_001;
   assert.equal(prices.priceOf(stock), undefined);
   assert.equal(prices.priceOf(NATIVE_BNB), undefined);
+});
+
+test('Keeper 备用行情只使用合约和报价币匹配且有成交及流动性的池', async () => {
+  const pair = (address, priceUsd, usd, { chainId = 'bsc', quote = token, h24 = 5000 } = {}) => ({
+    baseToken: { address }, quoteToken: { address: quote }, chainId, priceUsd, liquidity: { usd }, volume: { h24 },
+  });
+  const prices = createKeeperTransferPrices({ async fetchImpl(url) {
+    if (url.startsWith('https://coins.llama.fi/')) return { ok: false, status: 503 };
+    assert.match(url, new RegExp(WBNB));
+    return { ok: true, json: async () => [pair(WBNB, '575', 5000000), pair(stock, '3.37', 200000),
+      pair(stock, '4', 100000), pair(stock, '900', 800000, { quote: X }),
+      pair(stock, '900', 800000, { h24: 12 }), pair(stock, '900', 800000, { chainId: 'ethereum' }),
+      pair(bem, '15', 24000)] };
+  } });
+  await prices.refresh();
+  assert.equal(prices.priceOf(NATIVE_BNB), 57500000000n);
+  assert.equal(prices.priceOf(stock), 337000000n);
+  assert.equal(prices.priceOf(bem), undefined);
 });
 
 test('Keeper 报价未返回时区块照常提交，单笔告警无需等待报价', async () => {

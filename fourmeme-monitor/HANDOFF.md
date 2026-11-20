@@ -2,7 +2,9 @@
 
 ## 2026/11/20 Keeper 转账总额过滤（Suite 1.12.112 / Four.meme 1.5.50）
 
-按用户要求，替换原同币种 0.05 单位门槛。修改 `address-monitor.mjs`、`monitor.mjs`、`address-monitor.test.mjs`，新增 `keeper-transfer-prices.mjs` 并更新版本、根 README、项目状态和地址说明。已核实的 Keeper 独立转账按整笔合并直接及内部 BNB、WBNB、可靠报价代币，只有总额严格大于 0.01 BNB 才推送。领取的原生资产从完整参数取值，并逐币核对 ERC‑20 回执。授权、失败、无法估价和涉及其他观察对象的提醒继续按原流程处理。纯被动代币收款继续静默记录。报价不阻塞地址扫描，最多每分钟请求一次，无新增链上 RPC。既有快照可直接读取，仅重启 Four.meme。
+按用户要求，替换原同币种 0.05 单位门槛。修改 `address-monitor.mjs`、`monitor.mjs`、`address-monitor.test.mjs`，新增 `keeper-transfer-prices.mjs` 并更新版本、根 README、项目状态和地址说明。已核实的 Keeper 独立转账按整笔合并直接及内部 BNB、WBNB、可靠报价代币，只有总额严格大于 0.01 BNB 才推送。领取的原生资产从完整参数取值，并逐币核对 ERC‑20 回执。授权、失败、无法估价和涉及其他观察对象的提醒继续按原流程处理。纯被动代币收款继续静默记录。报价不阻塞地址扫描，DeFiLlama 及备用 DEX Screener 各最多每分钟批量请求一次，无新增链上 RPC。既有快照可直接读取，仅重启 Four.meme。
+
+初始候选 `a40c23f` 的实盘报价只覆盖 22 个候选合约中的 9 个，样例缺价并按设计保留提醒，未部署。备用来源仅对缺价合约启用，且要求可信报价币、至少 25,000 美元流动性和 1,000 美元 24 小时成交量。
 
 ## 2026/11/20 前端及 Safe 剩余重复通知优化（Suite 1.12.111 / Four.meme 1.5.49）
 
