@@ -238,7 +238,7 @@ test('Keeper 按交易折算总额，过滤小额并记录内部 BNB，同一资
   const companion = { ...first, topics: [companionTopic, ...first.topics.slice(1)], data: first.data + word(32687671412000000n) };
   f.add(101, claim([first, companion, payout(bem, 462n)], { native: 461360303000000n }));
   f.add(101, claim([]));
-  f.add(101, claim([payout(stock, 30000000000000000n), payout(stock, 30000000000000000n)]));
+  f.add(101, claim([payout(stock, 300000000000000000n), payout(stock, 300000000000000000n)]));
   f.data.head = 102;
   await f.monitor.poll();
   assert.equal(f.disk.fourmemeAddresses.cursor, 101);
@@ -250,7 +250,7 @@ test('Keeper 按交易折算总额，过滤小额并记录内部 BNB，同一资
   assert.equal(f.disk._notificationOutbox.length, 1);
   const card = f.disk._notificationOutbox[0].payload.content;
   assert.match(card, /资产转移 · 2 项/);
-  assert.match(card, /0\.03 BNCB/);
+  assert.match(card, /0\.3 BNCB/);
   assert.match(card, /Keeper 返佣路径/);
   assert.equal(card.match(new RegExp('→ \\[' + X + '\\]', 'g')).length, 1);
   await createFourmemeAddressMonitor(f.opts).poll();
@@ -289,9 +289,9 @@ test('Keeper 直接 BNB 入账严格大于阈值才发送，其他地址独立�
   f.data.head = 102;
   await f.monitor.poll();
   assert.equal(f.monitor.summary().keeperSmallTransfers, 2);
-  assert.equal(f.disk.fourmemeAddresses.passive[1].keeperValueWei, '10000000000000000');
+  assert.equal(f.disk.fourmemeAddresses.passive[1].keeperValueWei, '100000000000000000');
   assert.equal(f.disk._notificationOutbox.length, 2);
-  assert.match(f.disk._notificationOutbox[0].payload.content, /0\.010000000000000001 BNB/);
+  assert.match(f.disk._notificationOutbox[0].payload.content, /0\.100000000000000001 BNB/);
 });
 
 test('Keeper 领取的 BNB、WBNB 与多种币按单笔合计，缺报价时保留原推送', () => {
@@ -301,11 +301,11 @@ test('Keeper 领取的 BNB、WBNB 与多种币按单笔合计，缺报价时保�
     return observeFourmemeAddressTx(tx, r, [keeper], { keeperPriceOf: priceOf });
   };
   const internal = observe(claim([], { native: KEEPER_TRANSFER_LIMIT_WEI + 1n }));
-  assert.match(internal.lines[0], /0\.010000000000000001 BNB/);
-  const exact = claim([payout(WBNB, 3000000000000000n), payout(stock, 20000000000000000n), payout(bem, 20000000n)], { native: 1000000000000000n });
-  assert.equal(observe(exact).keeperValueWei, '10000000000000000');
+  assert.match(internal.lines[0], /0\.100000000000000001 BNB/);
+  const exact = claim([payout(WBNB, 30000000000000000n), payout(stock, 200000000000000000n), payout(bem, 200000000n)], { native: 10000000000000000n });
+  assert.equal(observe(exact).keeperValueWei, '100000000000000000');
   assert.equal(observe(exact, () => undefined).silentReason, undefined);
-  const over = claim([payout(WBNB, 3000000000000001n), payout(stock, 20000000000000000n), payout(bem, 20000000n)], { native: 1000000000000000n });
+  const over = claim([payout(WBNB, 30000000000000001n), payout(stock, 200000000000000000n), payout(bem, 200000000n)], { native: 10000000000000000n });
   assert.equal(observe(over).silentReason, undefined);
   const fractional = claim([payout(stock, 1n)], { native: KEEPER_TRANSFER_LIMIT_WEI });
   assert.ok(observe(fractional).lines.length);

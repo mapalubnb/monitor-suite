@@ -1,5 +1,9 @@
 # Four.meme 监控交接
 
+## 2026/11/20 Keeper 推送门槛调整（Suite 1.12.113 / Four.meme 1.5.51）
+
+用户将 Keeper 已核实的单笔独立资产转账推送门槛调整为严格大于 0.1 BNB。修改 `keeper-transfer-prices.mjs` 常量与 `address-monitor.test.mjs` 边界用例，同步版本、项目状态、根 README 和地址说明。直接 BNB 和混合资产在等于门槛时静默，高出门槛 1 wei 时推送。内部 BNB 单独超限也触发提醒。缺价、管理、失败及其他地址的独立提醒沿用原流程。无配置与快照迁移，只重启 Four.meme。
+
 ## 2026/11/20 Keeper 转账总额过滤（Suite 1.12.112 / Four.meme 1.5.50）
 
 按用户要求，替换原同币种 0.05 单位门槛。修改 `address-monitor.mjs`、`monitor.mjs`、`address-monitor.test.mjs`，新增 `keeper-transfer-prices.mjs` 并更新版本、根 README、项目状态和地址说明。已核实的 Keeper 独立转账按整笔合并直接及内部 BNB、WBNB、可靠报价代币，只有总额严格大于 0.01 BNB 才推送。领取的原生资产从完整参数取值，并逐币核对 ERC‑20 回执。授权、失败、无法估价和涉及其他观察对象的提醒继续按原流程处理。纯被动代币收款继续静默记录。报价不阻塞地址扫描，DeFiLlama 及备用 DEX Screener 各最多每分钟批量请求一次，无新增链上 RPC。既有快照可直接读取，仅重启 Four.meme。

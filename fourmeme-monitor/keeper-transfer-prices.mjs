@@ -3,7 +3,7 @@ import { KNOWN_ASSETS, VERIFIED_ASSET_DISPLAY } from './address-catalog.mjs';
 
 export const WBNB = '0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c';
 export const NATIVE_BNB = '0x' + '0'.repeat(40);
-export const KEEPER_TRANSFER_LIMIT_WEI = 10n ** 16n;
+export const KEEPER_TRANSFER_LIMIT_WEI = 10n ** 17n; // 0.1 BNB
 
 const BNB_QUOTE = 'coingecko:binancecoin';
 const assets = { ...KNOWN_ASSETS, ...VERIFIED_ASSET_DISPLAY };

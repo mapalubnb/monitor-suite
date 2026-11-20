@@ -1,5 +1,9 @@
 # Monitor Suite 📡
 
+## 2026/11/20 Keeper 推送门槛调整（Suite 1.12.113 / Four.meme 1.5.51）
+
+OpenFour Rebate Keeper 已核实的独立资产转账按单笔折算。总额严格大于 0.1 BNB 才推送，等于或低于 0.1 BNB 只记录流水。
+
 ## 2026/11/20 Keeper 转账总额过滤（Suite 1.12.112 / Four.meme 1.5.50）
 
 OpenFour Rebate Keeper 已核实的独立资产转账按整笔交易折算，原生 BNB、WBNB 和可报价代币合计严格大于 0.01 BNB 才推送。领取中的内部 BNB 也计入。小额交易仍保存原始流水及折算总额。缺价、权限、失败或其他受监控地址的独立提醒沿用现有处理，地址扫描仍为 1 秒和零确认。
