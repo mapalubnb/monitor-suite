@@ -4,6 +4,7 @@ import { createTransactionalOutbox } from '../shared/transactional-outbox.mjs';
 import { createFourmemeAddressMonitor, updateAddressHealth, observeFourmemeAddressTx, renderFourmemeAddressContent, addressLogFilters, TRANSFER, APPROVAL } from './address-monitor.mjs';
 import { FOURMEME_ADDRESS_CATALOG, KNOWN_ASSETS, FOURMEME_SAFE, readFourmemeAddressConfig } from './address-catalog.mjs';
 import { deliverSafeExecutionCard } from './safe-execution-delivery.mjs';
+import { createKeeperTransferPrices, KEEPER_TRANSFER_LIMIT_WEI, NATIVE_BNB, WBNB } from './keeper-transfer-prices.mjs';
 import { ENTRY_POINT_V07, USER_OPERATION_EVENT } from '../flap-monitor/erc4337-codec.mjs';
 import { keccak_256 } from '@noble/hashes/sha3';
 const A = FOURMEME_ADDRESS_CATALOG[0].address, B = FOURMEME_ADDRESS_CATALOG[1].address, X = '0x' + '33'.repeat(20);
@@ -217,19 +218,25 @@ test('主动授权/转移未知资产保留精度未知；失败调用不声称�
 const keeper = FOURMEME_ADDRESS_CATALOG.find(x => x.label === 'OpenFour Rebate Keeper');
 const completionTopic = '0x0b930379a90ac974f8f7af77345b7d40a967fc4ea295de11245b4045781ecdf3';
 const companionTopic = '0x0226a2f5c1ae0e071aeec3d4ebafcefdc5c549be11f40ed27e76e802acccf374';
-const claimInput = '0xffb83a52' + [100137601, 160, 352, 1795154819, 544].map(word).join('');
 const completion = { address: keeper.address, topics: [completionTopic], data: h(100137601) };
 const stock = '0x4902c5ebc598265ed2212b559b042de8a5eeec3f';
 const bem = '0x5ce033b2bfca3af30b3e8c8457deaf776a8b695a';
 const payout = (address, raw, to = X) => ({ address, topics: [TRANSFER, topic(keeper.address), topic(to)], data: h(raw) });
-const claim = (logs, extra = {}) => ({ from: X, to: keeper.address, value: '0x0', input: claimInput, logs: [...logs, completion], ...extra });
+const keeperPriceOf = address => ({ [NATIVE_BNB]: 500n, [stock]: 100n, [bem]: 5n, [token]: 1n })[address];
+function claim(logs, { native = 0n, ...extra } = {}) {
+  const transfers = logs.filter(l => l.topics[0] === TRANSFER);
+  const assets = [NATIVE_BNB, ...transfers.map(l => l.address)], count = assets.length;
+  const input = '0xffb83a52' + [100137601, 160, (6 + count) * 32, 1795154819, (7 + 2 * count) * 32,
+    count, ...assets, count, native, ...transfers.map(l => l.data), 1, 1].map(word).join('');
+  return { from: X, to: keeper.address, value: '0x0', input, logs: [...logs, completion], ...extra };
+}
 
-test('Keeper 已证实的小额与零额领取只写审计，同币种累计超限照常推送', async () => {
-  const f = fixture({}, { catalog: [keeper] });
+test('Keeper 按交易折算总额，过滤小额并记录内部 BNB，同一资产累加超限推送', async () => {
+  const f = fixture({}, { catalog: [keeper], keeperTransferPrices: { priceOf: keeperPriceOf, refresh() {} } });
   await f.monitor.poll();
   const first = payout(stock, 32687671412000000n);
   const companion = { ...first, topics: [companionTopic, ...first.topics.slice(1)], data: first.data + word(32687671412000000n) };
-  f.add(101, claim([first, companion, payout(bem, 462n)]));
+  f.add(101, claim([first, companion, payout(bem, 462n)], { native: 461360303000000n }));
   f.add(101, claim([]));
   f.add(101, claim([payout(stock, 30000000000000000n), payout(stock, 30000000000000000n)]));
   f.data.head = 102;
@@ -238,6 +245,8 @@ test('Keeper 已证实的小额与零额领取只写审计，同币种累计超�
   assert.equal(f.disk.fourmemeAddresses.keeperSmallRebates, 2);
   assert.deepEqual(f.disk.fourmemeAddresses.passive.map(x => [x.reason, x.eventCount]), [['keeper_small_rebate', 2], ['keeper_small_rebate', 0]]);
   assert.equal(BigInt(f.disk.fourmemeAddresses.passive[0].events[0].rawAmount), 32687671412000000n);
+  assert.equal(f.disk.fourmemeAddresses.passive[0].keeperNativeWei, '461360303000000');
+  assert.equal(f.disk.fourmemeAddresses.passive[0].keeperValueWei, '6998940785400000');
   assert.equal(f.disk._notificationOutbox.length, 1);
   const card = f.disk._notificationOutbox[0].payload.content;
   assert.match(card, /资产转移 · 2 项/);
@@ -248,12 +257,13 @@ test('Keeper 已证实的小额与零额领取只写审计，同币种累计超�
   assert.equal(f.disk.fourmemeAddresses.keeperSmallRebates, 2);
 });
 
-test('Keeper 领取锚点不匹配、不同收款方、未知精度、授权、失败和原生转账持续告警', () => {
+test('Keeper 领取锚点或金额不匹配、不同收款方、未知精度、授权和失败持续告警', () => {
   const f = fixture({}, { catalog: [keeper, ...cat] });
   const small = payout(stock, 1n);
   const samples = [
-    claim([small], { input: '0x12345678' + claimInput.slice(10) }),
+    { ...claim([small]), input: '0x12345678' + claim([small]).input.slice(10) },
     claim([small], { logs: [small, { ...completion, data: h(22) }] }),
+    claim([small], { logs: [{ ...small, data: h(2) }, completion] }),
     claim([payout(stock, 1n, A)]),
     claim([payout('0x' + '67'.repeat(20), 1n)]),
     claim([small, { ...small, topics: [APPROVAL, ...small.topics.slice(1)] }]),
@@ -263,10 +273,103 @@ test('Keeper 领取锚点不匹配、不同收款方、未知精度、授权、�
   ];
   for (const sample of samples) {
     const { tx, r } = f.add(101, sample);
-    const result = observeFourmemeAddressTx(tx, r, [keeper, ...cat]);
+    const result = observeFourmemeAddressTx(tx, r, [keeper, ...cat], { keeperPriceOf });
     assert.equal(result.silentReason, undefined);
     assert.ok(result.lines.length);
   }
+});
+
+test('Keeper 直接 BNB 入账严格大于阈值才发送，其他地址独立信号照常', async () => {
+  const f = fixture({}, { catalog: [keeper, ...cat] });
+  await f.monitor.poll();
+  for (const raw of [KEEPER_TRANSFER_LIMIT_WEI - 1n, KEEPER_TRANSFER_LIMIT_WEI, KEEPER_TRANSFER_LIMIT_WEI + 1n]) {
+    f.add(101, { from: X, to: keeper.address, value: hex(raw) });
+  }
+  f.add(101, { from: A, to: keeper.address, value: '0x1' });
+  f.data.head = 102;
+  await f.monitor.poll();
+  assert.equal(f.monitor.summary().keeperSmallTransfers, 2);
+  assert.equal(f.disk.fourmemeAddresses.passive[1].keeperValueWei, '10000000000000000');
+  assert.equal(f.disk._notificationOutbox.length, 2);
+  assert.match(f.disk._notificationOutbox[0].payload.content, /0\.010000000000000001 BNB/);
+});
+
+test('Keeper 领取的 BNB、WBNB 与多种币按单笔合计，缺报价时保留原推送', () => {
+  const f = fixture({}, { catalog: [keeper] });
+  const observe = (sample, priceOf = keeperPriceOf) => {
+    const { tx, r } = f.add(101, sample);
+    return observeFourmemeAddressTx(tx, r, [keeper], { keeperPriceOf: priceOf });
+  };
+  const internal = observe(claim([], { native: KEEPER_TRANSFER_LIMIT_WEI + 1n }));
+  assert.match(internal.lines[0], /0\.010000000000000001 BNB/);
+  const exact = claim([payout(WBNB, 3000000000000000n), payout(stock, 20000000000000000n), payout(bem, 20000000n)], { native: 1000000000000000n });
+  assert.equal(observe(exact).keeperValueWei, '10000000000000000');
+  assert.equal(observe(exact, () => undefined).silentReason, undefined);
+  const over = claim([payout(WBNB, 3000000000000001n), payout(stock, 20000000000000000n), payout(bem, 20000000n)], { native: 1000000000000000n });
+  assert.equal(observe(over).silentReason, undefined);
+  const fractional = claim([payout(stock, 1n)], { native: KEEPER_TRANSFER_LIMIT_WEI });
+  assert.ok(observe(fractional).lines.length);
+});
+
+test('Keeper 可核验的独立出账适用门槛，带额外授权或未识别调用仍保留', () => {
+  const f = fixture({}, { catalog: [keeper] });
+  const observe = sample => {
+    const { tx, r } = f.add(101, { from: X, to: keeper.address, value: '0x0', ...sample });
+    return observeFourmemeAddressTx(tx, r, [keeper], { keeperPriceOf });
+  };
+  const directNative = { input: '0xe9bb84c2' + [X, 1n].map(word).join('') };
+  const directToken = { input: '0x9db5dbe4' + [X, stock, 1n].map(word).join(''), logs: [payout(stock, 1n)] };
+  const batchRecipient = '0x701ddcf02092fa120733a7ef432005286110136d';
+  const batch = { input: '0xffc3a769' + [64, 160, 2, stock, NATIVE_BNB, 2, 1n, 1n].map(word).join(''), logs: [payout(stock, 1n, batchRecipient)] };
+  assert.equal(observe(directNative).silentReason, 'keeper_small_transfer');
+  assert.equal(observe(directToken).silentReason, 'keeper_small_transfer');
+  assert.equal(observe(batch).silentReason, 'keeper_small_transfer');
+  const transferFrom = { to: token, input: '0x23b872dd' + [keeper.address, X, 1n].map(word).join(''), logs: [payout(token, 1n)] };
+  assert.equal(observe(transferFrom).silentReason, 'keeper_small_transfer');
+  assert.ok(observe({ ...directToken, input: '0xabcd1234' + directToken.input.slice(10) }).lines.length);
+  assert.ok(observe({ ...directToken, logs: [...directToken.logs, { ...payout(stock, 1n), topics: [APPROVAL, topic(keeper.address), topic(X)] }] }).lines.length);
+});
+
+test('Keeper 报价合并刷新，缺价、低可信、过期和请求失败不转成零价', async () => {
+  let at = 1795171226000, calls = 0, unavailable = false;
+  const prices = createKeeperTransferPrices({ now: () => at, async fetchImpl(url) {
+    calls++;
+    assert.match(url, /coins\.llama\.fi\/prices\/current\/coingecko:binancecoin,bsc:/);
+    if (unavailable) throw Error('offline');
+    const quote = { price: 500, timestamp: at / 1000, confidence: 0.999 };
+    return { ok: true, json: async () => ({ coins: { 'coingecko:binancecoin': quote,
+      ['bsc:' + stock]: { ...quote, price: 3.37 },
+      ['bsc:' + bem]: { ...quote, confidence: 0.8 },
+      ['bsc:' + token]: { ...quote, timestamp: quote.timestamp - 301 } } }) };
+  } });
+  const refresh = prices.refresh();
+  assert.equal(prices.refresh(), refresh);
+  assert.equal(prices.priceOf(stock), undefined);
+  await refresh;
+  assert.equal(prices.priceOf(stock), 337000000n);
+  assert.equal(prices.priceOf(NATIVE_BNB), 50000000000n);
+  assert.equal(prices.priceOf(bem), undefined);
+  assert.equal(prices.priceOf(token), undefined);
+  await prices.refresh();
+  assert.equal(calls, 1);
+  unavailable = true;
+  at += 60_000;
+  await prices.refresh();
+  assert.equal(prices.priceOf(stock), 337000000n);
+  at += 240_001;
+  assert.equal(prices.priceOf(stock), undefined);
+  assert.equal(prices.priceOf(NATIVE_BNB), undefined);
+});
+
+test('Keeper 报价未返回时区块照常提交，单笔告警无需等待报价', async () => {
+  const pending = new Promise(() => {});
+  const f = fixture({}, { catalog: [keeper], keeperTransferPrices: { refresh: () => pending, priceOf: () => undefined } });
+  await f.monitor.poll();
+  f.add(101, claim([payout(stock, 1n)]));
+  f.data.head = 102;
+  await f.monitor.poll();
+  assert.equal(f.monitor.summary().cursor, 101);
+  assert.equal(f.disk._notificationOutbox.length, 1);
 });
 
 test('已验证精度显示 BEM 的八位小数，展示资产不扩大被动监听', () => {

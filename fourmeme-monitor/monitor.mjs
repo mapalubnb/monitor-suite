@@ -8,6 +8,7 @@ import { createGithubApi, createGithubMonitor, createGithubTransport, retireGith
 import { createFourmemeSafeMonitor, readFourmemeSafeConfig } from "./safe-monitor.mjs";
 import { deliverSafeExecutionCard } from "./safe-execution-delivery.mjs";
 import { createFourmemeAddressMonitor } from './address-monitor.mjs';
+import { createKeeperTransferPrices } from './keeper-transfer-prices.mjs';
 import { readFourmemeAddressConfig } from './address-catalog.mjs';
 import { createAddressRoundRpc } from './address-rpc.mjs';
 import { discoverCreators } from "./creator-discovery.mjs";
@@ -10200,6 +10201,7 @@ const fourmemeSafeMonitor = createFourmemeSafeMonitor({
 const fourmemeAddressConfig = readFourmemeAddressConfig();
 const fourmemeAddressMonitor = createFourmemeAddressMonitor({
   ...fourmemeAddressConfig, store: monitorStore, rpcBatch: bscRpcBatch,
+  keeperTransferPrices: IS_TEST_MODE ? undefined : createKeeperTransferPrices(),
   mergeSafeExecutions: fourmemeSafeConfig.enabled && fourmemeSafeConfig.apiKeys.length > 0,
   rpcFactory: round => createAddressRoundRpc({ signal: round.signal, id: round.startedAt, batchSize: RPC_BATCH_SIZE,
     control: rpcControl,
