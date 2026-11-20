@@ -4,6 +4,8 @@
 
 用户将 Keeper 已核实的单笔独立资产转账推送门槛调整为严格大于 0.1 BNB。修改 `keeper-transfer-prices.mjs` 常量与 `address-monitor.test.mjs` 边界用例，同步版本、项目状态、根 README 和地址说明。直接 BNB 和混合资产在等于门槛时静默，高出门槛 1 wei 时推送。内部 BNB 单独超限也触发提醒。缺价、管理、失败及其他地址的独立提醒沿用原流程。无配置与快照迁移，只重启 Four.meme。
 
+业务提交 `1bdce30b50753348fa38e8eba8e106b91c9603a0` 按 GitHub、VPS 顺序发布。本地和 VPS 隔离全量各 926/926，语法和差异检查通过。用同一批报价回放 33 笔真实领取，旧门槛静默 19 笔，新门槛静默 30 笔，保留 3 笔。线上于 22:53:48 仅重启 Four.meme，PID 1164529。22:54:27 地址游标推进 95 块，WSS 在线、1 秒、零确认，15 项调度周期及旧去重记录核对一致，报价覆盖 22/22，待发 0，错误日志新增 0 字节。备份和验收位于 `/root/monitor-suite-backups/keeper-bnb-threshold-1.12.113-OMUYee`。验收文档同步无需重启。
+
 ## 2026/11/20 Keeper 转账总额过滤（Suite 1.12.112 / Four.meme 1.5.50）
 
 按用户要求，替换原同币种 0.05 单位门槛。修改 `address-monitor.mjs`、`monitor.mjs`、`address-monitor.test.mjs`，新增 `keeper-transfer-prices.mjs` 并更新版本、根 README、项目状态和地址说明。已核实的 Keeper 独立转账按整笔合并直接及内部 BNB、WBNB、可靠报价代币，只有总额严格大于 0.01 BNB 才推送。领取的原生资产从完整参数取值，并逐币核对 ERC‑20 回执。授权、失败、无法估价和涉及其他观察对象的提醒继续按原流程处理。纯被动代币收款继续静默记录。报价不阻塞地址扫描，DeFiLlama 及备用 DEX Screener 各最多每分钟批量请求一次，无新增链上 RPC。既有快照可直接读取，仅重启 Four.meme。
