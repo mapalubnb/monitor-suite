@@ -198,3 +198,70 @@ test('新目录按公开 API 翻页，完整空目录有效，重复和不完整
   assert.throws(() => parseRegistration(flight({ registration: { appId: 'other', slug: 'corla' } }),
     { ...rows[0], appId: 'expected' }), /身份不匹配/);
 });
+
+test('目录增删只发送名称，名称变更不报增删，重启不重放', async () => {
+  let saved = { catalog: [] }, rows = [{ appId: 'a', slug: 'a', name: 'A', displayTitle: { zh: '应用甲' } }];
+  const sent = [];
+  const make = () => createMiniAppMonitor({ initial: saved, persist: s => { saved = structuredClone(s); },
+    fetchText: legacyDirectory(async url => url.includes('/apps?') ? flight({ apps: rows }) : '<h1>incomplete</h1>'),
+    deliver: async p => { sent.push(p); return 'id'; } });
+  const monitor = make();
+  await monitor.run();
+  rows = [{ appId: 'b', slug: 'b', name: '应用乙' }];
+  await monitor.run();
+  assert.deepEqual(sent.map(p => [p.title, p.content]), [
+    ['Flap 小程序｜新增应用', '应用甲'], ['Flap 小程序｜新增应用', '应用乙'], ['Flap 小程序｜应用目录移除', '应用甲'],
+  ]);
+  rows[0].name = '乙的新名称';
+  await make().run();
+  assert.equal(sent.length, 3);
+  assert.equal(saved.catalog[0].name, '乙的新名称');
+});
+
+test('描述、资源和配置更新静默保存，重启后沿用新基线', async () => {
+  const registration = structuredClone(fixture.registration);
+  registration.slug = 'sample'; registration.appId = 'sample-id';
+  const manifest = { ...fixture.manifest, slug: registration.slug, artifactId: registration.appId };
+  const texts = { manifest: JSON.stringify(manifest), metadata: '{"description":"旧说明"}', i18n: '{"zh":{}}', component: 'old code' };
+  const rehash = () => {
+    for (const name of Object.keys(texts)) registration.artifact.assetHashes[name + 'Sha256'] = createHash('sha256').update(texts[name]).digest('hex');
+  };
+  rehash();
+  let saved = {};
+  const sent = [];
+  const make = () => createMiniAppMonitor({ initial: saved, persist: s => { saved = structuredClone(s); },
+    fetchText: legacyDirectory(async url => {
+      if (url.includes('/apps?')) return flight({ apps: [{ appId: registration.appId, slug: registration.slug, name: '示例' }] });
+      if (url.includes('/apps/sample')) return flight({ registration });
+      return texts[Object.keys(texts).find(name => registration.artifact.assets[name + 'Url'] === url)];
+    }), deliver: async p => { sent.push(p); return 'id'; } });
+  const monitor = make(); await monitor.run();
+  assert.equal(saved.apps['sample-id'].config.metadata.description, '旧说明');
+  texts.metadata = '{"description":"新版长说明"}'; texts.component = 'new code';
+  registration.enabled = !registration.enabled; registration.artifact.version = 'next'; rehash();
+  await monitor.run();
+  assert.equal(saved.apps['sample-id'].config.metadata.description, '新版长说明');
+  assert.equal(saved.apps['sample-id'].config.componentSha256, registration.artifact.assetHashes.componentSha256);
+  assert.equal(saved.apps['sample-id'].config.enabled, registration.enabled);
+  await make().run();
+  assert.equal(sent.length, 0); assert.equal(saved._notificationOutbox?.length || 0, 0);
+  assert.deepEqual(saved.errors || {}, {});
+});
+
+test('遗留详情待发归档且重启不补发，模板及增删待发保持原投递身份', async () => {
+  const entry = (id, title, content) => ({ id, payload: { title, content }, attempts: 2, nextAttemptAt: 0, parts: [] });
+  const detail = entry('detail', 'Flap 小程序｜描述、资源或配置变更', '应用\n大量描述');
+  let saved = { catalog: [], _notificationOutbox: [detail,
+    entry('template', 'Flap｜机制模板详情变更', '模板说明'), entry('added', 'Flap 小程序｜新增应用', '应用乙')] };
+  const sent = [];
+  const make = persist => createMiniAppMonitor({ initial: structuredClone(saved), persist,
+    fetchText: async () => { throw Error('目录暂时不可用'); },
+    deliver: async (p, options) => { sent.push([options.deliveryId, p.content]); return 'id'; } });
+  await assert.rejects(make(() => { throw Error('保存失败'); }).run(), /保存失败/);
+  assert.equal(sent.length, 0); assert.equal(saved._notificationOutbox.length, 3);
+  const persist = s => { saved = structuredClone(s); };
+  await make(persist).run(); await make(persist).run();
+  assert.deepEqual(saved.suppressedAppDetailNotifications, [detail]);
+  assert.deepEqual(sent, [['template', '模板说明'], ['added', '应用乙']]);
+  assert.equal(saved._notificationOutbox.length, 0);
+});

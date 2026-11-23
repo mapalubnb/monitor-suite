@@ -265,6 +265,13 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
         if (excluded({ appId }) || removed.some(row => row.appId === appId)) delete box.state.errors[appId];
       }
       if (box.state.catalog) box.state.catalog = box.state.catalog.filter(row => !excluded(row));
+      // 用户仅保留目录增删通知。旧详情待发项先归档，防止重启后继续发送长卡。
+      const details = (box.state._notificationOutbox || []).filter(entry =>
+        entry.payload?.title === 'Flap 小程序｜描述、资源或配置变更');
+      if (details.length) {
+        box.state.suppressedAppDetailNotifications = [...(box.state.suppressedAppDetailNotifications || []), ...details];
+        box.state._notificationOutbox = box.state._notificationOutbox.filter(entry => !details.includes(entry));
+      }
     });
     await box.drain();
     try {
@@ -274,8 +281,8 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
         .map(row => row.appId || !known.get(row.slug) ? row : { ...row, appId: known.get(row.slug) });
       await box.transaction(async () => {
         if (old) {
-          for (const row of rows) if (!old.some(item => sameApp(item, row))) await notify('新增应用', `${row.displayTitle?.zh || row.name}\nhttps://flap.sh/apps/${row.slug}`);
-          for (const row of old) if (!rows.some(item => sameApp(item, row))) await notify('应用目录移除', `${row.name}\n${APPS_URL}\n仅表示目录未再列出，不代表链上停用。`);
+          for (const row of rows) if (!old.some(item => sameApp(item, row))) await notify('新增应用', row.displayTitle?.zh || row.name);
+          for (const row of old) if (!rows.some(item => sameApp(item, row))) await notify('应用目录移除', row.displayTitle?.zh || row.name);
         }
         box.state.catalog = rows;
       });
@@ -288,7 +295,7 @@ export function createMiniAppMonitor({ initial = {}, persist, fetchText, rpc, de
             const catalog = { ...row, appId: registration.appId };
             const old = apps[registration.appId];
             const config = { ...artifact, enabled: registration.enabled, artifactEnabled: registration.artifact.enabled, catalog };
-            if (old && stable(old.config) !== stable(config)) await notify('描述、资源或配置变更', `${row.name}\nhttps://flap.sh/apps/${row.slug}\n${appConfigDiff(old.config, config).join('\n')}`);
+            // 资源仍核验并保存最新基线，描述、资源与配置变化不再推送。
             apps[registration.appId] = { ...old, config, lastSuccess: formatBeijingTime(new Date()), lastError: '' };
             if (!row.appId) box.state.catalog = box.state.catalog.map(item => item.slug === row.slug ? catalog : item);
           });
