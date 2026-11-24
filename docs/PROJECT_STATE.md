@@ -2,7 +2,7 @@
 
 ## 2026/11/25 Safe Queue 兼容迁移
 
-Suite 1.12.115 / Flap 1.10.60 / Four.meme 1.5.52。两套监控按原频率单 Safe 读取 Queue，执行详情与补查继续 Transaction Service v2；保留原 Key 额度/冷却、历史、降噪、卡片和 AI。非空队列只读核验门槛。无需改生产环境，只重启两套监控。本地全量 938/938；上线验收见两模块 HANDOFF。
+Suite 1.12.115 / Flap 1.10.60 / Four.meme 1.5.52。两套监控按原频率单 Safe 读取 Queue，执行详情与补查继续 Transaction Service v2；保留原 Key 额度/冷却、历史、降噪、卡片和 AI。非空队列只读核验门槛。无需改生产环境，只重启两套监控。业务 `7f253e8` 已先推 GitHub 再发布；本地和 VPS 全量各 938/938。00:10:02 仅重启 Flap/Four.meme，00:11:47 确认 Flap 11/11 Safe 刷新成功，Four.meme nonce 157 仍 1/3、首次时间保留。14/15 项周期、环境、Key 冷却、历史和 AI 逐项核对，待发均 0，机器人未重启；详见两模块 HANDOFF。
 
 ## 2026/11/23 Flap 小程序通知精简
 

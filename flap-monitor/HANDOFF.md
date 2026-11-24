@@ -1,5 +1,15 @@
 # Flap 监控交接
 
+## 2026/11/25 Safe Queue 迁移上线验收
+
+业务 `7f253e8` 已先推 GitHub 再快进 VPS。Suite 1.12.115 / Flap 1.10.60 / Four.meme 1.5.52。本地与服务器隔离全量各 938/938，语法及 diff 检查通过。真实只读对照：Four.meme nonce 157 的 calldata、精确数量、完整签名、时间及 1/3 门槛一致；Flap nonce 245 的执行哈希、成功状态与解码动作一致。
+
+2026/11/25 00:10:02 两套监控切换：Flap PID 2768049、Four.meme PID 2768123；机器人 PID 724414 未变。00:11:47.630 确认 11/11 Flap Safe 均已通过新版轮询，错误为空。Four.meme nonce 157 通过新接口刷新，仍为 1/3，firstSeen 保留为 2026/11/24 18:29:50.667；原 353 个 Flap 与 9 个 Four.meme 提案全部保留首次时间。未向群发人工测试卡，未人为重跑历史 AI。
+
+Flap 14 项及 Four.meme 15 项周期逐项一致，环境逐字一致；Key 池标识及原额度耗尽账户冷却保留，历史终点/放弃记录、公共池归档、Agent Curve 停用与前端忽略记录均核对。Flap Safe AI 为 deepseek-flash 且激活时间未变，其他 AI 关闭。00:11:21 验收两边待发 0，提前信号游标 135492376→135492601，末次追平。启动窗口 Four.meme 公共地址接口曾 502 并沿原缓存/退避恢复，不属于 Safe 迁移故障；不能据短时验收承诺上游永久无错。
+
+备份 `/root/monitor-suite-backups/safe-queue-20261125-1.12.115` 含旧代码、环境、两套停服状态及分片、测试日志、真实接口比对、周期/历史/Key/进程验收和完整 Safe 刷新记录。无生产配置修改。文档同步不再重启服务。
+
 ## 2026/11/25 Safe Queue 兼容迁移
 
 Suite 1.12.115 / Flap 1.10.60 / Four.meme 1.5.52。新增 `flap-monitor/safe-queue-api.mjs` 及专项测试；共享 Safe 扫描增加显式 Queue 接入，Flap 手动/持续入口和 Four.meme 入口启用。逐 Safe 查询并完整分页，链固定 56；新字段转换为旧格式，保留 calldata/签名及提案来源；非空队列额外读取一次 threshold，失败保留旧提案。执行详情与补查使用 Transaction Service v2，发现与 credential ID 保持原基址，现有额度冷却不重置。
