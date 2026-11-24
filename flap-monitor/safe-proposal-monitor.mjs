@@ -1,6 +1,7 @@
 import { withDeadline } from '../shared/request-deadline.mjs';
 import { OWNER_MANAGEMENT_CONTRACT, annotateOwners, ownerLink } from './owner-catalog.mjs';
 import { safeApiAddress } from './safe-api-address.mjs';
+import { fetchQueueProposals, normalizeQueueProposal, safeExecutionApiBase } from './safe-queue-api.mjs';
 import { formatBeijingTime } from "../shared/display-format.cjs";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from 'node:timers/promises';
@@ -363,6 +364,8 @@ function normalizeProposal(proposal, safe, quoteToken, nowText) {
     nonce: Number(proposal?.nonce),
     quoteToken,
     proposer: normalizeAddress(proposal?.proposer),
+    proposedVia: proposal?.proposedVia || 'UNKNOWN',
+    proposedBy: normalizeAddress(proposal?.proposedBy),
     submissionDate: proposal?.submissionDate || "",
     confirmations,
     confirmationOwners: [...new Set((proposal.confirmations || []).map(c => normalizeAddress(c.owner)).filter(Boolean))],
@@ -441,7 +444,8 @@ async function fetchSafeJson(url, { apiKey, timeoutMs, fetchFn, signal: parentSi
     signal.throwIfAborted();
     if (!response?.ok) {
       const status = response?.status || "unknown";
-      const suffix = status === 422 ? "（Safe 地址必须使用 EIP-55 校验和格式）" : "";
+      const suffix = status === 422 ? (new URL(url).pathname.includes('/queue/')
+        ? "（Safe Queue 参数或 Safe 状态校验失败）" : "（Safe 地址必须使用 EIP-55 校验和格式）") : "";
       const quotaExhausted = response?.headers?.get?.('x-ratelimit-remaining') === '0';
       const error = new Error(`Safe API HTTP ${status}${suffix}${quotaExhausted ? '（账户月度额度已耗尽）' : ''}`);
       error.status = status;
@@ -634,6 +638,7 @@ export async function runSafeProposalScan({
   rpcBatch,
   fetchFn = globalThis.fetch,
   apiBaseUrl = DEFAULT_SAFE_API_BASE_URL,
+  queueApiBaseUrl = '',
   apiKey = "",
   apiKeys = [],
   timeoutMs = 5_000,
@@ -733,7 +738,8 @@ export async function runSafeProposalScan({
     if (Number(safeState.nextAttemptAtMs) > nowMs) return { safe, skipped: true, currentNonce };
     // 错开同一轮多个 Safe 请求，降低出口 IP 触发 Safe API 限流的概率。
     if (index > 0) await new Promise(resolve => setTimeout(resolve, index * SAFE_API_STAGGER_MS));
-    const proposals = await fetchSafeProposals({
+    const proposals = queueApiBaseUrl ? await fetchQueueProposals({ safe, baseUrl: queueApiBaseUrl,
+      readJson: url => fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }) }) : await fetchSafeProposals({
       safe: apiAddressBySafe.get(safe),
       nonce: currentNonce,
       apiBaseUrl,
@@ -741,6 +747,12 @@ export async function runSafeProposalScan({
       timeoutMs,
       fetchFn,
     });
+    if (queueApiBaseUrl && proposals.length) {
+      const [value] = await rpcBatch([{ method: 'eth_call', params: [{ to: safe, data: '0xe75235b8' }, 'latest'] }],
+        { critical: true, requireAllResults: true });
+      const threshold = decodeUintWord(value);
+      for (let i = 0; i < proposals.length; i++) proposals[i] = normalizeQueueProposal(proposals[i], safe, threshold);
+    }
     return { safe, currentNonce, proposals, baselineWasEstablished: safeState.baselineEstablished === true };
   }));
 
@@ -816,7 +828,7 @@ export async function runSafeProposalScan({
         if (previous) next.firstSeenAt = previous.firstSeenAt || next.firstSeenAt;
         state.proposals[next.key] = next;
         if (suppressForSafe) continue;
-        if (!previous) {
+        if (!previous || queueApiBaseUrl && !ACTIVE_STATUSES.includes(previous.status)) {
           changes.push(appendPendingChange(state, !outcome.value.baselineWasEstablished ? "existing" : next.status === "ready" ? "ready" : "proposed", next, runAt));
         } else if (next.required > 0 && (previous.status !== "ready" || Boolean(previous.nonceBlocked) !== next.nonceBlocked
           || previous.executionCheck?.status !== "passed" && next.executionCheck.status === "passed") && next.confirmations >= next.required) {
@@ -857,7 +869,7 @@ export async function runSafeProposalScan({
       || (isolateExecutionFailures && Date.now() >= executionEndsAt)) continue;
     try {
       await waitExecution();
-      const base = String(apiBaseUrl).replace(/\/+$/, "");
+      const base = queueApiBaseUrl ? safeExecutionApiBase(apiBaseUrl) : String(apiBaseUrl).replace(/\/+$/, "");
       let detail;
       try { detail = await readExecution(base + "/multisig-transactions/" + safeTxHash + "/"); }
       catch (error) { if (!isolateExecutionFailures || error.status !== 404) throw error; }
@@ -937,7 +949,8 @@ export async function runSafeProposalScan({
     if (isolateExecutionFailures ? health.executionHistoryNextAttemptAtMs > nowMs || Date.now() >= executionEndsAt : health.nextAttemptAtMs > nowMs) continue;
     try {
       const query = new URLSearchParams({ executed: 'true', nonce__gte: String(health.executionNextNonce), nonce__lt: String(currentNonce), ordering: 'nonce', limit: '100' });
-      const page = await readExecution(String(apiBaseUrl).replace(/\/+$/, '') + '/safes/' + safeApiAddress(safe) + '/multisig-transactions/?' + query);
+      const base = queueApiBaseUrl ? safeExecutionApiBase(apiBaseUrl) : String(apiBaseUrl).replace(/\/+$/, '');
+      const page = await readExecution(base + '/safes/' + safeApiAddress(safe) + '/multisig-transactions/?' + query);
       if (!Array.isArray(page.results)) throw Error('Safe 执行补查响应无效');
       for (const proposal of [...page.results].sort((a, b) => Number(a.nonce) - Number(b.nonce))) {
         const nonce = Number(proposal.nonce), hash = normalizeHash(proposal.safeTxHash), tx = normalizeHash(proposal.transactionHash);

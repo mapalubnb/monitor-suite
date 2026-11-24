@@ -1,5 +1,9 @@
 # Monitor Suite 📡
 
+## 2026/11/25 Safe Queue 兼容迁移（Suite 1.12.115 / Flap 1.10.60 / Four.meme 1.5.52）
+
+Flap 和 Four.meme 按原周期逐个 Safe 查询 Queue Service，不做多 Safe 批量优化。提案时间、签名与执行状态转换为原内部格式，签名门槛在有提案时通过 Safe getter 只读核验；执行详情和执行补查读取 Transaction Service v2，owner 发现继续使用原接口。现有 Key、额度冷却标识、卡片、历史基线、去重和 AI 规则保留。无需修改生产 .env，`FLAP_SAFE_API_BASE_URL` 仍保留原 Transaction Service 基址。
+
 ## 2026/11/23 Flap 小程序通知精简（Suite 1.12.114 / Flap 1.10.59）
 
 小程序业务推送仅保留目录新增、移除，正文只显示名称。描述、资源与配置仍采集校验并保存，但不再推送差异；遗留详情待发项原样归档，不重放。采集健康告警、机制模板通知、原频率、Agent Curve 停用、历史策略及 Safe AI 配置保持。

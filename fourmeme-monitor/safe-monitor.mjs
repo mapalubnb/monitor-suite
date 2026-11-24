@@ -3,6 +3,7 @@ import { createSafeProposalState, runSafeProposalScan, acknowledgeSafeProposalCh
 import { createDeadlineSignal, withAbortSignal, withDeadline } from '../shared/request-deadline.mjs';
 import { cardStatus } from './card-style.mjs';
 import { FOURMEME_SAFE } from './address-catalog.mjs';
+import { SAFE_QUEUE_API_BASE_URL } from '../flap-monitor/safe-queue-api.mjs';
 
 export { FOURMEME_SAFE };
 const ACTIVE = new Set(['pending', 'ready', 'confirming']);
@@ -106,6 +107,7 @@ export function createFourmemeSafeMonitor({ store, rpcBatch, fetchFn = fetch, no
           }
         }
         const scanned = await scan({ state: draft, safes: [FOURMEME_SAFE], rpcBatch: call,
+          queueApiBaseUrl: SAFE_QUEUE_API_BASE_URL,
           apiKeys, requestIntervalMs: 5000, maxSafesPerRun: 1, timeoutMs, nowMs: now(), captureUnseenExecutions: true,
           isolateExecutionFailures: true, executionBudgetMs: 3000,
           fetchFn: async (url, options) => {

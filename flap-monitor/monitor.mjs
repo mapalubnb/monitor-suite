@@ -4,6 +4,7 @@ import { createSafeAiService } from './safe-ai-analysis.mjs';
 import { createSafeEvidenceCollector } from './safe-ai-evidence.mjs';
 import { observedSafeConfig } from './safe-observation.mjs';
 import { createMiniAppMonitor } from './mini-app-monitor.mjs';
+import { SAFE_QUEUE_API_BASE_URL } from './safe-queue-api.mjs';
 import { createDeadlineSignal, withDeadline } from '../shared/request-deadline.mjs';
 import { formatBeijingTime, formatDisplayText } from "../shared/display-format.cjs";
 import { createRpcControl, rpcCacheTtl, createRpcErrorLogger, rpcReadLane, RPC_BATCH_SIZE } from "../shared/rpc-control.mjs";
@@ -7141,6 +7142,7 @@ async function runCheck() {
         factoryAddress: CONFIG.factoryPoolMonitor.proxy,
         rpcBatch: bscRpcBatch,
         apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
+        queueApiBaseUrl: SAFE_QUEUE_API_BASE_URL,
         apiKey: CONFIG.safeProposalMonitor.apiKey,
           apiKeys: CONFIG.safeProposalMonitor.apiKeys,
         timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,
@@ -7774,6 +7776,7 @@ async function startMonitor() {
           factoryAddress: CONFIG.factoryPoolMonitor.proxy,
           rpcBatch: bscRpcBatch,
           apiBaseUrl: CONFIG.safeProposalMonitor.apiBaseUrl,
+          queueApiBaseUrl: SAFE_QUEUE_API_BASE_URL,
           apiKey: CONFIG.safeProposalMonitor.apiKey,
           apiKeys: CONFIG.safeProposalMonitor.apiKeys,
           timeoutMs: CONFIG.safeProposalMonitor.requestTimeoutMs,

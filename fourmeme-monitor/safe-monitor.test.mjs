@@ -32,6 +32,13 @@ function fixture(initial = {}, overrides = {}) {
   const fetchFn = async url => {
     data.requests.push(url);
     if (data.status !== 200) return new Response('{}', { status: data.status, headers: { 'retry-after': '60' } });
+    if (url.includes('/queue/api/')) {
+      const results = data.proposals.map(p => ({ ...p, chainId: '56', nonce: String(p.nonce), created: p.submissionDate,
+        txHash: p.transactionHash || null, failed: p.isSuccessful === undefined ? null : !p.isSuccessful,
+        safeTxGas: '0', baseGas: '0', gasPrice: '0', gasToken: null, refundReceiver: null,
+        confirmationsRequired: undefined, submissionDate: undefined }));
+      return new Response(JSON.stringify({ count: results.length, results, next: null, previous: null }));
+    }
     return new Response(JSON.stringify(url.includes('/multisig-transactions/0x') ? data.detail : { results: url.includes('executed=true') ? data.history || (data.detail ? [data.detail] : []) : data.proposals, next: null }));
   };
   const opts = { store, rpcBatch, fetchFn, now: () => time, apiKeys: ['test-key'],
@@ -152,10 +159,10 @@ test('Safe无凭证或关闭不发请求，凭证不进入快照与面板', asyn
   const f = fixture(); await f.poll(); assert.doesNotMatch(JSON.stringify([f.disk, f.monitor.summary()]), /test-key/);
 });
 
-test('Safe身份首次读取无效不建立基线；旧身份复核失败仍可监控提案', async () => {
+test('Safe身份首次读取无效不建立基线；成员复核失败但独立门槛成功仍可监控提案', async () => {
   const f = fixture(); f.data.threshold = 0; await assert.rejects(f.poll(), /身份读取无效/);
   assert.equal(f.disk.fourmemeSafe.identity, undefined); assert.equal(f.data.requests.length, 0);
-  f.data.threshold = 3; await f.poll(); f.data.threshold = 0; f.advance(60000);
+  f.data.threshold = 3; await f.poll(); f.data.owners = []; f.advance(60000);
   f.data.proposals[0].confirmations.push({ owner: TOKEN }); await f.poll();
   assert.equal(f.disk.fourmemeSafe.identity.threshold, 3); assert.match(f.disk.fourmemeSafe.identityError, /无效/);
   assert.match(f.disk._notificationOutbox.at(-1).payload.title, /签名进度更新/);
@@ -168,7 +175,7 @@ test('Four.meme旧详情404按nonce查询实际执行者，旧提案只标替换
   const m = createFourmemeSafeMonitor({ ...f.opts, fetchFn: async url => {
     calls.push(url);
     return url.includes('/multisig-transactions/0x') ? new Response('{}', { status: 404 })
-      : new Response(JSON.stringify({ results: url.includes('executed=true') ? [winner] : [], next: null }));
+      : new Response(JSON.stringify({ count: url.includes('executed=true') ? 1 : 0, results: url.includes('executed=true') ? [winner] : [], next: null }));
   } });
   await settle(); assert.equal(await m.poll(), true);
   const old = Object.values(f.disk.fourmemeSafe.proposals).find(p => p.safeTxHash === HASH);
@@ -208,7 +215,7 @@ test('错误Safe、nonce、缺哈希或未知结果不能将404旧提案认定�
     const g = fixture(initial); g.data.nonce = 151; g.data.proposals = [];
     const winner = { ...proposal(), isExecuted: true, isSuccessful: true, transactionHash: TX, ...change };
     const m = createFourmemeSafeMonitor({ ...g.opts, fetchFn: url => url.includes('/multisig-transactions/0x')
-      ? new Response('{}', { status: 404 }) : new Response(JSON.stringify({ results: url.includes('executed=true') ? [winner] : [], next: null })) });
+      ? new Response('{}', { status: 404 }) : new Response(JSON.stringify({ count: url.includes('executed=true') ? 1 : 0, results: url.includes('executed=true') ? [winner] : [], next: null })) });
     await settle(); await m.poll();
     assert.equal(Object.values(g.disk.fourmemeSafe.proposals)[0].status, 'confirming');
     assert.equal(g.disk._notificationOutbox.length, initial._notificationOutbox.length);

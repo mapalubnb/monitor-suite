@@ -1,5 +1,13 @@
 # Four.meme 监控交接
 
+## 2026/11/25 Safe Queue 兼容迁移
+
+Suite 1.12.115 / Flap 1.10.60 / Four.meme 1.5.52。新增 `flap-monitor/safe-queue-api.mjs` 及专项测试；共享 Safe 扫描增加显式 Queue 接入，Flap 手动/持续入口和 Four.meme 入口启用。逐 Safe 查询并完整分页，链固定 56；新字段转换为旧格式，保留 calldata/签名及提案来源；非空队列额外读取一次 threshold，失败保留旧提案。执行详情与补查使用 Transaction Service v2，发现与 credential ID 保持原基址，现有额度冷却不重置。
+
+零 owner 确认仍捕获，队列消失不等于执行成功；重组后返回队列可恢复为待执行。原频率、地址范围、历史及去重不重置，Flap Safe AI 200 字/完整地址/绿色/异步原卡保持，其余 AI 关闭。修改入口、共享扫描、新适配与测试、版本、README、.env 示例说明和项目状态。旧查询路径保留用于显式兼容调用，生产入口均已接新接口。
+
+本地全量 938/938、语法检查通过；涵盖分页错链/缺页、签名增减、门槛、重启、执行与重组、Key 冷却和双入口。只读实测旧凭证访问 Queue 与执行 v2 均 200，Flap nonce 245 执行哈希/签名/时间一致，Four.meme 队列有 1 笔可供上线前真实回放。无新增生产配置，需停服备份两模块状态及分片后分别重启 Flap 与 Four.meme；机器人无需重启。备份和最终验收另记。
+
 ## 2026/11/20 Keeper 推送门槛调整（Suite 1.12.113 / Four.meme 1.5.51）
 
 用户将 Keeper 已核实的单笔独立资产转账推送门槛调整为严格大于 0.1 BNB。修改 `keeper-transfer-prices.mjs` 常量与 `address-monitor.test.mjs` 边界用例，同步版本、项目状态、根 README 和地址说明。直接 BNB 和混合资产在等于门槛时静默，高出门槛 1 wei 时推送。内部 BNB 单独超限也触发提醒。缺价、管理、失败及其他地址的独立提醒沿用原流程。无配置与快照迁移，只重启 Four.meme。
