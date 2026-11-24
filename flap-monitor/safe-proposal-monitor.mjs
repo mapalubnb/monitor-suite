@@ -2,6 +2,7 @@ import { withDeadline } from '../shared/request-deadline.mjs';
 import { OWNER_MANAGEMENT_CONTRACT, annotateOwners, ownerLink } from './owner-catalog.mjs';
 import { safeApiAddress } from './safe-api-address.mjs';
 import { fetchQueueProposals, normalizeQueueProposal, safeExecutionApiBase } from './safe-queue-api.mjs';
+import { selectQueueBatch, finishQueueBatch } from './safe-queue-batch.mjs';
 import { formatBeijingTime } from "../shared/display-format.cjs";
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from 'node:timers/promises';
@@ -639,6 +640,7 @@ export async function runSafeProposalScan({
   fetchFn = globalThis.fetch,
   apiBaseUrl = DEFAULT_SAFE_API_BASE_URL,
   queueApiBaseUrl = '',
+  queueBatchEnabled = false,
   apiKey = "",
   apiKeys = [],
   timeoutMs = 5_000,
@@ -716,9 +718,44 @@ export async function runSafeProposalScan({
   const start = (state.pollCursor || 0) % normalizedSafes.length;
   const eligible = [...normalizedSafes.slice(start), ...normalizedSafes.slice(0, start)]
     .filter(safe => !(state.safes[safe]?.nextAttemptAtMs > nowMs));
-  const selected = new Set(state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs ? [] : eligible.slice(0, maxSafesPerRun));
+  const useBatch = Boolean(queueApiBaseUrl && queueBatchEnabled);
+  const apiWaiting = state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs;
+  const batchSelection = useBatch ? selectQueueBatch(state, normalizedSafes,
+    apiWaiting ? [] : eligible.filter(safe => currentNonces.get(safe) !== null)) : null;
+  const selected = new Set(useBatch ? batchSelection?.safes || [] : apiWaiting ? [] : eligible.slice(0, maxSafesPerRun));
   const lastSelected = [...selected].at(-1);
   if (lastSelected) state.pollCursor = (normalizedSafes.indexOf(lastSelected) + 1) % normalizedSafes.length;
+
+  let batchError;
+  const batchRows = new Map(), thresholds = new Map();
+  if (batchSelection) {
+    let requests = 0;
+    try {
+      const rows = await fetchQueueProposals({ safes: batchSelection.safes, baseUrl: queueApiBaseUrl,
+        readJson: url => { requests++; return fetchSafeJson(url, { apiKey, timeoutMs, fetchFn }); } });
+      for (const safe of selected) batchRows.set(safe, []);
+      for (const row of rows) batchRows.get(row.safe.toLowerCase()).push(row);
+    } catch (error) { batchError = error; }
+    finishQueueBatch(state, batchSelection, batchError);
+    state.queueBatch.lastScan = { at: runAt, requestedSafes: selected.size, pageRequests: requests,
+      apiCompleted: !batchError, lastError: batchError?.message || '' };
+    if (!batchError) {
+      const needed = [...selected].filter(safe => batchRows.get(safe).length);
+      // One threshold per nonempty Safe, in sequential two-call chunks through
+      // the existing RPC budget. An invalid result only blocks its own Safe.
+      for (let offset = 0; offset < needed.length; offset += 2) {
+        const chunk = needed.slice(offset, offset + 2);
+        try {
+          const values = await rpcBatch(chunk.map(safe => ({ method: 'eth_call',
+            params: [{ to: safe, data: '0xe75235b8' }, 'latest'] })), { critical: true });
+          chunk.forEach((safe, i) => {
+            try { const value = decodeUintWord(values?.[i]); if (value < 1) throw Error('Safe 门槛无效'); thresholds.set(safe, value); }
+            catch (error) { thresholds.set(safe, error); }
+          });
+        } catch (error) { for (const safe of chunk) thresholds.set(safe, error); }
+      }
+    }
+  }
 
   const settled = await Promise.allSettled(normalizedSafes.map(async (safe, index) => {
     const safeState = state.safes[safe] || createSafeStatus(safe);
@@ -734,8 +771,15 @@ export async function runSafeProposalScan({
     safeState.currentNonce = currentNonce;
     if (captureUnseenExecutions && !Number.isInteger(safeState.executionNextNonce)) safeState.executionNextNonce = currentNonce;
     safeState.lastNonceAt = runAt;
-    if (!selected.has(safe) || state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs) return { safe, skipped: true, currentNonce };
+    if (!selected.has(safe) || !useBatch && (state.apiNextAttemptAtMs > nowMs || state.apiRequestNextAt > nowMs)) return { safe, skipped: true, currentNonce };
     if (Number(safeState.nextAttemptAtMs) > nowMs) return { safe, skipped: true, currentNonce };
+    if (useBatch) {
+      if (batchError) throw batchError;
+      const rows = batchRows.get(safe), threshold = thresholds.get(safe);
+      if (threshold instanceof Error) throw threshold;
+      const proposals = rows.map(row => normalizeQueueProposal(row, safe, threshold));
+      return { safe, currentNonce, proposals, baselineWasEstablished: safeState.baselineEstablished === true };
+    }
     // 错开同一轮多个 Safe 请求，降低出口 IP 触发 Safe API 限流的概率。
     if (index > 0) await new Promise(resolve => setTimeout(resolve, index * SAFE_API_STAGGER_MS));
     const proposals = queueApiBaseUrl ? await fetchQueueProposals({ safe, baseUrl: queueApiBaseUrl,

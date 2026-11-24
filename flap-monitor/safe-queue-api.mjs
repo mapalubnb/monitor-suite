@@ -28,10 +28,14 @@ export function normalizeQueueProposal(row, safe, threshold) {
     confirmations: row.confirmations.map(c => ({ ...c, submissionDate: c.created })) };
 }
 
-export async function fetchQueueProposals({ safe, baseUrl = SAFE_QUEUE_API_BASE_URL, readJson }) {
-  if (!address(safe)) throw Error('Safe Queue 查询地址无效');
+export async function fetchQueueProposals({ safe, safes = [safe], baseUrl = SAFE_QUEUE_API_BASE_URL, readJson }) {
+  if (!Array.isArray(safes) || !safes.length || safes.length > 100 || safes.some(s => !address(s)))
+    throw Error('Safe Queue 查询地址无效或超过100项');
+  const requested = new Set(safes.map(s => s.toLowerCase()));
+  if (requested.size !== safes.length) throw Error('Safe Queue 查询地址重复');
   const first = new URL(baseUrl.replace(/\/+$/, '') + '/multisig-transactions/queue');
-  first.search = new URLSearchParams({ safes: safe.toLowerCase() + ':56', nonceOrder: 'asc', limit: '100' });
+  first.search = new URLSearchParams({ nonceOrder: 'asc', limit: '100' });
+  for (const item of requested) first.searchParams.append('safes', item + ':56');
   const results = [], visited = new Set(), hashes = new Set();
   let url = first.href, expected;
   while (url) {
@@ -43,7 +47,8 @@ export async function fetchQueueProposals({ safe, baseUrl = SAFE_QUEUE_API_BASE_
     if (!integer(offset) || Number(offset) !== results.length) throw Error('Safe Queue 分页游标不连续');
     parsed.search = first.search;
     parsed.searchParams.set('offset', offset);
-    if (visited.has(parsed.href) || visited.size >= 10) throw Error('Safe Queue 分页超过上限或循环');
+    if (visited.has(parsed.href)) throw Error('Safe Queue 分页循环');
+    if (visited.size >= 10) throw Object.assign(Error('Safe Queue 分页超过上限，保留旧基线并拆分批次'), { code: 'QUEUE_PAGE_LIMIT' });
     visited.add(parsed.href);
     const page = await readJson(parsed.href);
     if (!Number.isSafeInteger(page?.count) || page.count < 0 || !Array.isArray(page.results)
@@ -51,7 +56,7 @@ export async function fetchQueueProposals({ safe, baseUrl = SAFE_QUEUE_API_BASE_
       || (expected !== undefined && page.count !== expected)) throw Error('Safe Queue 分页响应不完整，保留旧基线');
     expected = page.count;
     for (const row of page.results) {
-      if (String(row?.chainId) !== '56' || !address(row.safe) || row.safe.toLowerCase() !== safe.toLowerCase()
+      if (String(row?.chainId) !== '56' || !address(row.safe) || !requested.has(row.safe.toLowerCase())
         || !hash(row.safeTxHash) || hashes.has(row.safeTxHash.toLowerCase())) throw Error('Safe Queue 分页身份不符或重复');
       hashes.add(row.safeTxHash.toLowerCase()); results.push(row);
     }
